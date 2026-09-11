@@ -12,7 +12,7 @@ use vm::compiler::{
 use vm::host_api::{HostStructField, HostTypeSchema};
 use vm::{
     CompiledProgram, HostFunctionRegistry, SourcePathError, SqliteHostExt, SqlitePolicy,
-    sqlite_host_catalog, standard_host_catalog,
+    register_sqlite_builtin_module, sqlite_host_catalog, standard_host_catalog,
 };
 
 fn opt(inner: HostTypeSchema) -> HostTypeSchema {
@@ -218,7 +218,7 @@ fn object_literal_open_query_and_statement_params_compile() {
         sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
         sqlite::query(&db, "SELECT a FROM t", [], { max_rows: 8 });
         sqlite::transaction(&db, [{ sql: "INSERT INTO t VALUES (1)", query: false }]);
-        sqlite::close(&db);
+        sqlite::close(db);
         "#,
     )
     .expect("object literal sqlite params should compile");
@@ -231,7 +231,7 @@ fn empty_open_and_limits_objects_compile() {
         use sqlite;
         let db = sqlite::open({});
         sqlite::query(&db, "SELECT 1", [], {});
-        sqlite::close(&db);
+        sqlite::close(db);
         "#,
     )
     .expect("all-optional open/limits objects should compile");
@@ -320,7 +320,7 @@ fn typed_field_access_on_execute_and_query_results_compiles() {
         let columns = queried.columns;
         let rows = queried.rows;
         let truncated = queried.truncated;
-        sqlite::close(&db);
+        sqlite::close(db);
         affected + rowid;
         "#,
     )
@@ -337,7 +337,7 @@ fn positional_params_and_row_arrays_remain_dynamic() {
         sqlite::execute(&db, "INSERT INTO t VALUES (?)", [7]);
         let queried = sqlite::query(&db, "SELECT a FROM t", [], {});
         let first = queried.rows[0];
-        sqlite::close(&db);
+        sqlite::close(db);
         queried.truncated;
         "#,
     )
@@ -378,6 +378,18 @@ fn drive_to_halt(vm: &mut vm::vm::Vm) {
     }
 }
 
+fn run_compiled_sqlite(compiled: CompiledProgram) {
+    let mut vm = vm::vm::Vm::try_new(compiled.program).expect("vm");
+    let mut registry = HostFunctionRegistry::empty();
+    register_sqlite_builtin_module(&mut registry)
+        .expect("sqlite exact registration should succeed");
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("sqlite exact host imports should bind");
+    vm.configure_sqlite(SqlitePolicy::default());
+    drive_to_halt(&mut vm);
+}
+
 #[test]
 fn runtime_execute_and_query_results_remain_maps_with_typed_fields() {
     let compiled = compile_standard(
@@ -392,17 +404,12 @@ fn runtime_execute_and_query_results_remain_maps_with_typed_fields() {
         let columns = queried.columns;
         let rows = queried.rows;
         let truncated = queried.truncated;
-        sqlite::close(&db);
+        sqlite::close(db);
         affected + rowid;
         "#,
     )
     .expect("runtime field-access script should compile");
-    let mut vm = vm::vm::Vm::try_new(compiled.program).expect("vm");
-    HostFunctionRegistry::new()
-        .bind_vm_cached(&mut vm)
-        .expect("bind sqlite");
-    vm.configure_sqlite(SqlitePolicy::default());
-    drive_to_halt(&mut vm);
+    run_compiled_sqlite(compiled);
 }
 
 #[test]
@@ -439,7 +446,7 @@ fn optional_null_fields_compile_as_omitted() {
             query: null,
             limits: null,
         }]);
-        sqlite::close(&db);
+        sqlite::close(db);
         "#,
     )
     .expect("present Null on optional sqlite fields should compile");
@@ -454,7 +461,7 @@ fn next_cursor_field_access_compiles() {
         sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
         let queried = sqlite::query(&db, "SELECT a FROM t", [], {});
         let cursor = queried.next_cursor;
-        sqlite::close(&db);
+        sqlite::close(db);
         "#,
     )
     .expect("optional next_cursor field access should compile");
@@ -482,16 +489,11 @@ fn runtime_null_optional_fields_and_next_cursor_field_access() {
         }]);
         let queried = sqlite::query(&db, "SELECT a FROM t", [], {});
         let cursor = queried.next_cursor;
-        sqlite::close(&db);
+        sqlite::close(db);
         empty_cursor;
         cursor;
         "#,
     )
     .expect("null optional fields and next_cursor access should compile");
-    let mut vm = vm::vm::Vm::try_new(compiled.program).expect("vm");
-    HostFunctionRegistry::new()
-        .bind_vm_cached(&mut vm)
-        .expect("bind sqlite");
-    vm.configure_sqlite(SqlitePolicy::default());
-    drive_to_halt(&mut vm);
+    run_compiled_sqlite(compiled);
 }
