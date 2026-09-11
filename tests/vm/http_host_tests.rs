@@ -799,7 +799,7 @@ fn capability_binding_plan_cannot_cross_registry_profiles() {
     let program = build_request_program("http://127.0.0.1:1/".to_string());
     let unrestricted = HostFunctionRegistry::new();
     let plan = unrestricted
-        .prepare_plan(&program.imports)
+        .prepare_plan_with_schemas(&program.imports, program.host_import_schemas())
         .expect("unrestricted registry should prepare HTTP plan");
     let mut vm = Vm::new(program);
     let error = HostFunctionRegistry::restricted()
@@ -813,11 +813,11 @@ fn capability_binding_plan_cannot_outlive_registry_mutation() {
     let program = build_request_program("http://127.0.0.1:1/".to_string());
     let mut registry = HostFunctionRegistry::new();
     let plan = registry
-        .prepare_plan(&program.imports)
+        .prepare_plan_with_schemas(&program.imports, program.host_import_schemas())
         .expect("registry should prepare HTTP plan");
     registry
-        .allow_builtin("http::client::request")
-        .expect("HTTP capability should be a known host callable");
+        .allow_builtin("io::open")
+        .expect("io capability should be a known builtin");
     let mut vm = Vm::new(program);
     let error = registry
         .bind_vm_with_plan(&mut vm, &plan)
@@ -833,7 +833,10 @@ fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
         .allow_builtin("http::client::request")
         .expect("HTTP capability should be known");
     let unchanged_plan = unchanged_registry
-        .prepare_plan(&unchanged_program.imports)
+        .prepare_plan_with_schemas(
+            &unchanged_program.imports,
+            unchanged_program.host_import_schemas(),
+        )
         .expect("restricted registry should prepare HTTP plan");
     let unchanged_clone = unchanged_registry.clone();
     let mut unchanged_vm = Vm::new(unchanged_program);
@@ -852,7 +855,10 @@ fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
         .allow_builtin("io::open")
         .expect("io capability should be known");
     let plan = first_mutation
-        .prepare_plan(&branch_program.imports)
+        .prepare_plan_with_schemas(
+            &branch_program.imports,
+            branch_program.host_import_schemas(),
+        )
         .expect("first capability branch should prepare HTTP plan");
     let mut mutated_vm = Vm::new(branch_program);
     let error = second_mutation
@@ -871,7 +877,7 @@ fn registry_state_rejects_structural_sibling_mutations() {
         Ok(CallOutcome::Return(CallReturn::One(Value::Null)))
     });
     let plan = source
-        .prepare_plan(&program.imports)
+        .prepare_plan_with_schemas(&program.imports, program.host_import_schemas())
         .expect("mutated source registry should prepare HTTP plan");
     let mut vm = Vm::new(program);
     let error = destination

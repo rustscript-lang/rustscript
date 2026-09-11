@@ -29,6 +29,14 @@ pub use builtins::runtime::sqlite::{SqliteHostExt, SqliteLimits, SqlitePolicy};
 #[cfg(feature = "runtime")]
 pub(crate) fn install_default_host_functions(registry: &mut vm::HostFunctionRegistry) {
     builtins::runtime::register_default_host_functions(registry);
+    #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
+    {
+        builtins::runtime::http::register_http_builtin_module_from_catalog(
+            registry,
+            &builtins::runtime::http::http_host_catalog(),
+        )
+        .expect("HTTP catalog registration must succeed");
+    }
 }
 
 #[cfg(all(
