@@ -89,20 +89,32 @@ fn widget_catalog() -> Arc<HostApiCatalog> {
     Arc::new(builder.build().expect("widget catalog must build"))
 }
 
+/// Panic-safe unique `.rss` file under `std::env::temp_dir()`.
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
-fn temp_rss_path(name: &str) -> PathBuf {
-    let root = PathBuf::from(
-        "/mnt/TEMP/workspace/rustscript/tmp/typed-host-callable-stack-sse-address2-9329d7c8",
-    );
-    std::fs::create_dir_all(&root).expect("task temp dir must exist");
-    root.join(format!(
-        "{name}_{}_{}.rss",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock should be valid")
-            .as_nanos()
-    ))
+struct TempRssPath {
+    path: PathBuf,
+}
+
+#[cfg(all(feature = "http-client", not(target_family = "wasm")))]
+impl TempRssPath {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "{name}_{}_{}.rss",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        ));
+        Self { path }
+    }
+}
+
+#[cfg(all(feature = "http-client", not(target_family = "wasm")))]
+impl Drop for TempRssPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 #[test]
@@ -217,15 +229,13 @@ fn custom_catalog_remains_authoritative() {
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
 #[test]
 fn compile_source_file_without_catalog_admits_sse_named_structs() {
-    let path = temp_rss_path("catalog_free_sse_file");
+    let temp = TempRssPath::new("pd_vm_catalog_free_sse_file");
     std::fs::write(
-        &path,
+        &temp.path,
         "fn go() -> SseCallbackAction { { action: \"continue\" } }\n",
     )
     .expect("temp rss must write");
-    let result = compile_source_file(&path);
-    let _ = std::fs::remove_file(&path);
-    result.unwrap_or_else(|err| {
+    compile_source_file(&temp.path).unwrap_or_else(|err| {
         panic!("file frontend without an explicit catalog must admit SseCallbackAction, got {err}")
     });
 }
