@@ -66,9 +66,10 @@ pub(crate) struct HostStreamAdmissionError {
 ///
 /// The VM always validates the callback's callable provenance and arity before
 /// installing a driver. When its metadata is [`TypeSchema::Callable`], it also
-/// validates the argument and result schemas against `fn(map) -> map`. Scripts
-/// receive ordinary callback items and a final value; they never receive a
-/// stream handle or a producer poll API.
+/// validates the argument and result schemas against `fn(map) -> map`. HTTP SSE
+/// additionally requires an `SseCallbackAction`-compatible named or object
+/// result rather than an arbitrary map. Scripts receive ordinary callback items
+/// and a final value; they never receive a stream handle or a producer poll API.
 ///
 /// Implementors must observe these contracts:
 ///
@@ -156,6 +157,20 @@ pub(crate) struct HostStreamContinuation {
     pub(crate) parent_stack_base: usize,
     pub(crate) parent_frame_count: usize,
     pub(crate) parent_ip: usize,
+}
+
+#[cfg(feature = "http-client")]
+fn sse_callback_action_result_schema(result: &TypeSchema) -> bool {
+    match result {
+        TypeSchema::Named(name, args) => name == "SseCallbackAction" && args.is_empty(),
+        TypeSchema::Object(fields) => {
+            fields.len() == 1
+                && fields
+                    .get("action")
+                    .is_some_and(|ty| matches!(ty, TypeSchema::String))
+        }
+        _ => false,
+    }
 }
 
 impl Vm {
@@ -257,6 +272,27 @@ impl Vm {
                 ))
         {
             return Err(VmError::TypeMismatch("fn(map) -> map"));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "http-client")]
+    pub fn validate_sse_callback_value(&self, callback: &Value) -> VmResult<()> {
+        self.validate_stream_callback_value(callback)?;
+        let Value::Callable(callable) = callback else {
+            return Ok(());
+        };
+        let Some(prototype) = self
+            .program
+            .callable_prototypes
+            .get(callable.prototype_id as usize)
+        else {
+            return Ok(());
+        };
+        if let Some(TypeSchema::Callable { result, .. }) = &prototype.schema
+            && !sse_callback_action_result_schema(result)
+        {
+            return Err(VmError::TypeMismatch("fn(map) -> SseCallbackAction"));
         }
         Ok(())
     }
