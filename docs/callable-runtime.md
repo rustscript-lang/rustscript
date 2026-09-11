@@ -80,7 +80,7 @@ Polling drives execution and provides backpressure: at most one event item is bu
 
 ## Callable-driven HTTP streams
 
-With the `http-client` feature, `http::client::request(request)` and `http::client::sse(request, on_event)` are script-facing host imports. SSE is a long-running ordinary host call. Its handler has the schema `fn(map) -> map`. The host produces one event, the VM runs one child callback frame, and the returned action controls continuation before another event can arrive at the VM boundary.
+With the `http-client` feature, `http::client::request(request)` and `http::client::sse(request, on_event)` are script-facing host imports. SSE is a long-running ordinary host call. Its handler has the schema `fn(map) -> SseCallbackAction`. The host produces one event, the VM runs one child callback frame, and the returned action controls continuation before another event can arrive at the VM boundary.
 
 The callback may yield or wait in an ordinary async host call. Existing frame machinery resumes the callback first and returns its final action to the suspended HTTP call. The network future does not own or enter the VM and is not polled while the callback is active, so at most one item remains unacknowledged and callback completion supplies backpressure.
 

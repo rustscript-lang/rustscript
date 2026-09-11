@@ -338,31 +338,33 @@ pub(super) fn parse_request(map: &VmMap, config: &HttpConfig) -> VmResult<HttpRe
     };
 
     let mut headers = Vec::new();
-    if let Some(Value::Map(header_map)) = map.get(&Value::string("headers")) {
-        for (key, value) in header_map.iter() {
-            let Value::String(key) = key else {
-                return Err(VmError::TypeMismatch("HTTP header name"));
-            };
-            let Value::String(value) = value else {
-                return Err(VmError::TypeMismatch("HTTP header value"));
-            };
-            if matches!(
-                key.to_ascii_lowercase().as_str(),
-                "host" | "content-length" | "transfer-encoding" | "connection"
-            ) {
-                return Err(VmError::HostError(format!(
-                    "HTTP header '{key}' is managed by the client",
-                )));
+    match map.get(&Value::string("headers")) {
+        None | Some(Value::Null) => {}
+        Some(Value::Map(header_map)) => {
+            for (key, value) in header_map.iter() {
+                let Value::String(key) = key else {
+                    return Err(VmError::TypeMismatch("HTTP header name"));
+                };
+                let Value::String(value) = value else {
+                    return Err(VmError::TypeMismatch("HTTP header value"));
+                };
+                if matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "host" | "content-length" | "transfer-encoding" | "connection"
+                ) {
+                    return Err(VmError::HostError(format!(
+                        "HTTP header '{key}' is managed by the client",
+                    )));
+                }
+                let name = hyper::header::HeaderName::from_bytes(key.as_bytes())
+                    .map_err(|_| VmError::HostError(format!("invalid HTTP header name '{key}'")))?;
+                let value = hyper::header::HeaderValue::from_str(value).map_err(|_| {
+                    VmError::HostError(format!("invalid HTTP header value for '{key}'"))
+                })?;
+                headers.push((name, value));
             }
-            let name = hyper::header::HeaderName::from_bytes(key.as_bytes())
-                .map_err(|_| VmError::HostError(format!("invalid HTTP header name '{key}'")))?;
-            let value = hyper::header::HeaderValue::from_str(value).map_err(|_| {
-                VmError::HostError(format!("invalid HTTP header value for '{key}'"))
-            })?;
-            headers.push((name, value));
         }
-    } else if map.get(&Value::string("headers")).is_some() {
-        return Err(VmError::TypeMismatch("HTTP headers"));
+        Some(_) => return Err(VmError::TypeMismatch("HTTP headers")),
     }
 
     Ok(HttpRequest {

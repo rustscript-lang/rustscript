@@ -195,18 +195,21 @@ fn build_http_host_catalog() -> Arc<HostApiCatalog> {
 
     let http_request = http_request_struct();
     let http_response = http_response_struct();
+    let sse_request = sse_request_struct();
     let sse_callback_action = sse_callback_action_struct();
     let sse_summary = sse_summary_struct();
     builder.named_struct(http_request.clone());
     builder.named_struct(http_response.clone());
+    builder.named_struct(sse_request.clone());
     builder.named_struct(sse_callback_action.clone());
     builder.named_struct(sse_summary.clone());
 
     // Fixed-shape request/response/action/summary values are named structs.
     // Runtime carriers remain maps. HTTP headers stay a dynamic map. Request
-    // body is optional string at the catalog boundary (the runtime still
-    // accepts bytes). SSE inbound events stay `map` because they are a tagged
-    // union (`open` / `event` / `end`).
+    // body is optional unknown at the catalog boundary because the type system
+    // has no string|bytes union; runtime still accepts only those two forms.
+    // Buffered requests omit SSE-only `timeout_ms`. SSE inbound events stay
+    // `map` because they are a tagged union (`open` / `event` / `end`).
     builder.function(HostFunctionSchema::with_return(
         "http::client::request",
         vec![HostParamSchema::value("request", http_request.as_type())],
@@ -215,7 +218,7 @@ fn build_http_host_catalog() -> Arc<HostApiCatalog> {
     builder.function(HostFunctionSchema::with_return(
         "http::client::sse",
         vec![
-            HostParamSchema::value("request", http_request.as_type()),
+            HostParamSchema::value("request", sse_request.as_type()),
             HostParamSchema::with_passing(
                 "on_event",
                 HostTypeSchema::Callable {
@@ -243,17 +246,23 @@ fn map_unknown() -> HostTypeSchema {
     HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown))
 }
 
+fn http_request_fields() -> Vec<HostStructField> {
+    vec![
+        HostStructField::new("method", HostTypeSchema::String),
+        HostStructField::new("url", HostTypeSchema::String),
+        HostStructField::new("headers", opt(map_string())),
+        HostStructField::new("body", opt(HostTypeSchema::Unknown)),
+    ]
+}
+
 fn http_request_struct() -> HostStructSchema {
-    HostStructSchema::new(
-        "HttpRequest",
-        vec![
-            HostStructField::new("method", HostTypeSchema::String),
-            HostStructField::new("url", HostTypeSchema::String),
-            HostStructField::new("headers", opt(map_string())),
-            HostStructField::new("body", opt(HostTypeSchema::String)),
-            HostStructField::new("timeout_ms", opt(HostTypeSchema::Int)),
-        ],
-    )
+    HostStructSchema::new("HttpRequest", http_request_fields())
+}
+
+fn sse_request_struct() -> HostStructSchema {
+    let mut fields = http_request_fields();
+    fields.push(HostStructField::new("timeout_ms", opt(HostTypeSchema::Int)));
+    HostStructSchema::new("SseRequest", fields)
 }
 
 fn http_response_struct() -> HostStructSchema {
@@ -391,9 +400,8 @@ fn sse_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
 /// Starts an HTTP request under the VM's configured network policy.
 ///
 /// The request is a named `HttpRequest` map: `method`, `url`, optional
-/// `headers`, optional `body`, and optional `timeout_ms` (SSE). The response
-/// is a named `HttpResponse` map with `status`, `headers`, `body`, and the
-/// final `url`.
+/// `headers`, and optional `body` (string or bytes). The response is a named
+/// `HttpResponse` map with `status`, `headers`, `body`, and the final `url`.
 #[pd_host_function(name = "http::client::request")]
 pub(super) fn builtin_http_client_request(
     vm: &mut Vm,

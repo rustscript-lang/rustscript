@@ -37,7 +37,7 @@ let body = response.body;
 - `method`: one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, or `OPTIONS`;
 - `url`: an `http` or `https` URL admitted by host policy;
 - `headers`: an optional string-to-string map;
-- `body`: optional string.
+- `body`: optional string or bytes.
 
 The response is an `HttpResponse` with field access:
 
@@ -70,14 +70,14 @@ let result = http::client::sse({
 let outcome = result.outcome;
 ```
 
-`http::client::sse(request, on_event)` uses the same `HttpRequest` object as buffered requests, plus optional `timeout_ms`:
+`http::client::sse(request, on_event)` accepts an `SseRequest` object with the buffered request fields plus optional `timeout_ms`:
 
 | Field | Required | Accepted type and value | Bound or policy |
 | --- | --- | --- | --- |
 | `method` | yes | string: `GET` or `POST` | Other methods are rejected before transport admission |
 | `url` | yes | string containing an `http` or `https` URL | Protocol family and the configured scheme, host, port, and address policy must all admit it |
 | `headers` | no | map from string header names to string values | Names and values must be syntactically valid; client-managed request headers remain forbidden, and `Accept: text/event-stream` is supplied when absent |
-| `body` | no | string, including for `POST` | Bounded by `max_request_body_bytes` |
+| `body` | no | string or bytes, including for `POST` | Bounded by `max_request_body_bytes` |
 | `timeout_ms` | no | positive integer milliseconds | Caps this optional shortening deadline by `HttpConfig::max_stream_duration` |
 
 The callback schema is `fn(map) -> SseCallbackAction`. Inbound events stay maps because they are a tagged union (`open` / `event` / `end`). The response must have an event-stream content type. The response head remains bounded by the existing HTTP parser. The contract adds no configurable request-header byte accounting.

@@ -692,7 +692,12 @@ fn schema_is_fully_known(schema: &TypeSchema) -> bool {
         | TypeSchema::GenericParam(_) => true,
         // A resource is fully known: its key fixes the nominal type statically.
         TypeSchema::Resource(_) => true,
-        TypeSchema::Optional(inner) => schema_is_fully_known(inner),
+        TypeSchema::Optional(inner) => {
+            // Optional unknown is the host-catalog stand-in for an unavailable
+            // union (HTTP request body is string or bytes). Map/array already
+            // treat unknown payloads as fully known.
+            matches!(inner.as_ref(), TypeSchema::Unknown) || schema_is_fully_known(inner)
+        }
         TypeSchema::Named(_, type_args) => type_args.iter().all(schema_is_fully_known),
         TypeSchema::Array(item) | TypeSchema::Map(item) => {
             matches!(item.as_ref(), TypeSchema::Unknown) || schema_is_fully_known(item)

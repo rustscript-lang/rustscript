@@ -304,17 +304,17 @@ fn map_value(entries: Vec<(&'static str, Value)>) -> Value {
 }
 
 fn parse_stream_timeout(request: &VmMap) -> VmResult<Option<Duration>> {
-    let Some(value) = request.get(&Value::string("timeout_ms")) else {
-        return Ok(None);
-    };
-    let Value::Int(milliseconds) = value else {
-        return Err(VmError::TypeMismatch("SSE timeout_ms"));
-    };
-    let milliseconds = u64::try_from(*milliseconds)
-        .ok()
-        .filter(|milliseconds| *milliseconds > 0)
-        .ok_or_else(|| VmError::HostError("SSE timeout_ms must be positive".to_string()))?;
-    Ok(Some(Duration::from_millis(milliseconds)))
+    match request.get(&Value::string("timeout_ms")) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Int(milliseconds)) => {
+            let milliseconds = u64::try_from(*milliseconds)
+                .ok()
+                .filter(|milliseconds| *milliseconds > 0)
+                .ok_or_else(|| VmError::HostError("SSE timeout_ms must be positive".to_string()))?;
+            Ok(Some(Duration::from_millis(milliseconds)))
+        }
+        Some(_) => Err(VmError::TypeMismatch("SSE timeout_ms")),
+    }
 }
 
 /// Shared SSE stream state owned by the child [`SseStreamResource`].
@@ -1040,7 +1040,7 @@ pub(super) fn builtin_http_client_sse(
     on_event: VmCallable<fn(VmMap) -> VmMap>,
 ) -> VmResult<HostCallResult<VmMap>> {
     let callback = on_event.into_value();
-    vm.validate_stream_callback_value(&callback)?;
+    vm.validate_sse_callback_value(&callback)?;
     let script_timeout = parse_stream_timeout(&request)?;
     let (context, _capture_deadline) = HttpRequestContext::capture(vm, script_timeout, "SSE")?;
     let mut request = parse_request(&request, &context.config)?;
