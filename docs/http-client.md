@@ -21,66 +21,66 @@ Each available API is a host import gated by the HTTP client feature. The two-im
 
 ```rust
 use http;
-use bytes;
 
 let response = http::client::request({
-    "method": "POST",
-    "url": "https://example.test/v1/messages",
-    "headers": {"content-type": "application/json"},
-    "body": bytes::from_utf8("{}"),
+    method: "POST",
+    url: "https://example.test/v1/messages",
+    headers: {"content-type": "application/json"},
+    body: "{}",
 });
+let status = response.status;
+let body = response.body;
 ```
 
-`http::client::request(request)` accepts a map with:
+`http::client::request` accepts an `HttpRequest` object with:
 
 - `method`: one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, or `OPTIONS`;
 - `url`: an `http` or `https` URL admitted by host policy;
 - `headers`: an optional string-to-string map;
-- `body`: optional bytes or a string.
+- `body`: optional string.
 
-The response is buffered under the configured response-body limit and returned as:
+The response is an `HttpResponse` with field access:
 
 ```rust
-{
-    "status": 200,
-    "headers": {"content-type": "application/json"},
-    "body": bytes,
-    "url": "https://example.test/v1/messages",
-}
+response.status   // int
+response.headers  // map (dynamic string keys)
+response.body     // bytes
+response.url      // string, the final validated URL after redirects
 ```
 
-`url` is the final validated URL after redirects. The request body, response body, response head, redirect count, concurrent connection count, connect phase, and total request duration are bounded. `Host`, `Content-Length`, `Transfer-Encoding`, and `Connection` are client-managed request headers. A limit, policy, transport, TLS, redirect, or timeout failure is a host error and produces no response map.
+Use field access (`response.status`). Index `response.headers` as a map. Unknown string indexes on the named response are rejected. The request body, response body, response head, redirect count, concurrent connection count, connect phase, and total request duration are bounded. `Host`, `Content-Length`, `Transfer-Encoding`, and `Connection` are client-managed request headers. A limit, policy, transport, TLS, redirect, or timeout failure is a host error and produces no response.
 
 ## Server-sent events
 
 `http::client::sse` is available with the `http-client` feature.
 
 ```rust
-fn on_sse(item: map) -> map {
+fn on_sse(item: map) -> SseCallbackAction {
     if item["kind"] == "event" {
         print(item["data"]);
     }
-    return {"action": "continue"};
+    return { action: "continue" };
 }
 
 let result = http::client::sse({
-    "method": "GET",
-    "url": "https://example.test/events",
-    "headers": {"accept": "text/event-stream"},
+    method: "GET",
+    url: "https://example.test/events",
+    headers: { accept: "text/event-stream" },
 }, on_sse);
+let outcome = result.outcome;
 ```
 
-`http::client::sse(request, on_event)` uses this request map:
+`http::client::sse(request, on_event)` uses the same `HttpRequest` object as buffered requests, plus optional `timeout_ms`:
 
 | Field | Required | Accepted type and value | Bound or policy |
 | --- | --- | --- | --- |
 | `method` | yes | string: `GET` or `POST` | Other methods are rejected before transport admission |
 | `url` | yes | string containing an `http` or `https` URL | Protocol family and the configured scheme, host, port, and address policy must all admit it |
 | `headers` | no | map from string header names to string values | Names and values must be syntactically valid; client-managed request headers remain forbidden, and `Accept: text/event-stream` is supplied when absent |
-| `body` | no | bytes or string, including for `POST` | Bounded by `max_request_body_bytes` |
+| `body` | no | string, including for `POST` | Bounded by `max_request_body_bytes` |
 | `timeout_ms` | no | positive integer milliseconds | Caps this optional shortening deadline by `HttpConfig::max_stream_duration` |
 
-The callback schema is `fn(map) -> map`, and the response must have an event-stream content type. The response head remains bounded by the existing HTTP parser. The contract adds no configurable request-header byte accounting.
+The callback schema is `fn(map) -> SseCallbackAction`. Inbound events stay maps because they are a tagged union (`open` / `event` / `end`). The response must have an event-stream content type. The response head remains bounded by the existing HTTP parser. The contract adds no configurable request-header byte accounting.
 
 The callback receives exactly one map at a time, in this order:
 
@@ -109,11 +109,11 @@ The callback receives exactly one map at a time, in this order:
 {"kind": "end"}
 ```
 
-The callback must return one of:
+The callback must return an `SseCallbackAction`:
 
 ```rust
-{"action": "continue"}
-{"action": "stop"}
+{ action: "continue" }
+{ action: "stop" }
 ```
 
 `continue` acknowledges the item and permits the next network poll. `stop` ends the call locally. Any other shape or action is a callback error.
@@ -132,18 +132,16 @@ There is no automatic reconnection. Values such as a provider's `[DONE]` marker 
 
 ## Terminal summaries and errors
 
-After callback processing terminates normally, the SSE call returns one summary:
+After callback processing terminates normally, the SSE call returns an `SseSummary`:
 
 ```rust
-{
-    "outcome": "eof" | "stopped",
-    "status": int,
-    "headers": map,
-    "url": string,
-    "items": int,
-    "bytes_received": int,
-    "bytes_sent": int,
-}
+result.outcome        // "eof" | "stopped"
+result.status         // int
+result.headers        // map
+result.url            // string
+result.items          // int
+result.bytes_received // int
+result.bytes_sent     // int
 ```
 
 `items` counts delivered callback items. `bytes_received` and `bytes_sent` are observational summary counters. Limit enforcement uses independent entire-call accounting and does not depend on whether or how these counters are displayed.

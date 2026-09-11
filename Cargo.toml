@@ -133,6 +133,11 @@ path = "tests/vm/http_sse_tests.rs"
 required-features = ["runtime", "http-client"]
 
 [[test]]
+name = "http_named_struct_contract_tests"
+path = "tests/http_named_struct_contract_tests.rs"
+required-features = ["runtime", "http-client"]
+
+[[test]]
 name = "io_http_coexistence_tests"
 path = "tests/vm/io_http_coexistence_tests.rs"
 required-features = ["runtime", "http-client"]

@@ -600,7 +600,7 @@ fn build_sse_program(port: u16) -> Program {
     compile_source(&format!(
         r#"
         use http;
-        fn record(item: map) -> map {{
+        fn record(item: map) -> SseCallbackAction {{
             {{"action": "continue"}}
         }}
         let result = http::client::sse(
@@ -710,7 +710,7 @@ async fn sse_callback_stop_retires_without_end_and_returns_stopped_summary() {
     });
     let source = format!(
         r#"use http;
-        fn stop(item: map) -> map {{ {{"action": "stop"}} }}
+        fn stop(item: map) -> SseCallbackAction {{ {{"action": "stop"}} }}
         let result = http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, stop);
         result;"#
     );

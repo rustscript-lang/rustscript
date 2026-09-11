@@ -94,6 +94,9 @@ fn standard_host_catalog_snapshot() -> &'static StandardHostCatalogSnapshot {
             for resource in catalog.resources() {
                 builder.resource(resource.clone());
             }
+            for schema in catalog.structs() {
+                builder.named_struct(schema.clone());
+            }
             for function in catalog.functions() {
                 builder.function(function.clone());
             }

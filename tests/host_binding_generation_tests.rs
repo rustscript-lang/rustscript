@@ -351,9 +351,9 @@ fn generated_http_imports_are_unique_typed_and_independently_capability_gated() 
 
         let source = r#"
             use http;
-            fn callback(item: map) -> map { { action: "stop" } }
-            http::client::request({ url: "https://example.test/" });
-            http::client::sse({ url: "https://example.test/" }, callback);
+            fn callback(item: map) -> SseCallbackAction { { action: "stop" } }
+            http::client::request({ method: "GET", url: "https://example.test/" });
+            http::client::sse({ method: "GET", url: "https://example.test/" }, callback);
         "#;
         let compiled = compile_source(source).expect("HTTP imports should compile");
         let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");

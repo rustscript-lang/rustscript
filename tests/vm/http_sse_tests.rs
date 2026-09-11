@@ -535,7 +535,7 @@ async fn sse_delivers_open_events_end_and_terminal_summary() {
     let source = format!(
         r#"
         use http;
-        fn record(item: map) -> map {{
+        fn record(item: map) -> SseCallbackAction {{
             if item["kind"] == "open" && item["status"] != 200 {{ let _ = 1 / 0; }}
             if item["kind"] == "event" && item["data"] == "one" && item["event"] != null {{ let _ = 1 / 0; }}
             if item["kind"] == "event" && item["data"] == "two" && item["event"] != "named" {{ let _ = 1 / 0; }}
@@ -580,15 +580,11 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
     )
     .is_err());
 
-    for (timeout, expected) in [
-        ("0", "positive"),
-        ("-1", "positive"),
-        ("\"1\"", "type mismatch"),
-    ] {
+    for (timeout, expected) in [("0", "positive"), ("-1", "positive")] {
         let source = format!(
             r#"
             use http;
-            fn callback(item: map) -> map {{ {{action: "continue"}} }}
+            fn callback(item: map) -> SseCallbackAction {{ {{action: "continue"}} }}
             http::client::sse(
                 {{method: "GET", url: "http://127.0.0.1:1/events", timeout_ms: {timeout}}},
                 callback
@@ -608,9 +604,24 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
         );
     }
 
+    assert!(
+        compile_source(
+            r#"
+            use http;
+            fn callback(item: map) -> SseCallbackAction { {action: "continue"} }
+            http::client::sse(
+                {method: "GET", url: "http://127.0.0.1:1/events", timeout_ms: "1"},
+                callback
+            );
+            "#
+        )
+        .is_err(),
+        "string timeout_ms must be rejected at compile time"
+    );
+
     let source = r#"
         use http;
-        fn callback(item: map) -> map { {action: "continue"} }
+        fn callback(item: map) -> SseCallbackAction { {action: "continue"} }
         http::client::sse(
             {method: "GET", url: "http://127.0.0.1:1/events", timeout_ms: 1},
             callback
@@ -629,7 +640,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
 
     let source = r#"
         use http;
-        fn callback(item: map) -> map { {action: "continue"} }
+        fn callback(item: map) -> SseCallbackAction { {action: "continue"} }
         http::client::sse(
             {method: "PUT", url: "http://127.0.0.1:1/events"},
             callback
@@ -647,7 +658,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
 fn sse_admission_does_not_require_a_tokio_reactor() {
     let source = r#"
         use http;
-        fn callback(item: map) -> map { {action: "continue"} }
+        fn callback(item: map) -> SseCallbackAction { {action: "continue"} }
         http::client::sse(
             {method: "GET", url: "http://127.0.0.1:1/events"},
             callback
@@ -670,7 +681,7 @@ async fn sse_accepts_post_with_body() {
     let source = format!(
         r#"
         use http;
-        fn callback(item: map) -> map {{ {{action: "continue"}} }}
+        fn callback(item: map) -> SseCallbackAction {{ {{action: "continue"}} }}
         http::client::sse(
             {{method: "POST", url: "http://127.0.0.1:{port}/events", body: "payload"}},
             callback
@@ -738,7 +749,7 @@ async fn sse_post_redirect_method_and_body_follow_http_rules() {
         let (port, requests, server) = redirect_server(status);
         let source = format!(
             r#"use http;
-            fn callback(item: map) -> map {{ {{action: "continue"}} }}
+            fn callback(item: map) -> SseCallbackAction {{ {{action: "continue"}} }}
             http::client::sse({{method:"POST", url:"http://127.0.0.1:{port}/start", body:"payload"}}, callback);"#
         );
         run_sse_source(&source, config(port)).await.unwrap();
@@ -771,7 +782,7 @@ async fn sse_rejects_redirect_userinfo_before_reconnecting() {
     });
     let source = format!(
         r#"use http;
-        fn callback(item: map) -> map {{ {{action: "continue"}} }}
+        fn callback(item: map) -> SseCallbackAction {{ {{action: "continue"}} }}
         http::client::sse(
             {{method:"GET", url:"http://127.0.0.1:{port}/start", headers:{{Authorization:"Bearer secret", Cookie:"a=b"}}}},
             callback
@@ -817,7 +828,7 @@ async fn sse_rejects_disallowed_redirect_targets_before_connecting() {
         let (source_port, requests, source_server) = recording_server(vec![vec![redirect]]);
         let source = format!(
             r#"use http;
-            fn callback(item: map) -> map {{ {{action: "continue"}} }}
+            fn callback(item: map) -> SseCallbackAction {{ {{action: "continue"}} }}
             http::client::sse(
                 {{method:"GET", url:"http://127.0.0.1:{source_port}/start", headers:{{Authorization:"Bearer secret", Cookie:"a=b"}}}},
                 callback
@@ -856,7 +867,7 @@ async fn sse_stop_retires_without_end_and_returns_stopped_summary() {
     ]);
     let source = format!(
         r#"use http;
-        fn stop(item: map) -> map {{ {{action: "stop"}} }}
+        fn stop(item: map) -> SseCallbackAction {{ {{action: "stop"}} }}
         http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, stop);"#
     );
     let vm = run_sse_source(&source, config(port)).await.unwrap();
@@ -909,7 +920,7 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
     ] {
         let (port, server) = server(vec![head]);
         let source = format!(
-            r#"use http; fn go(item: map) -> map {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+            r#"use http; fn go(item: map) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
         );
         let error = match run_sse_source(&source, config(port)).await {
             Ok(_) => panic!("invalid SSE response must fail"),
@@ -941,7 +952,7 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
     let mut idle_config = config(port);
     idle_config.stream_idle_timeout = std::time::Duration::from_millis(20);
     let source = format!(
-        r#"use http; fn go(item: map) -> map {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+        r#"use http; fn go(item: map) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
     );
     let error = match run_sse_source(&source, idle_config).await {
         Ok(_) => panic!("idle SSE peer must time out"),
@@ -971,7 +982,7 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
     let mut opening_config = config(port);
     opening_config.stream_idle_timeout = std::time::Duration::from_millis(20);
     let source = format!(
-        r#"use http; fn go(item: map) -> map {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+        r#"use http; fn go(item: map) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
     );
     let error = match run_sse_source(&source, opening_config).await {
         Ok(_) => panic!("SSE response opening must obey idle timeout"),
@@ -1011,7 +1022,7 @@ async fn sse_script_timeout_shortens_the_host_stream_duration() {
     deadline_config.max_stream_duration = std::time::Duration::from_millis(200);
     deadline_config.stream_idle_timeout = std::time::Duration::from_millis(200);
     let source = format!(
-        r#"use http; fn go(item: map) -> map {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events","timeout_ms":20}}, go);"#
+        r#"use http; fn go(item: map) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events","timeout_ms":20}}, go);"#
     );
     let error = match run_sse_source(&source, deadline_config).await {
         Ok(_) => panic!("script deadline should shorten the host maximum"),
@@ -1042,7 +1053,7 @@ async fn sse_host_stream_duration_caps_script_timeout_while_opening() {
     deadline_config.max_stream_duration = std::time::Duration::from_millis(20);
     deadline_config.stream_idle_timeout = std::time::Duration::from_millis(200);
     let source = format!(
-        r#"use http; fn go(item: map) -> map {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events","timeout_ms":1000}}, go);"#
+        r#"use http; fn go(item: map) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events","timeout_ms":1000}}, go);"#
     );
     let error = match run_sse_source(&source, deadline_config).await {
         Ok(_) => panic!("host duration should cap the script timeout during opening"),
@@ -1089,7 +1100,7 @@ async fn sse_stalled_tls_connect_reports_connect_deadline_not_total() {
     connect_config.max_stream_duration = std::time::Duration::from_secs(5);
     connect_config.stream_idle_timeout = std::time::Duration::from_secs(5);
     let source = format!(
-        r#"use http; fn go(item: map) -> map {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"https://127.0.0.1:{port}/events"}}, go);"#
+        r#"use http; fn go(item: map) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"https://127.0.0.1:{port}/events"}}, go);"#
     );
     let error = match run_sse_source(&source, connect_config).await {
         Ok(_) => panic!("a stalled TLS connect must time out"),
@@ -1135,7 +1146,7 @@ async fn sse_withheld_headers_reports_total_deadline_not_connect() {
     deadline_config.connect_timeout = std::time::Duration::from_secs(5);
     deadline_config.stream_idle_timeout = std::time::Duration::from_secs(5);
     let source = format!(
-        r#"use http; fn go(item: map) -> map {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+        r#"use http; fn go(item: map) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
     );
     let error = match run_sse_source(&source, deadline_config).await {
         Ok(_) => panic!("withheld response headers must time out"),
@@ -1182,7 +1193,7 @@ async fn sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout
     let source = format!(
         r#"use http;
         fn count_call() -> bool;
-        fn go(item: map) -> map {{
+        fn go(item: map) -> SseCallbackAction {{
             {{action: if count_call() => {{"continue"}} else => {{"continue"}}}}
         }}
         http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
@@ -1444,7 +1455,7 @@ async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
     let source_code = format!(
         r#"
         use http;
-        fn record(item: map) -> map {{
+        fn record(item: map) -> SseCallbackAction {{
             if item["kind"] == "open" && item != {{
                 kind: "open",
                 status: 200,
