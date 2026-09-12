@@ -7,18 +7,20 @@ use crate::bytecode::{
     CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable,
     FunctionRegion, MAX_FRAME_LOCAL_COUNT, RootCallableBinding, ScriptFunction, TypeMap, ValueType,
 };
-use crate::compiler::ir::TypeSchema;
+use crate::compiler::ir::{StructDecl, StructDeclOrigin, TypeSchema};
 use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 use crate::host_api::{
-    HostApiFingerprint, HostImportParam, HostImportSchema, HostParamPassing, HostTypeSchema,
-    MAX_HOST_CATALOG_PARAMETERS, MAX_HOST_FUNCTION_NAME_LEN, MAX_HOST_RESOURCE_KEY_LEN,
-    MAX_HOST_SCHEMA_DEPTH, MAX_HOST_SCHEMA_NODES, MAX_HOST_SCHEMA_PROPERTIES, ResourceTypeKey,
+    HostApiFingerprint, HostImportParam, HostImportSchema, HostParamPassing, HostStructField,
+    HostTypeSchema, MAX_HOST_CATALOG_PARAMETERS, MAX_HOST_FUNCTION_NAME_LEN,
+    MAX_HOST_PARAMETER_NAME_LEN, MAX_HOST_RESOURCE_KEY_LEN, MAX_HOST_SCHEMA_DEPTH,
+    MAX_HOST_SCHEMA_NODES, MAX_HOST_SCHEMA_PROPERTIES, ResourceTypeKey,
 };
 use crate::vm::{HostImport, OpCode, Program, Value};
 
 const MAGIC: [u8; 4] = *b"VMBC";
 const VERSION_V11: u16 = 11;
 const VERSION_V12: u16 = 12;
+const VERSION_V13: u16 = 13;
 const FLAGS: u16 = 0;
 const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;
@@ -304,7 +306,7 @@ fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireErr
 pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION_V12.to_le_bytes());
+    out.extend_from_slice(&VERSION_V13.to_le_bytes());
     out.extend_from_slice(&FLAGS.to_le_bytes());
     write_u32_count("constants", program.constants.len(), &mut out)?;
 
@@ -341,6 +343,7 @@ pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     write_type_map(&mut out, program.type_map.as_ref())?;
     write_debug_info(&mut out, program.debug.as_ref())?;
     write_callable_metadata(&mut out, program)?;
+    write_named_struct_decls(&mut out, program)?;
 
     Ok(out)
 }
@@ -359,7 +362,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     let version = cursor.read_u16()?;
     let has_host_import_schemas = match version {
         VERSION_V11 => false,
-        VERSION_V12 => true,
+        VERSION_V12 | VERSION_V13 => true,
         _ => return Err(WireError::UnsupportedVersion(version)),
     };
 
@@ -425,6 +428,11 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         root_callable_bindings,
         exported_callables,
     ) = read_callable_metadata(&mut cursor)?;
+    let named_struct_decls = if version >= VERSION_V13 {
+        read_named_struct_decls(&mut cursor)?
+    } else {
+        HashMap::new()
+    };
 
     if !cursor.is_eof() {
         return Err(WireError::TrailingBytes);
@@ -438,6 +446,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     program.function_regions = function_regions;
     program.root_callable_bindings = root_callable_bindings;
     program.exported_callables = exported_callables;
+    program.named_struct_decls = named_struct_decls;
     let type_map_local_count = program
         .type_map
         .as_ref()
@@ -1063,6 +1072,58 @@ fn write_callable_metadata(out: &mut Vec<u8>, program: &Program) -> Result<(), W
     Ok(())
 }
 
+fn write_named_struct_decls(out: &mut Vec<u8>, program: &Program) -> Result<(), WireError> {
+    let mut decls = program.named_struct_decls.values().collect::<Vec<_>>();
+    decls.sort_unstable_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+    write_u32_count("named struct decls", decls.len(), out)?;
+    for decl in decls {
+        write_string("named struct name", &decl.name, out)?;
+        write_u32_count("named struct type params", decl.type_params.len(), out)?;
+        for type_param in &decl.type_params {
+            write_string("named struct type param", type_param, out)?;
+        }
+        write_schema(&decl.body_schema, out)?;
+    }
+    Ok(())
+}
+
+fn read_named_struct_decls(
+    cursor: &mut Cursor<'_>,
+) -> Result<HashMap<String, StructDecl>, WireError> {
+    let count = cursor.read_count("named struct decls", 1)?;
+    let mut decls = HashMap::new();
+    reserve_map(&mut decls, "named struct decls", count)?;
+    for _ in 0..count {
+        let name = cursor.read_string()?;
+        let param_count = cursor.read_count("named struct type params", 1)?;
+        let mut type_params = Vec::new();
+        reserve_vec(&mut type_params, "named struct type params", param_count)?;
+        for _ in 0..param_count {
+            let param = cursor.read_string()?;
+            if type_params.iter().any(|existing| existing == &param) {
+                return Err(WireError::InvalidValueType(0));
+            }
+            type_params.push(param);
+        }
+        let body_schema = read_schema(cursor, 0)?;
+        if decls
+            .insert(
+                name.clone(),
+                StructDecl {
+                    name,
+                    type_params,
+                    body_schema,
+                    origin: StructDeclOrigin::Guest,
+                },
+            )
+            .is_some()
+        {
+            return Err(WireError::InvalidValueType(0));
+        }
+    }
+    Ok(decls)
+}
+
 fn write_u16_list(field: &'static str, values: &[u16], out: &mut Vec<u8>) -> Result<(), WireError> {
     write_u32_count(field, values.len(), out)?;
     for value in values {
@@ -1622,6 +1683,15 @@ fn write_host_type_schema(
             out.push(12);
             write_string("host resource type key", key.as_str(), out)?;
         }
+        HostTypeSchema::Named { name, fields } => {
+            out.push(13);
+            write_string("host named struct name", name, out)?;
+            write_u32_count("host named struct fields", fields.len(), out)?;
+            for field in fields {
+                write_string("host named struct field name", &field.name, out)?;
+                write_host_type_schema(&field.ty, out, next_host_schema_depth(depth)?)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1684,6 +1754,26 @@ fn read_host_type_schema(
             )
             .map_err(|_| WireError::InvalidHostResourceKey)?;
             Ok(HostTypeSchema::Resource(key))
+        }
+        13 => {
+            let name =
+                cursor.read_bounded_string("host named struct name", MAX_HOST_FUNCTION_NAME_LEN)?;
+            let count = cursor.read_count_with_overhead("host named struct fields", 1, 1)?;
+            if count > MAX_HOST_SCHEMA_PROPERTIES {
+                return Err(WireError::LengthTooLarge("host named struct fields", count));
+            }
+            cursor.debit_host_schema_properties(count)?;
+            let mut fields = Vec::new();
+            reserve_vec(&mut fields, "host named struct fields", count)?;
+            for _ in 0..count {
+                let field_name = cursor.read_bounded_string(
+                    "host named struct field name",
+                    MAX_HOST_PARAMETER_NAME_LEN,
+                )?;
+                let ty = read_host_type_schema(cursor, next_host_schema_depth(depth)?)?;
+                fields.push(HostStructField::new(field_name, ty));
+            }
+            Ok(HostTypeSchema::Named { name, fields })
         }
         other => Err(WireError::InvalidHostSchemaTag(other)),
     }

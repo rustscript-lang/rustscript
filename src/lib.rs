@@ -26,11 +26,32 @@ pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, a
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
 #[cfg(all(feature = "runtime", feature = "sqlite", not(target_arch = "wasm32")))]
 pub use builtins::runtime::sqlite::{SqliteHostExt, SqliteLimits, SqlitePolicy};
+#[cfg(all(feature = "runtime", feature = "sqlite", not(target_arch = "wasm32")))]
+pub use builtins::runtime::{
+    register_sqlite_builtin_module, register_sqlite_builtin_module_from_catalog,
+};
 #[cfg(feature = "runtime")]
 pub(crate) fn install_default_host_functions(registry: &mut vm::HostFunctionRegistry) {
     builtins::runtime::register_default_host_functions(registry);
+    #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
+    {
+        builtins::runtime::http::register_http_builtin_module_from_catalog(
+            registry,
+            &builtins::runtime::http::http_host_catalog(),
+        )
+        .expect("HTTP catalog registration must succeed");
+    }
 }
 
+#[cfg(all(
+    feature = "runtime",
+    feature = "http-client",
+    not(target_family = "wasm")
+))]
+pub use builtins::runtime::http::{
+    HttpConfig, HttpExtension, HttpHostExt, http_host_catalog, register_http_builtin_module,
+    register_http_builtin_module_from_catalog,
+};
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
     BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg,
@@ -40,7 +61,9 @@ pub use builtins::runtime::{
 pub use builtins::runtime::{IoHostExt, IoPolicy};
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
-    io_host_catalog, sqlite_host_catalog, standard_composition, standard_host_catalog,
+    io_host_catalog, jit_host_catalog, register_jit_builtin_module,
+    register_jit_builtin_module_from_catalog, sqlite_host_catalog, standard_composition,
+    standard_host_catalog, standard_host_catalog_fingerprint,
 };
 pub use builtins::{
     BUILTIN_CATALOG, BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec,
@@ -52,16 +75,16 @@ pub use builtins::{
 pub use bytecode::{
     CallableEnvironment, CallableKind, CallablePrototype, CallableTarget, CallableValue,
     CaptureBindingMode, ExportedCallable, FunctionRegion, HostImport, MAX_FRAME_LOCAL_COUNT,
-    OpCode, Program, RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType,
+    OpCode, Program, RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType, VmMap,
 };
 pub use host_api::{
     FunctionNameError, HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint,
     HostFunctionSchema, HostParamPassing, HostParamSchema, HostSchemaValidationError,
-    HostTypeSchema, MAX_HOST_CATALOG_FUNCTIONS, MAX_HOST_CATALOG_PARAMETERS,
-    MAX_HOST_CATALOG_RESOURCES, MAX_HOST_DESCRIPTION_LEN, MAX_HOST_FUNCTION_NAME_LEN,
-    MAX_HOST_PARAMETER_NAME_LEN, MAX_HOST_RESOURCE_KEY_LEN, MAX_HOST_SCHEMA_DEPTH,
-    MAX_HOST_SCHEMA_NODES, MAX_HOST_SCHEMA_PROPERTIES, ResourceTypeKey, ResourceTypeKeyError,
-    ResourceTypeSchema, validate_host_import_schemas,
+    HostStructField, HostStructSchema, HostTypeSchema, MAX_HOST_CATALOG_FUNCTIONS,
+    MAX_HOST_CATALOG_PARAMETERS, MAX_HOST_CATALOG_RESOURCES, MAX_HOST_DESCRIPTION_LEN,
+    MAX_HOST_FUNCTION_NAME_LEN, MAX_HOST_PARAMETER_NAME_LEN, MAX_HOST_RESOURCE_KEY_LEN,
+    MAX_HOST_SCHEMA_DEPTH, MAX_HOST_SCHEMA_NODES, MAX_HOST_SCHEMA_PROPERTIES, ResourceTypeKey,
+    ResourceTypeKeyError, ResourceTypeSchema, validate_host_import_schemas,
 };
 #[cfg(feature = "runtime")]
 pub use vm::runtime::{
@@ -127,9 +150,10 @@ pub use vm::{
     InvocationPoll, QueuedScriptInvocation, RegistrySchemaError, ResourceCloseReason, ScriptArgs,
     ScriptCallback, ScriptResult, StandardSurfaceComposition, StaticHostArgsFunction,
     StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus,
-    VmYieldReason, async_host, catalog_import_schemas, execution_scope, host_context,
-    host_extension, operation, register_catalog_function, register_catalog_static_function,
-    resource, validate_catalog_import_schemas, validate_catalog_import_schemas_with_fingerprints,
+    VmYieldReason, async_host, catalog_import_schemas, catalog_import_schemas_into,
+    catalog_named_struct_schemas, execution_scope, host_context, host_extension, operation,
+    register_catalog_function, register_catalog_static_function, register_host_extension, resource,
+    validate_catalog_import_schemas, validate_catalog_import_schemas_with_fingerprints,
 };
 #[cfg(feature = "runtime")]
 pub use vmbc::{

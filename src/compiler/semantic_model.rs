@@ -48,7 +48,7 @@ use std::sync::Arc;
 
 use crate::host_api::{
     HostApiCatalog, HostApiFingerprint, HostFunctionSchema, HostImportParam, HostImportSchema,
-    HostParamPassing, HostTypeSchema,
+    HostParamPassing, HostStructSchema, HostTypeSchema,
 };
 
 use super::CompileError;
@@ -627,7 +627,7 @@ impl SemanticModel {
     /// Convert a compiler [`TypeSchema`] to a [`HostTypeSchema`] for display.
     fn compiler_schema_to_host_schema(&self, schema: &TypeSchema) -> HostTypeSchema {
         match schema {
-            TypeSchema::Unknown => HostTypeSchema::Unknown,
+            TypeSchema::Unknown => crate::host_api::HostTypeSchema::Unknown,
             TypeSchema::Null => HostTypeSchema::Null,
             TypeSchema::Int => HostTypeSchema::Int,
             TypeSchema::Float => HostTypeSchema::Float,
@@ -652,15 +652,24 @@ impl SemanticModel {
                 result: Box::new(self.compiler_schema_to_host_schema(result)),
             },
             TypeSchema::Resource(key) => HostTypeSchema::Resource(key.clone()),
-            TypeSchema::Named(_name, _type_args) => HostTypeSchema::Unknown,
-            TypeSchema::GenericParam(_name) => HostTypeSchema::Unknown,
+            TypeSchema::Named(name, _type_args) => self
+                .catalog
+                .struct_named(name)
+                .map(HostStructSchema::as_type)
+                .unwrap_or_else(|| HostTypeSchema::Named {
+                    name: name.clone(),
+                    fields: Vec::new(),
+                }),
+            TypeSchema::GenericParam(_name) => crate::host_api::HostTypeSchema::Unknown,
             TypeSchema::ArrayTuple(_items) => {
-                HostTypeSchema::Array(Box::new(HostTypeSchema::Unknown))
+                HostTypeSchema::Array(Box::new(crate::host_api::HostTypeSchema::Unknown))
             }
             TypeSchema::ArrayTupleRest { prefix: _, rest: _ } => {
-                HostTypeSchema::Array(Box::new(HostTypeSchema::Unknown))
+                HostTypeSchema::Array(Box::new(crate::host_api::HostTypeSchema::Unknown))
             }
-            TypeSchema::Object(_) => HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown)),
+            TypeSchema::Object(_) => {
+                HostTypeSchema::Map(Box::new(crate::host_api::HostTypeSchema::Unknown))
+            }
         }
     }
 
@@ -1796,7 +1805,7 @@ mod tests {
             "len",
             vec![HostParamSchema::value(
                 "value",
-                HostTypeSchema::Array(Box::new(HostTypeSchema::Unknown)),
+                HostTypeSchema::Array(Box::new(crate::host_api::HostTypeSchema::Unknown)),
             )],
             HostTypeSchema::Int,
         ));
@@ -1813,7 +1822,7 @@ mod tests {
             "len",
             vec![HostParamSchema::value(
                 "value",
-                HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown)),
+                HostTypeSchema::Map(Box::new(crate::host_api::HostTypeSchema::Unknown)),
             )],
             HostTypeSchema::Int,
         ));
@@ -2466,6 +2475,8 @@ mod tests {
             return_type: TypeSchema::Resource(ResourceTypeKey::new("test.resource").unwrap()),
             passing: vec![HostParamPassing::Value],
             fingerprint: catalog.fingerprint(),
+            host_params: Vec::new(),
+            host_return_type: crate::host_api::HostTypeSchema::Unknown,
         };
         ir.stmts.push(Stmt::Expr {
             expr: Expr::Call(

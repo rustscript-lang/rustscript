@@ -1,0 +1,18 @@
+use sqlite;
+
+fn main() {
+    let db = sqlite::open({
+        path: ":memory:",
+        mode: "memory",
+        limits: { max_rows: 32 },
+    });
+    sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
+    let inserted = sqlite::execute(&db, "INSERT INTO t VALUES (?)", [7]);
+    let queried = sqlite::query(&db, "SELECT a FROM t", [], {});
+    let n = inserted.rows_affected;
+    let id = inserted.last_insert_rowid;
+    let truncated = queried.truncated;
+    sqlite::close(db);
+    n + id;
+    truncated;
+}

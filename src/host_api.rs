@@ -10,8 +10,9 @@
 //! ## Design invariants
 //!
 //! * **Host-agnostic.** The catalog carries only semantic signatures: scalar,
-//!   collection, callable and unknown schemas plus typed resource references.
-//!   It does not talk about handles, bytecode or VM state.
+//!   collection, callable, named fixed-shape structs and unknown schemas plus
+//!   typed resource references. It does not talk about handles, bytecode or VM
+//!   state. Named structs are compile-time shapes; runtime values remain maps.
 //! * **Owned and serializable-friendly.** Every type owns its data (`String` /
 //!   `Vec`) and derives or implements [`serde::Serialize`] /
 //!   [`serde::Deserialize`]. No lifetimes, no `&'static` slices, no
@@ -22,9 +23,9 @@
 //!   cannot enter through serde — the same rules the builder enforces.
 //! * **Explicit resource ownership.** A parameter whose type **contains any
 //!   resource**, directly or recursively (`Optional`, `Array`, `Map`,
-//!   `Callable`), must use an explicit borrow/ownership passing mode; `Value`
-//!   is forbidden. A parameter whose type contains **no** resource must use
-//!   `Value`; a borrow/ownership mode is forbidden.
+//!   `Callable`, named struct fields), must use an explicit borrow/ownership
+//!   passing mode; `Value` is forbidden. A parameter whose type contains **no**
+//!   resource must use `Value`; a borrow/ownership mode is forbidden.
 //! * **Overloading.** Host functions may legally share a name with distinct
 //!   argument signatures (standard builtins such as `len` dispatch for string,
 //!   array, bytes and map). Overloads must differ in their **argument type /
@@ -85,11 +86,17 @@ pub const MAX_HOST_CATALOG_RESOURCES: usize = 1_024;
 /// Maximum function/overload declarations in one catalog.
 pub const MAX_HOST_CATALOG_FUNCTIONS: usize = 1_024;
 
+/// Maximum named-struct declarations in one catalog.
+pub const MAX_HOST_CATALOG_STRUCTS: usize = 1_024;
+
 /// Maximum byte length of names on host parameter records.
 pub const MAX_HOST_PARAMETER_NAME_LEN: usize = 128;
 
 /// Maximum byte length of host resource/function documentation.
 pub const MAX_HOST_DESCRIPTION_LEN: usize = 4_096;
+
+/// Max byte length of a validated named-struct or struct-field identifier.
+const MAX_STRUCT_IDENT_LEN: usize = 128;
 
 /// 8-byte domain magic prepended to every fingerprint so digest bytes in one
 /// domain (host API catalogs) cannot be confused with unrelated FNV digests
@@ -99,7 +106,7 @@ const FINGERPRINT_DOMAIN_MAGIC: &[u8; 8] = b"rss-hapi";
 /// The fingerprint wire/format version. Bump whenever the canonical byte
 /// encoding or semantic interpretation changes so old and new digests are
 /// never compared across versions.
-const FINGERPRINT_FORMAT_VERSION: u8 = 1;
+const FINGERPRINT_FORMAT_VERSION: u8 = 2;
 
 /// Error returned when a [`ResourceTypeKey`] cannot be constructed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -338,11 +345,71 @@ impl HostParamPassing {
     }
 }
 
+/// One field of a named host struct.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct HostStructField {
+    /// Field identifier.
+    pub name: String,
+    /// Field type.
+    pub ty: HostTypeSchema,
+}
+
+impl HostStructField {
+    /// Constructs a named field.
+    pub fn new(name: impl Into<String>, ty: HostTypeSchema) -> Self {
+        Self {
+            name: name.into(),
+            ty,
+        }
+    }
+}
+
+/// Catalog-level named fixed-shape host struct.
+///
+/// Functions reference the same shape via [`HostTypeSchema::Named`]. Runtime
+/// values remain maps; the name is a compile-time identity used for field
+/// access, object-literal compatibility, display, and LSP.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct HostStructSchema {
+    /// Struct type name (identifier).
+    pub name: String,
+    /// Declared fields in registration order.
+    pub fields: Vec<HostStructField>,
+    /// Human-readable documentation. Excluded from the fingerprint.
+    pub description: String,
+}
+
+impl HostStructSchema {
+    /// Constructs a named struct with empty documentation.
+    pub fn new(name: impl Into<String>, fields: Vec<HostStructField>) -> Self {
+        Self {
+            name: name.into(),
+            fields,
+            description: String::new(),
+        }
+    }
+
+    /// Sets the documentation string.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    /// Type used in function params/returns for this struct.
+    pub fn as_type(&self) -> HostTypeSchema {
+        HostTypeSchema::Named {
+            name: self.name.clone(),
+            fields: self.fields.clone(),
+        }
+    }
+}
+
 /// Semantic schema of a single host value type.
 ///
 /// Covers the same scalar / collection / callable / unknown surface used by
 /// the compiler's inference pass, and adds an explicit [`Self::Resource`]
-/// variant that references a declared [`ResourceTypeKey`].
+/// variant that references a declared [`ResourceTypeKey`] plus
+/// [`Self::Named`] for catalog-declared fixed-shape structs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum HostTypeSchema {
     Unknown,
@@ -362,9 +429,22 @@ pub enum HostTypeSchema {
     },
     /// A host resource identified by a declared [`ResourceTypeKey`].
     Resource(ResourceTypeKey),
+    /// Named fixed-shape struct. Runtime values remain maps.
+    Named {
+        name: String,
+        fields: Vec<HostStructField>,
+    },
 }
 
 impl HostTypeSchema {
+    /// Named fixed-shape struct used in function params/returns.
+    pub fn named_struct(name: impl Into<String>, fields: Vec<HostStructField>) -> Self {
+        Self::Named {
+            name: name.into(),
+            fields,
+        }
+    }
+
     /// Returns the resource key when this schema (directly, or wrapped in a
     /// single optional layer) denotes a host resource. This is a shallow
     /// helper; use [`Self::contains_resource`] for the full recursive test.
@@ -388,8 +468,8 @@ impl HostTypeSchema {
     }
 
     /// Whether this schema references at least one resource, anywhere in the
-    /// tree (direct, `Optional`, `Array`, `Map` value, or inside a `Callable`
-    /// parameter/result).
+    /// tree (direct, `Optional`, `Array`, `Map` value, named struct field, or
+    /// inside a `Callable` parameter/result).
     pub fn contains_resource(&self) -> bool {
         let mut budget = ComplexityBudget::default();
         let mut on_resource = |_key: &ResourceTypeKey| {};
@@ -438,6 +518,13 @@ impl Serialize for HostTypeSchema {
             Self::Resource(key) => {
                 serializer.serialize_newtype_variant("HostTypeSchema", 12, "Resource", key)
             }
+            Self::Named { name, fields } => {
+                let mut state =
+                    serializer.serialize_struct_variant("HostTypeSchema", 13, "Named", 2)?;
+                state.serialize_field("name", name)?;
+                state.serialize_field("fields", fields)?;
+                state.end()
+            }
         }
     }
 }
@@ -457,6 +544,7 @@ enum HostTypeSchemaVariant {
     Optional,
     Callable,
     Resource,
+    Named,
 }
 
 struct HostTypeSchemaSeed<'a> {
@@ -489,7 +577,7 @@ impl<'de> DeserializeSeed<'de> for HostTypeSchemaSeed<'_> {
             "HostTypeSchema",
             &[
                 "Unknown", "Null", "Int", "Float", "Number", "Bool", "String", "Bytes", "Array",
-                "Map", "Optional", "Callable", "Resource",
+                "Map", "Optional", "Callable", "Resource", "Named",
             ],
             HostTypeSchemaVisitor {
                 budget: self.budget,
@@ -566,6 +654,12 @@ impl<'de> Visitor<'de> for HostTypeSchemaVisitor<'_> {
             HostTypeSchemaVariant::Resource => access
                 .newtype_variant::<ResourceTypeKey>()
                 .map(HostTypeSchema::Resource),
+            HostTypeSchemaVariant::Named => access
+                .newtype_variant_seed(NamedSchemaSeed {
+                    budget: self.budget,
+                    depth: self.depth,
+                })
+                .map(|(name, fields)| HostTypeSchema::Named { name, fields }),
         }
     }
 }
@@ -680,6 +774,239 @@ impl<'de> Visitor<'de> for CallableSchemaVisitor<'_> {
     }
 }
 
+struct NamedSchemaSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for NamedSchemaSeed<'_> {
+    type Value = (String, Vec<HostStructField>);
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let child_depth = next_schema_depth::<D::Error>(self.depth)?;
+        deserializer.deserialize_struct(
+            "HostTypeSchema::Named",
+            &["name", "fields"],
+            NamedSchemaVisitor {
+                budget: self.budget,
+                child_depth,
+            },
+        )
+    }
+}
+
+struct NamedSchemaVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+    child_depth: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum NamedSchemaField {
+    Name,
+    Fields,
+}
+
+impl<'de> Visitor<'de> for NamedSchemaVisitor<'_> {
+    type Value = (String, Vec<HostStructField>);
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a named struct schema object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        bounded_map_size_hint(map.size_hint(), "named schema", 2)?;
+        let mut entries = 0;
+        let mut name = None;
+        let mut fields = None;
+        loop {
+            let Some(field) = map.next_key::<NamedSchemaField>()? else {
+                break;
+            };
+            bounded_map_entry(&mut entries, "named schema", 2)?;
+            match field {
+                NamedSchemaField::Name => {
+                    if name.is_some() {
+                        return Err(de::Error::duplicate_field("name"));
+                    }
+                    name = Some(map.next_value_seed(BoundedStringSeed {
+                        field: "struct name",
+                        limit: MAX_STRUCT_IDENT_LEN,
+                    })?);
+                }
+                NamedSchemaField::Fields => {
+                    if fields.is_some() {
+                        return Err(de::Error::duplicate_field("fields"));
+                    }
+                    fields = Some(map.next_value_seed(HostStructFieldListSeed {
+                        budget: self.budget,
+                        depth: self.child_depth,
+                    })?);
+                }
+            }
+        }
+        let name = name.ok_or_else(|| de::Error::missing_field("name"))?;
+        let fields = fields.ok_or_else(|| de::Error::missing_field("fields"))?;
+        Ok((name, fields))
+    }
+}
+
+struct HostStructFieldListSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for HostStructFieldListSeed<'_> {
+    type Value = Vec<HostStructField>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(HostStructFieldListVisitor {
+            budget: self.budget,
+            depth: self.depth,
+        })
+    }
+}
+
+struct HostStructFieldListVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+    depth: usize,
+}
+
+impl<'de> Visitor<'de> for HostStructFieldListVisitor<'_> {
+    type Value = Vec<HostStructField>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded named-struct field list")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let hint = seq.size_hint();
+        let capacity = bounded_sequence_capacity(
+            hint,
+            MAX_HOST_SCHEMA_PROPERTIES - self.budget.properties,
+            HostSchemaValidationError::PropertyBudgetExceeded {
+                limit: MAX_HOST_SCHEMA_PROPERTIES,
+            },
+        )?;
+        let mut values = Vec::new();
+        if capacity != 0 {
+            values.try_reserve_exact(capacity).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "named struct fields",
+                })
+            })?;
+        }
+        while let Some(value) = seq.next_element_seed(HostStructFieldSeed {
+            budget: self.budget,
+            depth: self.depth,
+        })? {
+            values.try_reserve_exact(1).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "named struct fields",
+                })
+            })?;
+            values.push(value);
+        }
+        Ok(values)
+    }
+}
+
+struct HostStructFieldSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for HostStructFieldSeed<'_> {
+    type Value = HostStructField;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "HostStructField",
+            &["name", "ty"],
+            HostStructFieldVisitor {
+                budget: self.budget,
+                depth: self.depth,
+            },
+        )
+    }
+}
+
+struct HostStructFieldVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+    depth: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum HostStructFieldDeField {
+    Name,
+    Ty,
+}
+
+impl<'de> Visitor<'de> for HostStructFieldVisitor<'_> {
+    type Value = HostStructField;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a named struct field")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        bounded_map_size_hint(map.size_hint(), "named struct field", 2)?;
+        let mut entries = 0;
+        let mut name = None;
+        let mut ty = None;
+        loop {
+            let Some(field) = map.next_key::<HostStructFieldDeField>()? else {
+                break;
+            };
+            bounded_map_entry(&mut entries, "named struct field", 2)?;
+            match field {
+                HostStructFieldDeField::Name => {
+                    if name.is_some() {
+                        return Err(de::Error::duplicate_field("name"));
+                    }
+                    name = Some(map.next_value_seed(BoundedStringSeed {
+                        field: "struct field name",
+                        limit: MAX_STRUCT_IDENT_LEN,
+                    })?);
+                }
+                HostStructFieldDeField::Ty => {
+                    if ty.is_some() {
+                        return Err(de::Error::duplicate_field("ty"));
+                    }
+                    ty = Some(map.next_value_seed(HostTypeSchemaSeed {
+                        budget: self.budget,
+                        depth: self.depth,
+                        property: true,
+                    })?);
+                }
+            }
+        }
+        Ok(HostStructField {
+            name: name.ok_or_else(|| de::Error::missing_field("name"))?,
+            ty: ty.ok_or_else(|| de::Error::missing_field("ty"))?,
+        })
+    }
+}
+
 struct HostSchemaListSeed<'a> {
     budget: &'a mut ComplexityBudget,
     depth: usize,
@@ -773,6 +1100,7 @@ impl fmt::Display for HostTypeSchema {
                 write!(f, ") -> {result}")
             }
             Self::Resource(key) => write!(f, "resource<{key}>"),
+            Self::Named { name, .. } => write!(f, "{name}"),
         }
     }
 }
@@ -1800,6 +2128,9 @@ pub enum HostSchemaValidationError {
     FunctionBudgetExceeded {
         limit: usize,
     },
+    StructBudgetExceeded {
+        limit: usize,
+    },
     MapEntriesExceeded {
         field: &'static str,
         limit: usize,
@@ -1845,6 +2176,9 @@ impl fmt::Display for HostSchemaValidationError {
             Self::FunctionBudgetExceeded { limit } => {
                 write!(f, "host catalog function budget exceeds maximum of {limit}")
             }
+            Self::StructBudgetExceeded { limit } => {
+                write!(f, "host catalog struct budget exceeds maximum of {limit}")
+            }
             Self::MapEntriesExceeded { field, limit } => {
                 write!(f, "host {field} map contains more than {limit} entries")
             }
@@ -1873,6 +2207,7 @@ struct ComplexityBudget {
     parameters: usize,
     resources: usize,
     functions: usize,
+    structs: usize,
 }
 
 impl ComplexityBudget {
@@ -1931,6 +2266,18 @@ impl ComplexityBudget {
             MAX_HOST_CATALOG_FUNCTIONS,
             HostSchemaValidationError::FunctionBudgetExceeded {
                 limit: MAX_HOST_CATALOG_FUNCTIONS,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn charge_structs(&mut self, amount: usize) -> Result<(), HostSchemaValidationError> {
+        self.structs = checked_budget_add(
+            self.structs,
+            amount,
+            MAX_HOST_CATALOG_STRUCTS,
+            HostSchemaValidationError::StructBudgetExceeded {
+                limit: MAX_HOST_CATALOG_STRUCTS,
             },
         )?;
         Ok(())
@@ -2080,6 +2427,23 @@ where
                 pending.push((result, child_depth));
                 for param in params.iter().rev() {
                     pending.push((param, child_depth));
+                }
+            }
+            HostTypeSchema::Named { fields, .. } => {
+                budget.charge_properties(fields.len())?;
+                let child_depth =
+                    depth
+                        .checked_add(1)
+                        .ok_or(HostSchemaValidationError::IntegerOverflow {
+                            field: "schema depth",
+                        })?;
+                pending.try_reserve(fields.len()).map_err(|_| {
+                    HostSchemaValidationError::AllocationFailed {
+                        field: "schema traversal",
+                    }
+                })?;
+                for field in fields.iter().rev() {
+                    pending.push((&field.ty, child_depth));
                 }
             }
             HostTypeSchema::Unknown
@@ -2236,6 +2600,35 @@ pub enum HostApiCatalogError {
         parameter: String,
     },
     SchemaValidation(HostSchemaValidationError),
+    DuplicateStructName {
+        name: String,
+    },
+    InvalidStructName {
+        name: String,
+        reason: String,
+    },
+    DuplicateStructField {
+        struct_name: String,
+        field: String,
+    },
+    InvalidStructFieldName {
+        struct_name: String,
+        field: String,
+        reason: String,
+    },
+    UnknownStructReference {
+        function: String,
+        name: String,
+    },
+    StructFieldMismatch {
+        function: String,
+        name: String,
+    },
+    /// A named struct field referenced an undeclared resource type.
+    UnknownStructResourceReference {
+        struct_name: String,
+        key: ResourceTypeKey,
+    },
 }
 
 impl fmt::Display for HostApiCatalogError {
@@ -2280,6 +2673,37 @@ impl fmt::Display for HostApiCatalogError {
                  by `Value`; an explicit Borrow/BorrowMut/TakeOwned is required",
             ),
             Self::SchemaValidation(error) => error.fmt(f),
+            Self::DuplicateStructName { name } => {
+                write!(f, "duplicate named host struct `{name}`")
+            }
+            Self::InvalidStructName { name, reason } => {
+                write!(f, "invalid named host struct `{name}`: {reason}")
+            }
+            Self::DuplicateStructField { struct_name, field } => write!(
+                f,
+                "named host struct `{struct_name}` declares duplicate field `{field}`"
+            ),
+            Self::InvalidStructFieldName {
+                struct_name,
+                field,
+                reason,
+            } => write!(
+                f,
+                "named host struct `{struct_name}` has invalid field `{field}`: {reason}"
+            ),
+            Self::UnknownStructReference { function, name } => write!(
+                f,
+                "undeclared named struct `{name}` referenced from `{function}`"
+            ),
+            Self::StructFieldMismatch { function, name } => write!(
+                f,
+                "host function `{function}` uses named struct `{name}` with fields that do not \
+                 match the catalog declaration"
+            ),
+            Self::UnknownStructResourceReference { struct_name, key } => write!(
+                f,
+                "named host struct `{struct_name}` references undeclared resource type `{key}`"
+            ),
         }
     }
 }
@@ -2300,6 +2724,7 @@ impl std::error::Error for HostApiCatalogError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostApiCatalog {
     resources: Vec<ResourceTypeSchema>,
+    structs: Vec<HostStructSchema>,
     functions: Vec<HostFunctionSchema>,
 }
 
@@ -2353,8 +2778,9 @@ impl Serialize for HostApiCatalog {
         S: serde::Serializer,
     {
         self.validate().map_err(serde::ser::Error::custom)?;
-        let mut state = serializer.serialize_struct("HostApiCatalog", 2)?;
+        let mut state = serializer.serialize_struct("HostApiCatalog", 3)?;
         state.serialize_field("resources", &self.resources)?;
+        state.serialize_field("structs", &self.structs)?;
         state.serialize_field("functions", &self.functions)?;
         state.end()
     }
@@ -2364,6 +2790,7 @@ impl Serialize for HostApiCatalog {
 #[serde(field_identifier, rename_all = "snake_case")]
 enum HostApiCatalogField {
     Resources,
+    Structs,
     Functions,
 }
 
@@ -2526,6 +2953,84 @@ impl<'de> Visitor<'de> for CatalogFunctionListVisitor<'_> {
     }
 }
 
+struct CatalogStructSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for CatalogStructSeed<'_> {
+    type Value = HostStructSchema;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.budget.charge_structs(1).map_err(de::Error::custom)?;
+        HostStructSchema::deserialize(deserializer)
+    }
+}
+
+struct CatalogStructListSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for CatalogStructListSeed<'_> {
+    type Value = Vec<HostStructSchema>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(CatalogStructListVisitor {
+            budget: self.budget,
+        })
+    }
+}
+
+struct CatalogStructListVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+}
+
+impl<'de> Visitor<'de> for CatalogStructListVisitor<'_> {
+    type Value = Vec<HostStructSchema>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded catalog struct list")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let hint = seq.size_hint();
+        let capacity = bounded_sequence_capacity(
+            hint,
+            MAX_HOST_CATALOG_STRUCTS - self.budget.structs,
+            HostSchemaValidationError::StructBudgetExceeded {
+                limit: MAX_HOST_CATALOG_STRUCTS,
+            },
+        )?;
+        let mut values = Vec::new();
+        if capacity != 0 {
+            values.try_reserve_exact(capacity).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "catalog structs",
+                })
+            })?;
+        }
+        while let Some(value) = seq.next_element_seed(CatalogStructSeed {
+            budget: self.budget,
+        })? {
+            values.try_reserve_exact(1).map_err(|_| {
+                de::Error::custom(HostSchemaValidationError::AllocationFailed {
+                    field: "catalog structs",
+                })
+            })?;
+            values.push(value);
+        }
+        Ok(values)
+    }
+}
+
 struct HostApiCatalogVisitor<'a> {
     budget: &'a mut ComplexityBudget,
 }
@@ -2541,21 +3046,30 @@ impl<'de> Visitor<'de> for HostApiCatalogVisitor<'_> {
     where
         A: MapAccess<'de>,
     {
-        bounded_map_size_hint(map.size_hint(), "host API catalog", 2)?;
+        bounded_map_size_hint(map.size_hint(), "host API catalog", 3)?;
         let mut entries = 0;
         let mut resources = None;
+        let mut structs = None;
         let mut functions = None;
         loop {
             let Some(field) = map.next_key::<HostApiCatalogField>()? else {
                 break;
             };
-            bounded_map_entry(&mut entries, "host API catalog", 2)?;
+            bounded_map_entry(&mut entries, "host API catalog", 3)?;
             match field {
                 HostApiCatalogField::Resources => {
                     if resources.is_some() {
                         return Err(de::Error::duplicate_field("resources"));
                     }
                     resources = Some(map.next_value_seed(CatalogResourceListSeed {
+                        budget: self.budget,
+                    })?);
+                }
+                HostApiCatalogField::Structs => {
+                    if structs.is_some() {
+                        return Err(de::Error::duplicate_field("structs"));
+                    }
+                    structs = Some(map.next_value_seed(CatalogStructListSeed {
                         budget: self.budget,
                     })?);
                 }
@@ -2571,6 +3085,7 @@ impl<'de> Visitor<'de> for HostApiCatalogVisitor<'_> {
         }
         HostApiBuilder {
             resources: resources.ok_or_else(|| de::Error::missing_field("resources"))?,
+            structs: structs.unwrap_or_default(),
             functions: functions.ok_or_else(|| de::Error::missing_field("functions"))?,
         }
         .build()
@@ -2586,7 +3101,7 @@ impl<'de> Deserialize<'de> for HostApiCatalog {
         let mut budget = ComplexityBudget::default();
         deserializer.deserialize_struct(
             "HostApiCatalog",
-            &["resources", "functions"],
+            &["resources", "structs", "functions"],
             HostApiCatalogVisitor {
                 budget: &mut budget,
             },
@@ -2603,6 +3118,7 @@ impl<'de> Deserialize<'de> for HostApiCatalog {
 #[derive(Clone, Debug, Default)]
 pub struct HostApiBuilder {
     resources: Vec<ResourceTypeSchema>,
+    structs: Vec<HostStructSchema>,
     functions: Vec<HostFunctionSchema>,
 }
 
@@ -2674,6 +3190,16 @@ impl HostApiCatalog {
         &self.resources
     }
 
+    /// Looks up a declared named struct by name.
+    pub fn struct_named(&self, name: &str) -> Option<&HostStructSchema> {
+        self.structs.iter().find(|schema| schema.name == name)
+    }
+
+    /// All declared named structs (in registration order).
+    pub fn structs(&self) -> &[HostStructSchema] {
+        &self.structs
+    }
+
     /// All host functions (in registration order).
     pub fn functions(&self) -> &[HostFunctionSchema] {
         &self.functions
@@ -2682,11 +3208,12 @@ impl HostApiCatalog {
     /// Validates this catalog with the same bounded traversal used by the
     /// builder and all identity paths.
     pub fn validate(&self) -> Result<(), HostApiCatalogError> {
-        validate_surface(&self.resources, &self.functions)
+        validate_surface(&self.resources, &self.structs, &self.functions)
     }
 
     /// Canonical semantic bytes for the whole catalog: `FINGERPRINT_DOMAIN_MAGIC`
     /// ++ `FINGERPRINT_FORMAT_VERSION` ++ resources (sorted by key) ++
+    /// named structs (sorted by name, fields sorted by field name) ++
     /// functions (sorted by full semantic signature bytes).
     fn canonical_bytes(&self) -> Vec<u8> {
         self.try_canonical_bytes()
@@ -2709,6 +3236,17 @@ impl HostApiCatalog {
             push_len_str(&mut bytes, resource.key.as_str())?;
         }
 
+        // Named structs sorted by name; fields sorted by field name so
+        // registration order does not affect the digest. Descriptions are
+        // excluded.
+        let mut structs: Vec<&HostStructSchema> = self.structs.iter().collect();
+        structs.sort_by(|a, b| a.name.cmp(&b.name));
+        push_tag(&mut bytes, b'T');
+        push_len(&mut bytes, structs.len())?;
+        for schema in &structs {
+            push_struct_def(&mut bytes, schema)?;
+        }
+
         // Functions sorted by their full canonical semantic signature bytes so
         // overloaded registration order is irrelevant (exact duplicates are
         // already rejected at build time).
@@ -2729,11 +3267,11 @@ impl HostApiCatalog {
 
     /// Deterministic, order-independent fingerprint of the semantic contents.
     ///
-    /// The fingerprint covers resource keys and every function’s name,
-    /// parameter (name, type, passing mode) and return type. It excludes
-    /// documentation and registration order. See the module doc for the
-    /// security caveat: this 64-bit FNV digest is equality / change-detection
-    /// only, never authentication.
+    /// The fingerprint covers resource keys, named-struct names and field
+    /// types, and every function’s name, parameter (name, type, passing mode)
+    /// and return type. It excludes documentation and registration order. See
+    /// the module doc for the security caveat: this 64-bit FNV digest is
+    /// equality / change-detection only, never authentication.
     pub fn fingerprint(&self) -> HostApiFingerprint {
         HostApiFingerprint(fnv1a(&self.canonical_bytes()))
     }
@@ -2776,6 +3314,7 @@ where
 /// builder and the serde path so both reject the same malformed inputs.
 fn validate_surface(
     resources: &[ResourceTypeSchema],
+    structs: &[HostStructSchema],
     functions: &[HostFunctionSchema],
 ) -> Result<(), HostApiCatalogError> {
     let mut budget = ComplexityBudget::default();
@@ -2784,6 +3323,9 @@ fn validate_surface(
         .map_err(HostApiCatalogError::from)?;
     budget
         .charge_functions(functions.len())
+        .map_err(HostApiCatalogError::from)?;
+    budget
+        .charge_structs(structs.len())
         .map_err(HostApiCatalogError::from)?;
 
     for resource in resources {
@@ -2798,6 +3340,8 @@ fn validate_surface(
             ));
         }
     }
+
+    validate_structs(resources, structs)?;
 
     // Per-function invariants.
     for function in functions {
@@ -2880,6 +3424,11 @@ fn validate_surface(
                 key,
             });
         }
+
+        validate_named_struct_refs(&function.name, &function.return_type, structs)?;
+        for param in &function.params {
+            validate_named_struct_refs(&function.name, &param.ty, structs)?;
+        }
     }
 
     // Reject ambiguous overloads: two functions sharing a name and an identical
@@ -2918,6 +3467,11 @@ impl HostApiBuilder {
         self.resources.push(resource);
     }
 
+    /// Registers a named fixed-shape host struct.
+    pub fn named_struct(&mut self, schema: HostStructSchema) {
+        self.structs.push(schema);
+    }
+
     /// Registers a host function signature. Same-name functions with distinct
     /// signatures (overloads) are allowed.
     pub fn function(&mut self, function: HostFunctionSchema) {
@@ -2936,9 +3490,10 @@ impl HostApiBuilder {
 
     /// Validates and freezes the catalog.
     pub fn build(self) -> Result<HostApiCatalog, HostApiCatalogError> {
-        validate_surface(&self.resources, &self.functions)?;
+        validate_surface(&self.resources, &self.structs, &self.functions)?;
         Ok(HostApiCatalog {
             resources: self.resources,
+            structs: self.structs,
             functions: self.functions,
         })
     }
@@ -3034,9 +3589,154 @@ fn try_push_type(
                 push_tag(bytes, b'r');
                 push_len_str(bytes, key.as_str())?;
             }
+            HostTypeSchema::Named { name, fields } => {
+                push_tag(bytes, b'n');
+                push_len_str(bytes, name)?;
+                push_named_fields(bytes, fields)?;
+            }
         }
     }
     Ok(())
+}
+
+fn push_named_fields(
+    bytes: &mut Vec<u8>,
+    fields: &[HostStructField],
+) -> Result<(), HostSchemaValidationError> {
+    let mut fields: Vec<&HostStructField> = fields.iter().collect();
+    fields.sort_by(|a, b| a.name.cmp(&b.name));
+    push_len(bytes, fields.len())?;
+    for field in fields {
+        push_len_str(bytes, &field.name)?;
+        try_push_type(bytes, &field.ty)?;
+    }
+    Ok(())
+}
+
+fn push_struct_def(
+    bytes: &mut Vec<u8>,
+    schema: &HostStructSchema,
+) -> Result<(), HostSchemaValidationError> {
+    push_len_str(bytes, &schema.name)?;
+    push_named_fields(bytes, &schema.fields)
+}
+
+fn validate_struct_ident(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if name.len() > MAX_STRUCT_IDENT_LEN {
+        return Err(format!(
+            "is {} bytes; the maximum is {MAX_STRUCT_IDENT_LEN}",
+            name.len()
+        ));
+    }
+    let mut chars = name.chars();
+    let first = chars.next().expect("name is non-empty");
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return Err("must start with an ASCII letter or '_'".to_string());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("must be ASCII alphanumeric or '_'".to_string());
+    }
+    Ok(())
+}
+
+fn validate_structs(
+    resources: &[ResourceTypeSchema],
+    structs: &[HostStructSchema],
+) -> Result<(), HostApiCatalogError> {
+    for (i, schema) in structs.iter().enumerate() {
+        if structs[..i].iter().any(|prior| prior.name == schema.name) {
+            return Err(HostApiCatalogError::DuplicateStructName {
+                name: schema.name.clone(),
+            });
+        }
+        if let Err(reason) = validate_struct_ident(&schema.name) {
+            return Err(HostApiCatalogError::InvalidStructName {
+                name: schema.name.clone(),
+                reason,
+            });
+        }
+        for (j, field) in schema.fields.iter().enumerate() {
+            if schema.fields[..j]
+                .iter()
+                .any(|prior| prior.name == field.name)
+            {
+                return Err(HostApiCatalogError::DuplicateStructField {
+                    struct_name: schema.name.clone(),
+                    field: field.name.clone(),
+                });
+            }
+            if let Err(reason) = validate_struct_ident(&field.name) {
+                return Err(HostApiCatalogError::InvalidStructFieldName {
+                    struct_name: schema.name.clone(),
+                    field: field.name.clone(),
+                    reason,
+                });
+            }
+            let mut keys = Vec::new();
+            field.ty.collect_resource_keys(&mut keys);
+            for key in keys {
+                if !resources.iter().any(|resource| &resource.key == key) {
+                    return Err(HostApiCatalogError::UnknownStructResourceReference {
+                        struct_name: schema.name.clone(),
+                        key: key.clone(),
+                    });
+                }
+            }
+            validate_named_struct_refs(&schema.name, &field.ty, structs)?;
+        }
+    }
+    Ok(())
+}
+
+fn struct_fields_equivalent(left: &[HostStructField], right: &[HostStructField]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut left_sorted: Vec<_> = left.iter().map(|field| (&field.name, &field.ty)).collect();
+    let mut right_sorted: Vec<_> = right.iter().map(|field| (&field.name, &field.ty)).collect();
+    left_sorted.sort_by(|a, b| a.0.cmp(b.0));
+    right_sorted.sort_by(|a, b| a.0.cmp(b.0));
+    left_sorted == right_sorted
+}
+
+fn validate_named_struct_refs(
+    function: &str,
+    schema: &HostTypeSchema,
+    structs: &[HostStructSchema],
+) -> Result<(), HostApiCatalogError> {
+    match schema {
+        HostTypeSchema::Named { name, fields } => {
+            let Some(declared) = structs.iter().find(|schema| schema.name == *name) else {
+                return Err(HostApiCatalogError::UnknownStructReference {
+                    function: function.to_string(),
+                    name: name.clone(),
+                });
+            };
+            if !struct_fields_equivalent(&declared.fields, fields) {
+                return Err(HostApiCatalogError::StructFieldMismatch {
+                    function: function.to_string(),
+                    name: name.clone(),
+                });
+            }
+            for field in fields {
+                validate_named_struct_refs(function, &field.ty, structs)?;
+            }
+            Ok(())
+        }
+        HostTypeSchema::Array(inner)
+        | HostTypeSchema::Map(inner)
+        | HostTypeSchema::Optional(inner) => validate_named_struct_refs(function, inner, structs),
+        HostTypeSchema::Callable { params, result } => {
+            for param in params {
+                validate_named_struct_refs(function, param, structs)?;
+            }
+            validate_named_struct_refs(function, result, structs)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn invalid_schema_bytes(error: &HostSchemaValidationError) -> Vec<u8> {
@@ -3645,8 +4345,8 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_version_is_one() {
-        assert_eq!(FINGERPRINT_FORMAT_VERSION, 1);
+    fn fingerprint_version_is_two() {
+        assert_eq!(FINGERPRINT_FORMAT_VERSION, 2);
     }
 
     #[test]
@@ -4164,6 +4864,405 @@ mod tests {
         assert!(
             result.expect("deep import result").is_err(),
             "deep import JSON must exceed the schema-depth limit"
+        );
+    }
+
+    // --- Named host structs ---
+
+    fn point_fields() -> Vec<HostStructField> {
+        vec![
+            HostStructField::new("x", HostTypeSchema::Int),
+            HostStructField::new("y", HostTypeSchema::Int),
+        ]
+    }
+
+    fn point_struct() -> HostStructSchema {
+        HostStructSchema::new("Point", point_fields()).with_description("A 2D point")
+    }
+
+    fn point_type() -> HostTypeSchema {
+        point_struct().as_type()
+    }
+
+    #[test]
+    fn named_struct_can_be_declared_and_used_as_param_and_return() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(point_struct());
+        builder.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![
+                HostParamSchema::value("x", HostTypeSchema::Int),
+                HostParamSchema::value("y", HostTypeSchema::Int),
+            ],
+            point_type(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "take_point",
+            vec![HostParamSchema::value("p", point_type())],
+            HostTypeSchema::Int,
+        ));
+        let catalog = builder.build().expect("named struct catalog must build");
+        assert_eq!(catalog.structs().len(), 1);
+        assert_eq!(catalog.struct_named("Point").expect("Point").name, "Point");
+        assert_eq!(
+            catalog
+                .function("make_point")
+                .expect("make_point")
+                .return_type,
+            point_type()
+        );
+        assert_eq!(
+            catalog.function("take_point").expect("take_point").params[0].ty,
+            point_type()
+        );
+    }
+
+    #[test]
+    fn named_struct_display_is_the_struct_name() {
+        assert_eq!(format!("{}", point_type()), "Point");
+        assert_eq!(
+            format!("{}", HostTypeSchema::Optional(Box::new(point_type()))),
+            "optional<Point>"
+        );
+    }
+
+    #[test]
+    fn named_struct_keeps_dynamic_map_distinct() {
+        let named = point_type();
+        let dynamic = HostTypeSchema::Map(Box::new(HostTypeSchema::Int));
+        assert_ne!(named, dynamic);
+        assert!(!named.contains_resource());
+        assert!(!dynamic.contains_resource());
+    }
+
+    #[test]
+    fn nested_resource_in_named_struct_requires_explicit_passing() {
+        let handle = HostStructSchema::new(
+            "HandleBox",
+            vec![HostStructField::new(
+                "file",
+                HostTypeSchema::Resource(io_file_key()),
+            )],
+        );
+        let mut builder = HostApiCatalog::builder();
+        builder.resource(io_file_resource());
+        builder.named_struct(handle.clone());
+        builder.function(HostFunctionSchema::with_return(
+            "take_box",
+            vec![HostParamSchema::value("box", handle.as_type())],
+            HostTypeSchema::Null,
+        ));
+        assert_eq!(
+            builder.build(),
+            Err(HostApiCatalogError::ResourceValuePassing {
+                function: "take_box".to_string(),
+                parameter: "box".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn nested_resource_in_named_struct_borrow_is_allowed() {
+        let handle = HostStructSchema::new(
+            "HandleBox",
+            vec![HostStructField::new(
+                "file",
+                HostTypeSchema::Resource(io_file_key()),
+            )],
+        );
+        let mut builder = HostApiCatalog::builder();
+        builder.resource(io_file_resource());
+        builder.named_struct(handle.clone());
+        builder.function(HostFunctionSchema::with_return(
+            "borrow_box",
+            vec![HostParamSchema::with_passing(
+                "box",
+                handle.as_type(),
+                HostParamPassing::Borrow,
+            )],
+            HostTypeSchema::Null,
+        ));
+        builder
+            .build()
+            .expect("borrow of resource-bearing named struct is valid");
+    }
+
+    #[test]
+    fn undeclared_named_struct_reference_is_rejected() {
+        let mut builder = HostApiCatalog::builder();
+        builder.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            point_type(),
+        ));
+        assert!(matches!(
+            builder.build(),
+            Err(HostApiCatalogError::UnknownStructReference { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_struct_name_is_rejected() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(point_struct());
+        builder.named_struct(point_struct());
+        assert!(matches!(
+            builder.build(),
+            Err(HostApiCatalogError::DuplicateStructName { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_struct_field_is_rejected() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(HostStructSchema::new(
+            "Dup",
+            vec![
+                HostStructField::new("x", HostTypeSchema::Int),
+                HostStructField::new("x", HostTypeSchema::String),
+            ],
+        ));
+        assert!(matches!(
+            builder.build(),
+            Err(HostApiCatalogError::DuplicateStructField { .. })
+        ));
+    }
+
+    #[test]
+    fn named_struct_fingerprint_is_order_independent_and_excludes_docs() {
+        let mut a = HostApiCatalog::builder();
+        a.named_struct(point_struct());
+        a.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            point_type(),
+        ));
+        let catalog_a = a.build().expect("valid");
+
+        let mut b = HostApiCatalog::builder();
+        b.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            HostTypeSchema::named_struct(
+                "Point",
+                vec![
+                    HostStructField::new("y", HostTypeSchema::Int),
+                    HostStructField::new("x", HostTypeSchema::Int),
+                ],
+            ),
+        ));
+        b.named_struct(
+            HostStructSchema::new(
+                "Point",
+                vec![
+                    HostStructField::new("y", HostTypeSchema::Int),
+                    HostStructField::new("x", HostTypeSchema::Int),
+                ],
+            )
+            .with_description("docs must not affect fingerprint"),
+        );
+        let catalog_b = b.build().expect("valid");
+        assert_eq!(catalog_a.fingerprint(), catalog_b.fingerprint());
+
+        let mut c = HostApiCatalog::builder();
+        c.named_struct(HostStructSchema::new(
+            "Point",
+            vec![
+                HostStructField::new("x", HostTypeSchema::Int),
+                HostStructField::new("y", HostTypeSchema::Float),
+            ],
+        ));
+        c.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            HostTypeSchema::named_struct(
+                "Point",
+                vec![
+                    HostStructField::new("x", HostTypeSchema::Int),
+                    HostStructField::new("y", HostTypeSchema::Float),
+                ],
+            ),
+        ));
+        let catalog_c = c.build().expect("valid");
+        assert_ne!(catalog_a.fingerprint(), catalog_c.fingerprint());
+    }
+
+    #[test]
+    fn named_struct_canonical_bytes_are_deterministic() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(point_struct());
+        builder.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            point_type(),
+        ));
+        let catalog = builder.build().expect("valid");
+        let bytes = catalog.canonical_bytes();
+        assert_eq!(
+            &bytes[..FINGERPRINT_DOMAIN_MAGIC.len()],
+            FINGERPRINT_DOMAIN_MAGIC
+        );
+        assert_eq!(bytes[FINGERPRINT_DOMAIN_MAGIC.len()], 2);
+        assert_eq!(catalog.canonical_bytes(), bytes);
+    }
+
+    #[test]
+    fn serde_round_trip_named_struct_catalog() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(point_struct());
+        builder.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            point_type(),
+        ));
+        let catalog = builder.build().expect("valid");
+        let json = serde_json::to_value(&catalog).expect("serialize");
+        let back: HostApiCatalog = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.fingerprint(), catalog.fingerprint());
+        assert_eq!(back.struct_named("Point").unwrap().fields.len(), 2);
+    }
+
+    #[test]
+    fn serde_catalog_without_structs_field_still_loads() {
+        let catalog: HostApiCatalog =
+            serde_json::from_value(valid_catalog_json()).expect("legacy JSON should deserialize");
+        assert!(catalog.structs().is_empty());
+    }
+
+    #[test]
+    fn nested_named_struct_is_validated_without_function_reference() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(HostStructSchema::new(
+            "Outer",
+            vec![HostStructField::new(
+                "inner",
+                HostTypeSchema::named_struct(
+                    "Inner",
+                    vec![HostStructField::new("x", HostTypeSchema::Int)],
+                ),
+            )],
+        ));
+        match builder.build() {
+            Err(err) => {
+                let text = err.to_string();
+                match &err {
+                    HostApiCatalogError::UnknownStructReference { name, .. } => {
+                        assert_eq!(name, "Inner");
+                    }
+                    other => {
+                        panic!("undeclared nested named struct must be rejected, got {other:?}")
+                    }
+                }
+                assert!(
+                    !text.contains("host function `Outer`"),
+                    "struct context should not be labeled as a host function: {text}"
+                );
+                assert!(
+                    text.contains("Inner") && text.contains("Outer"),
+                    "display should name both the missing struct and its referrer, got {text}"
+                );
+            }
+            other => panic!("undeclared nested named struct must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_named_struct_field_mismatch_is_rejected_without_function() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(HostStructSchema::new(
+            "Inner",
+            vec![HostStructField::new("x", HostTypeSchema::Int)],
+        ));
+        builder.named_struct(HostStructSchema::new(
+            "Outer",
+            vec![HostStructField::new(
+                "inner",
+                HostTypeSchema::named_struct(
+                    "Inner",
+                    vec![HostStructField::new("x", HostTypeSchema::String)],
+                ),
+            )],
+        ));
+        match builder.build() {
+            Err(HostApiCatalogError::StructFieldMismatch { name, .. }) => {
+                assert_eq!(name, "Inner");
+            }
+            other => panic!("nested named field shape must match declaration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_named_struct_is_accepted_without_function_when_declared() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(HostStructSchema::new(
+            "Inner",
+            vec![HostStructField::new("x", HostTypeSchema::Int)],
+        ));
+        builder.named_struct(HostStructSchema::new(
+            "Outer",
+            vec![HostStructField::new(
+                "inner",
+                HostTypeSchema::named_struct(
+                    "Inner",
+                    vec![HostStructField::new("x", HostTypeSchema::Int)],
+                ),
+            )],
+        ));
+        builder
+            .build()
+            .expect("declared nested named struct is valid without a function");
+    }
+
+    #[test]
+    fn struct_field_mismatch_is_order_insensitive() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(HostStructSchema::new(
+            "Point",
+            vec![
+                HostStructField::new("x", HostTypeSchema::Int),
+                HostStructField::new("y", HostTypeSchema::Int),
+            ],
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "take_point",
+            vec![HostParamSchema::value(
+                "p",
+                HostTypeSchema::named_struct(
+                    "Point",
+                    vec![
+                        HostStructField::new("y", HostTypeSchema::Int),
+                        HostStructField::new("x", HostTypeSchema::Int),
+                    ],
+                ),
+            )],
+            HostTypeSchema::Int,
+        ));
+        builder
+            .build()
+            .expect("named struct field order must not affect catalog matching");
+    }
+
+    #[test]
+    fn undeclared_resource_in_struct_field_names_struct_context() {
+        let mut builder = HostApiCatalog::builder();
+        builder.named_struct(HostStructSchema::new(
+            "HandleBox",
+            vec![HostStructField::new(
+                "file",
+                HostTypeSchema::Resource(io_file_key()),
+            )],
+        ));
+        let err = builder
+            .build()
+            .expect_err("struct field resource must be declared");
+        let text = err.to_string();
+        assert!(
+            text.contains("HandleBox"),
+            "struct name should appear in the diagnostic, got {text}"
+        );
+        assert!(
+            !text.contains("host function `HandleBox`"),
+            "struct-field resource errors should not pretend the struct is a function, got {text}"
         );
     }
 

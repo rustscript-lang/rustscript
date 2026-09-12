@@ -289,6 +289,7 @@ impl Parser {
         )?;
         parser.host_api_metadata = Some(HostApiIrMetadata::new(catalog.fingerprint()));
         parser.host_catalog = Some(catalog);
+        parser.install_host_catalog_structs();
         Ok(parser)
     }
 
@@ -341,11 +342,46 @@ impl Parser {
         if let Some(catalog) = host_catalog {
             parser.host_api_metadata = Some(HostApiIrMetadata::new(catalog.fingerprint()));
             parser.host_catalog = Some(catalog);
+            parser.install_host_catalog_structs();
+        } else {
+            parser.install_standard_runtime_named_structs();
         }
         for binding in predeclared_locals {
             parser.predeclare_local(binding)?;
         }
         Ok(parser)
+    }
+
+    fn install_host_catalog_structs(&mut self) {
+        let Some(catalog) = self.host_catalog.clone() else {
+            return;
+        };
+        self.install_named_structs_from_catalog(&catalog);
+    }
+
+    /// Installs HTTP named structs on catalog-free parse paths without
+    /// attaching catalog function metadata.
+    ///
+    /// Public [`ParserDialect`] / import-scan / REPL-without-HTTP parses have
+    /// no catalog snapshot. When the HTTP surface is available, install only
+    /// the authoritative HTTP catalog structs so names such as
+    /// `SseCallbackAction` resolve. Unrelated standard names (`JitConfig`,
+    /// `SqliteLimits`) stay unreserved. With HTTP disabled, install nothing.
+    pub(super) fn install_standard_runtime_named_structs(&mut self) {
+        debug_assert!(self.host_catalog.is_none());
+        #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
+        {
+            self.install_named_structs_from_catalog(
+                crate::builtins::runtime::http::http_host_catalog().as_ref(),
+            );
+        }
+    }
+
+    fn install_named_structs_from_catalog(&mut self, catalog: &HostApiCatalog) {
+        for schema in catalog.structs() {
+            self.struct_schemas
+                .insert(schema.name.clone(), schema.to_struct_decl());
+        }
     }
 
     pub(super) fn use_declarations(&self) -> Vec<UseDecl> {

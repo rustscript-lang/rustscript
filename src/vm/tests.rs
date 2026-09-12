@@ -3455,7 +3455,7 @@ fn native_callable_abi_version_covers_direct_script_calls() {
 mod callable_resource_schema_tests {
     use super::*;
     use crate::bytecode::VmMap;
-    use crate::compiler::TypeSchema;
+    use crate::compiler::{StructDecl, TypeSchema};
     use crate::vm::resource::{CloseProgress, HostResource, ResourceCloseReason, ResourceHandle};
     use crate::{CallableKind, CallablePrototype, FunctionRegion, ScriptFunction};
 
@@ -3699,5 +3699,763 @@ mod callable_resource_schema_tests {
             .invoke_callable(callable, &[invalid])
             .expect_err("nested arbitrary ints must not satisfy resources");
         assert_resource_schema_error(error, "invalid_resource_handle");
+    }
+
+    fn handle_box_schema() -> (TypeSchema, HashMap<String, TypeSchema>) {
+        let mut fields = HashMap::new();
+        fields.insert("file".to_string(), TypeSchema::Resource(resource_key()));
+        fields.insert(
+            "note".to_string(),
+            TypeSchema::Optional(Box::new(TypeSchema::String)),
+        );
+        let mut named = HashMap::new();
+        named.insert("HandleBox".to_string(), TypeSchema::Object(fields));
+        (
+            TypeSchema::Named("HandleBox".to_string(), Vec::new()),
+            named,
+        )
+    }
+
+    fn callable_vm_with_named(
+        callee_body: &[u8],
+        constants: Vec<Value>,
+        parameter_schema: TypeSchema,
+        result_schema: TypeSchema,
+        named: HashMap<String, TypeSchema>,
+    ) -> (Vm, Value) {
+        let (mut vm, callable) =
+            callable_vm(callee_body, constants, parameter_schema, result_schema);
+        vm.host.named_struct_schemas = Arc::new(named);
+        (vm, callable)
+    }
+
+    fn callable_vm_with_guest_named(
+        callee_body: &[u8],
+        constants: Vec<Value>,
+        parameter_schema: TypeSchema,
+        result_schema: TypeSchema,
+        guest: HashMap<String, StructDecl>,
+    ) -> (Vm, Value) {
+        let function_entry = 1u32;
+        let function_end = function_entry + callee_body.len() as u32;
+        let mut code = vec![OpCode::Ret as u8];
+        code.extend_from_slice(callee_body);
+        let program = Program::new(constants, code)
+            .with_local_count(0)
+            .with_callable_metadata(
+                vec![ScriptFunction {
+                    entry_ip: function_entry,
+                    end_ip: function_end,
+                }],
+                vec![CallablePrototype {
+                    kind: CallableKind::FunctionItem,
+                    target: CallableTarget::ScriptFunction(0),
+                    arity: 1,
+                    frame_local_count: 1,
+                    parameter_slots: vec![0],
+                    capture_source_slots: Vec::new(),
+                    capture_slots: Vec::new(),
+                    capture_modes: Vec::new(),
+                    self_slot: None,
+                    schema: Some(TypeSchema::Callable {
+                        params: vec![parameter_schema],
+                        result: Box::new(result_schema),
+                    }),
+                }],
+                vec![
+                    FunctionRegion {
+                        start_ip: 0,
+                        end_ip: function_entry,
+                        prototype_id: None,
+                    },
+                    FunctionRegion {
+                        start_ip: function_entry,
+                        end_ip: function_end,
+                        prototype_id: Some(0),
+                    },
+                ],
+                Vec::new(),
+            )
+            .with_named_struct_decls(guest);
+        let mut vm = Vm::new(program);
+        let callable = vm
+            .bind_callable_value(0, Vec::new())
+            .expect("callable should bind");
+        vm.run().expect("root program should halt");
+        (vm, callable)
+    }
+
+    fn point_guest_decl() -> HashMap<String, StructDecl> {
+        let mut fields = HashMap::new();
+        fields.insert("x".to_string(), TypeSchema::Int);
+        fields.insert("y".to_string(), TypeSchema::Int);
+        let mut guest = HashMap::new();
+        guest.insert(
+            "Point".to_string(),
+            StructDecl {
+                name: "Point".to_string(),
+                type_params: Vec::new(),
+                body_schema: TypeSchema::Object(fields),
+                origin: crate::compiler::StructDeclOrigin::Guest,
+            },
+        );
+        guest
+    }
+
+    fn empty_map() -> Value {
+        Value::Map(VmMap::new().into())
+    }
+
+    fn guest_handle_box_decl() -> HashMap<String, StructDecl> {
+        let mut fields = HashMap::new();
+        fields.insert("file".to_string(), TypeSchema::Resource(resource_key()));
+        fields.insert(
+            "note".to_string(),
+            TypeSchema::Optional(Box::new(TypeSchema::String)),
+        );
+        let mut guest = HashMap::new();
+        guest.insert(
+            "HandleBox".to_string(),
+            StructDecl {
+                name: "HandleBox".to_string(),
+                type_params: Vec::new(),
+                body_schema: TypeSchema::Object(fields),
+                origin: crate::compiler::StructDeclOrigin::Guest,
+            },
+        );
+        guest
+    }
+
+    fn guest_holder_decl() -> HashMap<String, StructDecl> {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "value".to_string(),
+            TypeSchema::GenericParam("T".to_string()),
+        );
+        let mut guest = HashMap::new();
+        guest.insert(
+            "Holder".to_string(),
+            StructDecl {
+                name: "Holder".to_string(),
+                type_params: vec!["T".to_string()],
+                body_schema: TypeSchema::Object(fields),
+                origin: crate::compiler::StructDeclOrigin::Guest,
+            },
+        );
+        guest
+    }
+
+    fn assert_callable_schema_error(error: VmError) {
+        assert!(
+            matches!(error, VmError::TypeMismatch("callable argument schema"))
+                || matches!(error, VmError::HostError(_)),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    fn named_handle_box(handle: i64, note: Option<&str>) -> Value {
+        let mut object = VmMap::new();
+        object.insert(Value::string("file"), Value::Int(handle));
+        if let Some(note) = note {
+            object.insert(Value::string("note"), Value::string(note));
+        }
+        Value::Map(object.into())
+    }
+
+    #[test]
+    fn named_struct_with_resource_field_validates_nested_handle() {
+        let (schema, named) = handle_box_schema();
+        let (mut vm, callable) = callable_vm_with_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            named,
+        );
+        let handle = resource_handle(&mut vm);
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[named_handle_box(handle, Some("ok"))])
+                .expect("named struct with live resource should pass"),
+            Value::Null
+        );
+
+        let error = vm
+            .invoke_callable(callable, &[named_handle_box(41, Some("bad"))])
+            .expect_err("named struct must reject invalid nested resource");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+    }
+
+    #[test]
+    fn named_struct_optional_field_may_be_omitted() {
+        let (schema, named) = handle_box_schema();
+        let (mut vm, callable) = callable_vm_with_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            named,
+        );
+        let handle = resource_handle(&mut vm);
+        assert_eq!(
+            vm.invoke_callable(callable, &[named_handle_box(handle, None)])
+                .expect("optional named field may be omitted"),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn named_struct_nested_array_validates_resource_elements() {
+        let (element, named) = handle_box_schema();
+        let schema = TypeSchema::Array(Box::new(element));
+        let (mut vm, callable) = callable_vm_with_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            named,
+        );
+        let handle = resource_handle(&mut vm);
+        let valid = Value::Array(vec![named_handle_box(handle, None)].into());
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[valid])
+                .expect("array of named structs with live resources should pass"),
+            Value::Null
+        );
+
+        let invalid = Value::Array(vec![named_handle_box(41, None)].into());
+        let error = vm
+            .invoke_callable(callable, &[invalid])
+            .expect_err("array of named structs must reject invalid nested resources");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+    }
+
+    #[test]
+    fn host_named_struct_rejects_nonempty_type_args() {
+        let (_schema, named) = handle_box_schema();
+        let schema = TypeSchema::Named("HandleBox".to_string(), vec![TypeSchema::Int]);
+        let (mut vm, callable) = callable_vm_with_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            named,
+        );
+        let handle = resource_handle(&mut vm);
+        let error = vm
+            .invoke_callable(callable, &[named_handle_box(handle, None)])
+            .expect_err("host Named with type args must fail closed");
+        match error {
+            VmError::HostError(message) => {
+                assert!(
+                    message.contains("unknown named struct"),
+                    "unexpected host error: {message}"
+                );
+            }
+            other => panic!("expected HostError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_named_struct_fails_closed() {
+        let schema = TypeSchema::Named("MissingBox".to_string(), Vec::new());
+        let (mut vm, callable) =
+            callable_vm(&[OpCode::Ret as u8], Vec::new(), schema, TypeSchema::Null);
+        let mut object = VmMap::new();
+        object.insert(Value::string("file"), Value::Int(1));
+        let error = vm
+            .invoke_callable(callable, &[Value::Map(object.into())])
+            .expect_err("unknown Named must fail closed");
+        match error {
+            VmError::HostError(message) => {
+                assert!(
+                    message.contains("unknown named struct"),
+                    "unexpected host error: {message}"
+                );
+            }
+            other => panic!("expected HostError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cyclic_named_struct_does_not_hang_and_classifies_resources() {
+        let mut fields = HashMap::new();
+        fields.insert("file".to_string(), TypeSchema::Resource(resource_key()));
+        fields.insert(
+            "child".to_string(),
+            TypeSchema::Optional(Box::new(TypeSchema::Named("Node".to_string(), Vec::new()))),
+        );
+        let mut named = HashMap::new();
+        named.insert("Node".to_string(), TypeSchema::Object(fields));
+        let schema = TypeSchema::Named("Node".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            named,
+        );
+        let handle = resource_handle(&mut vm);
+        let mut inner = VmMap::new();
+        inner.insert(Value::string("file"), Value::Int(handle));
+        let mut outer = VmMap::new();
+        outer.insert(Value::string("file"), Value::Int(handle));
+        outer.insert(Value::string("child"), Value::Map(inner.into()));
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[Value::Map(outer.into())])
+                .expect("acyclic value of cyclic schema should pass"),
+            Value::Null
+        );
+
+        let mut bad = VmMap::new();
+        bad.insert(Value::string("file"), Value::Int(41));
+        let error = vm
+            .invoke_callable(callable, &[Value::Map(bad.into())])
+            .expect_err("cyclic named schema must still validate nested resources");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+    }
+
+    #[test]
+    fn named_struct_return_validates_nested_resource() {
+        let (schema, named) = handle_box_schema();
+        let (mut vm, callable) = callable_vm_with_named(
+            &[OpCode::Ldloc as u8, 0, OpCode::Ret as u8],
+            Vec::new(),
+            schema.clone(),
+            schema,
+            named,
+        );
+        let handle = resource_handle(&mut vm);
+        let returned = vm
+            .invoke_callable(callable.clone(), &[named_handle_box(handle, None)])
+            .expect("named return with live resource should pass");
+        assert!(matches!(returned, Value::Map(_)));
+
+        let error = vm
+            .invoke_callable(callable, &[named_handle_box(41, None)])
+            .expect_err("named return must reject invalid nested resource");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+    }
+
+    fn point_value(x: i64, y: i64) -> Value {
+        let mut object = VmMap::new();
+        object.insert(Value::string("x"), Value::Int(x));
+        object.insert(Value::string("y"), Value::Int(y));
+        Value::Map(object.into())
+    }
+
+    fn run_compiled(source: &str) -> crate::VmResult<Vec<Value>> {
+        let compiled = crate::compile_source(source).expect("source should compile");
+        let mut vm = Vm::new(compiled.program);
+        loop {
+            match vm.run()? {
+                VmStatus::Halted => break,
+                VmStatus::Yielded => continue,
+                VmStatus::Waiting(_) => panic!("compiled guest named program should not wait"),
+            }
+        }
+        Ok(vm.stack().to_vec())
+    }
+
+    #[test]
+    fn guest_named_struct_validates_callable_argument_without_host_catalog() {
+        let schema = TypeSchema::Named("Point".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            point_guest_decl(),
+        );
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[point_value(1, 2)])
+                .expect("guest Named argument should pass without host catalog"),
+            Value::Null
+        );
+
+        let error = vm
+            .invoke_callable(callable, &[Value::Int(1)])
+            .expect_err("guest Named must still require a map");
+        assert!(
+            matches!(error, VmError::TypeMismatch("callable argument schema")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn guest_named_struct_validates_callable_return_without_host_catalog() {
+        let schema = TypeSchema::Named("Point".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ldloc as u8, 0, OpCode::Ret as u8],
+            Vec::new(),
+            schema.clone(),
+            schema,
+            point_guest_decl(),
+        );
+        let returned = vm
+            .invoke_callable(callable, &[point_value(3, 4)])
+            .expect("guest Named return should pass without host catalog");
+        assert_eq!(returned, point_value(3, 4));
+    }
+
+    #[test]
+    fn guest_named_decls_do_not_accept_unknown_host_named() {
+        let schema = TypeSchema::Named("MissingBox".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            point_guest_decl(),
+        );
+        let error = vm
+            .invoke_callable(callable, &[point_value(1, 2)])
+            .expect_err("unknown host Named must stay fail-closed");
+        match error {
+            VmError::HostError(message) => {
+                assert!(
+                    message.contains("unknown named struct"),
+                    "unexpected host error: {message}"
+                );
+            }
+            other => panic!("expected HostError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guest_named_struct_validates_nested_resource_without_host_catalog() {
+        let mut fields = HashMap::new();
+        fields.insert("file".to_string(), TypeSchema::Resource(resource_key()));
+        let mut guest = HashMap::new();
+        guest.insert(
+            "HandleBox".to_string(),
+            StructDecl {
+                name: "HandleBox".to_string(),
+                type_params: Vec::new(),
+                body_schema: TypeSchema::Object(fields),
+                origin: crate::compiler::StructDeclOrigin::Guest,
+            },
+        );
+        let schema = TypeSchema::Named("HandleBox".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            guest,
+        );
+        let handle = resource_handle(&mut vm);
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[named_handle_box(handle, None)])
+                .expect("guest Named nested resource should pass"),
+            Value::Null
+        );
+        let error = vm
+            .invoke_callable(callable, &[named_handle_box(41, None)])
+            .expect_err("guest Named must still reject invalid nested resources");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+    }
+
+    #[test]
+    fn generic_guest_named_struct_instantiates_body() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "value".to_string(),
+            TypeSchema::GenericParam("T".to_string()),
+        );
+        let mut guest = HashMap::new();
+        guest.insert(
+            "Holder".to_string(),
+            StructDecl {
+                name: "Holder".to_string(),
+                type_params: vec!["T".to_string()],
+                body_schema: TypeSchema::Object(fields),
+                origin: crate::compiler::StructDeclOrigin::Guest,
+            },
+        );
+        let schema = TypeSchema::Named("Holder".to_string(), vec![TypeSchema::Int]);
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            guest,
+        );
+        let mut valid = VmMap::new();
+        valid.insert(Value::string("value"), Value::Int(7));
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[Value::Map(valid.into())])
+                .expect("instantiated guest Named should pass"),
+            Value::Null
+        );
+
+        let error = vm
+            .invoke_callable(callable, &[Value::Int(7)])
+            .expect_err("generic guest Named must still require a map");
+        assert!(
+            matches!(error, VmError::TypeMismatch("callable argument schema")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn guest_named_struct_rejects_empty_map_for_required_resource_field() {
+        let schema = TypeSchema::Named("HandleBox".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            guest_handle_box_decl(),
+        );
+        let error = vm
+            .invoke_callable(callable, &[empty_map()])
+            .expect_err("guest Named must reject missing required resource field");
+        assert_callable_schema_error(error);
+    }
+
+    #[test]
+    fn guest_named_struct_rejects_nested_empty_map() {
+        let mut inner_fields = HashMap::new();
+        inner_fields.insert("file".to_string(), TypeSchema::Resource(resource_key()));
+        let mut outer_fields = HashMap::new();
+        outer_fields.insert(
+            "inner".to_string(),
+            TypeSchema::Named("HandleBox".to_string(), Vec::new()),
+        );
+        let mut guest = guest_handle_box_decl();
+        guest.insert(
+            "Wrapper".to_string(),
+            StructDecl {
+                name: "Wrapper".to_string(),
+                type_params: Vec::new(),
+                body_schema: TypeSchema::Object(outer_fields),
+                origin: crate::compiler::StructDeclOrigin::Guest,
+            },
+        );
+        let schema = TypeSchema::Named("Wrapper".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            guest,
+        );
+        let mut nested_empty = VmMap::new();
+        nested_empty.insert(Value::string("inner"), empty_map());
+        let error = vm
+            .invoke_callable(callable.clone(), &[Value::Map(nested_empty.into())])
+            .expect_err("nested guest Named must reject empty inner object");
+        assert_callable_schema_error(error);
+
+        let error = vm
+            .invoke_callable(callable, &[empty_map()])
+            .expect_err("outer guest Named must reject missing required nested field");
+        assert_callable_schema_error(error);
+    }
+
+    #[test]
+    fn guest_named_struct_optional_field_may_be_omitted() {
+        let schema = TypeSchema::Named("HandleBox".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            guest_handle_box_decl(),
+        );
+        let handle = resource_handle(&mut vm);
+        assert_eq!(
+            vm.invoke_callable(callable, &[named_handle_box(handle, None)])
+                .expect("optional guest Named field may be omitted"),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn generic_guest_named_struct_resource_substitution_is_load_bearing() {
+        let schema = TypeSchema::Named(
+            "Holder".to_string(),
+            vec![TypeSchema::Resource(resource_key())],
+        );
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            guest_holder_decl(),
+        );
+        let handle = resource_handle(&mut vm);
+        let mut valid = VmMap::new();
+        valid.insert(Value::string("value"), Value::Int(handle));
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[Value::Map(valid.into())])
+                .expect("Holder<resource> with a live handle should pass"),
+            Value::Null
+        );
+
+        let error = vm
+            .invoke_callable(callable.clone(), &[empty_map()])
+            .expect_err("Holder<resource> must reject a missing resource field");
+        assert_callable_schema_error(error);
+
+        let mut wrong = VmMap::new();
+        wrong.insert(Value::string("value"), Value::Int(41));
+        let error = vm
+            .invoke_callable(callable.clone(), &[Value::Map(wrong.into())])
+            .expect_err("Holder<resource> must reject an invalid handle");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+
+        let other = other_resource_handle(&mut vm);
+        let mut other_map = VmMap::new();
+        other_map.insert(Value::string("value"), Value::Int(other));
+        let error = vm
+            .invoke_callable(callable, &[Value::Map(other_map.into())])
+            .expect_err("Holder<resource> must reject the wrong resource type");
+        assert_resource_schema_error(error, "resource_type_key_mismatch");
+    }
+
+    #[test]
+    fn generic_guest_named_struct_arity_mismatch_fails_closed() {
+        let schema = TypeSchema::Named("Holder".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            guest_holder_decl(),
+        );
+        let mut value = VmMap::new();
+        value.insert(Value::string("value"), Value::Int(7));
+        let error = vm
+            .invoke_callable(callable, &[Value::Map(value.into())])
+            .expect_err("generic arity mismatch must fail closed");
+        match error {
+            VmError::HostError(message) => {
+                assert!(
+                    message.contains("unknown named struct"),
+                    "unexpected host error: {message}"
+                );
+            }
+            other => panic!("expected HostError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generic_guest_named_struct_wrong_arity_vector_fails_closed() {
+        let schema =
+            TypeSchema::Named("Holder".to_string(), vec![TypeSchema::Int, TypeSchema::Int]);
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            guest_holder_decl(),
+        );
+        let mut value = VmMap::new();
+        value.insert(Value::string("value"), Value::Int(7));
+        let error = vm
+            .invoke_callable(callable, &[Value::Map(value.into())])
+            .expect_err("extra generic args must fail closed");
+        match error {
+            VmError::HostError(message) => {
+                assert!(
+                    message.contains("unknown named struct"),
+                    "unexpected host error: {message}"
+                );
+            }
+            other => panic!("expected HostError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vmbc_rejects_duplicate_generic_params_on_named_struct_decode() {
+        let mut guest = guest_holder_decl();
+        guest.get_mut("Holder").expect("Holder").type_params =
+            vec!["T".to_string(), "T".to_string()];
+        let program =
+            Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_named_struct_decls(guest);
+        let bytes = encode_program(&program).expect("malformed generic params should still encode");
+        decode_program(&bytes).expect_err("duplicate generic params must be rejected");
+    }
+
+    #[test]
+    fn compiled_guest_named_callable_and_return_roundtrip() {
+        let stack = run_compiled(
+            r#"
+            struct Point { x: int, y: int }
+            fn ident(p: Point) -> Point { p }
+            ident({ x: 1, y: 2 });
+            "#,
+        )
+        .expect("compiled guest Named callable should run");
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0], point_value(1, 2));
+    }
+
+    #[test]
+    fn compiled_generic_guest_named_like_lru_state_runs() {
+        let stack = run_compiled(
+            r#"
+            struct Holder<T> { value: T }
+            fn ident(p: Holder<int>) -> Holder<int> { p }
+            ident({ value: 9 });
+            "#,
+        )
+        .expect("compiled generic guest Named should run");
+        assert_eq!(stack.len(), 1);
+        let mut expected = VmMap::new();
+        expected.insert(Value::string("value"), Value::Int(9));
+        assert_eq!(stack[0], Value::Map(expected.into()));
+    }
+
+    #[test]
+    fn compiled_nested_guest_named_struct_runs() {
+        let stack = run_compiled(
+            r#"
+            struct Inner { n: int }
+            struct Outer { inner: Inner }
+            fn ident(p: Outer) -> Outer { p }
+            ident({ inner: { n: 4 } });
+            "#,
+        )
+        .expect("compiled nested guest Named should run");
+        assert_eq!(stack.len(), 1);
+        assert!(matches!(stack[0], Value::Map(_)));
+    }
+
+    #[test]
+    fn vmbc_roundtrip_preserves_guest_named_struct_decls() {
+        let compiled = crate::compile_source(
+            r#"
+            struct Point { x: int, y: int }
+            fn ident(p: Point) -> Point { p }
+            ident({ x: 8, y: 9 });
+            "#,
+        )
+        .expect("source should compile");
+        assert!(
+            compiled.program.named_struct_decls.contains_key("Point"),
+            "codegen should attach guest struct decls"
+        );
+        assert!(
+            compiled
+                .program
+                .named_struct_decls
+                .values()
+                .all(StructDecl::is_guest),
+            "codegen guest table must not carry catalog structs"
+        );
+        let bytes = encode_program(&compiled.program).expect("program should encode");
+        let decoded = decode_program(&bytes).expect("program should decode");
+        assert!(
+            decoded.named_struct_decls.contains_key("Point"),
+            "VMBC should preserve guest struct decls"
+        );
+        let mut vm = Vm::new(decoded);
+        assert_eq!(
+            vm.run().expect("decoded program should halt"),
+            VmStatus::Halted
+        );
+        assert_eq!(vm.stack(), &[point_value(8, 9)]);
     }
 }

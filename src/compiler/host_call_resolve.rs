@@ -435,8 +435,9 @@ fn resolve_candidate_refs<'a, A: ActualCallArgView>(
         let mut score = MatchScore::default();
         let mut passing_conforms = true;
         for (param, arg) in function.params.iter().zip(args.iter()) {
-            let expected_schema = param.ty.to_compiler_schema();
-            score = score.combined(score_pair(&expected_schema, arg.schema()));
+            let expected_schema = param.ty.to_compiler_object_schema();
+            let actual_schema = expand_actual_named(arg.schema(), &param.ty);
+            score = score.combined(score_pair(&expected_schema, &actual_schema));
             if passing_conforms && !arg.passing_matches_param(param.passing) {
                 passing_conforms = false;
             }
@@ -501,6 +502,12 @@ fn build_resolved(
         return_type: function.return_type.to_compiler_schema(),
         passing: function.params.iter().map(|param| param.passing).collect(),
         fingerprint,
+        host_params: function
+            .params
+            .iter()
+            .map(|param| param.ty.clone())
+            .collect(),
+        host_return_type: function.return_type.clone(),
     }
 }
 
@@ -605,10 +612,27 @@ fn score_pair(expected: &TypeSchema, actual: &TypeSchema) -> MatchScore {
     }
 
     match (expected, actual) {
-        (Optional(e), Optional(a)) | (Array(e), Array(a)) | (Map(e), Map(a)) => {
-            MatchScore::default()
-                .plus_exact()
-                .combined(score_pair(e, a))
+        (Optional(e), Optional(a)) => MatchScore::default()
+            .plus_exact()
+            .combined(score_pair(e, a)),
+        (Optional(_), Null) => MatchScore::default().plus_exact(),
+        (Optional(e), a) => score_pair(e, a),
+        (Array(e), Array(a)) | (Map(e), Map(a)) => MatchScore::default()
+            .plus_exact()
+            .combined(score_pair(e, a)),
+        (Array(e), ArrayTuple(items)) => {
+            let mut total = MatchScore::default().plus_exact();
+            for item in items {
+                total = total.combined(score_pair(e, item));
+            }
+            total
+        }
+        (Map(e), Object(a_fields)) => {
+            let mut total = MatchScore::default().plus_exact();
+            for a_schema in a_fields.values() {
+                total = total.combined(score_pair(e, a_schema));
+            }
+            total
         }
         (ArrayTuple(e_items), ArrayTuple(a_items)) => {
             if e_items.len() != a_items.len() {
@@ -673,14 +697,18 @@ fn score_pair(expected: &TypeSchema, actual: &TypeSchema) -> MatchScore {
             }
         }
         (Object(e_fields), Object(a_fields)) => {
-            if e_fields.len() != a_fields.len()
-                || e_fields.keys().any(|name| !a_fields.contains_key(name))
-            {
+            if a_fields.keys().any(|name| !e_fields.contains_key(name)) {
                 MatchScore::default().plus_mismatch()
             } else {
                 let mut total = MatchScore::default().plus_exact();
                 for (name, e_schema) in e_fields.iter() {
-                    total = total.combined(score_pair(e_schema, &a_fields[name]));
+                    match a_fields.get(name) {
+                        Some(a_schema) => {
+                            total = total.combined(score_pair(e_schema, a_schema));
+                        }
+                        None if matches!(e_schema, Optional(_)) => {}
+                        None => return MatchScore::default().plus_mismatch(),
+                    }
                 }
                 total
             }
@@ -764,8 +792,9 @@ fn best_concrete_mismatch<'f, A: ActualCallArgView>(
         .zip(args.iter())
         .enumerate()
         .find_map(|(index, (param, arg))| {
-            let expected_schema = param.ty.to_compiler_schema();
-            if score_pair(&expected_schema, arg.schema()).mismatches > 0 {
+            let expected_schema = param.ty.to_compiler_object_schema();
+            let actual_schema = expand_actual_named(arg.schema(), &param.ty);
+            if score_pair(&expected_schema, &actual_schema).mismatches > 0 {
                 Some(ConcreteMismatch {
                     index,
                     expected: schema_label(&param.ty),
@@ -941,6 +970,62 @@ fn schema_label(schema: &crate::host_api::HostTypeSchema) -> String {
             format!("fn({params}) -> {}", schema_label(result))
         }
         HostTypeSchema::Resource(key) => format!("resource<{key}>"),
+        HostTypeSchema::Named { name, .. } => name.clone(),
+    }
+}
+
+fn expand_actual_named(
+    actual: &TypeSchema,
+    expected: &crate::host_api::HostTypeSchema,
+) -> TypeSchema {
+    use crate::host_api::HostTypeSchema;
+    match (actual, expected) {
+        (TypeSchema::Named(actual_name, _), HostTypeSchema::Named { name, .. })
+            if actual_name == name =>
+        {
+            expected.to_compiler_object_schema()
+        }
+        (TypeSchema::Optional(inner), HostTypeSchema::Optional(expected_inner)) => {
+            TypeSchema::Optional(Box::new(expand_actual_named(inner, expected_inner)))
+        }
+        (TypeSchema::Array(inner), HostTypeSchema::Array(expected_inner)) => {
+            TypeSchema::Array(Box::new(expand_actual_named(inner, expected_inner)))
+        }
+        (TypeSchema::Map(inner), HostTypeSchema::Map(expected_inner)) => {
+            TypeSchema::Map(Box::new(expand_actual_named(inner, expected_inner)))
+        }
+        (TypeSchema::Object(actual_fields), HostTypeSchema::Named { fields, .. }) => {
+            let mut expanded = std::collections::HashMap::new();
+            for (name, actual_ty) in actual_fields {
+                if let Some(field) = fields.iter().find(|field| field.name == *name) {
+                    expanded.insert(name.clone(), expand_actual_named(actual_ty, &field.ty));
+                } else {
+                    expanded.insert(name.clone(), actual_ty.clone());
+                }
+            }
+            TypeSchema::Object(expanded)
+        }
+        (
+            TypeSchema::Callable { params, result },
+            HostTypeSchema::Callable {
+                params: expected_params,
+                result: expected_result,
+            },
+        ) => TypeSchema::Callable {
+            params: if params.len() != expected_params.len() {
+                params.clone()
+            } else {
+                params
+                    .iter()
+                    .zip(expected_params.iter())
+                    .map(|(actual_param, expected_param)| {
+                        expand_actual_named(actual_param, expected_param)
+                    })
+                    .collect()
+            },
+            result: Box::new(expand_actual_named(result, expected_result)),
+        },
+        _ => actual.clone(),
     }
 }
 #[cfg(test)]
@@ -2462,5 +2547,345 @@ mod tests {
             passing_result, schema_result,
             "deferred passing must equal the schema-only result"
         );
+    }
+
+    fn point_type() -> HostTypeSchema {
+        HostTypeSchema::named_struct(
+            "Point",
+            vec![
+                crate::host_api::HostStructField::new("x", HostTypeSchema::Int),
+                crate::host_api::HostStructField::new("y", HostTypeSchema::Int),
+            ],
+        )
+    }
+
+    fn point_catalog() -> HostApiCatalog {
+        let mut b = HostApiBuilder::new();
+        b.named_struct(crate::host_api::HostStructSchema::new(
+            "Point",
+            vec![
+                crate::host_api::HostStructField::new("x", HostTypeSchema::Int),
+                crate::host_api::HostStructField::new("y", HostTypeSchema::Int),
+            ],
+        ));
+        b.function(HostFunctionSchema::with_return(
+            "make_point",
+            vec![],
+            point_type(),
+        ));
+        b.function(HostFunctionSchema::with_return(
+            "take_point",
+            vec![value_param("p", point_type())],
+            HostTypeSchema::Int,
+        ));
+        b.build().expect("point catalog")
+    }
+
+    #[test]
+    fn named_struct_return_stays_named() {
+        let catalog = point_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let resolved = resolver.resolve("make_point", &[]).expect("resolve");
+        assert_eq!(resolved.return_type, Ts::Named("Point".to_string(), vec![]));
+    }
+
+    #[test]
+    fn object_literal_matches_named_struct_param() {
+        let catalog = point_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("x".to_string(), Ts::Int);
+        fields.insert("y".to_string(), Ts::Int);
+        let resolved = resolver
+            .resolve("take_point", &[Ts::Object(fields)])
+            .expect("object literal should match named struct");
+        assert_eq!(
+            resolved.params[0].schema,
+            Ts::Named("Point".to_string(), vec![])
+        );
+    }
+
+    #[test]
+    fn named_value_matches_named_struct_param() {
+        let catalog = point_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let resolved = resolver
+            .resolve("take_point", &[Ts::Named("Point".to_string(), vec![])])
+            .expect("named Point should match named Point");
+        assert_eq!(resolved.name, "take_point");
+    }
+
+    #[test]
+    fn dynamic_map_does_not_match_named_struct_param() {
+        let catalog = point_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let err = resolver
+            .resolve("take_point", &[Ts::Map(Box::new(Ts::Int))])
+            .unwrap_err();
+        match err {
+            HostCallResolveError::NoMatch { detail, .. } => {
+                assert!(
+                    detail.contains("Point") || detail.contains("object"),
+                    "mismatch should mention named struct or object, got {detail}"
+                );
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_literal_missing_field_does_not_match_named_struct() {
+        let catalog = point_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("x".to_string(), Ts::Int);
+        let err = resolver
+            .resolve("take_point", &[Ts::Object(fields)])
+            .unwrap_err();
+        assert!(matches!(err, HostCallResolveError::NoMatch { .. }));
+    }
+
+    fn inner_type() -> HostTypeSchema {
+        HostTypeSchema::named_struct(
+            "Inner",
+            vec![crate::host_api::HostStructField::new(
+                "x",
+                HostTypeSchema::Int,
+            )],
+        )
+    }
+
+    fn nested_named_catalog() -> HostApiCatalog {
+        let inner_fields = vec![crate::host_api::HostStructField::new(
+            "x",
+            HostTypeSchema::Int,
+        )];
+        let mut b = HostApiBuilder::new();
+        b.named_struct(crate::host_api::HostStructSchema::new(
+            "Inner",
+            inner_fields,
+        ));
+        b.named_struct(crate::host_api::HostStructSchema::new(
+            "Outer",
+            vec![crate::host_api::HostStructField::new("inner", inner_type())],
+        ));
+        b.function(HostFunctionSchema::with_return(
+            "take_outer",
+            vec![value_param(
+                "o",
+                HostTypeSchema::named_struct(
+                    "Outer",
+                    vec![crate::host_api::HostStructField::new("inner", inner_type())],
+                ),
+            )],
+            HostTypeSchema::Int,
+        ));
+        b.function(HostFunctionSchema::with_return(
+            "take_cb",
+            vec![value_param(
+                "cb",
+                HostTypeSchema::Callable {
+                    params: vec![inner_type()],
+                    result: Box::new(HostTypeSchema::Int),
+                },
+            )],
+            HostTypeSchema::Int,
+        ));
+        b.build().expect("nested named catalog")
+    }
+
+    #[test]
+    fn nested_named_field_in_object_literal_matches() {
+        let catalog = nested_named_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let mut outer = std::collections::HashMap::new();
+        outer.insert("inner".to_string(), Ts::Named("Inner".to_string(), vec![]));
+        resolver
+            .resolve("take_outer", &[Ts::Object(outer)])
+            .expect("object literal with a nested named field should match");
+    }
+
+    #[test]
+    fn nested_named_in_callable_param_matches() {
+        let catalog = nested_named_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let actual = Ts::Callable {
+            params: vec![Ts::Named("Inner".to_string(), vec![])],
+            result: Box::new(Ts::Int),
+        };
+        resolver
+            .resolve("take_cb", &[actual])
+            .expect("callable whose param is a nested named struct should match");
+    }
+
+    #[test]
+    fn callable_unequal_arity_is_rejected() {
+        let mut builder = HostApiBuilder::new();
+        builder.function(HostFunctionSchema::with_return(
+            "apply",
+            vec![value_param(
+                "cb",
+                HostTypeSchema::Callable {
+                    params: vec![HostTypeSchema::Int],
+                    result: Box::new(HostTypeSchema::Int),
+                },
+            )],
+            HostTypeSchema::Int,
+        ));
+        let catalog = builder.build().expect("valid callable catalog");
+        let resolver = HostCallResolver::new(&catalog);
+
+        let extra_actual = Ts::Callable {
+            params: vec![Ts::Int, Ts::String],
+            result: Box::new(Ts::Int),
+        };
+        assert!(
+            matches!(
+                resolver.resolve("apply", &[extra_actual]),
+                Err(HostCallResolveError::NoMatch { .. })
+            ),
+            "extra callable parameter must not be dropped by zip expansion"
+        );
+
+        let fewer_actual = Ts::Callable {
+            params: Vec::new(),
+            result: Box::new(Ts::Int),
+        };
+        assert!(
+            matches!(
+                resolver.resolve("apply", &[fewer_actual]),
+                Err(HostCallResolveError::NoMatch { .. })
+            ),
+            "fewer callable parameters must not match"
+        );
+    }
+
+    fn maybe_point_fields() -> Vec<crate::host_api::HostStructField> {
+        vec![
+            crate::host_api::HostStructField::new(
+                "x",
+                HostTypeSchema::Optional(Box::new(HostTypeSchema::Int)),
+            ),
+            crate::host_api::HostStructField::new("y", HostTypeSchema::Int),
+        ]
+    }
+
+    fn optional_field_catalog() -> HostApiCatalog {
+        let mut b = HostApiBuilder::new();
+        b.named_struct(crate::host_api::HostStructSchema::new(
+            "MaybePoint",
+            maybe_point_fields(),
+        ));
+        b.function(HostFunctionSchema::with_return(
+            "take_maybe",
+            vec![value_param(
+                "p",
+                HostTypeSchema::named_struct("MaybePoint", maybe_point_fields()),
+            )],
+            HostTypeSchema::Int,
+        ));
+        b.build().expect("optional field catalog")
+    }
+
+    fn object_fields(entries: &[(&str, Ts)]) -> Ts {
+        Ts::Object(
+            entries
+                .iter()
+                .map(|(name, ty)| ((*name).to_string(), ty.clone()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn object_literal_omitted_or_null_optional_field_matches_named_struct() {
+        let catalog = optional_field_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        resolver
+            .resolve("take_maybe", &[object_fields(&[("y", Ts::Int)])])
+            .expect("omitted optional field should match");
+        resolver
+            .resolve(
+                "take_maybe",
+                &[object_fields(&[("x", Ts::Null), ("y", Ts::Int)])],
+            )
+            .expect("explicit null optional field should match");
+        resolver
+            .resolve(
+                "take_maybe",
+                &[object_fields(&[("x", Ts::Int), ("y", Ts::Int)])],
+            )
+            .expect("present optional inner type should match");
+    }
+
+    #[test]
+    fn object_literal_extra_or_wrong_optional_field_does_not_match() {
+        let catalog = optional_field_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let extra = resolver
+            .resolve(
+                "take_maybe",
+                &[object_fields(&[("y", Ts::Int), ("z", Ts::Int)])],
+            )
+            .unwrap_err();
+        match extra {
+            HostCallResolveError::NoMatch { detail, .. } => {
+                assert!(
+                    detail.contains("MaybePoint") && detail.contains("z"),
+                    "extra field diagnostic should name the struct and key, got {detail}"
+                );
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
+
+        let wrong = resolver
+            .resolve(
+                "take_maybe",
+                &[object_fields(&[("x", Ts::String), ("y", Ts::Int)])],
+            )
+            .unwrap_err();
+        assert!(matches!(wrong, HostCallResolveError::NoMatch { .. }));
+    }
+
+    fn take_ints_catalog() -> HostApiCatalog {
+        let mut b = HostApiBuilder::new();
+        b.function(HostFunctionSchema::with_return(
+            "take_ints",
+            vec![value_param(
+                "xs",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::Int)),
+            )],
+            HostTypeSchema::Int,
+        ));
+        b.build().expect("array catalog")
+    }
+
+    #[test]
+    fn array_param_matches_array_tuple_of_same_element() {
+        let catalog = take_ints_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        resolver
+            .resolve("take_ints", &[Ts::Array(Box::new(Ts::Int))])
+            .expect("array<int> should match array<int>");
+        resolver
+            .resolve("take_ints", &[Ts::ArrayTuple(vec![Ts::Int, Ts::Int])])
+            .expect("array tuple of ints should match array<int>");
+    }
+
+    #[test]
+    fn array_param_rejects_array_tuple_with_wrong_element() {
+        let catalog = take_ints_catalog();
+        let resolver = HostCallResolver::new(&catalog);
+        let err = resolver
+            .resolve("take_ints", &[Ts::ArrayTuple(vec![Ts::Int, Ts::String])])
+            .unwrap_err();
+        match err {
+            HostCallResolveError::NoMatch { detail, .. } => {
+                assert!(
+                    detail.contains("array<int>"),
+                    "array/tuple mismatch should name array<int>, got {detail}"
+                );
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
     }
 }

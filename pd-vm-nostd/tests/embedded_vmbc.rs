@@ -5,9 +5,9 @@ use pd_vm_nostd::{
 use vm::compiler::TypeSchema;
 use vm::{
     HostApiBuilder, HostFunctionSchema, HostImport, HostImportSchema, HostParamPassing,
-    HostParamSchema, HostTypeSchema, OpCode, Program, ReplLocalBinding, ResourceTypeKey,
-    ResourceTypeSchema, TypeMap, Value, ValueType, compile_source, compile_source_for_repl,
-    compile_source_for_repl_with_locals, encode_program,
+    HostParamSchema, HostStructField, HostStructSchema, HostTypeSchema, OpCode, Program,
+    ReplLocalBinding, ResourceTypeKey, ResourceTypeSchema, TypeMap, Value, ValueType,
+    compile_source, compile_source_for_repl, compile_source_for_repl_with_locals, encode_program,
 };
 
 fn encoded_scalar_program() -> Vec<u8> {
@@ -31,9 +31,9 @@ fn encoded_scalar_program() -> Vec<u8> {
 }
 
 #[test]
-fn embedded_decoder_reads_host_generated_v12() {
+fn embedded_decoder_reads_host_generated_v13() {
     let bytes = encoded_scalar_program();
-    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v12");
+    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v13");
 
     assert_eq!(
         program.code(),
@@ -89,6 +89,62 @@ fn embedded_decoder_skips_full_host_schema_metadata() {
     assert_eq!(decoded.imports().len(), 1);
 }
 
+fn point_named_schema() -> HostTypeSchema {
+    HostTypeSchema::named_struct(
+        "Point",
+        vec![
+            HostStructField::new("x", HostTypeSchema::Int),
+            HostStructField::new("y", HostTypeSchema::Int),
+        ],
+    )
+}
+
+fn envelope_named_schema() -> HostTypeSchema {
+    HostTypeSchema::named_struct(
+        "Envelope",
+        vec![HostStructField::new("inner", point_named_schema())],
+    )
+}
+
+#[test]
+fn embedded_decoder_skips_named_host_schema_from_std_encode() {
+    let function = HostFunctionSchema::with_return(
+        "embedded::named",
+        vec![HostParamSchema::value("req", envelope_named_schema())],
+        point_named_schema(),
+    );
+    let mut builder = HostApiBuilder::new();
+    builder.named_struct(HostStructSchema::new(
+        "Point",
+        vec![
+            HostStructField::new("x", HostTypeSchema::Int),
+            HostStructField::new("y", HostTypeSchema::Int),
+        ],
+    ));
+    builder.named_struct(HostStructSchema::new(
+        "Envelope",
+        vec![HostStructField::new("inner", point_named_schema())],
+    ));
+    builder.function(function.clone());
+    let catalog = builder.build().expect("catalog");
+    let schema = HostImportSchema::from_function(&catalog, &function);
+
+    let mut program = Program::new(Vec::new(), vec![OpCode::Ret as u8]);
+    program.imports.push(HostImport {
+        name: "embedded::named".to_string(),
+        arity: 1,
+        return_type: ValueType::Map,
+    });
+    let program = program
+        .with_host_import_schemas(vec![schema])
+        .expect("schema alignment");
+    let bytes = encode_program(&program).expect("named host schema should encode");
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
+    let decoded = decode_program(&bytes).expect("embedded decoder should skip Named host schemas");
+    assert_eq!(decoded.imports().len(), 1);
+    assert_eq!(decoded.imports()[0].name, "embedded::named");
+}
+
 #[test]
 fn embedded_decoder_reads_legacy_v11_without_schema_markers() {
     let program = Program::new(
@@ -96,6 +152,8 @@ fn embedded_decoder_reads_legacy_v11_without_schema_markers() {
         vec![OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8],
     );
     let mut bytes = encode_program(&program).expect("legacy fixture should encode");
+    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 4);
     bytes[4..6].copy_from_slice(&11u16.to_le_bytes());
 
     let decoded = decode_program(&bytes).expect("embedded decoder should accept VMBC v11");
@@ -459,4 +517,175 @@ fn call_script_opcode_is_0x1a_in_both_crates() {
         Ok(EmbeddedOpCode::CallScript)
     );
     assert!(EmbeddedOpCode::try_from(0x7f).is_err());
+}
+
+fn append_wire_string(out: &mut Vec<u8>, value: &str) {
+    out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn v12_with_named_host_return_schema(schema: &[u8]) -> Vec<u8> {
+    let mut bytes = minimal_vmbc_prefix(0, &[EmbeddedOpCode::Ret as u8], 1);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(b'h');
+    bytes.extend_from_slice(&[0, 0, 1]);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(b'h');
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(schema);
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.push(0);
+    bytes.push(0);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes
+}
+
+fn empty_named_host_schema(name: &str) -> Vec<u8> {
+    let mut schema = vec![13];
+    append_wire_string(&mut schema, name);
+    schema.extend_from_slice(&0u32.to_le_bytes());
+    schema
+}
+
+fn nested_named_host_schema(depth: usize) -> Vec<u8> {
+    let mut schema = empty_named_host_schema("Leaf");
+    for _ in 0..depth {
+        let mut outer = vec![13];
+        append_wire_string(&mut outer, "Wrap");
+        outer.extend_from_slice(&1u32.to_le_bytes());
+        append_wire_string(&mut outer, "inner");
+        outer.extend_from_slice(&schema);
+        schema = outer;
+    }
+    schema
+}
+
+#[test]
+fn embedded_decoder_accepts_empty_named_host_schema() {
+    let bytes = v12_with_named_host_return_schema(&empty_named_host_schema("Point"));
+    decode_program(&bytes).expect("empty Named host schema should skip");
+}
+
+#[test]
+fn embedded_decoder_rejects_truncated_named_host_schema() {
+    let mut schema = vec![13];
+    append_wire_string(&mut schema, "Point");
+    schema.extend_from_slice(&1u32.to_le_bytes());
+    assert_eq!(
+        decode_program(&v12_with_named_host_return_schema(&schema)),
+        Err(WireError::UnexpectedEof)
+    );
+}
+
+#[test]
+fn embedded_decoder_rejects_oversized_named_host_field_count() {
+    const TOO_MANY: u32 = 1_000_001;
+    let mut schema = vec![13];
+    append_wire_string(&mut schema, "Point");
+    schema.extend_from_slice(&TOO_MANY.to_le_bytes());
+    assert!(matches!(
+        decode_program(&v12_with_named_host_return_schema(&schema)),
+        Err(WireError::LengthTooLarge("host named struct fields", count))
+            if count == TOO_MANY as usize
+    ));
+}
+
+#[test]
+fn embedded_decoder_rejects_malformed_nested_named_host_schema() {
+    let mut schema = vec![13];
+    append_wire_string(&mut schema, "Outer");
+    schema.extend_from_slice(&1u32.to_le_bytes());
+    append_wire_string(&mut schema, "inner");
+    schema.push(99);
+    assert_eq!(
+        decode_program(&v12_with_named_host_return_schema(&schema)),
+        Err(WireError::InvalidValueType(99))
+    );
+}
+
+#[test]
+fn embedded_decoder_rejects_truncated_nested_named_host_schema() {
+    let mut schema = vec![13];
+    append_wire_string(&mut schema, "Outer");
+    schema.extend_from_slice(&1u32.to_le_bytes());
+    append_wire_string(&mut schema, "inner");
+    schema.push(13);
+    append_wire_string(&mut schema, "Inner");
+    schema.extend_from_slice(&1u32.to_le_bytes());
+    assert_eq!(
+        decode_program(&v12_with_named_host_return_schema(&schema)),
+        Err(WireError::UnexpectedEof)
+    );
+}
+
+#[test]
+fn embedded_decoder_rejects_oversized_nested_named_host_depth() {
+    let bytes = v12_with_named_host_return_schema(&nested_named_host_schema(64));
+    assert_eq!(decode_program(&bytes), Err(WireError::SchemaTooDeep));
+}
+
+#[test]
+fn embedded_decoder_reads_v13_guest_named_struct_payload() {
+    let compiled = compile_source(
+        r#"
+        struct Point { x: int, y: int }
+        fn ident(p: Point) -> Point { p }
+        ident({ x: 8, y: 9 });
+        "#,
+    )
+    .expect("guest Named source should compile");
+    let bytes = encode_program(&compiled.program).expect("struct-bearing program should encode");
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
+    let program = decode_program(&bytes).expect("embedded decoder should skip guest named structs");
+    assert_eq!(program.code().last().copied(), Some(OpCode::Ret as u8));
+}
+
+#[test]
+fn embedded_decoder_rejects_duplicate_named_struct_generic_params() {
+    let mut bytes = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("empty program should encode");
+    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 4);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    append_wire_string(&mut bytes, "Holder");
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    append_wire_string(&mut bytes, "T");
+    append_wire_string(&mut bytes, "T");
+    bytes.push(14);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(decode_program(&bytes), Err(WireError::InvalidValueType(0)));
+}
+
+#[test]
+fn embedded_decoder_rejects_duplicate_named_struct_names() {
+    let mut bytes = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("empty program should encode");
+    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 4);
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    append_wire_string(&mut bytes, "Dup");
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.push(14);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    append_wire_string(&mut bytes, "Dup");
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.push(14);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(decode_program(&bytes), Err(WireError::InvalidValueType(0)));
+}
+
+#[test]
+fn embedded_decoder_rejects_v12_trailing_zero_named_struct_garbage() {
+    let mut bytes = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("empty program should encode");
+    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 4);
+    bytes[4..6].copy_from_slice(&12u16.to_le_bytes());
+    decode_program(&bytes).expect("clean v12 should decode");
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(decode_program(&bytes), Err(WireError::TrailingBytes));
 }

@@ -44,9 +44,9 @@ pub(super) fn parse_source(
     parse_source_with_source_id(source, flavor, options, 0)
 }
 
-/// Parse one source unit for bytecode compilation. The runtime standard
-/// catalog is reserved for semantic analysis; explicit caller catalogs remain
-/// available for custom host APIs.
+/// Parse one source unit for bytecode compilation. Callers that need named
+/// host structs must attach a catalog through compile options; the compile
+/// entry points install the HTTP catalog when the runtime HTTP surface is on.
 pub(super) fn parse_source_for_compile(
     source: &str,
     flavor: SourceFlavor,
@@ -240,15 +240,19 @@ fn parse_with_parser(
             dialect,
             catalog,
         )?,
-        None => Parser::new(
-            source,
-            source_id,
-            allow_implicit_externs,
-            allow_implicit_semicolons,
-            enforce_mutable_bindings,
-            import_scan_mode,
-            dialect,
-        )?,
+        None => {
+            let mut parser = Parser::new(
+                source,
+                source_id,
+                allow_implicit_externs,
+                allow_implicit_semicolons,
+                enforce_mutable_bindings,
+                import_scan_mode,
+                dialect,
+            )?;
+            parser.install_standard_runtime_named_structs();
+            parser
+        }
     };
     let stmts = parser.parse_program()?;
     Ok(FrontendIr {

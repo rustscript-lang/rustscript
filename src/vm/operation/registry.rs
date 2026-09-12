@@ -298,12 +298,12 @@ impl OperationRegistry {
                     Ok(slot) => slot,
                     Err(error) => return Poll::Ready(Err(error)),
                 };
-                let operation = self.slots[slot]
+                let quiescent = self.slots[slot]
                     .operation
                     .as_mut()
-                    .expect("cancelled deadline operation remains occupied");
-                if !operation.driver.is_quiescent() {
-                    operation.driver.register_quiescence_waker(cx);
+                    .map(|operation| operation.driver.poll_quiescent(cx))
+                    .unwrap_or(Poll::Ready(()));
+                if quiescent.is_pending() {
                     return Poll::Pending;
                 }
                 Poll::Ready(Ok(self.consume_terminal(slot)))
@@ -335,6 +335,29 @@ impl OperationRegistry {
                 self.poll_terminal(slot, cx)
             }
         }
+    }
+
+    /// Polls a terminal operation until its driver has quiesced, then consumes
+    /// the terminal slot. This is the non-driving half of [`poll`](Self::poll)
+    /// used by asynchronous cleanup owners that have already requested a
+    /// cancellation or completion.
+    pub fn poll_quiescent(
+        &mut self,
+        id: OperationId,
+        cx: &mut Context<'_>,
+    ) -> Poll<OperationResult<OperationOutcome>> {
+        let slot = match self.location(id) {
+            Ok(slot) => slot,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        if !self.slots[slot]
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.status.is_terminal())
+        {
+            return Poll::Pending;
+        }
+        self.poll_terminal(slot, cx)
     }
 
     /// Cancels one operation, forwarding the reason to its driver.
@@ -529,10 +552,8 @@ impl OperationRegistry {
             if !operation.status.is_terminal() {
                 continue;
             }
-            if operation.driver.is_quiescent() {
+            if operation.driver.poll_quiescent(cx).is_ready() {
                 let _ = self.consume_terminal(slot);
-            } else {
-                operation.driver.register_quiescence_waker(cx);
             }
         }
         self.is_empty()
@@ -656,12 +677,7 @@ impl OperationRegistry {
                 .operation
                 .as_mut()
                 .expect("terminal slot remains occupied");
-            if operation.driver.is_quiescent() {
-                true
-            } else {
-                operation.driver.register_quiescence_waker(cx);
-                false
-            }
+            operation.driver.poll_quiescent(cx).is_ready()
         };
         if quiescent {
             Poll::Ready(Ok(self.consume_terminal(slot)))
@@ -1362,6 +1378,82 @@ mod tests {
             other => panic!("expected deadline cancellation, got {other:?}"),
         }
         assert_eq!(registry.len(), 0);
+    }
+
+    /// The worker may finish after the first quiescence observation but before
+    /// the driver's waker registration. The registry must perform the second
+    /// observation in the same poll, otherwise this terminal operation can be
+    /// stranded forever with no future wakeup.
+    struct CompletesDuringQuiescenceRegistration {
+        quiescent: bool,
+        registrations: Arc<AtomicUsize>,
+    }
+
+    impl HostOperation for CompletesDuringQuiescenceRegistration {
+        fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
+            Poll::Pending
+        }
+
+        fn cancel(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
+            Ok(())
+        }
+
+        fn is_quiescent(&self) -> bool {
+            self.quiescent
+        }
+
+        fn register_quiescence_waker(&mut self, _cx: &Context<'_>) {
+            self.registrations.fetch_add(1, Ordering::SeqCst);
+            self.quiescent = true;
+        }
+    }
+
+    #[test]
+    fn poll_quiescence_rechecks_after_registration() {
+        let registrations = Arc::new(AtomicUsize::new(0));
+        let mut registry = OperationRegistry::with_limit(1).expect("registry");
+        let id = registry
+            .start(OperationSpec::new(CompletesDuringQuiescenceRegistration {
+                quiescent: false,
+                registrations: Arc::clone(&registrations),
+            }))
+            .expect("start");
+        registry
+            .cancel(id, OperationCancelReason::VmReset)
+            .expect("cancel");
+
+        let (waker, _) = test_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(registry.poll_quiescence(&mut cx));
+        assert_eq!(registrations.load(Ordering::SeqCst), 1);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn terminal_poll_rechecks_after_registration_across_many_iterations() {
+        let (waker, _) = test_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..256 {
+            let registrations = Arc::new(AtomicUsize::new(0));
+            let mut registry = OperationRegistry::with_limit(1).expect("registry");
+            let id = registry
+                .start(OperationSpec::new(CompletesDuringQuiescenceRegistration {
+                    quiescent: false,
+                    registrations: Arc::clone(&registrations),
+                }))
+                .expect("start");
+            registry
+                .cancel(id, OperationCancelReason::Requested)
+                .expect("cancel");
+            assert_eq!(
+                registry.poll(id, &mut cx),
+                Poll::Ready(Ok(OperationOutcome::Cancelled(
+                    OperationCancelReason::Requested
+                )))
+            );
+            assert_eq!(registrations.load(Ordering::SeqCst), 1);
+            assert!(registry.is_empty());
+        }
     }
 
     #[test]

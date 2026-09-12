@@ -14,11 +14,13 @@
 //!   [`HostFunctionRegistry`]. Registration is validated against the
 //!   extension's [`HostApiCatalog`] via [`catalog_import_schemas`] so the
 //!   registered function declarations — parameter labels, type schemas and
-//!   passing modes — match the catalog exactly. The catalog is the
-//!   authoritative host-side contract: it carries the fingerprint and the
-//!   resource type keys the host exposes, and the same catalog can be
-//!   supplied to the compiler so the program's `HostImport`s resolve against
-//!   it.
+//!   passing modes — match the catalog exactly. Named-struct bodies from
+//!   [`HostExtension::catalog`] are installed atomically by
+//!   [`register_host_extension`] / [`super::Vm::install_extension`] before
+//!   `register`. The catalog is the authoritative host-side contract: it
+//!   carries the fingerprint and the resource type keys the host exposes, and
+//!   the same catalog can be supplied to the compiler so the program's
+//!   `HostImport`s resolve against it.
 //!
 //! `src/vm` therefore stays host-agnostic: resource classes, pending
 //! operations and module state are supplied by the extension, while the
@@ -53,15 +55,26 @@ pub use crate::host_api::{HostImportParam, HostImportSchema};
 /// Used directly by embedders; the `register` / `install` lifecycle is split
 /// so an extension can also be registered into a caller-supplied (e.g.
 /// restricted / capability-granted) [`HostFunctionRegistry`] by calling
-/// [`HostExtension::register`] directly and binding it with
+/// [`register_host_extension`] and binding it with
 /// [`HostFunctionRegistry::bind_vm_cached`].
 pub trait HostExtension: Send + Sync + 'static {
+    /// Catalog whose named-struct bodies are installed atomically before
+    /// [`Self::register`] by [`super::Vm::install_extension`] and
+    /// [`register_host_extension`]. Compiler import identity stays
+    /// `TypeSchema::Named`. The default is none.
+    fn catalog(&self) -> Option<&HostApiCatalog> {
+        None
+    }
+
     /// Registers this extension's host functions into `registry`.
     ///
     /// Registration must be validated against the extension's
-    /// [`HostApiCatalog`] (e.g. [`catalog_import_schemas`] plus the
+    /// [`HostApiCatalog`] (e.g. [`catalog_import_schemas_into`] or
+    /// [`catalog_import_schemas`] plus the
     /// [`validate_catalog_import_schemas`] family); a name-only fallback is
-    /// not part of this surface. The default registers nothing.
+    /// not part of this surface. Prefer [`register_host_extension`] or
+    /// [`super::Vm::install_extension`] so catalog named-struct bodies are
+    /// installed before registration. The default registers nothing.
     fn register(&self, registry: &mut super::host::HostFunctionRegistry) -> VmResult<()> {
         let _ = registry;
         Ok(())
@@ -96,6 +109,9 @@ pub trait HostExtension: Send + Sync + 'static {
     /// so a failure leaves the VM unmodified.
     fn install_into(&self, vm: &mut super::Vm) -> VmResult<()> {
         let mut registry = super::host::HostFunctionRegistry::new();
+        if let Some(catalog) = self.catalog() {
+            registry.install_named_struct_schemas(catalog_named_struct_schemas(catalog))?;
+        }
         self.register(&mut registry)?;
         registry.bind_vm_cached(vm)?;
         self.install(vm);
@@ -116,6 +132,46 @@ pub trait HostExtension: Send + Sync + 'static {
 pub fn catalog_import_schemas(catalog: &HostApiCatalog, name: &str) -> Vec<HostImportSchema> {
     let fingerprint = catalog.fingerprint();
     catalog_import_schemas_with_fingerprint(catalog, name, fingerprint)
+}
+
+/// Named struct bodies for VM resource walks. Compiler import schemas keep
+/// `TypeSchema::Named` identity; install these on
+/// [`HostFunctionRegistry::install_named_struct_schemas`] so nested resources
+/// inside named structs remain visible after catalog registration.
+pub fn catalog_named_struct_schemas(
+    catalog: &HostApiCatalog,
+) -> std::collections::HashMap<String, crate::compiler::TypeSchema> {
+    catalog
+        .structs()
+        .iter()
+        .map(|schema| (schema.name.clone(), schema.to_compiler_object_schema()))
+        .collect()
+}
+
+/// Installs catalog named-struct bodies onto `registry`, then returns exact
+/// import schemas for `name`. Use this from [`HostExtension::register`] so
+/// resource walks see nested `TypeSchema::Named` bodies without a separate
+/// test-only table install. Compiler import identity stays `TypeSchema::Named`.
+pub fn catalog_import_schemas_into(
+    registry: &mut super::host::HostFunctionRegistry,
+    catalog: &HostApiCatalog,
+    name: &str,
+) -> VmResult<Vec<HostImportSchema>> {
+    registry.install_named_struct_schemas(catalog_named_struct_schemas(catalog))?;
+    Ok(catalog_import_schemas(catalog, name))
+}
+
+/// Registers `extension` after atomically installing named-struct bodies from
+/// [`HostExtension::catalog`]. Restricted-registry callers should use this
+/// instead of calling [`HostExtension::register`] directly.
+pub fn register_host_extension(
+    registry: &mut super::host::HostFunctionRegistry,
+    extension: &dyn HostExtension,
+) -> VmResult<()> {
+    if let Some(catalog) = extension.catalog() {
+        registry.install_named_struct_schemas(catalog_named_struct_schemas(catalog))?;
+    }
+    extension.register(registry)
 }
 
 fn catalog_import_schemas_with_fingerprint(
@@ -219,8 +275,8 @@ pub enum CatalogRegistrationError {
     ParameterTypeMismatch {
         name: String,
         index: usize,
-        expected: HostTypeSchema,
-        actual: HostTypeSchema,
+        expected: Box<HostTypeSchema>,
+        actual: Box<HostTypeSchema>,
     },
     /// A parameter's passing mode differs from the catalog declaration.
     ParameterPassingMismatch {
@@ -239,8 +295,8 @@ pub enum CatalogRegistrationError {
     /// The selected declaration has a different return schema.
     ReturnTypeMismatch {
         name: String,
-        expected: HostTypeSchema,
-        actual: HostTypeSchema,
+        expected: Box<HostTypeSchema>,
+        actual: Box<HostTypeSchema>,
     },
     /// More than one catalog overload matches an arity-only selection.
     AmbiguousOverload {
@@ -425,8 +481,8 @@ fn schema_field_mismatch(
             return Some(CatalogRegistrationError::ParameterTypeMismatch {
                 name: name.to_string(),
                 index,
-                expected: expected.schema.clone(),
-                actual: actual.schema.clone(),
+                expected: Box::new(expected.schema.clone()),
+                actual: Box::new(actual.schema.clone()),
             });
         }
         if expected.passing != actual.passing {
@@ -449,8 +505,8 @@ fn schema_field_mismatch(
     if candidate.return_type != selected.return_type {
         return Some(CatalogRegistrationError::ReturnTypeMismatch {
             name: name.to_string(),
-            expected: candidate.return_type.clone(),
-            actual: selected.return_type.clone(),
+            expected: Box::new(candidate.return_type.clone()),
+            actual: Box::new(selected.return_type.clone()),
         });
     }
     None

@@ -259,6 +259,13 @@ impl Compiler {
         program.exported_callables = exported_callables;
         program.imports = self.host_imports;
         program = program.with_optional_host_import_schemas(self.host_import_schemas);
+        let guest_struct_decls = self
+            .struct_schemas
+            .iter()
+            .filter(|(_, decl)| decl.is_guest())
+            .map(|(name, decl)| (name.clone(), decl.clone()))
+            .collect();
+        program = program.with_named_struct_decls(guest_struct_decls);
         Ok(program)
     }
 
@@ -1833,13 +1840,23 @@ impl Compiler {
                 .params
                 .iter()
                 .zip(&resolution.passing)
-                .map(|(param, passing)| HostImportParam {
+                .enumerate()
+                .map(|(index, (param, passing))| HostImportParam {
                     name: param.name.clone(),
-                    schema: super::host_conversion::to_host_schema(&param.schema),
+                    schema: resolution
+                        .host_params
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| super::host_conversion::to_host_schema(&param.schema)),
                     passing: *passing,
                 })
                 .collect(),
-            return_type: super::host_conversion::to_host_schema(&resolution.return_type),
+            return_type: if resolution.host_return_type != crate::host_api::HostTypeSchema::Unknown
+            {
+                resolution.host_return_type.clone()
+            } else {
+                super::host_conversion::to_host_schema(&resolution.return_type)
+            },
             fingerprint: resolution.fingerprint,
         };
         let base_index = self

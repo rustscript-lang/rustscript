@@ -3,7 +3,9 @@ use std::hash::{Hash, Hasher};
 
 use crate::ValueType;
 use crate::builtins::default_host_callable;
-use crate::host_api::{HostApiFingerprint, HostFunctionSchema, HostParamPassing, ResourceTypeKey};
+use crate::host_api::{
+    HostApiFingerprint, HostFunctionSchema, HostParamPassing, HostTypeSchema, ResourceTypeKey,
+};
 
 use super::ParseError;
 use super::modules::SymbolId;
@@ -419,13 +421,37 @@ pub struct ResolvedHostCall {
     pub passing: Vec<HostParamPassing>,
     /// The catalog fingerprint at resolution time, for provenance/ABI ties.
     pub fingerprint: HostApiFingerprint,
+    /// Host-facing parameter schemas, index-aligned with [`Self::params`].
+    ///
+    /// These preserve [`HostTypeSchema::Named`] identity for the VMBC sidecar
+    /// instead of collapsing named structs onto `map`.
+    pub host_params: Vec<HostTypeSchema>,
+    /// Host-facing return schema, including named-struct identity.
+    pub host_return_type: HostTypeSchema,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Provenance for a parser/compiler struct declaration.
+///
+/// Catalog-installed host structs stay on the registry side at runtime.
+/// Only source/guest declarations are transported on `Program.named_struct_decls`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StructDeclOrigin {
+    Guest,
+    Catalog,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StructDecl {
     pub name: String,
     pub type_params: Vec<String>,
     pub body_schema: TypeSchema,
+    pub origin: StructDeclOrigin,
+}
+
+impl StructDecl {
+    pub(crate) fn is_guest(&self) -> bool {
+        matches!(self.origin, StructDeclOrigin::Guest)
+    }
 }
 
 fn known_host_accepts_arity(name: &str, arity: u8) -> bool {
@@ -1875,7 +1901,7 @@ mod host_api_ir_metadata_tests {
 mod call_resolution_carrier_tests {
     use super::{Expr, ResolvedHostCall, TypeSchema};
     use crate::compiler::ResolvedHostParam;
-    use crate::host_api::{HostApiFingerprint, HostParamPassing};
+    use crate::host_api::{HostApiFingerprint, HostParamPassing, HostTypeSchema};
 
     fn fingerprint(n: u64) -> HostApiFingerprint {
         serde_json::from_value(serde_json::Value::Number(n.into())).unwrap()
@@ -1891,6 +1917,8 @@ mod call_resolution_carrier_tests {
             return_type: TypeSchema::Int,
             passing: vec![HostParamPassing::Borrow],
             fingerprint: fingerprint(7),
+            host_params: vec![HostTypeSchema::Int],
+            host_return_type: HostTypeSchema::Int,
         }
     }
 
@@ -1990,7 +2018,7 @@ mod call_resolution_carrier_tests {
 
 #[cfg(test)]
 mod type_schema_contains_resource_tests {
-    use super::{StructDecl, TypeSchema};
+    use super::{StructDecl, StructDeclOrigin, TypeSchema};
     use crate::host_api::ResourceTypeKey;
     use std::collections::HashMap;
 
@@ -2136,6 +2164,7 @@ mod type_schema_contains_resource_tests {
                     "handle".to_string(),
                     resource(),
                 )])),
+                origin: StructDeclOrigin::Guest,
             },
         )]);
         let wrapper = TypeSchema::Named("wrapper".to_string(), Vec::new());
@@ -2153,6 +2182,7 @@ mod type_schema_contains_resource_tests {
                     "value".to_string(),
                     TypeSchema::GenericParam("T".to_string()),
                 )])),
+                origin: StructDeclOrigin::Guest,
             },
         )]);
         let resource_wrapper = TypeSchema::Named("wrapper".to_string(), vec![resource()]);
@@ -2177,6 +2207,7 @@ mod type_schema_contains_resource_tests {
                         )))],
                     ),
                 )])),
+                origin: StructDeclOrigin::Guest,
             },
         )]);
         let node = TypeSchema::Named("node".to_string(), vec![TypeSchema::Int]);

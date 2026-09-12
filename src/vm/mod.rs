@@ -35,6 +35,7 @@ mod superinstructions;
 #[cfg(test)]
 mod tests;
 pub use self::aot::AotArtifactError;
+use self::async_host::preserve_stream_cleanup;
 pub use self::async_host::{CaptureAsyncHostContext, HostFuture, HostFutureOutput};
 pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder};
 use self::engine::Engine;
@@ -53,8 +54,9 @@ pub use self::host_context::{
 };
 pub use self::host_extension::{
     CatalogRegistrationError, CatalogSchemaSelection, HostExtension, HostImportParam,
-    HostImportSchema, catalog_import_schemas, register_catalog_function,
-    register_catalog_static_function, validate_catalog_import_schemas,
+    HostImportSchema, catalog_import_schemas, catalog_import_schemas_into,
+    catalog_named_struct_schemas, register_catalog_function, register_catalog_static_function,
+    register_host_extension, validate_catalog_import_schemas,
     validate_catalog_import_schemas_with_fingerprints,
 };
 use self::host_runtime::HostRuntime;
@@ -440,6 +442,14 @@ fn compute_program_cache_key(program: &Program) -> u64 {
         }
     }
     hash_type_map(program.type_map.as_ref(), &mut hasher);
+    let mut named_struct_decls = program.named_struct_decls.iter().collect::<Vec<_>>();
+    named_struct_decls.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    named_struct_decls.len().hash(&mut hasher);
+    for (name, decl) in named_struct_decls {
+        name.hash(&mut hasher);
+        decl.type_params.hash(&mut hasher);
+        hash_type_schema(&decl.body_schema, &mut hasher);
+    }
     hasher.finish()
 }
 
@@ -477,13 +487,157 @@ fn hash_local_schemas(schemas: &[Option<crate::compiler::TypeSchema>], state: &m
     }
 }
 
+#[derive(Clone, Copy)]
+enum NamedStructOrigin {
+    Host,
+    Guest,
+}
+
+#[derive(Clone, Copy)]
+struct NamedStructLookup<'a> {
+    host: &'a HashMap<String, crate::compiler::TypeSchema>,
+    guest: &'a HashMap<String, crate::compiler::StructDecl>,
+}
+
+impl<'a> NamedStructLookup<'a> {
+    fn body(
+        self,
+        name: &str,
+        args: &[crate::compiler::TypeSchema],
+    ) -> Option<(crate::compiler::TypeSchema, NamedStructOrigin)> {
+        if let Some(body) = self.host.get(name) {
+            if !args.is_empty() {
+                return None;
+            }
+            return Some((body.clone(), NamedStructOrigin::Host));
+        }
+        let decl = self.guest.get(name)?;
+        if decl.type_params.len() != args.len() {
+            return None;
+        }
+        let body = if args.is_empty() {
+            decl.body_schema.clone()
+        } else {
+            let bindings = decl
+                .type_params
+                .iter()
+                .cloned()
+                .zip(args.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            substitute_named_struct_schema(&decl.body_schema, &bindings)
+        };
+        Some((body, NamedStructOrigin::Guest))
+    }
+}
+
+fn substitute_named_struct_schema(
+    schema: &crate::compiler::TypeSchema,
+    bindings: &HashMap<String, crate::compiler::TypeSchema>,
+) -> crate::compiler::TypeSchema {
+    use crate::compiler::TypeSchema;
+
+    match schema {
+        TypeSchema::GenericParam(name) => bindings
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| schema.clone()),
+        TypeSchema::Optional(inner) => {
+            TypeSchema::Optional(Box::new(substitute_named_struct_schema(inner, bindings)))
+        }
+        TypeSchema::Named(name, args) => TypeSchema::Named(
+            name.clone(),
+            args.iter()
+                .map(|arg| substitute_named_struct_schema(arg, bindings))
+                .collect(),
+        ),
+        TypeSchema::Array(inner) => {
+            TypeSchema::Array(Box::new(substitute_named_struct_schema(inner, bindings)))
+        }
+        TypeSchema::ArrayTuple(items) => TypeSchema::ArrayTuple(
+            items
+                .iter()
+                .map(|item| substitute_named_struct_schema(item, bindings))
+                .collect(),
+        ),
+        TypeSchema::ArrayTupleRest { prefix, rest } => TypeSchema::ArrayTupleRest {
+            prefix: prefix
+                .iter()
+                .map(|item| substitute_named_struct_schema(item, bindings))
+                .collect(),
+            rest: Box::new(substitute_named_struct_schema(rest, bindings)),
+        },
+        TypeSchema::Map(inner) => {
+            TypeSchema::Map(Box::new(substitute_named_struct_schema(inner, bindings)))
+        }
+        TypeSchema::Object(fields) => TypeSchema::Object(
+            fields
+                .iter()
+                .map(|(name, field)| {
+                    (
+                        name.clone(),
+                        substitute_named_struct_schema(field, bindings),
+                    )
+                })
+                .collect(),
+        ),
+        TypeSchema::Callable { params, result } => TypeSchema::Callable {
+            params: params
+                .iter()
+                .map(|param| substitute_named_struct_schema(param, bindings))
+                .collect(),
+            result: Box::new(substitute_named_struct_schema(result, bindings)),
+        },
+        _ => schema.clone(),
+    }
+}
+
 fn validate_value_against_type_schema(
     value: &Value,
     schema: &crate::compiler::TypeSchema,
     resources: &ResourceTable,
     validate_scalars: bool,
+    named_struct_schemas: NamedStructLookup<'_>,
+) -> VmResult<()> {
+    validate_value_against_type_schema_walk(
+        value,
+        schema,
+        resources,
+        validate_scalars,
+        named_struct_schemas,
+        0,
+        &mut 0,
+    )
+}
+
+fn charge_named_schema_node(nodes: &mut usize) -> VmResult<()> {
+    *nodes = nodes.saturating_add(1);
+    if *nodes > crate::host_api::MAX_HOST_SCHEMA_NODES {
+        return Err(VmError::HostError(format!(
+            "named struct schema exceeded complexity limit {}",
+            crate::host_api::MAX_HOST_SCHEMA_NODES
+        )));
+    }
+    Ok(())
+}
+
+fn validate_value_against_type_schema_walk(
+    value: &Value,
+    schema: &crate::compiler::TypeSchema,
+    resources: &ResourceTable,
+    validate_scalars: bool,
+    named_struct_schemas: NamedStructLookup<'_>,
+    depth: usize,
+    nodes: &mut usize,
 ) -> VmResult<()> {
     use crate::compiler::TypeSchema;
+
+    charge_named_schema_node(nodes)?;
+    if depth > crate::host_api::MAX_HOST_SCHEMA_DEPTH {
+        return Err(VmError::HostError(format!(
+            "named struct schema exceeded depth limit {}",
+            crate::host_api::MAX_HOST_SCHEMA_DEPTH
+        )));
+    }
 
     match schema {
         TypeSchema::Unknown | TypeSchema::GenericParam(_) => Ok(()),
@@ -540,25 +694,62 @@ fn validate_value_against_type_schema(
             if matches!(value, Value::Null) {
                 Ok(())
             } else {
-                validate_value_against_type_schema(value, inner, resources, validate_scalars)
+                validate_value_against_type_schema_walk(
+                    value,
+                    inner,
+                    resources,
+                    validate_scalars,
+                    named_struct_schemas,
+                    depth + 1,
+                    nodes,
+                )
             }
         }
-        TypeSchema::Named(_, _) => {
-            if matches!(value, Value::Map(_)) {
-                Ok(())
-            } else {
-                Err(VmError::TypeMismatch("map"))
+        TypeSchema::Named(name, args) => {
+            if !matches!(value, Value::Map(_)) {
+                return Err(VmError::TypeMismatch("map"));
+            }
+            let Some((body, origin)) = named_struct_schemas.body(name, args) else {
+                return Err(VmError::HostError(format!("unknown named struct '{name}'")));
+            };
+            match &body {
+                TypeSchema::Object(fields) => validate_named_object_fields(
+                    value,
+                    fields,
+                    resources,
+                    matches!(origin, NamedStructOrigin::Host),
+                    named_struct_schemas,
+                    depth + 1,
+                    nodes,
+                ),
+                _ => validate_value_against_type_schema_walk(
+                    value,
+                    &body,
+                    resources,
+                    true,
+                    named_struct_schemas,
+                    depth + 1,
+                    nodes,
+                ),
             }
         }
         TypeSchema::Map(inner) => {
             let Value::Map(values) = value else {
                 return Err(VmError::TypeMismatch("map"));
             };
-            if !schema_contains_resource(inner) {
+            if !schema_contains_resource(inner, named_struct_schemas) {
                 return Ok(());
             }
             for (_, value) in values.iter() {
-                validate_value_against_type_schema(value, inner, resources, false)?;
+                validate_value_against_type_schema_walk(
+                    value,
+                    inner,
+                    resources,
+                    false,
+                    named_struct_schemas,
+                    depth + 1,
+                    nodes,
+                )?;
             }
             Ok(())
         }
@@ -567,11 +758,19 @@ fn validate_value_against_type_schema(
                 return Err(VmError::TypeMismatch("object"));
             };
             for (name, field_schema) in fields {
-                if !schema_contains_resource(field_schema) {
+                if !schema_contains_resource(field_schema, named_struct_schemas) {
                     continue;
                 }
                 if let Some(field) = values.get(&Value::string(name)) {
-                    validate_value_against_type_schema(field, field_schema, resources, false)?;
+                    validate_value_against_type_schema_walk(
+                        field,
+                        field_schema,
+                        resources,
+                        false,
+                        named_struct_schemas,
+                        depth + 1,
+                        nodes,
+                    )?;
                 }
             }
             Ok(())
@@ -580,11 +779,19 @@ fn validate_value_against_type_schema(
             let Value::Array(values) = value else {
                 return Err(VmError::TypeMismatch("array"));
             };
-            if !schema_contains_resource(inner) {
+            if !schema_contains_resource(inner, named_struct_schemas) {
                 return Ok(());
             }
             for value in values.iter() {
-                validate_value_against_type_schema(value, inner, resources, false)?;
+                validate_value_against_type_schema_walk(
+                    value,
+                    inner,
+                    resources,
+                    false,
+                    named_struct_schemas,
+                    depth + 1,
+                    nodes,
+                )?;
             }
             Ok(())
         }
@@ -592,15 +799,23 @@ fn validate_value_against_type_schema(
             let Value::Array(values) = value else {
                 return Err(VmError::TypeMismatch("tuple"));
             };
-            if !schema_contains_resource(schema) {
+            if !schema_contains_resource(schema, named_struct_schemas) {
                 return Ok(());
             }
             if values.len() != items.len() {
                 return Err(VmError::TypeMismatch("tuple"));
             }
             for (value, item) in values.iter().zip(items) {
-                if schema_contains_resource(item) {
-                    validate_value_against_type_schema(value, item, resources, false)?;
+                if schema_contains_resource(item, named_struct_schemas) {
+                    validate_value_against_type_schema_walk(
+                        value,
+                        item,
+                        resources,
+                        false,
+                        named_struct_schemas,
+                        depth + 1,
+                        nodes,
+                    )?;
                 }
             }
             Ok(())
@@ -609,20 +824,36 @@ fn validate_value_against_type_schema(
             let Value::Array(values) = value else {
                 return Err(VmError::TypeMismatch("tuple"));
             };
-            if !schema_contains_resource(schema) {
+            if !schema_contains_resource(schema, named_struct_schemas) {
                 return Ok(());
             }
             if values.len() < prefix.len() {
                 return Err(VmError::TypeMismatch("tuple"));
             }
             for (value, item) in values.iter().zip(prefix) {
-                if schema_contains_resource(item) {
-                    validate_value_against_type_schema(value, item, resources, false)?;
+                if schema_contains_resource(item, named_struct_schemas) {
+                    validate_value_against_type_schema_walk(
+                        value,
+                        item,
+                        resources,
+                        false,
+                        named_struct_schemas,
+                        depth + 1,
+                        nodes,
+                    )?;
                 }
             }
-            if schema_contains_resource(rest) {
+            if schema_contains_resource(rest, named_struct_schemas) {
                 for value in values.iter().skip(prefix.len()) {
-                    validate_value_against_type_schema(value, rest, resources, false)?;
+                    validate_value_against_type_schema_walk(
+                        value,
+                        rest,
+                        resources,
+                        false,
+                        named_struct_schemas,
+                        depth + 1,
+                        nodes,
+                    )?;
                 }
             }
             Ok(())
@@ -647,30 +878,117 @@ fn validate_value_against_type_schema(
     }
 }
 
-fn schema_contains_resource(schema: &crate::compiler::TypeSchema) -> bool {
+fn validate_named_object_fields(
+    value: &Value,
+    fields: &HashMap<String, crate::compiler::TypeSchema>,
+    resources: &ResourceTable,
+    validate_scalars: bool,
+    named_struct_schemas: NamedStructLookup<'_>,
+    depth: usize,
+    nodes: &mut usize,
+) -> VmResult<()> {
     use crate::compiler::TypeSchema;
+
+    let Value::Map(values) = value else {
+        return Err(VmError::TypeMismatch("map"));
+    };
+    for (name, field_schema) in fields {
+        match values.get(&Value::string(name)) {
+            Some(field) => validate_value_against_type_schema_walk(
+                field,
+                field_schema,
+                resources,
+                validate_scalars,
+                named_struct_schemas,
+                depth,
+                nodes,
+            )?,
+            None if matches!(field_schema, TypeSchema::Optional(_))
+                || (!validate_scalars
+                    && !schema_contains_resource(field_schema, named_struct_schemas)) => {}
+            None => return Err(VmError::TypeMismatch("object")),
+        }
+    }
+    Ok(())
+}
+
+fn schema_contains_resource(
+    schema: &crate::compiler::TypeSchema,
+    named_struct_schemas: NamedStructLookup<'_>,
+) -> bool {
+    schema_contains_resource_walk(schema, named_struct_schemas, 0, &mut HashSet::new(), &mut 0)
+}
+
+fn schema_contains_resource_walk(
+    schema: &crate::compiler::TypeSchema,
+    named_struct_schemas: NamedStructLookup<'_>,
+    depth: usize,
+    active: &mut HashSet<String>,
+    nodes: &mut usize,
+) -> bool {
+    use crate::compiler::TypeSchema;
+
+    *nodes = nodes.saturating_add(1);
+    if depth > crate::host_api::MAX_HOST_SCHEMA_DEPTH
+        || *nodes > crate::host_api::MAX_HOST_SCHEMA_NODES
+    {
+        return true;
+    }
 
     match schema {
         TypeSchema::Resource(_) => true,
         TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
-            schema_contains_resource(inner)
+            schema_contains_resource_walk(inner, named_struct_schemas, depth + 1, active, nodes)
         }
-        TypeSchema::Object(fields) => fields.values().any(schema_contains_resource),
-        TypeSchema::ArrayTuple(items) => items.iter().any(schema_contains_resource),
+        TypeSchema::Object(fields) => fields.values().any(|field| {
+            schema_contains_resource_walk(field, named_struct_schemas, depth + 1, active, nodes)
+        }),
+        TypeSchema::ArrayTuple(items) => items.iter().any(|item| {
+            schema_contains_resource_walk(item, named_struct_schemas, depth + 1, active, nodes)
+        }),
         TypeSchema::ArrayTupleRest { prefix, rest } => {
-            prefix.iter().any(schema_contains_resource) || schema_contains_resource(rest)
+            prefix.iter().any(|item| {
+                schema_contains_resource_walk(item, named_struct_schemas, depth + 1, active, nodes)
+            }) || schema_contains_resource_walk(
+                rest,
+                named_struct_schemas,
+                depth + 1,
+                active,
+                nodes,
+            )
         }
-        TypeSchema::Callable { .. }
+        TypeSchema::Named(name, args) => {
+            if args.iter().any(|arg| {
+                schema_contains_resource_walk(arg, named_struct_schemas, depth + 1, active, nodes)
+            }) {
+                return true;
+            }
+            let Some((body, _)) = named_struct_schemas.body(name, args) else {
+                return true;
+            };
+            if !active.insert(name.clone()) {
+                return false;
+            }
+            let contains = schema_contains_resource_walk(
+                &body,
+                named_struct_schemas,
+                depth + 1,
+                active,
+                nodes,
+            );
+            active.remove(name);
+            contains
+        }
+        TypeSchema::GenericParam(_)
+        | TypeSchema::Callable { .. }
         | TypeSchema::Unknown
-        | TypeSchema::GenericParam(_)
         | TypeSchema::Null
         | TypeSchema::Int
         | TypeSchema::Float
         | TypeSchema::Number
         | TypeSchema::Bool
         | TypeSchema::String
-        | TypeSchema::Bytes
-        | TypeSchema::Named(_, _) => false,
+        | TypeSchema::Bytes => false,
     }
 }
 
@@ -976,11 +1294,28 @@ impl Vm {
     /// retired through the generic execution-scope lifecycle. If generic close
     /// is still pending, the old scope remains retained and VM execution is
     /// blocked until `poll_reset_for_reuse` reaches quiescence.
+    /// A successful return only starts the reset; callers must poll
+    /// `poll_reset_for_reuse` to obtain the deterministic completion result
+    /// before observing an empty scope or reusing the VM.
     pub fn reset_for_reuse(&mut self) -> VmResult<()> {
-        validate_frame_allocation_limits(&self.program)?;
-        self.cancel_waiting_host_op_with_reason(
+        if let Err(error) = validate_frame_allocation_limits(&self.program) {
+            self.host.mark_reset_failed(&error);
+            return Err(error);
+        }
+        let waiting_cleanup = self.cancel_waiting_host_op_with_reason(
             crate::vm::operation::OperationCancelReason::VmReset,
-        )?;
+        );
+        let stream_cleanup = self.cancel_callable_stream_with_reason(
+            crate::vm::operation::OperationCancelReason::VmReset,
+        );
+        let cleanup_result = match waiting_cleanup {
+            Ok(()) => stream_cleanup,
+            Err(error) => Err(preserve_stream_cleanup(error, stream_cleanup)),
+        };
+        if let Err(error) = cleanup_result {
+            self.host.mark_reset_failed(&error);
+            return Err(error);
+        }
         if let Err(error) = self.host.reset_execution_scope() {
             self.instance.invalidate_callback_registries();
             return Err(error);
@@ -1031,6 +1366,22 @@ impl Vm {
         }
         if let Some(error) = self.host.scope_reset_error().cloned() {
             return Err(VmError::ExecutionScope(error));
+        }
+        if let Some(error) = self.host.reset_error() {
+            return Err(error);
+        }
+        if self.host.has_pending_stream_terminations() {
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            match self.host.poll_stream_terminations(&mut cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Err(error),
+                Poll::Pending => {
+                    return Err(VmError::HostError(
+                        "callable stream termination is not quiescent".to_string(),
+                    ));
+                }
+            }
         }
         if !self.host.scope_reset_pending {
             if self.host.has_pending_bridge_cancellations() {
@@ -1330,7 +1681,14 @@ impl Vm {
 
     pub fn run(&mut self) -> VmResult<VmStatus> {
         self.ensure_scope_ready()?;
-        self.run_internal(None, true)
+        let status = match self.run_internal(None, true) {
+            Ok(status) => status,
+            Err(error) => {
+                let cleanup = self.abort_callable_stream_on_run_error();
+                return Err(preserve_stream_cleanup(error, cleanup));
+            }
+        };
+        self.resume_callable_stream_after_run(status)
     }
 
     pub fn run_with_debugger(
@@ -1338,13 +1696,26 @@ impl Vm {
         debugger: &mut crate::debugger::Debugger,
     ) -> VmResult<VmStatus> {
         self.ensure_scope_ready()?;
-        self.run_internal(Some(debugger), false)
+        let status = match self.run_internal(Some(debugger), false) {
+            Ok(status) => status,
+            Err(error) => {
+                let cleanup = self.abort_callable_stream_on_run_error();
+                return Err(preserve_stream_cleanup(error, cleanup));
+            }
+        };
+        self.resume_callable_stream_after_run(status)
     }
 }
 
 impl Drop for Vm {
     fn drop(&mut self) {
         let _ = self.cancel_waiting_host_op_with_reason(
+            crate::vm::operation::OperationCancelReason::VmDrop,
+        );
+        let _ = self.cancel_callable_stream_with_reason(
+            crate::vm::operation::OperationCancelReason::VmDrop,
+        );
+        let _ = self.terminate_all_callable_streams_with_reason(
             crate::vm::operation::OperationCancelReason::VmDrop,
         );
         self.host
@@ -1552,6 +1923,10 @@ impl Vm {
                     schema,
                     self.host.execution_scope.resources(),
                     true,
+                    NamedStructLookup {
+                        host: &self.host.named_struct_schemas,
+                        guest: &self.program.named_struct_decls,
+                    },
                 ) {
                     return Err(map_callable_schema_error(error, "callable argument schema"));
                 }
@@ -1830,6 +2205,10 @@ impl Vm {
                 schema,
                 self.host.execution_scope.resources(),
                 true,
+                NamedStructLookup {
+                    host: &self.host.named_struct_schemas,
+                    guest: &self.program.named_struct_decls,
+                },
             )
         {
             self.drop_value_with_contract(result);
@@ -3110,7 +3489,14 @@ impl Vm {
                 .map(|frame| &frame.continuation),
             Some(FrameContinuation::ReturnToHost)
         );
-        self.run_internal(None, allow_jit)
+        let status = match self.run_internal(None, allow_jit) {
+            Ok(status) => status,
+            Err(error) => {
+                let cleanup = self.abort_callable_stream_on_run_error();
+                return Err(preserve_stream_cleanup(error, cleanup));
+            }
+        };
+        self.resume_callable_stream_after_run(status)
     }
 
     pub fn stack(&self) -> &[Value] {
@@ -3318,15 +3704,24 @@ impl Vm {
         let _ = self.cancel_waiting_host_op_with_reason(
             crate::vm::operation::OperationCancelReason::VmDrop,
         );
+        let _ = self.cancel_callable_stream_with_reason(
+            crate::vm::operation::OperationCancelReason::VmDrop,
+        );
+        let _ = self.terminate_all_callable_streams_with_reason(
+            crate::vm::operation::OperationCancelReason::VmDrop,
+        );
         self.host
             .cancel_submitted_host_ops(crate::vm::operation::OperationCancelReason::VmDrop);
-        self.host.scoped_operation_completions.clear();
         // Begin execution-scope shutdown (first-reason-wins; sealing the
         // operation registry) before tearing down interpreter state.
         let _ = self
             .host
             .execution_scope
             .begin_close(crate::vm::resource::ResourceCloseReason::VmDrop);
+        self.host.scoped_operation_completions.clear();
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let _ = self.host.execution_scope.poll_close(&mut cx);
         self.instance.queued_callables.clear();
         self.instance.completed_callable_results.clear();
         self.instance.owned_callables.clear();

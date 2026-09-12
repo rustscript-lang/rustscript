@@ -679,7 +679,12 @@ fn schema_is_fully_known(schema: &TypeSchema) -> bool {
         | TypeSchema::GenericParam(_) => true,
         // A resource is fully known: its key fixes the nominal type statically.
         TypeSchema::Resource(_) => true,
-        TypeSchema::Optional(inner) => schema_is_fully_known(inner),
+        TypeSchema::Optional(inner) => {
+            // Optional unknown is the host-catalog stand-in for an unavailable
+            // union (HTTP request body is string or bytes). Map/array already
+            // treat unknown payloads as fully known.
+            matches!(inner.as_ref(), TypeSchema::Unknown) || schema_is_fully_known(inner)
+        }
         TypeSchema::Named(_, type_args) => type_args.iter().all(schema_is_fully_known),
         TypeSchema::Array(item) | TypeSchema::Map(item) => {
             matches!(item.as_ref(), TypeSchema::Unknown) || schema_is_fully_known(item)
@@ -1536,6 +1541,9 @@ fn compile_source_for_repl_with_locals_impl(
     let source_id = source_map.add_source("<source>", source.to_string());
     // REPL parsing/compiler entry state is separate from normal program compilation so
     // persisted locals do not leak into the generic frontend or IR surface.
+    #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
+    let repl_catalog = Some(crate::builtins::runtime::http::http_host_catalog());
+    #[cfg(not(all(feature = "http-client", not(target_family = "wasm"))))]
     let repl_catalog = None;
     let parsed = frontends::parse_rustscript_repl_source_with_catalog(
         source,
@@ -1645,7 +1653,7 @@ fn compile_source_with_flavor_impl(
 ) -> Result<CompiledProgram, SourceError> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
-    let effective = CompileSourceFileOptions::default();
+    let effective = default_http_compile_catalog_options(&CompileSourceFileOptions::default());
     let parsed =
         frontends::parse_source_for_compile(source, flavor, &effective).map_err(|err| {
             SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
@@ -1708,10 +1716,10 @@ fn compile_source_with_flavor_and_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    // Explicit catalogs are forwarded unchanged. The runtime standard catalog
-    // is applied by the analysis entry points; default bytecode compilation
-    // keeps legacy built-in dispatch for the standard surface.
-    let effective = options.clone();
+    // Explicit catalogs are forwarded unchanged. Otherwise the HTTP catalog is
+    // installed so `http::client::sse` named structs and function schemas are
+    // available without converting `io::` / `sqlite::` / `jit::` builtins.
+    let effective = default_http_compile_catalog_options(options);
 
     compile_source_with_flavor_and_options_pipeline(source, flavor, &effective)
 }
@@ -1736,8 +1744,7 @@ fn compile_source_with_flavor_and_options_pipeline(
 
 /// Attach the authoritative standard catalog for analysis when the runtime
 /// surface is enabled and the caller did not supply a custom catalog. Explicit
-/// catalogs remain unchanged; default bytecode compilation keeps the catalog-
-/// free built-in dispatch path.
+/// catalogs remain unchanged.
 fn default_standard_catalog_options(
     options: &CompileSourceFileOptions,
 ) -> CompileSourceFileOptions {
@@ -1750,6 +1757,27 @@ fn default_standard_catalog_options(
         effective
     }
     #[cfg(not(feature = "runtime"))]
+    {
+        options.clone()
+    }
+}
+
+/// Attach the HTTP catalog on bytecode compile when the HTTP surface is on and
+/// the caller did not supply a custom catalog. This installs SSE named structs
+/// and function schemas without pulling `io::` / `sqlite::` / `jit::` into
+/// catalog host imports.
+fn default_http_compile_catalog_options(
+    options: &CompileSourceFileOptions,
+) -> CompileSourceFileOptions {
+    #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
+    {
+        let mut effective = options.clone();
+        if effective.host_api_catalog().is_none() {
+            effective.set_host_api_catalog(crate::builtins::runtime::http::http_host_catalog());
+        }
+        effective
+    }
+    #[cfg(not(all(feature = "http-client", not(target_family = "wasm"))))]
     {
         options.clone()
     }
@@ -1772,7 +1800,7 @@ fn compile_source_at_path_with_flavor_and_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let effective = options.clone();
+    let effective = default_http_compile_catalog_options(options);
     let loaded = load_units_for_source_file(path, flavor, source, &effective)?;
     compile_loaded_units(
         source.to_string(),
@@ -1808,7 +1836,7 @@ fn compile_source_file_impl(
     path: &Path,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let effective = options.clone();
+    let effective = default_http_compile_catalog_options(options);
     let flavor = SourceFlavor::from_path_with_options(path, &effective)?;
     let source_raw = std::fs::read_to_string(path)?;
     let loaded = load_units_for_source_file(path, flavor, &source_raw, &effective)?;
