@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll, Wake, Waker};
@@ -432,15 +433,36 @@ impl HostFunctionRegistry {
         self.invalidate_plan_cache();
     }
 
-    /// Installs catalog named-struct bodies used to classify nested resources
+    /// Merges catalog named-struct bodies used to classify nested resources
     /// inside `TypeSchema::Named` values. Compiler identity stays named;
     /// runtime values remain maps.
+    ///
+    /// Identical duplicate bodies are accepted. Conflicting bodies for the
+    /// same name are rejected without mutating the registry, so callers that
+    /// compose HTTP/SQLite/JIT after defaults cannot silently discard earlier
+    /// schemas.
     pub fn install_named_struct_schemas(
         &mut self,
         schemas: HashMap<String, crate::compiler::TypeSchema>,
-    ) {
-        self.named_struct_schemas = Arc::new(schemas);
+    ) -> VmResult<()> {
+        if schemas.is_empty() {
+            return Ok(());
+        }
+        for (name, schema) in &schemas {
+            if let Some(existing) = self.named_struct_schemas.get(name)
+                && existing != schema
+            {
+                return Err(VmError::HostError(format!(
+                    "conflicting named struct schema '{name}'"
+                )));
+            }
+        }
+        let map = Arc::make_mut(&mut self.named_struct_schemas);
+        for (name, schema) in schemas {
+            map.entry(name).or_insert(schema);
+        }
         self.invalidate_plan_cache();
+        Ok(())
     }
 
     /// Catalog named-struct object bodies installed for VM resource walks.
@@ -1155,6 +1177,7 @@ impl HostFunctionRegistry {
             }
         }
         vm.set_default_host_fallback_enabled(false);
+        vm.host.named_struct_schemas = Arc::clone(&self.named_struct_schemas);
         vm.host.allowed_builtin_calls = plan.allowed_builtin_calls.clone();
         vm.host.allow_default_builtin_capabilities = plan.allow_default_builtin_capabilities;
         vm.host.allowed_host_function_slots = plan.allowed_host_function_slots.clone();
@@ -1338,8 +1361,33 @@ fn callable_schema_matches(
                 && callable_schema_matches(expected_result, actual_result)
         }
         (HostTypeSchema::Resource(expected), TypeSchema::Resource(actual)) => expected == actual,
+        (
+            HostTypeSchema::Named {
+                name: expected_name,
+                ..
+            },
+            TypeSchema::Named(actual_name, _),
+        ) => expected_name == actual_name,
+        (HostTypeSchema::Named { fields, .. }, TypeSchema::Object(actual_fields)) => {
+            named_fields_match_object(fields, actual_fields)
+        }
         _ => false,
     }
+}
+
+fn named_fields_match_object(
+    fields: &[crate::host_api::HostStructField],
+    actual_fields: &HashMap<String, crate::compiler::TypeSchema>,
+) -> bool {
+    fields
+        .iter()
+        .all(|field| match actual_fields.get(&field.name) {
+            Some(actual) => callable_schema_matches(&field.ty, actual),
+            None => matches!(field.ty, HostTypeSchema::Optional(_)),
+        })
+        && actual_fields
+            .keys()
+            .all(|name| fields.iter().any(|field| field.name == *name))
 }
 
 fn host_callable_schema_matches(expected: &HostTypeSchema, actual: &HostTypeSchema) -> bool {
@@ -1378,6 +1426,30 @@ fn host_callable_schema_matches(expected: &HostTypeSchema, actual: &HostTypeSche
         }
         (HostTypeSchema::Resource(expected), HostTypeSchema::Resource(actual)) => {
             expected == actual
+        }
+        (
+            HostTypeSchema::Named {
+                name: expected_name,
+                fields: expected_fields,
+            },
+            HostTypeSchema::Named {
+                name: actual_name,
+                fields: actual_fields,
+            },
+        ) => {
+            expected_name == actual_name
+                && expected_fields.iter().all(|expected| {
+                    actual_fields.iter().any(|actual| {
+                        actual.name == expected.name
+                            && host_callable_schema_matches(&expected.ty, &actual.ty)
+                    })
+                })
+                && actual_fields.iter().all(|actual| {
+                    expected_fields
+                        .iter()
+                        .any(|expected| expected.name == actual.name)
+                        || matches!(actual.ty, HostTypeSchema::Optional(_))
+                })
         }
         _ => false,
     }
@@ -1541,10 +1613,13 @@ fn validate_host_value(
                 return Err(VmError::TypeMismatch("map"));
             };
             for field in fields {
-                let Some(field_value) = values.get(&Value::string(&field.name)) else {
-                    return Err(VmError::TypeMismatch("map"));
-                };
-                validate_host_value(field_value, &field.ty, program, resources)?;
+                match values.get(&Value::string(&field.name)) {
+                    Some(field_value) => {
+                        validate_host_value(field_value, &field.ty, program, resources)?;
+                    }
+                    None if matches!(field.ty, HostTypeSchema::Optional(_)) => {}
+                    None => return Err(VmError::TypeMismatch("map")),
+                }
             }
             Ok(())
         }
@@ -3507,12 +3582,16 @@ impl Vm {
 mod tests {
     use std::collections::HashMap;
 
-    use super::callable_schema_matches;
+    use super::{
+        VmError, callable_schema_matches, host_callable_schema_matches, validate_host_value,
+    };
     use crate::ResourceTypeKey;
     use crate::compiler::TypeSchema;
     use crate::host_api::{
-        HostApiCatalog, HostFunctionSchema, HostImportSchema, HostTypeSchema, MAX_HOST_SCHEMA_DEPTH,
+        HostApiCatalog, HostFunctionSchema, HostImportSchema, HostStructField, HostTypeSchema,
+        MAX_HOST_SCHEMA_DEPTH,
     };
+    use crate::{OpCode, Program, Value};
 
     fn key(name: &str) -> ResourceTypeKey {
         ResourceTypeKey::new(name).expect("test resource key")
@@ -3617,6 +3696,138 @@ mod tests {
             &nested_expected(key("test.nested")),
             &nested_actual(other_key),
         ));
+    }
+
+    fn named_event_fields() -> Vec<HostStructField> {
+        vec![
+            HostStructField::new("id", HostTypeSchema::Int),
+            HostStructField::new(
+                "note",
+                HostTypeSchema::Optional(Box::new(HostTypeSchema::String)),
+            ),
+        ]
+    }
+
+    #[test]
+    fn callable_schema_matches_named_structs_by_name_and_rejects_maps() {
+        let expected = HostTypeSchema::named_struct("SseEvent", named_event_fields());
+        assert!(callable_schema_matches(
+            &expected,
+            &TypeSchema::Named("SseEvent".to_string(), Vec::new()),
+        ));
+        assert!(!callable_schema_matches(
+            &expected,
+            &TypeSchema::Named("OtherEvent".to_string(), Vec::new()),
+        ));
+        assert!(!callable_schema_matches(
+            &expected,
+            &TypeSchema::Map(Box::new(TypeSchema::Unknown)),
+        ));
+
+        let mut object_fields = HashMap::new();
+        object_fields.insert("id".to_string(), TypeSchema::Int);
+        object_fields.insert(
+            "note".to_string(),
+            TypeSchema::Optional(Box::new(TypeSchema::String)),
+        );
+        assert!(callable_schema_matches(
+            &expected,
+            &TypeSchema::Object(object_fields),
+        ));
+    }
+
+    #[test]
+    fn host_callable_schema_matches_named_structs_recursively() {
+        let expected = HostTypeSchema::named_struct("SseEvent", named_event_fields());
+        let matching = HostTypeSchema::named_struct("SseEvent", named_event_fields());
+        let mismatched = HostTypeSchema::named_struct(
+            "SseEvent",
+            vec![HostStructField::new("id", HostTypeSchema::String)],
+        );
+        assert!(host_callable_schema_matches(&expected, &matching));
+        assert!(!host_callable_schema_matches(&expected, &mismatched));
+        assert!(!host_callable_schema_matches(
+            &expected,
+            &HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown)),
+        ));
+    }
+
+    #[test]
+    fn named_host_return_allows_omitted_optional_fields() {
+        let program = Program::new(Vec::new(), vec![OpCode::Ret as u8]);
+        let resources = crate::vm::resource::ResourceTable::new().expect("resource table");
+        let schema = HostTypeSchema::named_struct("OptBox", named_event_fields());
+        let mut values = crate::bytecode::VmMap::new();
+        values.insert(Value::string("id"), Value::Int(1));
+        validate_host_value(&Value::Map(values.into()), &schema, &program, &resources)
+            .expect("optional named field may be omitted on host return");
+    }
+
+    #[test]
+    fn named_host_return_still_requires_non_optional_fields() {
+        let program = Program::new(Vec::new(), vec![OpCode::Ret as u8]);
+        let resources = crate::vm::resource::ResourceTable::new().expect("resource table");
+        let schema = HostTypeSchema::named_struct("OptBox", named_event_fields());
+        let values = crate::bytecode::VmMap::new();
+        let error = validate_host_value(&Value::Map(values.into()), &schema, &program, &resources)
+            .expect_err("required named field must stay present");
+        assert!(matches!(error, VmError::TypeMismatch("map")));
+    }
+
+    #[test]
+    fn install_named_struct_schemas_merges_identical_and_rejects_conflicts() {
+        let mut first = HashMap::new();
+        first.insert("HandleBox".to_string(), TypeSchema::Int);
+        let mut second = HashMap::new();
+        second.insert("OtherBox".to_string(), TypeSchema::String);
+        let mut conflict = HashMap::new();
+        conflict.insert("HandleBox".to_string(), TypeSchema::String);
+
+        let mut registry = super::HostFunctionRegistry::empty();
+        registry
+            .install_named_struct_schemas(first.clone())
+            .expect("first install");
+        registry
+            .install_named_struct_schemas(first)
+            .expect("identical duplicate must be accepted");
+        registry
+            .install_named_struct_schemas(second)
+            .expect("disjoint merge must keep both schemas");
+        assert!(registry.named_struct_schemas().contains_key("HandleBox"));
+        assert!(registry.named_struct_schemas().contains_key("OtherBox"));
+        let error = registry
+            .install_named_struct_schemas(conflict)
+            .expect_err("conflicting schema must be rejected");
+        assert!(
+            matches!(error, VmError::HostError(ref message) if message.contains("conflicting named struct schema")),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            matches!(
+                registry.named_struct_schemas().get("HandleBox"),
+                Some(TypeSchema::Int)
+            ),
+            "conflict must not mutate the installed table"
+        );
+    }
+
+    #[test]
+    fn bind_vm_copies_named_struct_schemas_onto_host_runtime() {
+        let mut schemas = HashMap::new();
+        schemas.insert("HandleBox".to_string(), TypeSchema::Int);
+        let mut registry = super::HostFunctionRegistry::empty();
+        registry
+            .install_named_struct_schemas(schemas)
+            .expect("install");
+        let mut vm = crate::Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        registry.bind_vm_cached(&mut vm).expect("bind");
+        assert!(
+            matches!(
+                vm.host.named_struct_schemas.get("HandleBox"),
+                Some(TypeSchema::Int)
+            ),
+            "bind must copy named-struct bodies onto the VM host runtime"
+        );
     }
 
     #[test]

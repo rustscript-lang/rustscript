@@ -372,7 +372,7 @@ pub fn register_http_builtin_module_from_catalog(
     registry.transactionally(|staged| {
         staged.install_named_struct_schemas(
             crate::vm::host_extension::catalog_named_struct_schemas(catalog),
-        );
+        )?;
         for (entry, schemas) in &schemas {
             for schema in schemas.iter().cloned() {
                 staged.register_exact_static(entry.name, entry.arity, schema, entry.adapter)?;

@@ -153,6 +153,11 @@ path = "tests/host_context_arch_tests.rs"
 required-features = ["runtime"]
 
 [[test]]
+name = "host_named_struct_foundation_tests"
+path = "tests/host_named_struct_foundation_tests.rs"
+required-features = ["runtime"]
+
+[[test]]
 name = "http_host_tests"
 path = "tests/vm/http_host_tests.rs"
 required-features = ["runtime", "http-client"]

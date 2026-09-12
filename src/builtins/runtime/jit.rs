@@ -271,7 +271,7 @@ pub fn register_jit_builtin_module_from_catalog(
         .collect::<VmResult<Vec<_>>>()?;
 
     registry.transactionally(|staged| {
-        staged.install_named_struct_schemas(catalog_named_struct_schemas(catalog));
+        staged.install_named_struct_schemas(catalog_named_struct_schemas(catalog))?;
         for (entry, schemas) in &schemas {
             if schemas.is_empty() {
                 continue;

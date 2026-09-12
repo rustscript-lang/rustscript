@@ -110,7 +110,7 @@ pub trait HostExtension: Send + Sync + 'static {
     fn install_into(&self, vm: &mut super::Vm) -> VmResult<()> {
         let mut registry = super::host::HostFunctionRegistry::new();
         if let Some(catalog) = self.catalog() {
-            registry.install_named_struct_schemas(catalog_named_struct_schemas(catalog));
+            registry.install_named_struct_schemas(catalog_named_struct_schemas(catalog))?;
         }
         self.register(&mut registry)?;
         registry.bind_vm_cached(vm)?;
@@ -156,9 +156,9 @@ pub fn catalog_import_schemas_into(
     registry: &mut super::host::HostFunctionRegistry,
     catalog: &HostApiCatalog,
     name: &str,
-) -> Vec<HostImportSchema> {
-    registry.install_named_struct_schemas(catalog_named_struct_schemas(catalog));
-    catalog_import_schemas(catalog, name)
+) -> VmResult<Vec<HostImportSchema>> {
+    registry.install_named_struct_schemas(catalog_named_struct_schemas(catalog))?;
+    Ok(catalog_import_schemas(catalog, name))
 }
 
 /// Registers `extension` after atomically installing named-struct bodies from
@@ -169,7 +169,7 @@ pub fn register_host_extension(
     extension: &dyn HostExtension,
 ) -> VmResult<()> {
     if let Some(catalog) = extension.catalog() {
-        registry.install_named_struct_schemas(catalog_named_struct_schemas(catalog));
+        registry.install_named_struct_schemas(catalog_named_struct_schemas(catalog))?;
     }
     extension.register(registry)
 }
