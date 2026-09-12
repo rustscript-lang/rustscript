@@ -6,8 +6,8 @@ use vm::{
     HostFunctionSchema, HostImport, HostImportSchema, HostParamPassing, HostParamSchema,
     HostTypeSchema, LineInfo, LocalInfo, Program, ResourceTypeKey, ResourceTypeSchema,
     ScriptFunction, TypeMap, ValidationError, Value, ValueType, WireError, builtin_call_index,
-    decode_program, disassemble_vmbc, disassemble_vmbc_with_options, encode_program,
-    infer_local_count, validate_program,
+    compile_source, decode_program, disassemble_vmbc, disassemble_vmbc_with_options,
+    encode_program, infer_local_count, validate_program,
 };
 
 #[test]
@@ -58,7 +58,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
     });
 
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 12);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
     let decoded = decode_program(&encoded).expect("decode should succeed");
 
     assert_eq!(decoded.constants, program.constants);
@@ -81,11 +81,12 @@ fn wire_v11_legacy_imports_decode_without_schema_metadata() {
         vec![import.clone()],
         None,
     );
-    let encoded = encode_program(&program).expect("v12 encoding should succeed");
+    let encoded = encode_program(&program).expect("v13 encoding should succeed");
     let marker_offset = 8 + 4 + 4 + program.code.len() + 4 + 4 + import.name.len() + 2;
     assert_eq!(encoded[marker_offset], 0);
     let mut legacy = encoded;
     legacy.drain(marker_offset..marker_offset + 1);
+    strip_empty_named_struct_section(&mut legacy);
     legacy[4..6].copy_from_slice(&11u16.to_le_bytes());
 
     let decoded = decode_program(&legacy).expect("v11 payload should remain readable");
@@ -96,13 +97,27 @@ fn wire_v11_legacy_imports_decode_without_schema_metadata() {
 #[test]
 fn wire_v11_zero_import_program_decodes_by_version() {
     let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
-    let mut encoded = encode_program(&program).expect("v12 encoding should succeed");
+    let mut encoded = encode_program(&program).expect("v13 encoding should succeed");
+    strip_empty_named_struct_section(&mut encoded);
     encoded[4..6].copy_from_slice(&11u16.to_le_bytes());
 
     let decoded = decode_program(&encoded).expect("schema-less v11 payload should decode");
     assert_eq!(decoded.code, program.code);
     assert!(decoded.imports.is_empty());
     assert!(decoded.host_import_schemas().is_empty());
+}
+
+fn strip_empty_named_struct_section(encoded: &mut Vec<u8>) {
+    assert!(
+        encoded.len() >= 4,
+        "encoded VMBC is too short to contain a named-struct section"
+    );
+    assert_eq!(
+        &encoded[encoded.len() - 4..],
+        &[0, 0, 0, 0],
+        "expected an empty named-struct count trailer on current encode"
+    );
+    encoded.truncate(encoded.len() - 4);
 }
 
 fn minimal_vmbc_prefix(constant_count: u32, code: &[u8], import_count: u32) -> Vec<u8> {
@@ -1051,19 +1066,20 @@ fn validate_rejects_call_script_targeting_host_import_prototype() {
 }
 
 #[test]
-fn call_script_wire_version_is_v12_and_v11_accepts_schema_less_program() {
+fn call_script_wire_version_is_v13_and_v11_accepts_schema_less_program() {
     let program = Program::new(vec![], vec![vm::OpCode::Ret as u8]);
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 12);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
 
-    let mut old = encoded.clone();
+    let mut old = encoded;
+    strip_empty_named_struct_section(&mut old);
     old[4..6].copy_from_slice(&11u16.to_le_bytes());
     decode_program(&old).expect("schema-less v11 program should decode");
 }
 
 #[test]
 fn call_script_no_script_program_code_bytes_unchanged_by_version_bump() {
-    // The V12 bump must not alter instruction bytes for programs without
+    // Version bumps must not alter instruction bytes for programs without
     // script calls: encode a plain arithmetic program and verify the
     // embedded code section is exactly the assembler output.
     let mut bc = BytecodeBuilder::new();
@@ -1073,8 +1089,47 @@ fn call_script_no_script_program_code_bytes_unchanged_by_version_bump() {
     bc.ret();
     let program = Program::new(vec![Value::Int(1), Value::Int(2)], bc.finish());
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 12);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
     let decoded = decode_program(&encoded).expect("decode should succeed");
     assert_eq!(decoded.code, program.code);
     assert_eq!(decoded.constants, program.constants);
+}
+
+#[test]
+fn v12_trailing_zero_count_is_not_a_named_struct_table() {
+    let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
+    let mut encoded = encode_program(&program).expect("v13 encoding should succeed");
+    strip_empty_named_struct_section(&mut encoded);
+    encoded[4..6].copy_from_slice(&12u16.to_le_bytes());
+    decode_program(&encoded).expect("clean v12 without a named-struct section should decode");
+
+    let mut garbage = encoded;
+    garbage.extend_from_slice(&0u32.to_le_bytes());
+    assert!(
+        matches!(decode_program(&garbage), Err(WireError::TrailingBytes)),
+        "v12 must not treat a 4-byte zero trailer as an empty named-struct table"
+    );
+}
+
+#[test]
+fn v13_roundtrip_preserves_guest_named_struct_payload() {
+    let compiled = compile_source(
+        r#"
+        struct Point { x: int, y: int }
+        fn ident(p: Point) -> Point { p }
+        ident({ x: 8, y: 9 });
+        "#,
+    )
+    .expect("guest Named source should compile");
+    assert!(
+        compiled.program.named_struct_decls().contains_key("Point"),
+        "codegen should attach guest struct decls"
+    );
+    let encoded = encode_program(&compiled.program).expect("struct-bearing program should encode");
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
+    let decoded = decode_program(&encoded).expect("v13 named-struct section should decode");
+    assert!(
+        decoded.named_struct_decls().contains_key("Point"),
+        "VMBC v13 should preserve guest struct decls"
+    );
 }

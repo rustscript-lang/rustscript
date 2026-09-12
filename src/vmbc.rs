@@ -7,7 +7,7 @@ use crate::bytecode::{
     CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable,
     FunctionRegion, MAX_FRAME_LOCAL_COUNT, RootCallableBinding, ScriptFunction, TypeMap, ValueType,
 };
-use crate::compiler::ir::{StructDecl, TypeSchema};
+use crate::compiler::ir::{StructDecl, StructDeclOrigin, TypeSchema};
 use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 use crate::host_api::{
     HostApiFingerprint, HostImportParam, HostImportSchema, HostParamPassing, HostStructField,
@@ -20,6 +20,7 @@ use crate::vm::{HostImport, OpCode, Program, Value};
 const MAGIC: [u8; 4] = *b"VMBC";
 const VERSION_V11: u16 = 11;
 const VERSION_V12: u16 = 12;
+const VERSION_V13: u16 = 13;
 const FLAGS: u16 = 0;
 const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;
@@ -305,7 +306,7 @@ fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireErr
 pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION_V12.to_le_bytes());
+    out.extend_from_slice(&VERSION_V13.to_le_bytes());
     out.extend_from_slice(&FLAGS.to_le_bytes());
     write_u32_count("constants", program.constants.len(), &mut out)?;
 
@@ -361,7 +362,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     let version = cursor.read_u16()?;
     let has_host_import_schemas = match version {
         VERSION_V11 => false,
-        VERSION_V12 => true,
+        VERSION_V12 | VERSION_V13 => true,
         _ => return Err(WireError::UnsupportedVersion(version)),
     };
 
@@ -427,10 +428,10 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         root_callable_bindings,
         exported_callables,
     ) = read_callable_metadata(&mut cursor)?;
-    let named_struct_decls = if cursor.is_eof() {
-        HashMap::new()
+    let named_struct_decls = if version >= VERSION_V13 {
+        read_named_struct_decls(&mut cursor)?
     } else {
-        read_named_struct_decls(&mut cursor).map_err(|_| WireError::TrailingBytes)?
+        HashMap::new()
     };
 
     if !cursor.is_eof() {
@@ -1072,9 +1073,6 @@ fn write_callable_metadata(out: &mut Vec<u8>, program: &Program) -> Result<(), W
 }
 
 fn write_named_struct_decls(out: &mut Vec<u8>, program: &Program) -> Result<(), WireError> {
-    if program.named_struct_decls.is_empty() {
-        return Ok(());
-    }
     let mut decls = program.named_struct_decls.values().collect::<Vec<_>>();
     decls.sort_unstable_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
     write_u32_count("named struct decls", decls.len(), out)?;
@@ -1101,7 +1099,11 @@ fn read_named_struct_decls(
         let mut type_params = Vec::new();
         reserve_vec(&mut type_params, "named struct type params", param_count)?;
         for _ in 0..param_count {
-            type_params.push(cursor.read_string()?);
+            let param = cursor.read_string()?;
+            if type_params.iter().any(|existing| existing == &param) {
+                return Err(WireError::InvalidValueType(0));
+            }
+            type_params.push(param);
         }
         let body_schema = read_schema(cursor, 0)?;
         if decls
@@ -1111,6 +1113,7 @@ fn read_named_struct_decls(
                     name,
                     type_params,
                     body_schema,
+                    origin: StructDeclOrigin::Guest,
                 },
             )
             .is_some()

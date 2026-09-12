@@ -709,28 +709,25 @@ fn validate_value_against_type_schema_walk(
             let Some((body, origin)) = named_struct_schemas.body(name, args) else {
                 return Err(VmError::HostError(format!("unknown named struct '{name}'")));
             };
-            match (&body, origin) {
-                (TypeSchema::Object(fields), NamedStructOrigin::Host) => {
-                    validate_named_object_fields(
-                        value,
-                        fields,
-                        resources,
-                        named_struct_schemas,
-                        depth + 1,
-                        nodes,
-                    )
-                }
-                (_, NamedStructOrigin::Guest) | (_, NamedStructOrigin::Host) => {
-                    validate_value_against_type_schema_walk(
-                        value,
-                        &body,
-                        resources,
-                        true,
-                        named_struct_schemas,
-                        depth + 1,
-                        nodes,
-                    )
-                }
+            match &body {
+                TypeSchema::Object(fields) => validate_named_object_fields(
+                    value,
+                    fields,
+                    resources,
+                    matches!(origin, NamedStructOrigin::Host),
+                    named_struct_schemas,
+                    depth + 1,
+                    nodes,
+                ),
+                _ => validate_value_against_type_schema_walk(
+                    value,
+                    &body,
+                    resources,
+                    true,
+                    named_struct_schemas,
+                    depth + 1,
+                    nodes,
+                ),
             }
         }
         TypeSchema::Map(inner) => {
@@ -882,6 +879,7 @@ fn validate_named_object_fields(
     value: &Value,
     fields: &HashMap<String, crate::compiler::TypeSchema>,
     resources: &ResourceTable,
+    validate_scalars: bool,
     named_struct_schemas: NamedStructLookup<'_>,
     depth: usize,
     nodes: &mut usize,
@@ -897,12 +895,14 @@ fn validate_named_object_fields(
                 field,
                 field_schema,
                 resources,
-                true,
+                validate_scalars,
                 named_struct_schemas,
                 depth,
                 nodes,
             )?,
-            None if matches!(field_schema, TypeSchema::Optional(_)) => {}
+            None if matches!(field_schema, TypeSchema::Optional(_))
+                || (!validate_scalars
+                    && !schema_contains_resource(field_schema, named_struct_schemas)) => {}
             None => return Err(VmError::TypeMismatch("object")),
         }
     }
@@ -976,9 +976,9 @@ fn schema_contains_resource_walk(
             active.remove(name);
             contains
         }
-        TypeSchema::Callable { .. }
+        TypeSchema::GenericParam(_)
+        | TypeSchema::Callable { .. }
         | TypeSchema::Unknown
-        | TypeSchema::GenericParam(_)
         | TypeSchema::Null
         | TypeSchema::Int
         | TypeSchema::Float

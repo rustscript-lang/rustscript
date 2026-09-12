@@ -6,7 +6,7 @@ compiler, parser, CLI, debugger, JIT/AOT backends, filesystem support, and opera
 
 ## Runtime surface
 
-- VMBC v12 decoding with environment-free `CallScript` direct script calls alongside dynamic callable calls
+- VMBC v13 decoding with environment-free `CallScript` direct script calls alongside dynamic callable calls, plus an explicit guest named-struct declaration section
 - stack, local, and recursive script-frame execution for direct bytecode opcodes
 - instruction fuel with pause/resume support
 - synchronous named host bindings and dynamic host dispatch

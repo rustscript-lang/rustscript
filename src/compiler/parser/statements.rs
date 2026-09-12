@@ -549,6 +549,7 @@ impl Parser {
                     name: name.clone(),
                     type_params,
                     body_schema: TypeSchema::Object(fields),
+                    origin: crate::compiler::StructDeclOrigin::Guest,
                 },
             )
             .is_some()

@@ -430,11 +430,28 @@ pub struct ResolvedHostCall {
     pub host_return_type: HostTypeSchema,
 }
 
+/// Provenance for a parser/compiler struct declaration.
+///
+/// Catalog-installed host structs stay on the registry side at runtime.
+/// Only source/guest declarations are transported on `Program.named_struct_decls`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StructDeclOrigin {
+    Guest,
+    Catalog,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StructDecl {
     pub name: String,
     pub type_params: Vec<String>,
     pub body_schema: TypeSchema,
+    pub origin: StructDeclOrigin,
+}
+
+impl StructDecl {
+    pub(crate) fn is_guest(&self) -> bool {
+        matches!(self.origin, StructDeclOrigin::Guest)
+    }
 }
 
 fn known_host_accepts_arity(name: &str, arity: u8) -> bool {
@@ -2001,7 +2018,7 @@ mod call_resolution_carrier_tests {
 
 #[cfg(test)]
 mod type_schema_contains_resource_tests {
-    use super::{StructDecl, TypeSchema};
+    use super::{StructDecl, StructDeclOrigin, TypeSchema};
     use crate::host_api::ResourceTypeKey;
     use std::collections::HashMap;
 
@@ -2147,6 +2164,7 @@ mod type_schema_contains_resource_tests {
                     "handle".to_string(),
                     resource(),
                 )])),
+                origin: StructDeclOrigin::Guest,
             },
         )]);
         let wrapper = TypeSchema::Named("wrapper".to_string(), Vec::new());
@@ -2164,6 +2182,7 @@ mod type_schema_contains_resource_tests {
                     "value".to_string(),
                     TypeSchema::GenericParam("T".to_string()),
                 )])),
+                origin: StructDeclOrigin::Guest,
             },
         )]);
         let resource_wrapper = TypeSchema::Named("wrapper".to_string(), vec![resource()]);
@@ -2188,6 +2207,7 @@ mod type_schema_contains_resource_tests {
                         )))],
                     ),
                 )])),
+                origin: StructDeclOrigin::Guest,
             },
         )]);
         let node = TypeSchema::Named("node".to_string(), vec![TypeSchema::Int]);

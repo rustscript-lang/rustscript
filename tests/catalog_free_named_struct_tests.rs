@@ -198,6 +198,10 @@ fn custom_catalog_remains_authoritative() {
             .any(|import| import.name == "widget::origin"),
         "custom catalog host functions must remain visible"
     );
+    assert!(
+        !compiled.program.named_struct_decls().contains_key("Widget"),
+        "custom catalog structs must stay registry-side, not on the guest VMBC table"
+    );
 
     let sse_message = match compile_source_with_flavor_and_options(
         r#"fn go() -> SseCallbackAction { { action: "continue" } }"#,
