@@ -80,11 +80,16 @@ Polling drives execution and provides backpressure: at most one event item is bu
 
 ## Callable-driven HTTP streams
 
-With the `http-client` feature, `http::client::request(request)` and `http::client::sse(request, on_event)` are script-facing host imports. SSE is a long-running ordinary host call. Its handler has the schema `fn(map) -> SseCallbackAction`. The host produces one event, the VM runs one child callback frame, and the returned action controls continuation before another event can arrive at the VM boundary.
+With the `http-client` feature, `http::client::request(request)` and `http::client::sse(request, on_event)` are script-facing host imports. SSE is a long-running ordinary host call. Its handler has the schema `fn(SseEvent) -> SseCallbackAction`. The host produces one typed `SseEvent`, the VM runs one child callback frame, and the returned action controls continuation before another event can arrive at the VM boundary.
 
 The callback may yield or wait in an ordinary async host call. Existing frame machinery resumes the callback first and returns its final action to the suspended HTTP call. The network future does not own or enter the VM and is not polled while the callback is active, so at most one item remains unacknowledged and callback completion supplies backpressure.
 
-The buffered and SSE imports are independent capabilities. SSE exposes no script request IDs, handles, detached resources, `next`, or cancellation callables. Its complete event maps, action maps, terminal summaries, bounds, destination policy, and lifecycle contract are documented in [HTTP client callable contract](http-client.md).
+`HttpRequest` and `SseRequest` use ordered `HttpRequestHeader` arrays and the
+discriminated `HttpRequestBody` (`text` or `bytes`). Responses and SSE summaries
+use ordered `HttpResponseHeader` arrays; each header value is an
+`HttpHeaderValue` (`text` or raw `bytes`). `SseEvent` exposes named fields for
+`open`, `event`, and `end` items. See [HTTP client callable contract](http-client.md)
+for field-level examples and lifecycle details.
 
 ## Optimized backends
 

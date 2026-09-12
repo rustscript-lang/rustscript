@@ -316,6 +316,45 @@ fn map_value(entries: Vec<(&'static str, Value)>) -> Value {
     )))
 }
 
+fn sse_open_event(status: u16, headers: Arc<Vec<Value>>, url: &str) -> Value {
+    map_value(vec![
+        ("kind", Value::string("open")),
+        ("status", Value::Int(i64::from(status))),
+        ("headers", Value::Array(headers)),
+        ("url", Value::string(url)),
+        ("event", Value::Null),
+        ("data", Value::Null),
+        ("id", Value::Null),
+        ("retry_ms", Value::Null),
+    ])
+}
+
+fn sse_data_event(event: SseEvent) -> Value {
+    map_value(vec![
+        ("kind", Value::string("event")),
+        ("status", Value::Null),
+        ("headers", Value::Null),
+        ("url", Value::Null),
+        ("event", event.event.map_or(Value::Null, Value::string)),
+        ("data", Value::string(event.data)),
+        ("id", event.id.map_or(Value::Null, Value::string)),
+        ("retry_ms", event.retry_ms.map_or(Value::Null, Value::Int)),
+    ])
+}
+
+fn sse_end_event() -> Value {
+    map_value(vec![
+        ("kind", Value::string("end")),
+        ("status", Value::Null),
+        ("headers", Value::Null),
+        ("url", Value::Null),
+        ("event", Value::Null),
+        ("data", Value::Null),
+        ("id", Value::Null),
+        ("retry_ms", Value::Null),
+    ])
+}
+
 fn parse_stream_timeout(request: &VmMap) -> VmResult<Option<Duration>> {
     match request.get(&Value::string("timeout_ms")) {
         None | Some(Value::Null) => Ok(None),
@@ -611,7 +650,7 @@ struct SseWorker {
     items: Arc<AtomicUsize>,
     bytes_received: Arc<AtomicUsize>,
     status: std::sync::Mutex<Option<u16>>,
-    headers: std::sync::Mutex<Option<Arc<VmMap>>>,
+    headers: std::sync::Mutex<Option<Arc<Vec<Value>>>>,
     url: std::sync::Mutex<Option<String>>,
 }
 
@@ -679,9 +718,7 @@ impl SseWorker {
                 )
             })?;
         let _ = content_type;
-        let headers = Arc::new(VmMap::from_entries(response_header_entries(
-            response.response().headers(),
-        )));
+        let headers = Arc::new(response_header_entries(response.response().headers()));
         *self
             .status
             .lock()
@@ -696,12 +733,7 @@ impl SseWorker {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(url.to_string());
         observer.admit_body(self.config.max_stream_total_bytes);
         self.publish(
-            map_value(vec![
-                ("kind", Value::string("open")),
-                ("status", Value::Int(i64::from(status.as_u16()))),
-                ("headers", Value::Map(headers)),
-                ("url", Value::string(url.as_str())),
-            ]),
+            sse_open_event(status.as_u16(), headers, url.as_str()),
             deadline,
         )
         .await?;
@@ -737,23 +769,12 @@ impl SseWorker {
                 offset += consumed;
                 if let Some(event) = event {
                     self.items.fetch_add(1, Ordering::SeqCst);
-                    self.publish(
-                        map_value(vec![
-                            ("kind", Value::string("event")),
-                            ("event", event.event.map_or(Value::Null, Value::string)),
-                            ("data", Value::string(event.data)),
-                            ("id", event.id.map_or(Value::Null, Value::string)),
-                            ("retry_ms", event.retry_ms.map_or(Value::Null, Value::Int)),
-                        ]),
-                        deadline,
-                    )
-                    .await?;
+                    self.publish(sse_data_event(event), deadline).await?;
                 }
             }
         }
         parser.finish()?;
-        self.publish(map_value(vec![("kind", Value::string("end"))]), deadline)
-            .await
+        self.publish(sse_end_event(), deadline).await
     }
 
     /// Opens the response stream with one absolute deadline shared by DNS,
@@ -896,7 +917,7 @@ struct SseStreamDriver {
     /// Bounded FIFO receiver for items published by the worker.
     receiver: mpsc::Receiver<Value>,
     status: u16,
-    headers: Arc<VmMap>,
+    headers: Arc<Vec<Value>>,
     url: String,
     items: usize,
     bytes_received: Arc<AtomicUsize>,
@@ -920,7 +941,7 @@ impl SseStreamDriver {
         map_value(vec![
             ("outcome", Value::string(outcome)),
             ("status", Value::Int(i64::from(self.status))),
-            ("headers", Value::Map(Arc::clone(&self.headers))),
+            ("headers", Value::Array(Arc::clone(&self.headers))),
             ("url", Value::string(&self.url)),
             ("items", Value::Int(self.items as i64)),
             (
@@ -1049,7 +1070,8 @@ impl HostStreamDriver for SseStreamDriver {
                             if let Some(Value::Int(status)) = map.get(&Value::string("status")) {
                                 self.status = *status as u16;
                             }
-                            if let Some(Value::Map(headers)) = map.get(&Value::string("headers")) {
+                            if let Some(Value::Array(headers)) = map.get(&Value::string("headers"))
+                            {
                                 self.headers = Arc::clone(headers);
                             }
                             if let Some(Value::String(url)) = map.get(&Value::string("url")) {
@@ -1440,7 +1462,7 @@ pub(super) fn builtin_http_client_sse(
         shared: Arc::clone(&shared),
         receiver,
         status: 0,
-        headers: Arc::new(VmMap::default()),
+        headers: Arc::new(Vec::new()),
         url: String::new(),
         items: 0,
         bytes_received,

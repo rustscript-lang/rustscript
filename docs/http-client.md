@@ -33,7 +33,7 @@ On a supported native target, enabling `http-client` preserves the public API:
 - `HttpExtension` and `HttpHostExt` install the native HTTP host integration;
 - `register_http_builtin_module` and `http_host_catalog` expose the native
   resource schema and callable metadata;
-- `http::client::request` returns a bounded response map; and
+- `http::client::request` returns a bounded `HttpResponse`; and
 - `http::client::sse` drives a bounded SSE stream through a script callback.
 
 The HTTP and SSE behavior, resource lifecycle, cancellation, and native async
@@ -47,8 +47,10 @@ use http;
 let response = http::client::request({
     method: "POST",
     url: "https://example.test/v1/messages",
-    headers: {"content-type": "application/json"},
-    body: "{}",
+    headers: [
+        { name: "content-type", value: "application/json" },
+    ],
+    body: { kind: "text", text: "{}" },
 });
 let status = response.status;
 let body = response.body;
@@ -58,36 +60,55 @@ let body = response.body;
 
 - `method`: one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, or `OPTIONS`;
 - `url`: an `http` or `https` URL admitted by host policy;
-- `headers`: an optional string-to-string map;
-- `body`: optional string or bytes.
+- `headers`: an optional ordered array of `{ name: string, value: string }` `HttpRequestHeader` values;
+- `body`: an optional `HttpRequestBody`, either `{ kind: "text", text: string }` or `{ kind: "bytes", bytes: bytes }`.
 
 The response is an `HttpResponse` with field access:
 
 ```rust
 response.status   // int
-response.headers  // map (dynamic string keys)
+response.headers  // array<HttpResponseHeader>
 response.body     // bytes
 response.url      // string, the final validated URL after redirects
 ```
 
-Use field access (`response.status`). Index `response.headers` as a map. Unknown string indexes on the named response are rejected. The request body, response body, response head, redirect count, concurrent connection count, connect phase, and total request duration are bounded. `Host`, `Content-Length`, `Transfer-Encoding`, and `Connection` are client-managed request headers. A limit, policy, transport, TLS, redirect, or timeout failure is a host error and produces no response.
+Each response header has a `name` and an `HttpHeaderValue`:
+
+```rust
+let header = response.headers[0];
+header.name          // string
+header.value.kind    // "text" or "bytes"
+header.value.text    // string or null
+header.value.bytes   // bytes or null
+```
+
+Response headers remain ordered, repeated names remain separate entries, and
+non-UTF-8 values use the `bytes` variant without loss. Use field access on
+named values; unknown fields and string indexes are rejected. The request body,
+response body, response head, redirect count, concurrent connection count,
+connect phase, and total request duration are bounded. `Host`,
+`Content-Length`, `Transfer-Encoding`, and `Connection` are client-managed
+request headers. A limit, policy, transport, TLS, redirect, or timeout failure
+is a host error and produces no response.
 
 ## Server-sent events
 
 `http::client::sse` is available with the `http-client` feature.
 
 ```rust
-fn on_sse(item: map) -> SseCallbackAction {
-    if item["kind"] == "event" {
-        print(item["data"]);
+fn on_sse(item: SseEvent) -> SseCallbackAction {
+    if item.kind == "event" {
+        print(item.data);
     }
-    return { action: "continue" };
+    { action: "continue" }
 }
 
 let result = http::client::sse({
     method: "GET",
     url: "https://example.test/events",
-    headers: { accept: "text/event-stream" },
+    headers: [
+        { name: "accept", value: "text/event-stream" },
+    ],
 }, on_sse);
 let outcome = result.outcome;
 ```
@@ -98,38 +119,61 @@ let outcome = result.outcome;
 | --- | --- | --- | --- |
 | `method` | yes | string: `GET` or `POST` | Other methods are rejected before transport admission |
 | `url` | yes | string containing an `http` or `https` URL | Protocol family and the configured scheme, host, port, and address policy must all admit it |
-| `headers` | no | map from string header names to string values | Names and values must be syntactically valid; client-managed request headers remain forbidden, and `Accept: text/event-stream` is supplied when absent |
-| `body` | no | string or bytes, including for `POST` | Bounded by `max_request_body_bytes` |
+| `headers` | no | ordered array of `{ name: string, value: string }` `HttpRequestHeader` values | Names and values must be syntactically valid; client-managed request headers remain forbidden, and `Accept: text/event-stream` is supplied when absent |
+| `body` | no | `HttpRequestBody`: `{ kind: "text", text: string }` or `{ kind: "bytes", bytes: bytes }`, including for `POST` | Bounded by `max_request_body_bytes` |
 | `timeout_ms` | no | positive integer milliseconds | Caps this optional shortening deadline by `HttpConfig::max_stream_duration` |
 
-The callback schema is `fn(map) -> SseCallbackAction`. Inbound events stay maps because they are a tagged union (`open` / `event` / `end`). The response must have an event-stream content type. The response head remains bounded by the existing HTTP parser. The contract adds no configurable request-header byte accounting.
+The callback schema is `fn(SseEvent) -> SseCallbackAction`. `SseEvent` is a
+named tagged record with `kind` equal to `open`, `event`, or `end`. The response
+must have an event-stream content type. The response head remains bounded by
+the existing HTTP parser. Request headers retain their configured count and byte
+budgets.
 
-The callback receives exactly one map at a time, in this order:
+The callback receives exactly one `SseEvent` at a time, in this order:
 
 ```rust
 // The response was accepted; this precedes every event.
 {
-    "kind": "open",
-    "status": 200,
-    "headers": map,
-    "url": string,
+    kind: "open",
+    status: 200,
+    headers: [HttpResponseHeader, ...],
+    url: string,
+    event: null,
+    data: null,
+    id: null,
+    retry_ms: null,
 }
 
 // One parsed event. "event" is per-dispatch state, reset to null at every
-// dispatch boundary (including a blank line that dispatches no event); "id"
-// and "retry_ms" are persistent stream state, retaining the last valid
-// values seen so far and null only before any value has been seen.
+// dispatch boundary; "id" and "retry_ms" retain the last valid values.
 {
-    "kind": "event",
-    "event": string | null,
-    "data": string,
-    "id": string | null,
-    "retry_ms": int | null,
+    kind: "event",
+    status: null,
+    headers: null,
+    url: null,
+    event: string | null,
+    data: string,
+    id: string | null,
+    retry_ms: int | null,
 }
 
 // Clean EOF, after every preceding event callback completed.
-{"kind": "end"}
+{
+    kind: "end",
+    status: null,
+    headers: null,
+    url: null,
+    event: null,
+    data: null,
+    id: null,
+    retry_ms: null,
+}
 ```
+
+`open.headers` and the summary's `headers` use ordered `HttpResponseHeader`
+entries. Each entry's `value` is an `HttpHeaderValue` with `kind: "text"` and
+`text`, or `kind: "bytes"` and `bytes`. The unused optional payload field is
+`null`. Duplicate names and raw non-UTF-8 values are preserved.
 
 The callback must return an `SseCallbackAction`:
 
@@ -145,7 +189,7 @@ SSE parsing follows the event-stream grammar:
 - UTF-8 text may start with one byte-order mark;
 - `\r\n`, `\r`, and `\n` line endings are recognized;
 - repeated `data:` fields are joined with `\n`, with the final join newline removed at dispatch;
-- `event`, `id`, and decimal non-negative `retry` fields are normalized into the event map;
+- `event`, `id`, and decimal non-negative `retry` fields are normalized into the typed event record;
 - comments and unknown fields are ignored;
 - a blank line dispatches only after at least one `data:` field;
 - malformed UTF-8, an over-limit line or event, and cumulative received event-stream application bytes exceeding the call limit are host errors.
@@ -159,11 +203,11 @@ After callback processing terminates normally, the SSE call returns an `SseSumma
 ```rust
 result.outcome        // "eof" | "stopped"
 result.status         // int
-result.headers        // map
-result.url            // string
-result.items          // int
-result.bytes_received // int
-result.bytes_sent     // int
+result.headers        // array<HttpResponseHeader>
+result.url             // string
+result.items           // int
+result.bytes_received  // int
+result.bytes_sent      // int
 ```
 
 `items` counts delivered callback items. `bytes_received` and `bytes_sent` are observational summary counters. Limit enforcement uses independent entire-call accounting and does not depend on whether or how these counters are displayed.

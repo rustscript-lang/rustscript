@@ -75,10 +75,10 @@ fn build_request_program_with_method(url: &str, method: &str) -> Program {
     compile_source(&format!(
         r#"
         use http;
-        http::client::request({{"method": "{method}", "url": "{url}", "body": "payload"}});
+        http::client::request({{"method": "{method}", "url": "{url}", "body": {{ kind: "text", text: "payload" }}}});
         "#
     ))
-    .expect("HTTP request source should compile")
+    .expect("HTTP request source with method should compile")
     .program
 }
 
@@ -86,17 +86,17 @@ fn build_request_program_with_headers(url: &str, method: &str) -> Program {
     compile_source(&format!(
         r#"
         use http;
-        http::client::request({{"method": "{method}", "url": "{url}", "body": "payload", "headers": {{
-            Authorization: "Bearer secret",
-            "Proxy-Authorization": "Basic proxy-secret",
-            Cookie: "a=b",
-            "X-Api-Key": "api-secret",
-            "X-Arbitrary": "custom-secret",
-            "Content-Type": "application/body",
-            Accept: "application/json",
-            "Accept-Language": "en-US",
-            "Accept-Encoding": "identity"
-        }}}});
+        http::client::request({{"method": "{method}", "url": "{url}", "body": {{ kind: "text", text: "payload" }}, "headers": [
+            {{ name: "Authorization", value: "Bearer secret" }},
+            {{ name: "Proxy-Authorization", value: "Basic proxy-secret" }},
+            {{ name: "Cookie", value: "a=b" }},
+            {{ name: "X-Api-Key", value: "api-secret" }},
+            {{ name: "X-Arbitrary", value: "custom-secret" }},
+            {{ name: "Content-Type", value: "application/body" }},
+            {{ name: "Accept", value: "application/json" }},
+            {{ name: "Accept-Language", value: "en-US" }},
+            {{ name: "Accept-Encoding", value: "identity" }}
+        ]}});
         "#
     ))
     .expect("HTTP request source with headers should compile")
@@ -201,6 +201,29 @@ fn spawn_response_server(response: Vec<u8>) -> (u16, thread::JoinHandle<()>) {
         let _ = stream.write_all(&response);
     });
     (port, handle)
+}
+
+fn spawn_recording_response_server(
+    response: Vec<u8>,
+) -> (u16, mpsc::Receiver<String>, thread::JoinHandle<()>) {
+    let listener = bind_test_listener();
+    let port = listener
+        .local_addr()
+        .expect("recording listener should have an address")
+        .port();
+    let (sender, receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) =
+            accept_test_connection(&listener).expect("recording request should arrive");
+        let request = read_recorded_request(&mut stream);
+        sender
+            .send(request)
+            .expect("recorded request receiver should remain open");
+        stream
+            .write_all(&response)
+            .expect("recorded response should be writable");
+    });
+    (port, receiver, handle)
 }
 
 fn response_head_with_size(size: usize) -> Vec<u8> {
@@ -313,6 +336,19 @@ fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
                 .eq_ignore_ascii_case(name)
                 .then_some(value.trim())
         })
+}
+
+fn header_values<'a>(request: &'a str, name: &str) -> Vec<&'a str> {
+    request
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter_map(|(header_name, value)| {
+            header_name
+                .eq_ignore_ascii_case(name)
+                .then_some(value.trim())
+        })
+        .collect()
 }
 
 fn has_header(request: &str, name: &str) -> bool {
@@ -443,6 +479,99 @@ async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
         response_field(&vm.stack()[0], "body"),
         &Value::bytes(b"ok".to_vec())
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn buffered_response_headers_preserve_order_duplicates_and_raw_bytes() {
+    let response = run_raw_response(
+        b"HTTP/1.1 200 OK\r\nX-Repeat: first\r\nX-Repeat: second\r\nX-Raw: \x80\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        HttpConfig::default(),
+    )
+    .await
+    .expect("typed response headers should decode");
+    let Value::Array(headers) = response_field(&response, "headers") else {
+        panic!("expected typed response header array");
+    };
+    assert_eq!(headers.len(), 4);
+    assert_eq!(
+        response_field(&headers[0], "name"),
+        &Value::string("x-repeat")
+    );
+    assert_eq!(
+        response_field(response_field(&headers[0], "value"), "kind"),
+        &Value::string("text")
+    );
+    assert_eq!(
+        response_field(response_field(&headers[0], "value"), "text"),
+        &Value::string("first")
+    );
+    assert_eq!(
+        response_field(response_field(&headers[0], "value"), "bytes"),
+        &Value::Null
+    );
+    assert_eq!(
+        response_field(&headers[1], "name"),
+        &Value::string("x-repeat")
+    );
+    assert_eq!(
+        response_field(response_field(&headers[1], "value"), "text"),
+        &Value::string("second")
+    );
+    assert_eq!(response_field(&headers[2], "name"), &Value::string("x-raw"));
+    assert_eq!(
+        response_field(response_field(&headers[2], "value"), "kind"),
+        &Value::string("bytes")
+    );
+    assert_eq!(
+        response_field(response_field(&headers[2], "value"), "text"),
+        &Value::Null
+    );
+    assert_eq!(
+        response_field(response_field(&headers[2], "value"), "bytes"),
+        &Value::bytes(vec![0x80])
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn buffered_request_preserves_duplicate_header_order() {
+    let (port, requests, server) =
+        spawn_recording_response_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec());
+    let source = format!(
+        r#"
+        use http;
+        http::client::request({{
+            method: "GET",
+            url: "http://127.0.0.1:{port}/",
+            headers: [
+                {{ name: "x-order", value: "first" }},
+                {{ name: "x-order", value: "second" }},
+                {{ name: "x-order", value: "third" }}
+            ]
+        }});
+        "#
+    );
+    let compiled = compile_source(&source).expect("duplicate headers should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.configure_http(local_http_config(port))
+        .expect("HTTP configuration should be valid");
+    install_host_driver(&mut vm);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("default host registry should bind HTTP");
+
+    drive_vm_to_halt(&mut vm)
+        .await
+        .expect("duplicate-header request should complete");
+    let request = requests.recv().expect("request should be recorded");
+    assert_eq!(
+        header_values(&request, "x-order"),
+        ["first", "second", "third"]
+    );
+    assert_eq!(
+        response_field(&vm.stack()[0], "body"),
+        &Value::bytes(b"ok".to_vec())
+    );
+    server.join().expect("recording server should finish");
 }
 
 #[tokio::test(flavor = "current_thread")]

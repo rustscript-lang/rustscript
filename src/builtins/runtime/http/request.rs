@@ -441,39 +441,20 @@ pub(super) fn parse_request(map: &VmMap, config: &HttpConfig) -> VmResult<HttpRe
         .parse::<url::Url>()
         .map_err(|error| VmError::HostError(format!("invalid HTTP URL: {error}")))?;
 
-    let body = match map.get(&Value::string("body")) {
-        None | Some(Value::Null) => None,
-        Some(Value::Bytes(bytes)) => {
-            if bytes.len() > config.max_request_body_bytes {
-                return Err(VmError::HostError(
-                    "HTTP request body exceeds limit".to_string(),
-                ));
-            }
-            Some(bytes.as_ref().clone())
-        }
-        Some(Value::String(text)) => {
-            if text.len() > config.max_request_body_bytes {
-                return Err(VmError::HostError(
-                    "HTTP request body exceeds limit".to_string(),
-                ));
-            }
-            Some(text.as_bytes().to_vec())
-        }
-        Some(_) => return Err(VmError::TypeMismatch("HTTP request body")),
-    };
+    let body = parse_request_body(map.get(&Value::string("body")), config)?;
 
     let mut headers = Vec::new();
     let mut header_budget = RequestHeaderBudget::from_config(config);
     match map.get(&Value::string("headers")) {
         None | Some(Value::Null) => {}
-        Some(Value::Map(header_map)) => {
-            for (key, value) in header_map.iter() {
-                let Value::String(key) = key else {
-                    return Err(VmError::TypeMismatch("HTTP header name"));
+        Some(Value::Array(header_entries)) => {
+            for entry in header_entries.iter() {
+                let Value::Map(header) = entry else {
+                    return Err(VmError::TypeMismatch("HTTP request header"));
                 };
-                let Value::String(value) = value else {
-                    return Err(VmError::TypeMismatch("HTTP header value"));
-                };
+                reject_unexpected_fields(header, &["name", "value"], "HTTP request header")?;
+                let key = required_string_field(header, "name", "HTTP header name")?;
+                let value = required_string_field(header, "value", "HTTP header value")?;
                 // Admit raw bytes before normalizing/converting either component.
                 // This keeps a rejected value from triggering a HeaderValue copy.
                 header_budget.admit(key.as_bytes(), value.as_bytes())?;
@@ -487,7 +468,7 @@ pub(super) fn parse_request(map: &VmMap, config: &HttpConfig) -> VmResult<HttpRe
                 }
                 let name = hyper::header::HeaderName::from_bytes(key.as_bytes())
                     .map_err(|_| VmError::HostError(format!("invalid HTTP header name '{key}'")))?;
-                let value = hyper::header::HeaderValue::from_str(value).map_err(|_| {
+                let value = hyper::header::HeaderValue::from_str(&value).map_err(|_| {
                     VmError::HostError(format!("invalid HTTP header value for '{key}'"))
                 })?;
                 headers.push((name, value));
@@ -503,6 +484,83 @@ pub(super) fn parse_request(map: &VmMap, config: &HttpConfig) -> VmResult<HttpRe
         headers,
         body,
     })
+}
+
+fn parse_request_body(value: Option<&Value>, config: &HttpConfig) -> VmResult<Option<Vec<u8>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+    let Value::Map(body) = value else {
+        return Err(VmError::TypeMismatch("HTTP request body"));
+    };
+    reject_unexpected_fields(body, &["kind", "text", "bytes"], "HTTP request body")?;
+    let kind = required_string_field(body, "kind", "HTTP request body kind")?;
+    let bytes = match kind.as_str() {
+        "text" => {
+            if body
+                .get(&Value::string("bytes"))
+                .is_some_and(|value| !matches!(value, Value::Null))
+            {
+                return Err(VmError::HostError(
+                    "HTTP request body text variant cannot contain bytes".to_string(),
+                ));
+            }
+            let Some(Value::String(text)) = body.get(&Value::string("text")) else {
+                return Err(VmError::TypeMismatch("HTTP request body text payload"));
+            };
+            text.as_bytes().to_vec()
+        }
+        "bytes" => {
+            if body
+                .get(&Value::string("text"))
+                .is_some_and(|value| !matches!(value, Value::Null))
+            {
+                return Err(VmError::HostError(
+                    "HTTP request body bytes variant cannot contain text".to_string(),
+                ));
+            }
+            let Some(Value::Bytes(bytes)) = body.get(&Value::string("bytes")) else {
+                return Err(VmError::TypeMismatch("HTTP request body bytes payload"));
+            };
+            bytes.as_ref().clone()
+        }
+        _ => {
+            return Err(VmError::HostError(
+                "HTTP request body kind must be 'text' or 'bytes'".to_string(),
+            ));
+        }
+    };
+    if bytes.len() > config.max_request_body_bytes {
+        return Err(VmError::HostError(
+            "HTTP request body exceeds limit".to_string(),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn reject_unexpected_fields(map: &VmMap, allowed: &[&str], context: &'static str) -> VmResult<()> {
+    for (key, _) in map {
+        let Value::String(key) = key else {
+            return Err(VmError::TypeMismatch(context));
+        };
+        if !allowed.iter().any(|allowed| *allowed == key.as_str()) {
+            return Err(VmError::HostError(format!(
+                "{context} contains unknown field '{key}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn required_string_field(map: &VmMap, key: &str, context: &'static str) -> VmResult<String> {
+    match map.get(&Value::string(key)) {
+        Some(Value::String(value)) => Ok(value.as_ref().clone()),
+        Some(_) => Err(VmError::TypeMismatch(context)),
+        None => Err(VmError::HostError(format!("{context} is missing '{key}'"))),
+    }
 }
 
 fn map_string(map: &VmMap, key: &str) -> VmResult<String> {
@@ -1372,15 +1430,30 @@ fn prepare_redirect(
     }
 }
 
-pub(super) fn response_header_entries(headers: &hyper::HeaderMap) -> Vec<(Value, Value)> {
+pub(super) fn response_header_entries(headers: &hyper::HeaderMap) -> Vec<Value> {
     headers
         .iter()
         .map(|(name, value)| {
-            let value = value
-                .to_str()
-                .map(Value::string)
-                .unwrap_or_else(|_| Value::bytes(value.as_bytes().to_vec()));
-            (Value::string(name.as_str()), value)
+            let value = if let Ok(text) = value.to_str() {
+                Value::Map(Arc::new(VmMap::from_entries(vec![
+                    (Value::string("kind"), Value::string("text")),
+                    (Value::string("text"), Value::string(text)),
+                    (Value::string("bytes"), Value::Null),
+                ])))
+            } else {
+                Value::Map(Arc::new(VmMap::from_entries(vec![
+                    (Value::string("kind"), Value::string("bytes")),
+                    (Value::string("text"), Value::Null),
+                    (
+                        Value::string("bytes"),
+                        Value::bytes(value.as_bytes().to_vec()),
+                    ),
+                ])))
+            };
+            Value::Map(Arc::new(VmMap::from_entries(vec![
+                (Value::string("name"), Value::string(name.as_str())),
+                (Value::string("value"), value),
+            ])))
         })
         .collect()
 }
@@ -1459,7 +1532,7 @@ pub(super) async fn open_stream_response(
 
 fn response_map(
     status: hyper::StatusCode,
-    headers: Vec<(Value, Value)>,
+    headers: Vec<Value>,
     body: Vec<u8>,
     url: &url::Url,
 ) -> VmMap {
@@ -1468,10 +1541,7 @@ fn response_map(
             Value::string("status"),
             Value::Int(i64::from(status.as_u16())),
         ),
-        (
-            Value::string("headers"),
-            Value::Map(std::sync::Arc::new(VmMap::from_entries(headers))),
-        ),
+        (Value::string("headers"), Value::array(headers)),
         (Value::string("body"), Value::bytes(body)),
         (Value::string("url"), Value::string(url.as_str())),
     ])
@@ -1793,20 +1863,98 @@ mod tests {
         })
     }
 
+    fn request_with_body(body: Value) -> VmMap {
+        let mut request = VmMap::new();
+        request.insert(Value::string("method"), Value::string("POST"));
+        request.insert(Value::string("url"), Value::string("http://example.test/"));
+        request.insert(Value::string("body"), body);
+        request
+    }
+
+    fn value_map(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+        Value::Map(Arc::new(VmMap::from_entries(
+            entries
+                .into_iter()
+                .map(|(key, value)| (Value::string(key), value))
+                .collect(),
+        )))
+    }
+
     fn request_with_headers(headers: Vec<(&str, &str)>) -> VmMap {
         let mut request = VmMap::new();
         request.insert(Value::string("method"), Value::string("GET"));
         request.insert(Value::string("url"), Value::string("http://example.test/"));
         request.insert(
             Value::string("headers"),
-            Value::Map(std::sync::Arc::new(VmMap::from_entries(
+            Value::Array(Arc::new(
                 headers
                     .into_iter()
-                    .map(|(name, value)| (Value::string(name), Value::string(value)))
+                    .map(|(name, value)| {
+                        Value::Map(std::sync::Arc::new(VmMap::from_entries(vec![
+                            (Value::string("name"), Value::string(name)),
+                            (Value::string("value"), Value::string(value)),
+                        ])))
+                    })
                     .collect(),
-            ))),
+            )),
         );
         request
+    }
+
+    #[test]
+    fn request_body_discriminator_rejects_invalid_variants() {
+        let config = crate::builtins::runtime::http::HttpConfig::default();
+        let cases = [
+            (
+                value_map([
+                    ("kind", Value::string("json")),
+                    ("text", Value::string("payload")),
+                ]),
+                "HTTP request body kind must",
+            ),
+            (
+                value_map([("kind", Value::string("text"))]),
+                "HTTP request body text payload",
+            ),
+            (
+                value_map([("kind", Value::string("bytes"))]),
+                "HTTP request body bytes payload",
+            ),
+            (
+                value_map([
+                    ("kind", Value::string("text")),
+                    ("text", Value::string("payload")),
+                    ("bytes", Value::bytes(b"raw".to_vec())),
+                ]),
+                "text variant cannot contain bytes",
+            ),
+            (
+                value_map([
+                    ("kind", Value::string("bytes")),
+                    ("text", Value::string("payload")),
+                    ("bytes", Value::bytes(b"raw".to_vec())),
+                ]),
+                "bytes variant cannot contain text",
+            ),
+            (
+                value_map([
+                    ("kind", Value::string("text")),
+                    ("text", Value::string("payload")),
+                    ("extra", Value::Null),
+                ]),
+                "contains unknown field 'extra'",
+            ),
+        ];
+        for (body, expected) in cases {
+            let error = match parse_request(&request_with_body(body), &config) {
+                Ok(_) => panic!("invalid request body variant was accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+        }
     }
 
     #[test]
