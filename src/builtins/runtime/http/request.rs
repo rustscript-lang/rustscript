@@ -498,7 +498,7 @@ fn parse_request_body(value: Option<&Value>, config: &HttpConfig) -> VmResult<Op
     };
     reject_unexpected_fields(body, &["kind", "text", "bytes"], "HTTP request body")?;
     let kind = required_string_field(body, "kind", "HTTP request body kind")?;
-    let bytes = match kind.as_str() {
+    let payload = match kind.as_str() {
         "text" => {
             if body
                 .get(&Value::string("bytes"))
@@ -511,7 +511,7 @@ fn parse_request_body(value: Option<&Value>, config: &HttpConfig) -> VmResult<Op
             let Some(Value::String(text)) = body.get(&Value::string("text")) else {
                 return Err(VmError::TypeMismatch("HTTP request body text payload"));
             };
-            text.as_bytes().to_vec()
+            text.as_bytes()
         }
         "bytes" => {
             if body
@@ -525,7 +525,7 @@ fn parse_request_body(value: Option<&Value>, config: &HttpConfig) -> VmResult<Op
             let Some(Value::Bytes(bytes)) = body.get(&Value::string("bytes")) else {
                 return Err(VmError::TypeMismatch("HTTP request body bytes payload"));
             };
-            bytes.as_ref().clone()
+            bytes.as_ref()
         }
         _ => {
             return Err(VmError::HostError(
@@ -533,12 +533,12 @@ fn parse_request_body(value: Option<&Value>, config: &HttpConfig) -> VmResult<Op
             ));
         }
     };
-    if bytes.len() > config.max_request_body_bytes {
+    if payload.len() > config.max_request_body_bytes {
         return Err(VmError::HostError(
             "HTTP request body exceeds limit".to_string(),
         ));
     }
-    Ok(Some(bytes))
+    Ok(Some(payload.to_vec()))
 }
 
 fn reject_unexpected_fields(map: &VmMap, allowed: &[&str], context: &'static str) -> VmResult<()> {
@@ -1431,8 +1431,13 @@ fn prepare_redirect(
 }
 
 pub(super) fn response_header_entries(headers: &hyper::HeaderMap) -> Vec<Value> {
-    headers
-        .iter()
+    // HeaderMap iteration does not promise original cross-name wire order.
+    // HeaderName::as_str() is normalized, and the stable sort retains the
+    // HeaderMap-provided order among repeated values of the same name.
+    let mut entries = headers.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+    entries
+        .into_iter()
         .map(|(name, value)| {
             let value = if let Ok(text) = value.to_str() {
                 Value::Map(Arc::new(VmMap::from_entries(vec![
@@ -1831,8 +1836,8 @@ mod tests {
     use super::{
         BufferedRequestShared, FAIL_NEXT_WORKER_SPAWN, HTTP_MAX_HEAD_BYTES, HttpRequestOperation,
         HttpRequestResource, REJECT_NEXT_OPERATION_ADMISSION, ReadCapIo, RequestHeaderBudget,
-        ResponseReadObserver, WorkerLifecycle, parse_request, rollback_buffered_request,
-        spawn_worker, start_operation, validate_response_trailers,
+        ResponseReadObserver, WorkerLifecycle, parse_request, parse_request_body,
+        rollback_buffered_request, spawn_worker, start_operation, validate_response_trailers,
     };
     use crate::builtins::runtime::typed::VmMap;
     use crate::vm::{Value, VmError};
@@ -1899,6 +1904,59 @@ mod tests {
             )),
         );
         request
+    }
+
+    #[test]
+    fn request_body_payload_checks_limit_before_copying() {
+        let exact_config = crate::builtins::runtime::http::HttpConfig {
+            max_request_body_bytes: 7,
+            ..Default::default()
+        };
+        let text = value_map([
+            ("kind", Value::string("text")),
+            ("text", Value::string("payload")),
+        ]);
+        assert_eq!(
+            parse_request_body(Some(&text), &exact_config)
+                .expect("exact text limit should be accepted"),
+            Some(b"payload".to_vec())
+        );
+
+        let zero_config = crate::builtins::runtime::http::HttpConfig {
+            max_request_body_bytes: 0,
+            ..Default::default()
+        };
+        let empty_bytes = value_map([
+            ("kind", Value::string("bytes")),
+            ("bytes", Value::bytes(Vec::new())),
+        ]);
+        assert_eq!(
+            parse_request_body(Some(&empty_bytes), &zero_config)
+                .expect("zero-length bytes should fit zero limit"),
+            Some(Vec::new())
+        );
+
+        let limited_config = crate::builtins::runtime::http::HttpConfig {
+            max_request_body_bytes: 6,
+            ..Default::default()
+        };
+        let text_error = parse_request_body(Some(&text), &limited_config)
+            .expect_err("one byte over the text limit must be rejected before copying");
+        assert!(matches!(
+            text_error,
+            VmError::HostError(message) if message == "HTTP request body exceeds limit"
+        ));
+
+        let bytes = value_map([
+            ("kind", Value::string("bytes")),
+            ("bytes", Value::bytes(b"payload".to_vec())),
+        ]);
+        let bytes_error = parse_request_body(Some(&bytes), &limited_config)
+            .expect_err("one byte over the bytes limit must be rejected before copying");
+        assert!(matches!(
+            bytes_error,
+            VmError::HostError(message) if message == "HTTP request body exceeds limit"
+        ));
     }
 
     #[test]

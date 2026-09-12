@@ -85,10 +85,13 @@ With the `http-client` feature, `http::client::request(request)` and `http::clie
 The callback may yield or wait in an ordinary async host call. Existing frame machinery resumes the callback first and returns its final action to the suspended HTTP call. The network future does not own or enter the VM and is not polled while the callback is active, so at most one item remains unacknowledged and callback completion supplies backpressure.
 
 `HttpRequest` and `SseRequest` use ordered `HttpRequestHeader` arrays and the
-discriminated `HttpRequestBody` (`text` or `bytes`). Responses and SSE summaries
-use ordered `HttpResponseHeader` arrays; each header value is an
-`HttpHeaderValue` (`text` or raw `bytes`). `SseEvent` exposes named fields for
-`open`, `event`, and `end` items. See [HTTP client callable contract](http-client.md)
+discriminated `HttpRequestBody` (`text` or `bytes`). Request arrays retain
+repeated entries and their supplied order; HTTP does not promise
+server-visible ordering across different names. Responses and SSE summaries
+use `HttpResponseHeader` arrays in deterministic normalized-name order, with
+stable same-name duplicate order and raw `HttpHeaderValue` (`text` or
+`bytes`) variants. `SseEvent` exposes named fields for `open`, `event`, and
+`end` items. See [HTTP client callable contract](http-client.md)
 for field-level examples and lifecycle details.
 
 ## Optimized backends

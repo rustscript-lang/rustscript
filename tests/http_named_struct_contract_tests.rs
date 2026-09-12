@@ -955,6 +955,33 @@ fn sse_callback_runtime_schema_rejects_arbitrary_map_result() {
 }
 
 #[test]
+fn generic_stream_callback_mismatch_describes_named_compatibility() {
+    let compiled = compile_with_http_catalog(
+        r#"
+        pub fn callback(value: int) -> int { value }
+        "#,
+    )
+    .expect("mismatched callback should compile in isolation");
+    let mut vm = Vm::try_new(compiled.program).expect("vm");
+    assert_eq!(vm.run().expect("run"), VmStatus::Halted);
+    let callback = vm
+        .resolve_exported_callable("callback")
+        .expect("export callback");
+    let error = vm
+        .validate_stream_callback_value(&callback)
+        .expect_err("generic stream should reject an incompatible callback");
+    assert!(
+        matches!(
+            error,
+            VmError::TypeMismatch(
+                "callable stream callback must accept one map or named input and return a map, named value, or object"
+            )
+        ),
+        "generic stream callback diagnostic must describe named compatibility, got {error:?}"
+    );
+}
+
+#[test]
 fn sse_callback_runtime_schema_accepts_named_action() {
     let compiled = compile_with_http_catalog(
         r#"

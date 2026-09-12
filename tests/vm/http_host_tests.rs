@@ -482,7 +482,7 @@ async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn buffered_response_headers_preserve_order_duplicates_and_raw_bytes() {
+async fn buffered_response_headers_use_canonical_order_duplicates_and_raw_bytes() {
     let response = run_raw_response(
         b"HTTP/1.1 200 OK\r\nX-Repeat: first\r\nX-Repeat: second\r\nX-Raw: \x80\r\nContent-Length: 0\r\n\r\n".to_vec(),
         HttpConfig::default(),
@@ -495,40 +495,44 @@ async fn buffered_response_headers_preserve_order_duplicates_and_raw_bytes() {
     assert_eq!(headers.len(), 4);
     assert_eq!(
         response_field(&headers[0], "name"),
-        &Value::string("x-repeat")
+        &Value::string("content-length")
     );
+    assert_eq!(response_field(&headers[1], "name"), &Value::string("x-raw"));
     assert_eq!(
-        response_field(response_field(&headers[0], "value"), "kind"),
-        &Value::string("text")
-    );
-    assert_eq!(
-        response_field(response_field(&headers[0], "value"), "text"),
-        &Value::string("first")
-    );
-    assert_eq!(
-        response_field(response_field(&headers[0], "value"), "bytes"),
-        &Value::Null
-    );
-    assert_eq!(
-        response_field(&headers[1], "name"),
-        &Value::string("x-repeat")
-    );
-    assert_eq!(
-        response_field(response_field(&headers[1], "value"), "text"),
-        &Value::string("second")
-    );
-    assert_eq!(response_field(&headers[2], "name"), &Value::string("x-raw"));
-    assert_eq!(
-        response_field(response_field(&headers[2], "value"), "kind"),
+        response_field(response_field(&headers[1], "value"), "kind"),
         &Value::string("bytes")
     );
     assert_eq!(
-        response_field(response_field(&headers[2], "value"), "text"),
+        response_field(response_field(&headers[1], "value"), "text"),
         &Value::Null
     );
     assert_eq!(
-        response_field(response_field(&headers[2], "value"), "bytes"),
+        response_field(response_field(&headers[1], "value"), "bytes"),
         &Value::bytes(vec![0x80])
+    );
+    assert_eq!(
+        response_field(&headers[2], "name"),
+        &Value::string("x-repeat")
+    );
+    assert_eq!(
+        response_field(response_field(&headers[2], "value"), "kind"),
+        &Value::string("text")
+    );
+    assert_eq!(
+        response_field(response_field(&headers[2], "value"), "text"),
+        &Value::string("first")
+    );
+    assert_eq!(
+        response_field(response_field(&headers[2], "value"), "bytes"),
+        &Value::Null
+    );
+    assert_eq!(
+        response_field(&headers[3], "name"),
+        &Value::string("x-repeat")
+    );
+    assert_eq!(
+        response_field(response_field(&headers[3], "value"), "text"),
+        &Value::string("second")
     );
 }
 

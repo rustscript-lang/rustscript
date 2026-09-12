@@ -84,6 +84,48 @@ impl HostStackFunction for CountCalls {
     }
 }
 
+struct InspectOpenHeaders;
+
+impl HostStackFunction for InspectOpenHeaders {
+    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+        let [event] = args else {
+            return Err(VmError::HostError(
+                "open-header inspector expected one event".to_string(),
+            ));
+        };
+        let valid = if field(event, "kind") == &Value::string("open")
+            && field(event, "status") == &Value::Int(200)
+            && field(event, "url") != &Value::Null
+            && field(event, "event") == &Value::Null
+            && field(event, "data") == &Value::Null
+            && field(event, "id") == &Value::Null
+            && field(event, "retry_ms") == &Value::Null
+        {
+            match field(event, "headers") {
+                Value::Array(headers) if headers.len() == 5 => {
+                    field(&headers[0], "name") == &Value::string("content-length")
+                        && field(&headers[1], "name") == &Value::string("content-type")
+                        && field(&headers[2], "name") == &Value::string("x-duplicate")
+                        && field(&headers[3], "name") == &Value::string("x-duplicate")
+                        && field(&headers[4], "name") == &Value::string("x-raw")
+                        && field(field(&headers[2], "value"), "kind") == &Value::string("text")
+                        && field(field(&headers[2], "value"), "text") == &Value::string("first")
+                        && field(field(&headers[2], "value"), "bytes") == &Value::Null
+                        && field(field(&headers[3], "value"), "text") == &Value::string("second")
+                        && field(field(&headers[3], "value"), "bytes") == &Value::Null
+                        && field(field(&headers[4], "value"), "kind") == &Value::string("bytes")
+                        && field(field(&headers[4], "value"), "text") == &Value::Null
+                        && field(field(&headers[4], "value"), "bytes") == &Value::bytes(vec![0x80])
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        Ok(CallOutcome::Return(CallReturn::one(Value::Bool(valid))))
+    }
+}
+
 impl HostStackFunction for AsyncWaitOnce {
     fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -470,6 +512,41 @@ async fn sse_delivers_open_events_end_and_terminal_summary() {
     assert_eq!(field(result, "status"), &Value::Int(200));
     assert_eq!(field(result, "items"), &Value::Int(4));
     assert_eq!(field(result, "bytes_sent"), &Value::Int(0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sse_callback_inspects_typed_open_headers() {
+    let (port, server) = server(vec![
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Duplicate: first\r\nX-Duplicate: second\r\nX-Raw: \x80\r\nContent-Length: 0\r\n\r\n",
+    ]);
+    let source = format!(
+        r#"
+        use http;
+        fn inspect_event(item: SseEvent) -> bool;
+        fn inspect(item: SseEvent) -> SseCallbackAction {{
+            {{
+                action: if inspect_event(item) => {{ "stop" }} else => {{ "continue" }}
+            }}
+        }}
+        let result = http::client::sse(
+            {{ method: "GET", url: "http://127.0.0.1:{port}/events" }},
+            inspect
+        );
+        result;
+        "#
+    );
+    let compiled = compile_source(&source).expect("SSE source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.configure_http(config(port)).unwrap();
+    vm.set_async_bridge(Box::<TokioHostDriver>::default())
+        .expect("test async bridge should install");
+    let mut registry = HostFunctionRegistry::new();
+    registry.register_stack("inspect_event", 1, || Box::new(InspectOpenHeaders));
+    registry.bind_vm_cached(&mut vm).unwrap();
+    drive(&mut vm).await.expect("SSE request");
+    server.join().expect("SSE server should finish");
+    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("stopped"));
+    assert_eq!(field(&vm.stack()[0], "items"), &Value::Int(1));
 }
 
 #[test]
@@ -1420,7 +1497,18 @@ async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
                     "headers",
                     Value::Array(Arc::new(vec![
                         map([
-                            ("name", Value::string("content-type"),),
+                            ("name", Value::string("content-length")),
+                            (
+                                "value",
+                                map([
+                                    ("kind", Value::string("text")),
+                                    ("text", Value::string("0")),
+                                    ("bytes", Value::Null),
+                                ]),
+                            ),
+                        ]),
+                        map([
+                            ("name", Value::string("content-type")),
                             (
                                 "value",
                                 map([
@@ -1459,17 +1547,6 @@ async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
                                 map([
                                     ("kind", Value::string("text")),
                                     ("text", Value::string("second")),
-                                    ("bytes", Value::Null),
-                                ]),
-                            ),
-                        ]),
-                        map([
-                            ("name", Value::string("content-length")),
-                            (
-                                "value",
-                                map([
-                                    ("kind", Value::string("text")),
-                                    ("text", Value::string("0")),
                                     ("bytes", Value::Null),
                                 ]),
                             ),
