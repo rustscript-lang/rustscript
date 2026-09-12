@@ -442,6 +442,14 @@ fn compute_program_cache_key(program: &Program) -> u64 {
         }
     }
     hash_type_map(program.type_map.as_ref(), &mut hasher);
+    let mut named_struct_decls = program.named_struct_decls.iter().collect::<Vec<_>>();
+    named_struct_decls.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    named_struct_decls.len().hash(&mut hasher);
+    for (name, decl) in named_struct_decls {
+        name.hash(&mut hasher);
+        decl.type_params.hash(&mut hasher);
+        hash_type_schema(&decl.body_schema, &mut hasher);
+    }
     hasher.finish()
 }
 
@@ -479,12 +487,113 @@ fn hash_local_schemas(schemas: &[Option<crate::compiler::TypeSchema>], state: &m
     }
 }
 
+#[derive(Clone, Copy)]
+enum NamedStructOrigin {
+    Host,
+    Guest,
+}
+
+#[derive(Clone, Copy)]
+struct NamedStructLookup<'a> {
+    host: &'a HashMap<String, crate::compiler::TypeSchema>,
+    guest: &'a HashMap<String, crate::compiler::StructDecl>,
+}
+
+impl<'a> NamedStructLookup<'a> {
+    fn body(
+        self,
+        name: &str,
+        args: &[crate::compiler::TypeSchema],
+    ) -> Option<(crate::compiler::TypeSchema, NamedStructOrigin)> {
+        if let Some(body) = self.host.get(name) {
+            return Some((body.clone(), NamedStructOrigin::Host));
+        }
+        let decl = self.guest.get(name)?;
+        if decl.type_params.len() != args.len() {
+            return None;
+        }
+        let body = if args.is_empty() {
+            decl.body_schema.clone()
+        } else {
+            let bindings = decl
+                .type_params
+                .iter()
+                .cloned()
+                .zip(args.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            substitute_named_struct_schema(&decl.body_schema, &bindings)
+        };
+        Some((body, NamedStructOrigin::Guest))
+    }
+}
+
+fn substitute_named_struct_schema(
+    schema: &crate::compiler::TypeSchema,
+    bindings: &HashMap<String, crate::compiler::TypeSchema>,
+) -> crate::compiler::TypeSchema {
+    use crate::compiler::TypeSchema;
+
+    match schema {
+        TypeSchema::GenericParam(name) => bindings
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| schema.clone()),
+        TypeSchema::Optional(inner) => {
+            TypeSchema::Optional(Box::new(substitute_named_struct_schema(inner, bindings)))
+        }
+        TypeSchema::Named(name, args) => TypeSchema::Named(
+            name.clone(),
+            args.iter()
+                .map(|arg| substitute_named_struct_schema(arg, bindings))
+                .collect(),
+        ),
+        TypeSchema::Array(inner) => {
+            TypeSchema::Array(Box::new(substitute_named_struct_schema(inner, bindings)))
+        }
+        TypeSchema::ArrayTuple(items) => TypeSchema::ArrayTuple(
+            items
+                .iter()
+                .map(|item| substitute_named_struct_schema(item, bindings))
+                .collect(),
+        ),
+        TypeSchema::ArrayTupleRest { prefix, rest } => TypeSchema::ArrayTupleRest {
+            prefix: prefix
+                .iter()
+                .map(|item| substitute_named_struct_schema(item, bindings))
+                .collect(),
+            rest: Box::new(substitute_named_struct_schema(rest, bindings)),
+        },
+        TypeSchema::Map(inner) => {
+            TypeSchema::Map(Box::new(substitute_named_struct_schema(inner, bindings)))
+        }
+        TypeSchema::Object(fields) => TypeSchema::Object(
+            fields
+                .iter()
+                .map(|(name, field)| {
+                    (
+                        name.clone(),
+                        substitute_named_struct_schema(field, bindings),
+                    )
+                })
+                .collect(),
+        ),
+        TypeSchema::Callable { params, result } => TypeSchema::Callable {
+            params: params
+                .iter()
+                .map(|param| substitute_named_struct_schema(param, bindings))
+                .collect(),
+            result: Box::new(substitute_named_struct_schema(result, bindings)),
+        },
+        _ => schema.clone(),
+    }
+}
+
 fn validate_value_against_type_schema(
     value: &Value,
     schema: &crate::compiler::TypeSchema,
     resources: &ResourceTable,
     validate_scalars: bool,
-    named_struct_schemas: &HashMap<String, crate::compiler::TypeSchema>,
+    named_struct_schemas: NamedStructLookup<'_>,
 ) -> VmResult<()> {
     validate_value_against_type_schema_walk(
         value,
@@ -513,7 +622,7 @@ fn validate_value_against_type_schema_walk(
     schema: &crate::compiler::TypeSchema,
     resources: &ResourceTable,
     validate_scalars: bool,
-    named_struct_schemas: &HashMap<String, crate::compiler::TypeSchema>,
+    named_struct_schemas: NamedStructLookup<'_>,
     depth: usize,
     nodes: &mut usize,
 ) -> VmResult<()> {
@@ -593,31 +702,35 @@ fn validate_value_against_type_schema_walk(
                 )
             }
         }
-        TypeSchema::Named(name, _args) => {
+        TypeSchema::Named(name, args) => {
             if !matches!(value, Value::Map(_)) {
                 return Err(VmError::TypeMismatch("map"));
             }
-            let Some(body) = named_struct_schemas.get(name) else {
+            let Some((body, origin)) = named_struct_schemas.body(name, args) else {
                 return Err(VmError::HostError(format!("unknown named struct '{name}'")));
             };
-            match body {
-                TypeSchema::Object(fields) => validate_named_object_fields(
-                    value,
-                    fields,
-                    resources,
-                    named_struct_schemas,
-                    depth + 1,
-                    nodes,
-                ),
-                other => validate_value_against_type_schema_walk(
-                    value,
-                    other,
-                    resources,
-                    true,
-                    named_struct_schemas,
-                    depth + 1,
-                    nodes,
-                ),
+            match (&body, origin) {
+                (TypeSchema::Object(fields), NamedStructOrigin::Host) => {
+                    validate_named_object_fields(
+                        value,
+                        fields,
+                        resources,
+                        named_struct_schemas,
+                        depth + 1,
+                        nodes,
+                    )
+                }
+                (_, NamedStructOrigin::Guest) | (_, NamedStructOrigin::Host) => {
+                    validate_value_against_type_schema_walk(
+                        value,
+                        &body,
+                        resources,
+                        true,
+                        named_struct_schemas,
+                        depth + 1,
+                        nodes,
+                    )
+                }
             }
         }
         TypeSchema::Map(inner) => {
@@ -769,7 +882,7 @@ fn validate_named_object_fields(
     value: &Value,
     fields: &HashMap<String, crate::compiler::TypeSchema>,
     resources: &ResourceTable,
-    named_struct_schemas: &HashMap<String, crate::compiler::TypeSchema>,
+    named_struct_schemas: NamedStructLookup<'_>,
     depth: usize,
     nodes: &mut usize,
 ) -> VmResult<()> {
@@ -798,14 +911,14 @@ fn validate_named_object_fields(
 
 fn schema_contains_resource(
     schema: &crate::compiler::TypeSchema,
-    named_struct_schemas: &HashMap<String, crate::compiler::TypeSchema>,
+    named_struct_schemas: NamedStructLookup<'_>,
 ) -> bool {
     schema_contains_resource_walk(schema, named_struct_schemas, 0, &mut HashSet::new(), &mut 0)
 }
 
 fn schema_contains_resource_walk(
     schema: &crate::compiler::TypeSchema,
-    named_struct_schemas: &HashMap<String, crate::compiler::TypeSchema>,
+    named_struct_schemas: NamedStructLookup<'_>,
     depth: usize,
     active: &mut HashSet<String>,
     nodes: &mut usize,
@@ -847,14 +960,19 @@ fn schema_contains_resource_walk(
             }) {
                 return true;
             }
-            let Some(body) = named_struct_schemas.get(name) else {
+            let Some((body, _)) = named_struct_schemas.body(name, args) else {
                 return true;
             };
             if !active.insert(name.clone()) {
                 return false;
             }
-            let contains =
-                schema_contains_resource_walk(body, named_struct_schemas, depth + 1, active, nodes);
+            let contains = schema_contains_resource_walk(
+                &body,
+                named_struct_schemas,
+                depth + 1,
+                active,
+                nodes,
+            );
             active.remove(name);
             contains
         }
@@ -1802,7 +1920,10 @@ impl Vm {
                     schema,
                     self.host.execution_scope.resources(),
                     true,
-                    &self.host.named_struct_schemas,
+                    NamedStructLookup {
+                        host: &self.host.named_struct_schemas,
+                        guest: &self.program.named_struct_decls,
+                    },
                 ) {
                     return Err(map_callable_schema_error(error, "callable argument schema"));
                 }
@@ -2081,7 +2202,10 @@ impl Vm {
                 schema,
                 self.host.execution_scope.resources(),
                 true,
-                &self.host.named_struct_schemas,
+                NamedStructLookup {
+                    host: &self.host.named_struct_schemas,
+                    guest: &self.program.named_struct_decls,
+                },
             )
         {
             self.drop_value_with_contract(result);

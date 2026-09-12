@@ -3,7 +3,7 @@ use std::fmt;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
-use crate::compiler::TypeSchema;
+use crate::compiler::{StructDecl, TypeSchema};
 use crate::host_api::HostImportSchema;
 
 /// Bytecode ABI version used for VM-internal cache identity (JIT trace cache,
@@ -639,6 +639,10 @@ pub struct Program {
     /// non-public avoids expanding the public layout while exposing the
     /// semantic metadata through [`Self::host_import_schemas`].
     pub(crate) host_import_schemas: Vec<Option<HostImportSchema>>,
+    /// Compiler struct declarations used to expand guest `TypeSchema::Named`
+    /// at runtime. Host catalog bodies stay on the bound registry table and
+    /// win on name lookup; missing names still fail closed.
+    pub(crate) named_struct_decls: HashMap<String, StructDecl>,
     pub debug: Option<crate::debug_info::DebugInfo>,
     pub type_map: Option<TypeMap>,
     pub script_functions: Vec<ScriptFunction>,
@@ -660,6 +664,7 @@ impl Program {
             local_count,
             imports: Vec::new(),
             host_import_schemas: Vec::new(),
+            named_struct_decls: HashMap::new(),
             debug: None,
             type_map: None,
             script_functions: Vec::new(),
@@ -684,6 +689,7 @@ impl Program {
             local_count,
             imports: Vec::new(),
             host_import_schemas: Vec::new(),
+            named_struct_decls: HashMap::new(),
             debug,
             type_map: None,
             script_functions: Vec::new(),
@@ -709,6 +715,7 @@ impl Program {
             local_count,
             imports,
             host_import_schemas: Vec::new(),
+            named_struct_decls: HashMap::new(),
             debug,
             type_map: None,
             script_functions: Vec::new(),
@@ -780,6 +787,16 @@ impl Program {
     ) -> Self {
         debug_assert_eq!(schemas.len(), self.imports.len());
         self.host_import_schemas = schemas;
+        self
+    }
+
+    /// Attaches compiler struct declarations used to expand guest Named
+    /// schemas at runtime. Host catalog bodies remain on the registry table.
+    pub(crate) fn with_named_struct_decls(
+        mut self,
+        named_struct_decls: HashMap<String, StructDecl>,
+    ) -> Self {
+        self.named_struct_decls = named_struct_decls;
         self
     }
 
