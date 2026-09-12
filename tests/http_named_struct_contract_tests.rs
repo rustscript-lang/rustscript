@@ -435,6 +435,77 @@ fn compile_source_installs_sse_named_structs_and_exact_schema() {
         .expect("default registry must exact-bind catalog-backed SSE");
 }
 
+const HTTP_NAMED_STRUCTS: [&str; 5] = [
+    "HttpRequest",
+    "HttpResponse",
+    "SseRequest",
+    "SseCallbackAction",
+    "SseSummary",
+];
+
+#[test]
+fn compile_source_http_program_guest_table_excludes_http_structs() {
+    let compiled = compile_source(SSE_NAMED_ACTION_SOURCE).unwrap_or_else(|err| {
+        panic!("default compile_source must admit SseCallbackAction, got {err}")
+    });
+    for name in HTTP_NAMED_STRUCTS {
+        assert!(
+            !compiled.program.named_struct_decls().contains_key(name),
+            "guest VMBC table must not carry catalog struct {name}"
+        );
+    }
+}
+
+#[test]
+fn unbound_vm_rejects_host_named_without_catalog_binding() {
+    let compiled = compile_source(
+        r#"
+        fn ident(p: SseCallbackAction) -> SseCallbackAction { p }
+        ident({ action: "continue" });
+        "#,
+    )
+    .unwrap_or_else(|err| panic!("SseCallbackAction program should compile, got {err}"));
+    for name in HTTP_NAMED_STRUCTS {
+        assert!(
+            !compiled.program.named_struct_decls().contains_key(name),
+            "guest table must not provide {name} as a fallback"
+        );
+    }
+    let mut vm = Vm::new(compiled.program);
+    let error = loop {
+        match vm.run() {
+            Err(error) => break error,
+            Ok(VmStatus::Halted) => panic!("unbound host Named must fail closed"),
+            Ok(VmStatus::Yielded) => continue,
+            Ok(VmStatus::Waiting(_)) => panic!("SseCallbackAction ident should not wait"),
+        }
+    };
+    match error {
+        VmError::HostError(message) => {
+            assert!(
+                message.contains("unknown named struct"),
+                "unexpected host error: {message}"
+            );
+        }
+        other => panic!("expected HostError, got {other:?}"),
+    }
+}
+
+#[test]
+fn guest_struct_colliding_with_http_catalog_name_is_rejected() {
+    let message = compile_err(
+        r#"
+        struct SseCallbackAction { action: string }
+        fn ident(p: SseCallbackAction) -> SseCallbackAction { p }
+        ident({ action: "continue" });
+        "#,
+    );
+    assert!(
+        message.contains("duplicate struct schema 'SseCallbackAction'"),
+        "host catalog name must win over a guest collision, got {message}"
+    );
+}
+
 #[test]
 fn options_compile_without_catalog_installs_sse_named_structs() {
     let compiled = compile_source_with_flavor_and_options(

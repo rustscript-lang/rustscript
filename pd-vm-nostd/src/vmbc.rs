@@ -10,6 +10,7 @@ use super::{
 const MAGIC: [u8; 4] = *b"VMBC";
 const VERSION_V11: u16 = 11;
 const VERSION_V12: u16 = 12;
+const VERSION_V13: u16 = 13;
 const FLAGS: u16 = 0;
 const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;
@@ -74,7 +75,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     let version = cursor.read_u16()?;
     let has_host_import_schemas = match version {
         VERSION_V11 => false,
-        VERSION_V12 => true,
+        VERSION_V12 | VERSION_V13 => true,
         _ => return Err(WireError::UnsupportedVersion(version)),
     };
     let flags = cursor.read_u16()?;
@@ -123,8 +124,8 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         root_callable_bindings,
         exported_callables,
     ) = read_callable_metadata(&mut cursor)?;
-    if !cursor.is_empty() {
-        skip_named_struct_decls(&mut cursor).map_err(|_| WireError::TrailingBytes)?;
+    if version >= VERSION_V13 {
+        skip_named_struct_decls(&mut cursor)?;
     }
     if !cursor.is_empty() {
         return Err(WireError::TrailingBytes);
@@ -294,8 +295,14 @@ fn skip_named_struct_decls(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
     for _ in 0..count {
         cursor.skip_string()?;
         let param_count = cursor.read_count("named struct type params", 1)?;
+        let mut seen = Vec::new();
+        reserve(&mut seen, "named struct type params", param_count)?;
         for _ in 0..param_count {
-            cursor.skip_string()?;
+            let param = cursor.read_string()?;
+            if seen.iter().any(|existing| existing == &param) {
+                return Err(WireError::InvalidValueType(0));
+            }
+            seen.push(param);
         }
         skip_schema(cursor, 0)?;
     }

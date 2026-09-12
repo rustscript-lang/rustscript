@@ -39,7 +39,7 @@ pub use self::host_call_resolve::{HostCallResolveError, HostCallResolver};
 pub use self::ir::{
     AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, FunctionParam,
     LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern, ResolvedHostCall, ResolvedHostParam,
-    SemanticIndex, Stmt, StructDecl, TypeSchema,
+    SemanticIndex, Stmt, StructDecl, StructDeclOrigin, TypeSchema,
 };
 pub use self::modules::{
     DeclSymbol, ExportEntry, ImportTargetKind, ImportedBinding, ModuleGraph, ModuleId, ModuleNode,

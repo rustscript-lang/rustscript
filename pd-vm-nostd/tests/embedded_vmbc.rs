@@ -31,9 +31,9 @@ fn encoded_scalar_program() -> Vec<u8> {
 }
 
 #[test]
-fn embedded_decoder_reads_host_generated_v12() {
+fn embedded_decoder_reads_host_generated_v13() {
     let bytes = encoded_scalar_program();
-    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v12");
+    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v13");
 
     assert_eq!(
         program.code(),
@@ -96,6 +96,8 @@ fn embedded_decoder_reads_legacy_v11_without_schema_markers() {
         vec![OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8],
     );
     let mut bytes = encode_program(&program).expect("legacy fixture should encode");
+    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 4);
     bytes[4..6].copy_from_slice(&11u16.to_le_bytes());
 
     let decoded = decode_program(&bytes).expect("embedded decoder should accept VMBC v11");
@@ -459,4 +461,53 @@ fn call_script_opcode_is_0x1a_in_both_crates() {
         Ok(EmbeddedOpCode::CallScript)
     );
     assert!(EmbeddedOpCode::try_from(0x7f).is_err());
+}
+
+fn append_wire_string(out: &mut Vec<u8>, value: &str) {
+    out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+#[test]
+fn embedded_decoder_reads_v13_guest_named_struct_payload() {
+    let compiled = compile_source(
+        r#"
+        struct Point { x: int, y: int }
+        fn ident(p: Point) -> Point { p }
+        ident({ x: 8, y: 9 });
+        "#,
+    )
+    .expect("guest Named source should compile");
+    let bytes = encode_program(&compiled.program).expect("struct-bearing program should encode");
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
+    let program = decode_program(&bytes).expect("embedded decoder should skip guest named structs");
+    assert_eq!(program.code().last().copied(), Some(OpCode::Ret as u8));
+}
+
+#[test]
+fn embedded_decoder_rejects_duplicate_named_struct_generic_params() {
+    let mut bytes = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("empty program should encode");
+    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 4);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    append_wire_string(&mut bytes, "Holder");
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    append_wire_string(&mut bytes, "T");
+    append_wire_string(&mut bytes, "T");
+    bytes.push(14);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(decode_program(&bytes), Err(WireError::InvalidValueType(0)));
+}
+
+#[test]
+fn embedded_decoder_rejects_v12_trailing_zero_named_struct_garbage() {
+    let mut bytes = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("empty program should encode");
+    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 4);
+    bytes[4..6].copy_from_slice(&12u16.to_le_bytes());
+    decode_program(&bytes).expect("clean v12 should decode");
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(decode_program(&bytes), Err(WireError::TrailingBytes));
 }

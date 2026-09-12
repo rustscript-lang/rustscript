@@ -28,7 +28,7 @@
 
 use crate::host_api::{HostStructField, HostStructSchema, HostTypeSchema};
 
-use super::{StructDecl, TypeSchema};
+use super::{StructDecl, StructDeclOrigin, TypeSchema};
 
 impl HostTypeSchema {
     /// Maps this host schema onto the compiler's [`TypeSchema`], recursively
@@ -100,6 +100,7 @@ impl HostStructSchema {
             name: self.name.clone(),
             type_params: Vec::new(),
             body_schema: self.to_compiler_object_schema(),
+            origin: StructDeclOrigin::Catalog,
         }
     }
 }

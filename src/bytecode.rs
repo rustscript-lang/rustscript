@@ -8,9 +8,10 @@ use crate::host_api::HostImportSchema;
 
 /// Bytecode ABI version used for VM-internal cache identity (JIT trace cache,
 /// program cache keys). The VMBC wire format version lives in `src/vmbc.rs`
-/// (`VERSION_V12`); both were bumped together for the static builtin ID break
-/// and again for the direct script-call (`CallScript`) opcode break.
-pub const BYTECODE_ABI_VERSION: u16 = 12;
+/// (`VERSION_V13`); both were bumped together for the static builtin ID break
+/// and again for the direct script-call (`CallScript`) opcode break. Version 13
+/// adds an explicit guest named-struct declaration section.
+pub const BYTECODE_ABI_VERSION: u16 = 13;
 
 pub type SharedString = Arc<String>;
 pub type SharedBytes = Arc<Vec<u8>>;
@@ -798,6 +799,14 @@ impl Program {
     ) -> Self {
         self.named_struct_decls = named_struct_decls;
         self
+    }
+
+    /// Guest/source named-struct declarations transported on this program.
+    ///
+    /// Host catalog structs are not included; they stay on the bound registry
+    /// table and fail closed when that table is absent.
+    pub fn named_struct_decls(&self) -> &HashMap<String, StructDecl> {
+        &self.named_struct_decls
     }
 
     pub fn with_local_count(mut self, local_count: usize) -> Self {

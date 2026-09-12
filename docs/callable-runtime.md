@@ -1,6 +1,6 @@
 # Script call frames and callable values
 
-RustScript bytecode format version 12 (VMBC v12) carries runtime script call frames, first-class callable values, the static builtin ID catalog, and the direct script-call opcode. Version 11 introduced frames, callable values, and the static catalog; version 12 adds `callscript` for statically resolved named calls.
+RustScript bytecode format version 13 (VMBC v13) carries runtime script call frames, first-class callable values, the static builtin ID catalog, the direct script-call opcode, and an explicit guest named-struct declaration section. Version 11 introduced frames, callable values, and the static catalog; version 12 adds `callscript` for statically resolved named calls; version 13 frames guest struct declarations so a 4-byte zero trailer cannot be mistaken for an empty table.
 
 ## Bytecode contract
 
@@ -18,7 +18,7 @@ The three call opcodes differ in who owns the callee and what the frame must pro
 - `callvalue` — the callee is a `Value::Callable` owned by the caller operand stack at the call site, and remains the caller's responsibility after the call. This path carries environments, closures, and any callable whose identity or capture state is runtime-valued.
 - `callscript` — the callee is owned by program callable metadata (the prototype table). The frame contributes only `argc` arguments and no callable value, but unlike `call` the callee is a script function rather than a builtin, so the call enters a new script frame with its own local base.
 
-VMBC v12 is the current format. It decodes the legacy v11 stream without host-schema metadata, while v12 carries full host schemas and callable metadata. Unknown versions and malformed resource schemas are rejected deterministically. PDRC v6 recordings and AOT artifacts (format 8, ABI 8) use their corresponding bumped versions and include callable metadata in cache identity.
+VMBC v13 is the current format. It decodes the legacy v11 stream without host-schema metadata and the v12 stream without a named-struct section, while v13 carries full host schemas, callable metadata, and an explicit guest named-struct table. Unknown versions and malformed resource schemas are rejected deterministically. PDRC v6 recordings and AOT artifacts (format 8, ABI 8) use their corresponding bumped versions and include callable metadata in cache identity.
 
 ## Static builtin IDs
 
@@ -27,7 +27,7 @@ Every VM-visible builtin (ordinary, internal, and special-call) has one explicit
 - **Immutable explicit IDs.** IDs never change once assigned. Adding or reordering catalog entries never renumbers existing entries; new builtins take the next free ID in their documented block (extension `0x0000..=0xFF8F` for future builtins and host imports, special-call `0xFF90..=0xFFA1`, ordinary `0xFFA2..=0xFFFF`). The reserved sentinel gap `0xFF90..=0xFF92` stays unassigned.
 - **Build-time validation.** The build fails on duplicate IDs, duplicate source names, duplicate Rust variants, out-of-block IDs, class/gate inconsistencies, a discovered runtime callable without an explicit ID, or a catalog entry without a runtime callable.
 - **Shared std/no-std IDs.** `pd-vm-nostd` dispatches on the same static indices through the checked-in generated mirror `pd-vm-nostd/src/generated_builtin_ids.rs`; the workspace test `static_builtin_ids_are_frozen` fails when the mirror drifts from the catalog.
-- **Format breaks are permanent.** The static ID migration bumped VMBC to v11 (and the internal bytecode ABI to 11); the `callscript` opcode break bumped both to v12. Versions below the current format are rejected, never decoded.
+- **Format breaks are permanent.** The static ID migration bumped VMBC to v11 (and the internal bytecode ABI to 11); the `callscript` opcode break bumped both to v12; the guest named-struct section bumped both to v13. Versions below the current encode format are not rewritten in place: v11/v12 remain readable only in their original framing.
 
 ## Runtime model
 
