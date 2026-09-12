@@ -506,6 +506,9 @@ impl<'a> NamedStructLookup<'a> {
         args: &[crate::compiler::TypeSchema],
     ) -> Option<(crate::compiler::TypeSchema, NamedStructOrigin)> {
         if let Some(body) = self.host.get(name) {
+            if !args.is_empty() {
+                return None;
+            }
             return Some((body.clone(), NamedStructOrigin::Host));
         }
         let decl = self.guest.get(name)?;
