@@ -501,6 +501,24 @@ fn embedded_decoder_rejects_duplicate_named_struct_generic_params() {
 }
 
 #[test]
+fn embedded_decoder_rejects_duplicate_named_struct_names() {
+    let mut bytes = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("empty program should encode");
+    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 4);
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    append_wire_string(&mut bytes, "Dup");
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.push(14);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    append_wire_string(&mut bytes, "Dup");
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.push(14);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(decode_program(&bytes), Err(WireError::InvalidValueType(0)));
+}
+
+#[test]
 fn embedded_decoder_rejects_v12_trailing_zero_named_struct_garbage() {
     let mut bytes = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
         .expect("empty program should encode");

@@ -1,6 +1,6 @@
 //! Milestone 7: `CallScript` parity in the no_std + alloc runtime.
 //!
-//! Programs are produced by the std VMBC encoder (V12) or hand-built with
+//! Programs are produced by the std VMBC encoder (V13) or hand-built with
 //! `CallScript` bytecode (0x1A, prototype_id:u32 LE, argc:u8) so the wire
 //! contract and the typed validation/execution failures are pinned
 //! independently of the compiler.
@@ -70,8 +70,8 @@ fn call_script_executes_direct_call() {
     let compiled = compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
         .expect("direct call source should compile");
     let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
-        .expect("direct call program should encode as VMBC v12");
-    let program = decode_program(&bytes).expect("no-std should decode VMBC v12");
+        .expect("direct call program should encode as VMBC v13");
+    let program = decode_program(&bytes).expect("no-std should decode VMBC v13");
     assert!(
         program.code().windows(2).any(|pair| pair[0] == 0x1A),
         "compiler output should contain CallScript"
