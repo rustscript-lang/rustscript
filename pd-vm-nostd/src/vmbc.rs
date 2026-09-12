@@ -292,8 +292,14 @@ fn skip_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireError> {
 
 fn skip_named_struct_decls(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
     let count = cursor.read_count("named struct decls", 1)?;
+    let mut seen_names = Vec::new();
+    reserve(&mut seen_names, "named struct decls", count)?;
     for _ in 0..count {
-        cursor.skip_string()?;
+        let name = cursor.read_string()?;
+        if seen_names.iter().any(|existing| existing == &name) {
+            return Err(WireError::InvalidValueType(0));
+        }
+        seen_names.push(name);
         let param_count = cursor.read_count("named struct type params", 1)?;
         let mut seen = Vec::new();
         reserve(&mut seen, "named struct type params", param_count)?;

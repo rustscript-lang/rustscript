@@ -92,4 +92,4 @@ Whole-program AOT and Trace JIT use the same builtin call path (static catalog I
 
 ## Embedded runtime
 
-`pd-vm-nostd` decodes the same VMBC v12 callable metadata and executes callable binding, `callvalue`, `callscript`, recursive frames, captures, and direct host targets using `core` plus `alloc`, dispatching on the identical static builtin IDs via its checked-in generated mirror.
+`pd-vm-nostd` decodes the same VMBC v13 callable metadata and executes callable binding, `callvalue`, `callscript`, recursive frames, captures, and direct host targets using `core` plus `alloc`, dispatching on the identical static builtin IDs via its checked-in generated mirror.
