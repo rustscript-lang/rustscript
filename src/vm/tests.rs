@@ -3930,6 +3930,32 @@ mod callable_resource_schema_tests {
     }
 
     #[test]
+    fn host_named_struct_rejects_nonempty_type_args() {
+        let (_schema, named) = handle_box_schema();
+        let schema = TypeSchema::Named("HandleBox".to_string(), vec![TypeSchema::Int]);
+        let (mut vm, callable) = callable_vm_with_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            named,
+        );
+        let handle = resource_handle(&mut vm);
+        let error = vm
+            .invoke_callable(callable, &[named_handle_box(handle, None)])
+            .expect_err("host Named with type args must fail closed");
+        match error {
+            VmError::HostError(message) => {
+                assert!(
+                    message.contains("unknown named struct"),
+                    "unexpected host error: {message}"
+                );
+            }
+            other => panic!("expected HostError, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unknown_named_struct_fails_closed() {
         let schema = TypeSchema::Named("MissingBox".to_string(), Vec::new());
         let (mut vm, callable) =

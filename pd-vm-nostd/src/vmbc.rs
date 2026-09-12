@@ -234,6 +234,15 @@ fn skip_host_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireErr
             skip_host_schema(cursor, depth + 1)
         }
         12 => cursor.skip_string(),
+        13 => {
+            cursor.skip_string()?;
+            let field_count = cursor.read_count_with_overhead("host named struct fields", 1, 1)?;
+            for _ in 0..field_count {
+                cursor.skip_string()?;
+                skip_host_schema(cursor, depth + 1)?;
+            }
+            Ok(())
+        }
         value => Err(WireError::InvalidValueType(value)),
     }
 }

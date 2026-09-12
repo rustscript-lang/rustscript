@@ -1366,8 +1366,8 @@ fn callable_schema_matches(
                 name: expected_name,
                 ..
             },
-            TypeSchema::Named(actual_name, _),
-        ) => expected_name == actual_name,
+            TypeSchema::Named(actual_name, args),
+        ) => expected_name == actual_name && args.is_empty(),
         (HostTypeSchema::Named { fields, .. }, TypeSchema::Object(actual_fields)) => {
             named_fields_match_object(fields, actual_fields)
         }
@@ -3733,6 +3733,10 @@ mod tests {
         assert!(callable_schema_matches(
             &expected,
             &TypeSchema::Object(object_fields),
+        ));
+        assert!(!callable_schema_matches(
+            &expected,
+            &TypeSchema::Named("SseEvent".to_string(), vec![TypeSchema::Int]),
         ));
     }
 

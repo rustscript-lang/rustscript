@@ -5,9 +5,9 @@ use pd_vm_nostd::{
 use vm::compiler::TypeSchema;
 use vm::{
     HostApiBuilder, HostFunctionSchema, HostImport, HostImportSchema, HostParamPassing,
-    HostParamSchema, HostTypeSchema, OpCode, Program, ReplLocalBinding, ResourceTypeKey,
-    ResourceTypeSchema, TypeMap, Value, ValueType, compile_source, compile_source_for_repl,
-    compile_source_for_repl_with_locals, encode_program,
+    HostParamSchema, HostStructField, HostStructSchema, HostTypeSchema, OpCode, Program,
+    ReplLocalBinding, ResourceTypeKey, ResourceTypeSchema, TypeMap, Value, ValueType,
+    compile_source, compile_source_for_repl, compile_source_for_repl_with_locals, encode_program,
 };
 
 fn encoded_scalar_program() -> Vec<u8> {
@@ -87,6 +87,62 @@ fn embedded_decoder_skips_full_host_schema_metadata() {
     let bytes = encode_program(&program).expect("schema payload should encode");
     let decoded = decode_program(&bytes).expect("embedded decoder should skip schema payload");
     assert_eq!(decoded.imports().len(), 1);
+}
+
+fn point_named_schema() -> HostTypeSchema {
+    HostTypeSchema::named_struct(
+        "Point",
+        vec![
+            HostStructField::new("x", HostTypeSchema::Int),
+            HostStructField::new("y", HostTypeSchema::Int),
+        ],
+    )
+}
+
+fn envelope_named_schema() -> HostTypeSchema {
+    HostTypeSchema::named_struct(
+        "Envelope",
+        vec![HostStructField::new("inner", point_named_schema())],
+    )
+}
+
+#[test]
+fn embedded_decoder_skips_named_host_schema_from_std_encode() {
+    let function = HostFunctionSchema::with_return(
+        "embedded::named",
+        vec![HostParamSchema::value("req", envelope_named_schema())],
+        point_named_schema(),
+    );
+    let mut builder = HostApiBuilder::new();
+    builder.named_struct(HostStructSchema::new(
+        "Point",
+        vec![
+            HostStructField::new("x", HostTypeSchema::Int),
+            HostStructField::new("y", HostTypeSchema::Int),
+        ],
+    ));
+    builder.named_struct(HostStructSchema::new(
+        "Envelope",
+        vec![HostStructField::new("inner", point_named_schema())],
+    ));
+    builder.function(function.clone());
+    let catalog = builder.build().expect("catalog");
+    let schema = HostImportSchema::from_function(&catalog, &function);
+
+    let mut program = Program::new(Vec::new(), vec![OpCode::Ret as u8]);
+    program.imports.push(HostImport {
+        name: "embedded::named".to_string(),
+        arity: 1,
+        return_type: ValueType::Map,
+    });
+    let program = program
+        .with_host_import_schemas(vec![schema])
+        .expect("schema alignment");
+    let bytes = encode_program(&program).expect("named host schema should encode");
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
+    let decoded = decode_program(&bytes).expect("embedded decoder should skip Named host schemas");
+    assert_eq!(decoded.imports().len(), 1);
+    assert_eq!(decoded.imports()[0].name, "embedded::named");
 }
 
 #[test]
@@ -466,6 +522,110 @@ fn call_script_opcode_is_0x1a_in_both_crates() {
 fn append_wire_string(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(&(value.len() as u32).to_le_bytes());
     out.extend_from_slice(value.as_bytes());
+}
+
+fn v12_with_named_host_return_schema(schema: &[u8]) -> Vec<u8> {
+    let mut bytes = minimal_vmbc_prefix(0, &[EmbeddedOpCode::Ret as u8], 1);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(b'h');
+    bytes.extend_from_slice(&[0, 0, 1]);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.push(b'h');
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(schema);
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.push(0);
+    bytes.push(0);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes
+}
+
+fn empty_named_host_schema(name: &str) -> Vec<u8> {
+    let mut schema = vec![13];
+    append_wire_string(&mut schema, name);
+    schema.extend_from_slice(&0u32.to_le_bytes());
+    schema
+}
+
+fn nested_named_host_schema(depth: usize) -> Vec<u8> {
+    let mut schema = empty_named_host_schema("Leaf");
+    for _ in 0..depth {
+        let mut outer = vec![13];
+        append_wire_string(&mut outer, "Wrap");
+        outer.extend_from_slice(&1u32.to_le_bytes());
+        append_wire_string(&mut outer, "inner");
+        outer.extend_from_slice(&schema);
+        schema = outer;
+    }
+    schema
+}
+
+#[test]
+fn embedded_decoder_accepts_empty_named_host_schema() {
+    let bytes = v12_with_named_host_return_schema(&empty_named_host_schema("Point"));
+    decode_program(&bytes).expect("empty Named host schema should skip");
+}
+
+#[test]
+fn embedded_decoder_rejects_truncated_named_host_schema() {
+    let mut schema = vec![13];
+    append_wire_string(&mut schema, "Point");
+    schema.extend_from_slice(&1u32.to_le_bytes());
+    assert_eq!(
+        decode_program(&v12_with_named_host_return_schema(&schema)),
+        Err(WireError::UnexpectedEof)
+    );
+}
+
+#[test]
+fn embedded_decoder_rejects_oversized_named_host_field_count() {
+    const TOO_MANY: u32 = 1_000_001;
+    let mut schema = vec![13];
+    append_wire_string(&mut schema, "Point");
+    schema.extend_from_slice(&TOO_MANY.to_le_bytes());
+    assert!(matches!(
+        decode_program(&v12_with_named_host_return_schema(&schema)),
+        Err(WireError::LengthTooLarge("host named struct fields", count))
+            if count == TOO_MANY as usize
+    ));
+}
+
+#[test]
+fn embedded_decoder_rejects_malformed_nested_named_host_schema() {
+    let mut schema = vec![13];
+    append_wire_string(&mut schema, "Outer");
+    schema.extend_from_slice(&1u32.to_le_bytes());
+    append_wire_string(&mut schema, "inner");
+    schema.push(99);
+    assert_eq!(
+        decode_program(&v12_with_named_host_return_schema(&schema)),
+        Err(WireError::InvalidValueType(99))
+    );
+}
+
+#[test]
+fn embedded_decoder_rejects_truncated_nested_named_host_schema() {
+    let mut schema = vec![13];
+    append_wire_string(&mut schema, "Outer");
+    schema.extend_from_slice(&1u32.to_le_bytes());
+    append_wire_string(&mut schema, "inner");
+    schema.push(13);
+    append_wire_string(&mut schema, "Inner");
+    schema.extend_from_slice(&1u32.to_le_bytes());
+    assert_eq!(
+        decode_program(&v12_with_named_host_return_schema(&schema)),
+        Err(WireError::UnexpectedEof)
+    );
+}
+
+#[test]
+fn embedded_decoder_rejects_oversized_nested_named_host_depth() {
+    let bytes = v12_with_named_host_return_schema(&nested_named_host_schema(64));
+    assert_eq!(decode_program(&bytes), Err(WireError::SchemaTooDeep));
 }
 
 #[test]

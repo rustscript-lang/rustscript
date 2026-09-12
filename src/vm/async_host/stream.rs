@@ -66,10 +66,11 @@ pub(crate) struct HostStreamAdmissionError {
 ///
 /// The VM always validates the callback's callable provenance and arity before
 /// installing a driver. When its metadata is [`TypeSchema::Callable`], it also
-/// validates the argument and result schemas against `fn(map) -> map`. HTTP SSE
-/// additionally requires an `SseCallbackAction`-compatible named or object
-/// result rather than an arbitrary map. Scripts receive ordinary callback items
-/// and a final value; they never receive a stream handle or a producer poll API.
+/// validates a map argument and a map, Named, or Object result. HTTP SSE
+/// additionally requires the exact `SseCallbackAction` named type or a matching
+/// `{ action: string }` object rather than an arbitrary map. Scripts receive
+/// ordinary callback items and a final value; they never receive a stream
+/// handle or a producer poll API.
 ///
 /// Implementors must observe these contracts:
 ///
@@ -179,9 +180,12 @@ impl Vm {
     /// This Rust embedding API does not create a script-visible handle. The VM
     /// always validates that `callback` is a callable owned by this VM and has
     /// arity one. When its metadata is [`TypeSchema::Callable`], the VM also
-    /// validates its argument and result schemas against `fn(map) -> map`. It
-    /// then owns the callback and driver until completion, cancellation, reset,
-    /// or error; removing the driver drops it to release producer resources.
+    /// validates a map argument and a map, Named, or Object result. HTTP SSE
+    /// uses [`Self::validate_sse_callback_value`] for the exact
+    /// `SseCallbackAction` named/object contract rather than an arbitrary map.
+    /// The VM then owns the callback and driver until completion, cancellation,
+    /// reset, or error; removing the driver drops it to release producer
+    /// resources.
     ///
     /// The driver contract is documented on [`HostStreamDriver`]. In
     /// particular, producer polling and callback action application stay
