@@ -60,7 +60,7 @@ let body = response.body;
 
 - `method`: one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, or `OPTIONS`;
 - `url`: an `http` or `https` URL admitted by host policy;
-- `headers`: an optional ordered array of `{ name: string, value: string }` `HttpRequestHeader` values;
+- `headers`: an optional ordered array of `{ name: string, value: string }` `HttpRequestHeader` values; repeated entries and their supplied order are retained by the runtime, while HTTP does not promise server-visible ordering across different names;
 - `body`: an optional `HttpRequestBody`, either `{ kind: "text", text: string }` or `{ kind: "bytes", bytes: bytes }`.
 
 The response is an `HttpResponse` with field access:
@@ -82,8 +82,7 @@ header.value.text    // string or null
 header.value.bytes   // bytes or null
 ```
 
-Response headers remain ordered, repeated names remain separate entries, and
-non-UTF-8 values use the `bytes` variant without loss. Use field access on
+Response header arrays use deterministic canonical order by normalized header name. Repeated names remain separate entries, and stable sorting preserves the `HeaderMap`-provided order among duplicate values. The original cross-name wire order is not an API contract. Non-UTF-8 values use the `bytes` variant without loss. Use field access on
 named values; unknown fields and string indexes are rejected. The request body,
 response body, response head, redirect count, concurrent connection count,
 connect phase, and total request duration are bounded. `Host`,
@@ -119,7 +118,7 @@ let outcome = result.outcome;
 | --- | --- | --- | --- |
 | `method` | yes | string: `GET` or `POST` | Other methods are rejected before transport admission |
 | `url` | yes | string containing an `http` or `https` URL | Protocol family and the configured scheme, host, port, and address policy must all admit it |
-| `headers` | no | ordered array of `{ name: string, value: string }` `HttpRequestHeader` values | Names and values must be syntactically valid; client-managed request headers remain forbidden, and `Accept: text/event-stream` is supplied when absent |
+| `headers` | no | ordered array of `{ name: string, value: string }` `HttpRequestHeader` values; repeated entries and supplied order are retained | HTTP does not promise server-visible ordering across different names; names and values must be syntactically valid, client-managed request headers remain forbidden, and `Accept: text/event-stream` is supplied when absent |
 | `body` | no | `HttpRequestBody`: `{ kind: "text", text: string }` or `{ kind: "bytes", bytes: bytes }`, including for `POST` | Bounded by `max_request_body_bytes` |
 | `timeout_ms` | no | positive integer milliseconds | Caps this optional shortening deadline by `HttpConfig::max_stream_duration` |
 
@@ -170,10 +169,13 @@ The callback receives exactly one `SseEvent` at a time, in this order:
 }
 ```
 
-`open.headers` and the summary's `headers` use ordered `HttpResponseHeader`
-entries. Each entry's `value` is an `HttpHeaderValue` with `kind: "text"` and
-`text`, or `kind: "bytes"` and `bytes`. The unused optional payload field is
-`null`. Duplicate names and raw non-UTF-8 values are preserved.
+`open.headers` and the summary's `headers` use deterministic canonical order by
+normalized header name. Repeated names remain separate entries, and stable
+sorting preserves the `HeaderMap`-provided order among duplicate values. Each
+entry's `value` is an `HttpHeaderValue` with `kind: "text"` and `text`, or
+`kind: "bytes"` and `bytes`. The unused optional payload field is `null`. The
+original cross-name wire order is not an API contract; raw non-UTF-8 values are
+preserved.
 
 The callback must return an `SseCallbackAction`:
 

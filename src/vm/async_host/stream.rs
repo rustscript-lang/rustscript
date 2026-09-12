@@ -287,7 +287,9 @@ impl Vm {
                 TypeSchema::Map(_) | TypeSchema::Named(_, _) | TypeSchema::Object(_)
             ))
         {
-            return Err(VmError::TypeMismatch("fn(map) -> map"));
+            return Err(VmError::TypeMismatch(
+                "callable stream callback must accept one map or named input and return a map, named value, or object",
+            ));
         }
         Ok(())
     }

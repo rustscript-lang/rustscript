@@ -487,9 +487,13 @@ fn sse_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
 
 /// Starts an HTTP request under the VM's configured network policy.
 ///
-/// The request is a named `HttpRequest` map: `method`, `url`, optional
-/// `headers`, and optional `body` (string or bytes). The response is a named
-/// `HttpResponse` map with `status`, `headers`, `body`, and the final `url`.
+/// The request is a named `HttpRequest` record with `method`, `url`, optional
+/// `headers` as an array of typed `HttpRequestHeader` wrappers, and optional
+/// `body` as a typed `HttpRequestBody` wrapper. `HttpRequestBody` discriminates
+/// between `{ kind: "text", text: string }` and `{ kind: "bytes", bytes: bytes }`;
+/// the unused payload field is null. The response is a named `HttpResponse`
+/// record with `status`, typed `HttpResponseHeader` entries in `headers`, raw
+/// response `body` bytes, and the final validated `url`.
 #[pd_host_function(name = "http::client::request")]
 pub(super) fn builtin_http_client_request(
     vm: &mut Vm,
