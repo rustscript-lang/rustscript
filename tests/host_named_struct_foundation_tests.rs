@@ -298,7 +298,9 @@ fn resource_bearing_named_param_is_detected_at_exact_registration() {
         "named struct with a nested resource must classify as resource-bearing"
     );
     let mut registry = vm::HostFunctionRegistry::empty();
-    registry.install_named_struct_schemas(vm::catalog_named_struct_schemas(&catalog));
+    registry
+        .install_named_struct_schemas(vm::catalog_named_struct_schemas(&catalog))
+        .expect("install named struct schemas");
     assert!(
         matches!(
             registry.named_struct_schemas().get("HandleBox"),
@@ -333,7 +335,9 @@ fn resource_bearing_named_return_is_classified_without_rejecting_registration() 
     );
     assert!(schema.return_type.contains_resource());
     let mut registry = vm::HostFunctionRegistry::empty();
-    registry.install_named_struct_schemas(vm::catalog_named_struct_schemas(&catalog));
+    registry
+        .install_named_struct_schemas(vm::catalog_named_struct_schemas(&catalog))
+        .expect("install named struct schemas");
     assert!(
         matches!(
             registry.named_struct_schemas().get("HandleBox"),
@@ -365,6 +369,7 @@ fn catalog_import_schemas_into_installs_named_struct_bodies() {
     let catalog = handle_catalog();
     let mut registry = HostFunctionRegistry::empty();
     let schema = vm::catalog_import_schemas_into(&mut registry, &catalog, "handles::borrow")
+        .expect("catalog import")
         .into_iter()
         .next()
         .expect("borrow schema");
@@ -394,4 +399,32 @@ fn named_struct_fields_are_inline_without_a_side_table() {
     registry
         .register_exact_static("handles::borrow", 1, schema, noop_host)
         .expect("HostTypeSchema::Named carries fields inline, so registration does not require a side table");
+}
+
+#[test]
+fn install_named_struct_schemas_merges_and_rejects_conflicts() {
+    let catalog = handle_catalog();
+    let mut registry = HostFunctionRegistry::empty();
+    registry
+        .install_named_struct_schemas(vm::catalog_named_struct_schemas(&catalog))
+        .expect("first install");
+    registry
+        .install_named_struct_schemas(vm::catalog_named_struct_schemas(&catalog))
+        .expect("identical catalog reinstall must merge");
+    let mut conflict = std::collections::HashMap::new();
+    conflict.insert("HandleBox".to_string(), TypeSchema::Int);
+    let error = registry
+        .install_named_struct_schemas(conflict)
+        .expect_err("conflicting HandleBox body must be rejected");
+    assert!(
+        matches!(error, vm::VmError::HostError(ref message) if message.contains("conflicting named struct schema")),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        matches!(
+            registry.named_struct_schemas().get("HandleBox"),
+            Some(TypeSchema::Object(_))
+        ),
+        "rejected conflict must leave the original HandleBox body in place"
+    );
 }

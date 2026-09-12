@@ -128,6 +128,10 @@ pub(crate) struct HostRuntime {
     bridge_operations: HashMap<HostOpId, BridgeOperationState>,
     /// Adapter-owned completions for operations driven by the execution scope.
     pub(crate) scoped_operation_completions: HashMap<OperationId, ScopedOperationCompletion>,
+    /// Catalog named-struct bodies copied from the bound host registry.
+    /// Compiler identity stays `TypeSchema::Named`; this table supplies Object
+    /// bodies for runtime validation and nested-resource classification.
+    pub(crate) named_struct_schemas: Arc<HashMap<String, crate::compiler::TypeSchema>>,
     /// Host-owned callable stream drivers. The VM stores only this generic
     /// driver contract; HTTP/SSE state remains in the adapter module.
     pub(crate) stream_drivers: HashMap<HostOpId, Box<dyn HostStreamDriver>>,
@@ -170,6 +174,7 @@ impl HostRuntime {
             allowed_host_function_slots: Vec::new(),
             allow_default_host_fallback: true,
             standard_composition: None,
+            named_struct_schemas: Arc::new(HashMap::new()),
             submitted_host_ops: HashSet::new(),
             bridge_operations: HashMap::new(),
             scoped_operation_completions: HashMap::new(),

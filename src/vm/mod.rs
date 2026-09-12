@@ -484,8 +484,48 @@ fn validate_value_against_type_schema(
     schema: &crate::compiler::TypeSchema,
     resources: &ResourceTable,
     validate_scalars: bool,
+    named_struct_schemas: &HashMap<String, crate::compiler::TypeSchema>,
+) -> VmResult<()> {
+    validate_value_against_type_schema_walk(
+        value,
+        schema,
+        resources,
+        validate_scalars,
+        named_struct_schemas,
+        0,
+        &mut 0,
+    )
+}
+
+fn charge_named_schema_node(nodes: &mut usize) -> VmResult<()> {
+    *nodes = nodes.saturating_add(1);
+    if *nodes > crate::host_api::MAX_HOST_SCHEMA_NODES {
+        return Err(VmError::HostError(format!(
+            "named struct schema exceeded complexity limit {}",
+            crate::host_api::MAX_HOST_SCHEMA_NODES
+        )));
+    }
+    Ok(())
+}
+
+fn validate_value_against_type_schema_walk(
+    value: &Value,
+    schema: &crate::compiler::TypeSchema,
+    resources: &ResourceTable,
+    validate_scalars: bool,
+    named_struct_schemas: &HashMap<String, crate::compiler::TypeSchema>,
+    depth: usize,
+    nodes: &mut usize,
 ) -> VmResult<()> {
     use crate::compiler::TypeSchema;
+
+    charge_named_schema_node(nodes)?;
+    if depth > crate::host_api::MAX_HOST_SCHEMA_DEPTH {
+        return Err(VmError::HostError(format!(
+            "named struct schema exceeded depth limit {}",
+            crate::host_api::MAX_HOST_SCHEMA_DEPTH
+        )));
+    }
 
     match schema {
         TypeSchema::Unknown | TypeSchema::GenericParam(_) => Ok(()),
@@ -542,25 +582,61 @@ fn validate_value_against_type_schema(
             if matches!(value, Value::Null) {
                 Ok(())
             } else {
-                validate_value_against_type_schema(value, inner, resources, validate_scalars)
+                validate_value_against_type_schema_walk(
+                    value,
+                    inner,
+                    resources,
+                    validate_scalars,
+                    named_struct_schemas,
+                    depth + 1,
+                    nodes,
+                )
             }
         }
-        TypeSchema::Named(_, _) => {
-            if matches!(value, Value::Map(_)) {
-                Ok(())
-            } else {
-                Err(VmError::TypeMismatch("map"))
+        TypeSchema::Named(name, _args) => {
+            if !matches!(value, Value::Map(_)) {
+                return Err(VmError::TypeMismatch("map"));
+            }
+            let Some(body) = named_struct_schemas.get(name) else {
+                return Err(VmError::HostError(format!("unknown named struct '{name}'")));
+            };
+            match body {
+                TypeSchema::Object(fields) => validate_named_object_fields(
+                    value,
+                    fields,
+                    resources,
+                    named_struct_schemas,
+                    depth + 1,
+                    nodes,
+                ),
+                other => validate_value_against_type_schema_walk(
+                    value,
+                    other,
+                    resources,
+                    true,
+                    named_struct_schemas,
+                    depth + 1,
+                    nodes,
+                ),
             }
         }
         TypeSchema::Map(inner) => {
             let Value::Map(values) = value else {
                 return Err(VmError::TypeMismatch("map"));
             };
-            if !schema_contains_resource(inner) {
+            if !schema_contains_resource(inner, named_struct_schemas) {
                 return Ok(());
             }
             for (_, value) in values.iter() {
-                validate_value_against_type_schema(value, inner, resources, false)?;
+                validate_value_against_type_schema_walk(
+                    value,
+                    inner,
+                    resources,
+                    false,
+                    named_struct_schemas,
+                    depth + 1,
+                    nodes,
+                )?;
             }
             Ok(())
         }
@@ -569,11 +645,19 @@ fn validate_value_against_type_schema(
                 return Err(VmError::TypeMismatch("object"));
             };
             for (name, field_schema) in fields {
-                if !schema_contains_resource(field_schema) {
+                if !schema_contains_resource(field_schema, named_struct_schemas) {
                     continue;
                 }
                 if let Some(field) = values.get(&Value::string(name)) {
-                    validate_value_against_type_schema(field, field_schema, resources, false)?;
+                    validate_value_against_type_schema_walk(
+                        field,
+                        field_schema,
+                        resources,
+                        false,
+                        named_struct_schemas,
+                        depth + 1,
+                        nodes,
+                    )?;
                 }
             }
             Ok(())
@@ -582,11 +666,19 @@ fn validate_value_against_type_schema(
             let Value::Array(values) = value else {
                 return Err(VmError::TypeMismatch("array"));
             };
-            if !schema_contains_resource(inner) {
+            if !schema_contains_resource(inner, named_struct_schemas) {
                 return Ok(());
             }
             for value in values.iter() {
-                validate_value_against_type_schema(value, inner, resources, false)?;
+                validate_value_against_type_schema_walk(
+                    value,
+                    inner,
+                    resources,
+                    false,
+                    named_struct_schemas,
+                    depth + 1,
+                    nodes,
+                )?;
             }
             Ok(())
         }
@@ -594,15 +686,23 @@ fn validate_value_against_type_schema(
             let Value::Array(values) = value else {
                 return Err(VmError::TypeMismatch("tuple"));
             };
-            if !schema_contains_resource(schema) {
+            if !schema_contains_resource(schema, named_struct_schemas) {
                 return Ok(());
             }
             if values.len() != items.len() {
                 return Err(VmError::TypeMismatch("tuple"));
             }
             for (value, item) in values.iter().zip(items) {
-                if schema_contains_resource(item) {
-                    validate_value_against_type_schema(value, item, resources, false)?;
+                if schema_contains_resource(item, named_struct_schemas) {
+                    validate_value_against_type_schema_walk(
+                        value,
+                        item,
+                        resources,
+                        false,
+                        named_struct_schemas,
+                        depth + 1,
+                        nodes,
+                    )?;
                 }
             }
             Ok(())
@@ -611,20 +711,36 @@ fn validate_value_against_type_schema(
             let Value::Array(values) = value else {
                 return Err(VmError::TypeMismatch("tuple"));
             };
-            if !schema_contains_resource(schema) {
+            if !schema_contains_resource(schema, named_struct_schemas) {
                 return Ok(());
             }
             if values.len() < prefix.len() {
                 return Err(VmError::TypeMismatch("tuple"));
             }
             for (value, item) in values.iter().zip(prefix) {
-                if schema_contains_resource(item) {
-                    validate_value_against_type_schema(value, item, resources, false)?;
+                if schema_contains_resource(item, named_struct_schemas) {
+                    validate_value_against_type_schema_walk(
+                        value,
+                        item,
+                        resources,
+                        false,
+                        named_struct_schemas,
+                        depth + 1,
+                        nodes,
+                    )?;
                 }
             }
-            if schema_contains_resource(rest) {
+            if schema_contains_resource(rest, named_struct_schemas) {
                 for value in values.iter().skip(prefix.len()) {
-                    validate_value_against_type_schema(value, rest, resources, false)?;
+                    validate_value_against_type_schema_walk(
+                        value,
+                        rest,
+                        resources,
+                        false,
+                        named_struct_schemas,
+                        depth + 1,
+                        nodes,
+                    )?;
                 }
             }
             Ok(())
@@ -649,18 +765,98 @@ fn validate_value_against_type_schema(
     }
 }
 
-fn schema_contains_resource(schema: &crate::compiler::TypeSchema) -> bool {
+fn validate_named_object_fields(
+    value: &Value,
+    fields: &HashMap<String, crate::compiler::TypeSchema>,
+    resources: &ResourceTable,
+    named_struct_schemas: &HashMap<String, crate::compiler::TypeSchema>,
+    depth: usize,
+    nodes: &mut usize,
+) -> VmResult<()> {
     use crate::compiler::TypeSchema;
+
+    let Value::Map(values) = value else {
+        return Err(VmError::TypeMismatch("map"));
+    };
+    for (name, field_schema) in fields {
+        match values.get(&Value::string(name)) {
+            Some(field) => validate_value_against_type_schema_walk(
+                field,
+                field_schema,
+                resources,
+                true,
+                named_struct_schemas,
+                depth,
+                nodes,
+            )?,
+            None if matches!(field_schema, TypeSchema::Optional(_)) => {}
+            None => return Err(VmError::TypeMismatch("object")),
+        }
+    }
+    Ok(())
+}
+
+fn schema_contains_resource(
+    schema: &crate::compiler::TypeSchema,
+    named_struct_schemas: &HashMap<String, crate::compiler::TypeSchema>,
+) -> bool {
+    schema_contains_resource_walk(schema, named_struct_schemas, 0, &mut HashSet::new(), &mut 0)
+}
+
+fn schema_contains_resource_walk(
+    schema: &crate::compiler::TypeSchema,
+    named_struct_schemas: &HashMap<String, crate::compiler::TypeSchema>,
+    depth: usize,
+    active: &mut HashSet<String>,
+    nodes: &mut usize,
+) -> bool {
+    use crate::compiler::TypeSchema;
+
+    *nodes = nodes.saturating_add(1);
+    if depth > crate::host_api::MAX_HOST_SCHEMA_DEPTH
+        || *nodes > crate::host_api::MAX_HOST_SCHEMA_NODES
+    {
+        return true;
+    }
 
     match schema {
         TypeSchema::Resource(_) => true,
         TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
-            schema_contains_resource(inner)
+            schema_contains_resource_walk(inner, named_struct_schemas, depth + 1, active, nodes)
         }
-        TypeSchema::Object(fields) => fields.values().any(schema_contains_resource),
-        TypeSchema::ArrayTuple(items) => items.iter().any(schema_contains_resource),
+        TypeSchema::Object(fields) => fields.values().any(|field| {
+            schema_contains_resource_walk(field, named_struct_schemas, depth + 1, active, nodes)
+        }),
+        TypeSchema::ArrayTuple(items) => items.iter().any(|item| {
+            schema_contains_resource_walk(item, named_struct_schemas, depth + 1, active, nodes)
+        }),
         TypeSchema::ArrayTupleRest { prefix, rest } => {
-            prefix.iter().any(schema_contains_resource) || schema_contains_resource(rest)
+            prefix.iter().any(|item| {
+                schema_contains_resource_walk(item, named_struct_schemas, depth + 1, active, nodes)
+            }) || schema_contains_resource_walk(
+                rest,
+                named_struct_schemas,
+                depth + 1,
+                active,
+                nodes,
+            )
+        }
+        TypeSchema::Named(name, args) => {
+            if args.iter().any(|arg| {
+                schema_contains_resource_walk(arg, named_struct_schemas, depth + 1, active, nodes)
+            }) {
+                return true;
+            }
+            let Some(body) = named_struct_schemas.get(name) else {
+                return true;
+            };
+            if !active.insert(name.clone()) {
+                return false;
+            }
+            let contains =
+                schema_contains_resource_walk(body, named_struct_schemas, depth + 1, active, nodes);
+            active.remove(name);
+            contains
         }
         TypeSchema::Callable { .. }
         | TypeSchema::Unknown
@@ -671,8 +867,7 @@ fn schema_contains_resource(schema: &crate::compiler::TypeSchema) -> bool {
         | TypeSchema::Number
         | TypeSchema::Bool
         | TypeSchema::String
-        | TypeSchema::Bytes
-        | TypeSchema::Named(_, _) => false,
+        | TypeSchema::Bytes => false,
     }
 }
 
@@ -1607,6 +1802,7 @@ impl Vm {
                     schema,
                     self.host.execution_scope.resources(),
                     true,
+                    &self.host.named_struct_schemas,
                 ) {
                     return Err(map_callable_schema_error(error, "callable argument schema"));
                 }
@@ -1885,6 +2081,7 @@ impl Vm {
                 schema,
                 self.host.execution_scope.resources(),
                 true,
+                &self.host.named_struct_schemas,
             )
         {
             self.drop_value_with_contract(result);

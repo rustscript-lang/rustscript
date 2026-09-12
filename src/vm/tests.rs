@@ -3700,4 +3700,189 @@ mod callable_resource_schema_tests {
             .expect_err("nested arbitrary ints must not satisfy resources");
         assert_resource_schema_error(error, "invalid_resource_handle");
     }
+
+    fn handle_box_schema() -> (TypeSchema, HashMap<String, TypeSchema>) {
+        let mut fields = HashMap::new();
+        fields.insert("file".to_string(), TypeSchema::Resource(resource_key()));
+        fields.insert(
+            "note".to_string(),
+            TypeSchema::Optional(Box::new(TypeSchema::String)),
+        );
+        let mut named = HashMap::new();
+        named.insert("HandleBox".to_string(), TypeSchema::Object(fields));
+        (
+            TypeSchema::Named("HandleBox".to_string(), Vec::new()),
+            named,
+        )
+    }
+
+    fn callable_vm_with_named(
+        callee_body: &[u8],
+        constants: Vec<Value>,
+        parameter_schema: TypeSchema,
+        result_schema: TypeSchema,
+        named: HashMap<String, TypeSchema>,
+    ) -> (Vm, Value) {
+        let (mut vm, callable) =
+            callable_vm(callee_body, constants, parameter_schema, result_schema);
+        vm.host.named_struct_schemas = Arc::new(named);
+        (vm, callable)
+    }
+
+    fn named_handle_box(handle: i64, note: Option<&str>) -> Value {
+        let mut object = VmMap::new();
+        object.insert(Value::string("file"), Value::Int(handle));
+        if let Some(note) = note {
+            object.insert(Value::string("note"), Value::string(note));
+        }
+        Value::Map(object.into())
+    }
+
+    #[test]
+    fn named_struct_with_resource_field_validates_nested_handle() {
+        let (schema, named) = handle_box_schema();
+        let (mut vm, callable) = callable_vm_with_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            named,
+        );
+        let handle = resource_handle(&mut vm);
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[named_handle_box(handle, Some("ok"))])
+                .expect("named struct with live resource should pass"),
+            Value::Null
+        );
+
+        let error = vm
+            .invoke_callable(callable, &[named_handle_box(41, Some("bad"))])
+            .expect_err("named struct must reject invalid nested resource");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+    }
+
+    #[test]
+    fn named_struct_optional_field_may_be_omitted() {
+        let (schema, named) = handle_box_schema();
+        let (mut vm, callable) = callable_vm_with_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            named,
+        );
+        let handle = resource_handle(&mut vm);
+        assert_eq!(
+            vm.invoke_callable(callable, &[named_handle_box(handle, None)])
+                .expect("optional named field may be omitted"),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn named_struct_nested_array_validates_resource_elements() {
+        let (element, named) = handle_box_schema();
+        let schema = TypeSchema::Array(Box::new(element));
+        let (mut vm, callable) = callable_vm_with_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            named,
+        );
+        let handle = resource_handle(&mut vm);
+        let valid = Value::Array(vec![named_handle_box(handle, None)].into());
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[valid])
+                .expect("array of named structs with live resources should pass"),
+            Value::Null
+        );
+
+        let invalid = Value::Array(vec![named_handle_box(41, None)].into());
+        let error = vm
+            .invoke_callable(callable, &[invalid])
+            .expect_err("array of named structs must reject invalid nested resources");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+    }
+
+    #[test]
+    fn unknown_named_struct_fails_closed() {
+        let schema = TypeSchema::Named("MissingBox".to_string(), Vec::new());
+        let (mut vm, callable) =
+            callable_vm(&[OpCode::Ret as u8], Vec::new(), schema, TypeSchema::Null);
+        let mut object = VmMap::new();
+        object.insert(Value::string("file"), Value::Int(1));
+        let error = vm
+            .invoke_callable(callable, &[Value::Map(object.into())])
+            .expect_err("unknown Named must fail closed");
+        match error {
+            VmError::HostError(message) => {
+                assert!(
+                    message.contains("unknown named struct"),
+                    "unexpected host error: {message}"
+                );
+            }
+            other => panic!("expected HostError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cyclic_named_struct_does_not_hang_and_classifies_resources() {
+        let mut fields = HashMap::new();
+        fields.insert("file".to_string(), TypeSchema::Resource(resource_key()));
+        fields.insert(
+            "child".to_string(),
+            TypeSchema::Optional(Box::new(TypeSchema::Named("Node".to_string(), Vec::new()))),
+        );
+        let mut named = HashMap::new();
+        named.insert("Node".to_string(), TypeSchema::Object(fields));
+        let schema = TypeSchema::Named("Node".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            named,
+        );
+        let handle = resource_handle(&mut vm);
+        let mut inner = VmMap::new();
+        inner.insert(Value::string("file"), Value::Int(handle));
+        let mut outer = VmMap::new();
+        outer.insert(Value::string("file"), Value::Int(handle));
+        outer.insert(Value::string("child"), Value::Map(inner.into()));
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[Value::Map(outer.into())])
+                .expect("acyclic value of cyclic schema should pass"),
+            Value::Null
+        );
+
+        let mut bad = VmMap::new();
+        bad.insert(Value::string("file"), Value::Int(41));
+        let error = vm
+            .invoke_callable(callable, &[Value::Map(bad.into())])
+            .expect_err("cyclic named schema must still validate nested resources");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+    }
+
+    #[test]
+    fn named_struct_return_validates_nested_resource() {
+        let (schema, named) = handle_box_schema();
+        let (mut vm, callable) = callable_vm_with_named(
+            &[OpCode::Ldloc as u8, 0, OpCode::Ret as u8],
+            Vec::new(),
+            schema.clone(),
+            schema,
+            named,
+        );
+        let handle = resource_handle(&mut vm);
+        let returned = vm
+            .invoke_callable(callable.clone(), &[named_handle_box(handle, None)])
+            .expect("named return with live resource should pass");
+        assert!(matches!(returned, Value::Map(_)));
+
+        let error = vm
+            .invoke_callable(callable, &[named_handle_box(41, None)])
+            .expect_err("named return must reject invalid nested resource");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+    }
 }
