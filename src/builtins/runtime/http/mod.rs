@@ -194,23 +194,31 @@ fn build_http_host_catalog() -> Arc<HostApiCatalog> {
         "An incremental SSE stream reader over an open response body stream",
     ));
 
-    let http_request = http_request_struct();
-    let http_response = http_response_struct();
-    let sse_request = sse_request_struct();
+    let http_request_header = http_request_header_struct();
+    let http_header_value = http_header_value_struct();
+    let http_response_header = http_response_header_struct(&http_header_value);
+    let http_request_body = http_request_body_struct();
+    let sse_event = sse_event_struct(&http_response_header);
+    let http_request = http_request_struct(&http_request_header, &http_request_body);
+    let http_response = http_response_struct(&http_response_header);
+    let sse_request = sse_request_struct(&http_request_header, &http_request_body);
     let sse_callback_action = sse_callback_action_struct();
-    let sse_summary = sse_summary_struct();
+    let sse_summary = sse_summary_struct(&http_response_header);
+    builder.named_struct(http_request_header.clone());
+    builder.named_struct(http_header_value.clone());
+    builder.named_struct(http_response_header.clone());
+    builder.named_struct(http_request_body.clone());
+    builder.named_struct(sse_event.clone());
     builder.named_struct(http_request.clone());
-    builder.named_struct(http_response.clone());
     builder.named_struct(sse_request.clone());
+    builder.named_struct(http_response.clone());
     builder.named_struct(sse_callback_action.clone());
     builder.named_struct(sse_summary.clone());
 
-    // Fixed-shape request/response/action/summary values are named structs.
-    // Runtime carriers remain maps. HTTP headers stay a dynamic map. Request
-    // body is optional unknown at the catalog boundary because the type system
-    // has no string|bytes union; runtime still accepts only those two forms.
-    // Buffered requests omit SSE-only `timeout_ms`. SSE inbound events stay
-    // `map` because they are a tagged union (`open` / `event` / `end`).
+    // Public headers, request bodies, and SSE events use named records and
+    // typed arrays. Runtime values remain map/array carriers for these named
+    // structs. The discriminator payload invariants are enforced by the HTTP
+    // runtime adapters before transport or callback execution.
     builder.function(HostFunctionSchema::with_return(
         "http::client::request",
         vec![HostParamSchema::value("request", http_request.as_type())],
@@ -223,7 +231,7 @@ fn build_http_host_catalog() -> Arc<HostApiCatalog> {
             HostParamSchema::with_passing(
                 "on_event",
                 HostTypeSchema::Callable {
-                    params: vec![HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown))],
+                    params: vec![sse_event.as_type()],
                     result: Box::new(sse_callback_action.as_type()),
                 },
                 HostParamPassing::Value,
@@ -239,39 +247,98 @@ fn opt(inner: HostTypeSchema) -> HostTypeSchema {
     HostTypeSchema::Optional(Box::new(inner))
 }
 
-fn map_string() -> HostTypeSchema {
-    HostTypeSchema::Map(Box::new(HostTypeSchema::String))
+fn array(inner: HostTypeSchema) -> HostTypeSchema {
+    HostTypeSchema::Array(Box::new(inner))
 }
 
-fn map_unknown() -> HostTypeSchema {
-    HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown))
+fn http_request_header_struct() -> HostStructSchema {
+    HostStructSchema::new(
+        "HttpRequestHeader",
+        vec![
+            HostStructField::new("name", HostTypeSchema::String),
+            HostStructField::new("value", HostTypeSchema::String),
+        ],
+    )
 }
 
-fn http_request_fields() -> Vec<HostStructField> {
-    vec![
-        HostStructField::new("method", HostTypeSchema::String),
-        HostStructField::new("url", HostTypeSchema::String),
-        HostStructField::new("headers", opt(map_string())),
-        HostStructField::new("body", opt(HostTypeSchema::Unknown)),
-    ]
+fn http_header_value_struct() -> HostStructSchema {
+    HostStructSchema::new(
+        "HttpHeaderValue",
+        vec![
+            HostStructField::new("kind", HostTypeSchema::String),
+            HostStructField::new("text", opt(HostTypeSchema::String)),
+            HostStructField::new("bytes", opt(HostTypeSchema::Bytes)),
+        ],
+    )
 }
 
-fn http_request_struct() -> HostStructSchema {
-    HostStructSchema::new("HttpRequest", http_request_fields())
+fn http_response_header_struct(header_value: &HostStructSchema) -> HostStructSchema {
+    HostStructSchema::new(
+        "HttpResponseHeader",
+        vec![
+            HostStructField::new("name", HostTypeSchema::String),
+            HostStructField::new("value", header_value.as_type()),
+        ],
+    )
 }
 
-fn sse_request_struct() -> HostStructSchema {
-    let mut fields = http_request_fields();
+fn http_request_body_struct() -> HostStructSchema {
+    HostStructSchema::new(
+        "HttpRequestBody",
+        vec![
+            HostStructField::new("kind", HostTypeSchema::String),
+            HostStructField::new("text", opt(HostTypeSchema::String)),
+            HostStructField::new("bytes", opt(HostTypeSchema::Bytes)),
+        ],
+    )
+}
+
+fn sse_event_struct(response_header: &HostStructSchema) -> HostStructSchema {
+    HostStructSchema::new(
+        "SseEvent",
+        vec![
+            HostStructField::new("kind", HostTypeSchema::String),
+            HostStructField::new("status", opt(HostTypeSchema::Int)),
+            HostStructField::new("headers", opt(array(response_header.as_type()))),
+            HostStructField::new("url", opt(HostTypeSchema::String)),
+            HostStructField::new("event", opt(HostTypeSchema::String)),
+            HostStructField::new("data", opt(HostTypeSchema::String)),
+            HostStructField::new("id", opt(HostTypeSchema::String)),
+            HostStructField::new("retry_ms", opt(HostTypeSchema::Int)),
+        ],
+    )
+}
+
+fn http_request_struct(
+    request_header: &HostStructSchema,
+    request_body: &HostStructSchema,
+) -> HostStructSchema {
+    HostStructSchema::new(
+        "HttpRequest",
+        vec![
+            HostStructField::new("method", HostTypeSchema::String),
+            HostStructField::new("url", HostTypeSchema::String),
+            HostStructField::new("headers", opt(array(request_header.as_type()))),
+            HostStructField::new("body", opt(request_body.as_type())),
+        ],
+    )
+}
+
+fn sse_request_struct(
+    request_header: &HostStructSchema,
+    request_body: &HostStructSchema,
+) -> HostStructSchema {
+    let mut fields = http_request_struct(request_header, request_body).fields;
     fields.push(HostStructField::new("timeout_ms", opt(HostTypeSchema::Int)));
     HostStructSchema::new("SseRequest", fields)
 }
 
-fn http_response_struct() -> HostStructSchema {
+fn http_response_struct(response_header: &HostStructSchema) -> HostStructSchema {
     HostStructSchema::new(
         "HttpResponse",
         vec![
             HostStructField::new("status", HostTypeSchema::Int),
-            HostStructField::new("headers", map_unknown()),
+            HostStructField::new("headers", array(response_header.as_type())),
             HostStructField::new("body", HostTypeSchema::Bytes),
             HostStructField::new("url", HostTypeSchema::String),
         ],
@@ -285,13 +352,13 @@ fn sse_callback_action_struct() -> HostStructSchema {
     )
 }
 
-fn sse_summary_struct() -> HostStructSchema {
+fn sse_summary_struct(response_header: &HostStructSchema) -> HostStructSchema {
     HostStructSchema::new(
         "SseSummary",
         vec![
             HostStructField::new("outcome", HostTypeSchema::String),
             HostStructField::new("status", HostTypeSchema::Int),
-            HostStructField::new("headers", map_unknown()),
+            HostStructField::new("headers", array(response_header.as_type())),
             HostStructField::new("url", HostTypeSchema::String),
             HostStructField::new("items", HostTypeSchema::Int),
             HostStructField::new("bytes_received", HostTypeSchema::Int),

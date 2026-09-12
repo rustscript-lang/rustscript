@@ -66,7 +66,7 @@ pub(crate) struct HostStreamAdmissionError {
 ///
 /// The VM always validates the callback's callable provenance and arity before
 /// installing a driver. When its metadata is [`TypeSchema::Callable`], it also
-/// validates a map argument and a map, Named, or Object result. HTTP SSE
+/// validates a map or Named argument and a map, Named, or Object result. HTTP SSE
 /// additionally requires the exact `SseCallbackAction` named type or a matching
 /// `{ action: string }` object rather than an arbitrary map. Scripts receive
 /// ordinary callback items and a final value; they never receive a stream
@@ -160,6 +160,16 @@ pub(crate) struct HostStreamContinuation {
     pub(crate) parent_ip: usize,
 }
 
+/// HTTP SSE callback results retain the existing named action/object runtime
+/// compatibility, while callback inputs use the exact `SseEvent` named schema.
+#[cfg(feature = "http-client")]
+fn sse_callback_input_schema(params: &[TypeSchema]) -> bool {
+    matches!(
+        params,
+        [TypeSchema::Named(name, args)] if name == "SseEvent" && args.is_empty()
+    )
+}
+
 #[cfg(feature = "http-client")]
 fn sse_callback_action_result_schema(result: &TypeSchema) -> bool {
     match result {
@@ -180,7 +190,7 @@ impl Vm {
     /// This Rust embedding API does not create a script-visible handle. The VM
     /// always validates that `callback` is a callable owned by this VM and has
     /// arity one. When its metadata is [`TypeSchema::Callable`], the VM also
-    /// validates a map argument and a map, Named, or Object result. HTTP SSE
+    /// validates a map or Named argument and a map, Named, or Object result. HTTP SSE
     /// uses [`Self::validate_sse_callback_value`] for the exact
     /// `SseCallbackAction` named/object contract rather than an arbitrary map.
     /// The VM then owns the callback and driver until completion, cancellation,
@@ -269,11 +279,13 @@ impl Vm {
             });
         }
         if let Some(TypeSchema::Callable { params, result }) = &prototype.schema
-            && (!matches!(params.as_slice(), [TypeSchema::Map(_)])
-                || !matches!(
-                    result.as_ref(),
-                    TypeSchema::Map(_) | TypeSchema::Named(_, _) | TypeSchema::Object(_)
-                ))
+            && (!matches!(
+                params.as_slice(),
+                [TypeSchema::Map(_)] | [TypeSchema::Named(_, _)]
+            ) || !matches!(
+                result.as_ref(),
+                TypeSchema::Map(_) | TypeSchema::Named(_, _) | TypeSchema::Object(_)
+            ))
         {
             return Err(VmError::TypeMismatch("fn(map) -> map"));
         }
@@ -293,10 +305,10 @@ impl Vm {
         else {
             return Ok(());
         };
-        if let Some(TypeSchema::Callable { result, .. }) = &prototype.schema
-            && !sse_callback_action_result_schema(result)
+        if let Some(TypeSchema::Callable { params, result, .. }) = &prototype.schema
+            && (!sse_callback_input_schema(params) || !sse_callback_action_result_schema(result))
         {
-            return Err(VmError::TypeMismatch("fn(map) -> SseCallbackAction"));
+            return Err(VmError::TypeMismatch("fn(SseEvent) -> SseCallbackAction"));
         }
         Ok(())
     }

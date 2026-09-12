@@ -1,8 +1,8 @@
 //! HTTP/SSE named-struct host contract: catalog identity, field access,
-//! object-literal params, and dynamic header maps.
+//! object-literal params, typed header/body values, and SSE events.
 //!
-//! Runtime values remain `Value::Map`. SSE inbound events stay maps because
-//! they are a tagged union (`open` / `event` / `end`).
+//! Runtime values remain `Value::Map` carriers for named structs. Public
+//! HTTP/SSE schemas use named records and typed entry arrays.
 
 #![cfg(feature = "http-client")]
 
@@ -26,12 +26,8 @@ fn opt(inner: HostTypeSchema) -> HostTypeSchema {
     HostTypeSchema::Optional(Box::new(inner))
 }
 
-fn map_string() -> HostTypeSchema {
-    HostTypeSchema::Map(Box::new(HostTypeSchema::String))
-}
-
-fn map_unknown() -> HostTypeSchema {
-    HostTypeSchema::Map(Box::new(HostTypeSchema::Unknown))
+fn array(inner: HostTypeSchema) -> HostTypeSchema {
+    HostTypeSchema::Array(Box::new(inner))
 }
 
 fn struct_by_name<'a>(catalog: &'a vm::HostApiCatalog, name: &str) -> &'a HostStructSchema {
@@ -78,26 +74,75 @@ fn compile_with_http_catalog(source: &str) -> Result<vm::CompiledProgram, vm::So
 }
 
 #[test]
-fn http_catalog_declares_fixed_shape_named_structs() {
+fn http_catalog_declares_fully_typed_named_structs() {
     let catalog = http_host_catalog();
     let names: Vec<&str> = catalog.structs().iter().map(|s| s.name.as_str()).collect();
     assert_eq!(
         names,
         [
+            "HttpRequestHeader",
+            "HttpHeaderValue",
+            "HttpResponseHeader",
+            "HttpRequestBody",
+            "SseEvent",
             "HttpRequest",
-            "HttpResponse",
             "SseRequest",
+            "HttpResponse",
             "SseCallbackAction",
             "SseSummary"
         ]
     );
 
+    let request_header = struct_by_name(&catalog, "HttpRequestHeader");
+    assert_eq!(field_names(request_header), ["name", "value"]);
+    assert_eq!(field_ty(request_header, "name"), &HostTypeSchema::String);
+    assert_eq!(field_ty(request_header, "value"), &HostTypeSchema::String);
+
+    let header_value = struct_by_name(&catalog, "HttpHeaderValue");
+    assert_eq!(field_names(header_value), ["kind", "text", "bytes"]);
+    assert_eq!(field_ty(header_value, "kind"), &HostTypeSchema::String);
+    assert_eq!(field_ty(header_value, "text"), &opt(HostTypeSchema::String));
+    assert_eq!(field_ty(header_value, "bytes"), &opt(HostTypeSchema::Bytes));
+
+    let response_header = struct_by_name(&catalog, "HttpResponseHeader");
+    assert_eq!(field_names(response_header), ["name", "value"]);
+    assert_eq!(field_ty(response_header, "name"), &HostTypeSchema::String);
+    assert_eq!(field_ty(response_header, "value"), &header_value.as_type());
+
+    let request_body = struct_by_name(&catalog, "HttpRequestBody");
+    assert_eq!(field_names(request_body), ["kind", "text", "bytes"]);
+    assert_eq!(field_ty(request_body, "kind"), &HostTypeSchema::String);
+    assert_eq!(field_ty(request_body, "text"), &opt(HostTypeSchema::String));
+    assert_eq!(field_ty(request_body, "bytes"), &opt(HostTypeSchema::Bytes));
+
+    let event = struct_by_name(&catalog, "SseEvent");
+    assert_eq!(
+        field_names(event),
+        [
+            "kind", "status", "headers", "url", "event", "data", "id", "retry_ms"
+        ]
+    );
+    assert_eq!(field_ty(event, "kind"), &HostTypeSchema::String);
+    assert_eq!(field_ty(event, "status"), &opt(HostTypeSchema::Int));
+    assert_eq!(
+        field_ty(event, "headers"),
+        &opt(array(response_header.as_type()))
+    );
+    assert_eq!(field_ty(event, "url"), &opt(HostTypeSchema::String));
+    assert_eq!(field_ty(event, "event"), &opt(HostTypeSchema::String));
+    assert_eq!(field_ty(event, "data"), &opt(HostTypeSchema::String));
+    assert_eq!(field_ty(event, "id"), &opt(HostTypeSchema::String));
+    assert_eq!(field_ty(event, "retry_ms"), &opt(HostTypeSchema::Int));
+
     let request = struct_by_name(&catalog, "HttpRequest");
     assert_eq!(field_names(request), ["method", "url", "headers", "body"]);
     assert_eq!(field_ty(request, "method"), &HostTypeSchema::String);
     assert_eq!(field_ty(request, "url"), &HostTypeSchema::String);
-    assert_eq!(field_ty(request, "headers"), &opt(map_string()));
-    assert_eq!(field_ty(request, "body"), &opt(HostTypeSchema::Unknown));
+    assert_eq!(
+        field_ty(request, "headers"),
+        &opt(array(request_header.as_type()))
+    );
+    assert_eq!(field_ty(request, "body"), &opt(request_body.as_type()));
 
     let sse_request = struct_by_name(&catalog, "SseRequest");
     assert_eq!(
@@ -106,8 +151,11 @@ fn http_catalog_declares_fixed_shape_named_structs() {
     );
     assert_eq!(field_ty(sse_request, "method"), &HostTypeSchema::String);
     assert_eq!(field_ty(sse_request, "url"), &HostTypeSchema::String);
-    assert_eq!(field_ty(sse_request, "headers"), &opt(map_string()));
-    assert_eq!(field_ty(sse_request, "body"), &opt(HostTypeSchema::Unknown));
+    assert_eq!(
+        field_ty(sse_request, "headers"),
+        &opt(array(request_header.as_type()))
+    );
+    assert_eq!(field_ty(sse_request, "body"), &opt(request_body.as_type()));
     assert_eq!(
         field_ty(sse_request, "timeout_ms"),
         &opt(HostTypeSchema::Int)
@@ -116,7 +164,10 @@ fn http_catalog_declares_fixed_shape_named_structs() {
     let response = struct_by_name(&catalog, "HttpResponse");
     assert_eq!(field_names(response), ["status", "headers", "body", "url"]);
     assert_eq!(field_ty(response, "status"), &HostTypeSchema::Int);
-    assert_eq!(field_ty(response, "headers"), &map_unknown());
+    assert_eq!(
+        field_ty(response, "headers"),
+        &array(response_header.as_type())
+    );
     assert_eq!(field_ty(response, "body"), &HostTypeSchema::Bytes);
     assert_eq!(field_ty(response, "url"), &HostTypeSchema::String);
 
@@ -139,7 +190,10 @@ fn http_catalog_declares_fixed_shape_named_structs() {
     );
     assert_eq!(field_ty(summary, "outcome"), &HostTypeSchema::String);
     assert_eq!(field_ty(summary, "status"), &HostTypeSchema::Int);
-    assert_eq!(field_ty(summary, "headers"), &map_unknown());
+    assert_eq!(
+        field_ty(summary, "headers"),
+        &array(response_header.as_type())
+    );
     assert_eq!(field_ty(summary, "url"), &HostTypeSchema::String);
     assert_eq!(field_ty(summary, "items"), &HostTypeSchema::Int);
     assert_eq!(field_ty(summary, "bytes_received"), &HostTypeSchema::Int);
@@ -171,7 +225,7 @@ fn http_request_and_sse_use_named_request_response_and_action_types() {
     assert_eq!(
         sse.params[1].ty,
         HostTypeSchema::Callable {
-            params: vec![map_unknown()],
+            params: vec![struct_by_name(&catalog, "SseEvent").as_type()],
             result: Box::new(struct_by_name(&catalog, "SseCallbackAction").as_type()),
         }
     );
@@ -201,7 +255,7 @@ fn compiler_import_schemas_preserve_named_identity() {
     assert_eq!(
         sse.params[1].schema,
         HostTypeSchema::Callable {
-            params: vec![map_unknown()],
+            params: vec![struct_by_name(&catalog, "SseEvent").as_type()],
             result: Box::new(struct_by_name(&catalog, "SseCallbackAction").as_type()),
         }
     );
@@ -222,31 +276,64 @@ fn object_literal_is_accepted_for_named_http_request() {
 }
 
 #[test]
-fn object_literal_with_dynamic_headers_is_accepted() {
+fn object_literal_with_typed_headers_is_accepted() {
     compile_ok(
         r#"
         use http;
         http::client::request({
             method: "POST",
             url: "http://127.0.0.1:1/x",
-            headers: { "content-type": "application/json" },
-            body: "{}"
+            headers: [{ name: "content-type", value: "application/json" }],
+            body: { kind: "text", text: "{}" }
         });
         "#,
     );
 }
 
 #[test]
-fn object_literal_with_byte_body_is_accepted() {
+fn object_literal_with_typed_byte_body_is_accepted() {
     compile_ok(
         r#"
         use http;
         http::client::request({
             method: "POST",
             url: "http://127.0.0.1:1/x",
-            body: b"raw-body"
+            body: { kind: "bytes", bytes: b"raw-body" }
         });
         "#,
+    );
+}
+
+#[test]
+fn legacy_dynamic_headers_and_scalar_body_are_rejected() {
+    let scalar_body = compile_err(
+        r#"
+        use http;
+        http::client::request({
+            method: "POST",
+            url: "http://127.0.0.1:1/x",
+            body: "raw-body"
+        });
+        "#,
+    );
+    assert!(
+        scalar_body.contains("no host function `http::client::request` matches the arguments"),
+        "scalar request body must be rejected by the typed schema: {scalar_body}"
+    );
+
+    let dynamic_headers = compile_err(
+        r#"
+        use http;
+        http::client::request({
+            method: "GET",
+            url: "http://127.0.0.1:1/x",
+            headers: { "x-test": "value" }
+        });
+        "#,
+    );
+    assert!(
+        dynamic_headers.contains("no host function `http::client::request` matches the arguments"),
+        "header maps must be rejected by the typed schema: {dynamic_headers}"
     );
 }
 
@@ -318,7 +405,7 @@ fn optional_null_timeout_compiles_for_sse_request() {
     compile_ok(
         r#"
         use http;
-        fn on_event(item: map) -> SseCallbackAction {
+        fn on_event(item: SseEvent) -> SseCallbackAction {
             { action: "continue" }
         }
         http::client::sse(
@@ -373,13 +460,12 @@ fn named_http_response_rejects_unknown_string_index() {
 }
 
 #[test]
-fn dynamic_response_headers_remain_indexable_maps() {
+fn typed_response_headers_expose_ordered_entry_fields() {
     compile_ok(
         r#"
         use http;
         let response = http::client::request({ method: "GET", url: "http://127.0.0.1:1/x" });
-        let headers = response.headers;
-        headers["content-type"];
+        response.headers[0].value.kind;
         "#,
     );
 }
@@ -389,7 +475,7 @@ fn sse_object_literal_and_action_struct_compile() {
     compile_ok(
         r#"
         use http;
-        fn on_event(item: map) -> SseCallbackAction {
+        fn on_event(item: SseEvent) -> SseCallbackAction {
             { action: "continue" }
         }
         http::client::sse(
@@ -402,7 +488,7 @@ fn sse_object_literal_and_action_struct_compile() {
 
 const SSE_NAMED_ACTION_SOURCE: &str = r#"
     use http;
-    fn on_event(item: map) -> SseCallbackAction {
+    fn on_event(item: SseEvent) -> SseCallbackAction {
         { action: "continue" }
     }
     http::client::sse(
@@ -435,10 +521,15 @@ fn compile_source_installs_sse_named_structs_and_exact_schema() {
         .expect("default registry must exact-bind catalog-backed SSE");
 }
 
-const HTTP_NAMED_STRUCTS: [&str; 5] = [
+const HTTP_NAMED_STRUCTS: [&str; 10] = [
+    "HttpRequestHeader",
+    "HttpHeaderValue",
+    "HttpResponseHeader",
+    "HttpRequestBody",
+    "SseEvent",
     "HttpRequest",
-    "HttpResponse",
     "SseRequest",
+    "HttpResponse",
     "SseCallbackAction",
     "SseSummary",
 ];
@@ -538,7 +629,7 @@ fn sse_map_returning_callback_is_rejected_with_action_schema() {
     let message = compile_err(
         r#"
         use http;
-        fn on_event(item: map) -> map {
+        fn on_event(item: SseEvent) -> map {
             { action: "continue" }
         }
         http::client::sse(
@@ -566,7 +657,7 @@ fn sse_summary_allows_field_access() {
     compile_ok(
         r#"
         use http;
-        fn on_event(item: map) -> SseCallbackAction {
+        fn on_event(item: SseEvent) -> SseCallbackAction {
             { action: "stop" }
         }
         let summary = http::client::sse(
@@ -582,13 +673,13 @@ fn sse_summary_allows_field_access() {
 }
 
 #[test]
-fn sse_inbound_event_stays_a_dynamic_map() {
+fn sse_named_event_exposes_typed_fields() {
     compile_ok(
         r#"
         use http;
-        fn on_event(item: map) -> SseCallbackAction {
-            if item["kind"] == "event" {
-                print(item["data"]);
+        fn on_event(item: SseEvent) -> SseCallbackAction {
+            if item.kind == "event" {
+                print(item.data);
             }
             { action: "continue" }
         }
@@ -775,7 +866,7 @@ async fn byte_request_body_is_accepted_at_runtime() {
         let response = http::client::request({{
             method: "POST",
             url: "http://127.0.0.1:{port}/",
-            body: b"raw-body"
+            body: {{ kind: "bytes", bytes: b"raw-body" }}
         }});
         response.status;
         "#
@@ -814,7 +905,7 @@ async fn null_headers_are_treated_as_omitted() {
 fn null_sse_timeout_is_treated_as_omitted() {
     let source = r#"
         use http;
-        fn on_event(item: map) -> SseCallbackAction { { action: "continue" } }
+        fn on_event(item: SseEvent) -> SseCallbackAction { { action: "continue" } }
         http::client::sse(
             { method: "GET", url: "http://127.0.0.1:1/events", timeout_ms: null },
             on_event
@@ -840,7 +931,7 @@ fn null_sse_timeout_is_treated_as_omitted() {
 fn sse_callback_runtime_schema_rejects_arbitrary_map_result() {
     let compiled = compile_with_http_catalog(
         r#"
-        pub fn callback(item: map) -> map { { action: "continue" } }
+        pub fn callback(item: SseEvent) -> map { { action: "continue" } }
         "#,
     )
     .expect("map callback should compile in isolation");
@@ -855,8 +946,11 @@ fn sse_callback_runtime_schema_rejects_arbitrary_map_result() {
         .validate_sse_callback_value(&callback)
         .expect_err("SSE must reject arbitrary map results");
     assert!(
-        matches!(error, VmError::TypeMismatch("fn(map) -> SseCallbackAction")),
-        "SSE callback diagnostic must name SseCallbackAction, got {error:?}"
+        matches!(
+            error,
+            VmError::TypeMismatch("fn(SseEvent) -> SseCallbackAction")
+        ),
+        "SSE callback diagnostic must name fn(SseEvent) -> SseCallbackAction, got {error:?}"
     );
 }
 
@@ -865,7 +959,7 @@ fn sse_callback_runtime_schema_accepts_named_action() {
     let compiled = compile_with_http_catalog(
         r#"
         use http;
-        pub fn callback(item: map) -> SseCallbackAction { { action: "continue" } }
+        pub fn callback(item: SseEvent) -> SseCallbackAction { { action: "continue" } }
         "#,
     )
     .expect("named action callback should compile");

@@ -441,11 +441,11 @@ async fn sse_delivers_open_events_end_and_terminal_summary() {
     let source = format!(
         r#"
         use http;
-        fn record(item: map) -> SseCallbackAction {{
-            if item["kind"] == "open" && item["status"] != 200 {{ let _ = 1 / 0; }}
-            if item["kind"] == "event" && item["data"] == "one" && item["event"] != null {{ let _ = 1 / 0; }}
-            if item["kind"] == "event" && item["data"] == "two" && item["event"] != "named" {{ let _ = 1 / 0; }}
-            if item["kind"] == "end" && item != {{kind: "end"}} {{ let _ = 1 / 0; }}
+        fn record(item: SseEvent) -> SseCallbackAction {{
+            if item.kind == "open" && item.status != 200 {{ let _ = 1 / 0; }}
+            if item.kind == "event" && item.data == "one" && item.event != null {{ let _ = 1 / 0; }}
+            if item.kind == "event" && item.data == "two" && item.event != "named" {{ let _ = 1 / 0; }}
+            if item.kind == "end" && item.status != null {{ let _ = 1 / 0; }}
             {{action: "continue"}}
         }}
         let result = http::client::sse(
@@ -483,7 +483,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
         let source = format!(
             r#"
             use http;
-            fn callback(item: map) -> SseCallbackAction {{ {{action: "continue"}} }}
+            fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
             http::client::sse(
                 {{method: "GET", url: "http://127.0.0.1:1/events", timeout_ms: {timeout}}},
                 callback
@@ -507,7 +507,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
         compile_source(
             r#"
             use http;
-            fn callback(item: map) -> SseCallbackAction { {action: "continue"} }
+            fn callback(item: SseEvent) -> SseCallbackAction { {action: "continue"} }
             http::client::sse(
                 {method: "GET", url: "http://127.0.0.1:1/events", timeout_ms: "1"},
                 callback
@@ -520,7 +520,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
 
     let source = r#"
         use http;
-        fn callback(item: map) -> SseCallbackAction { {action: "continue"} }
+        fn callback(item: SseEvent) -> SseCallbackAction { {action: "continue"} }
         http::client::sse(
             {method: "GET", url: "http://127.0.0.1:1/events", timeout_ms: 1},
             callback
@@ -539,7 +539,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
 
     let source = r#"
         use http;
-        fn callback(item: map) -> SseCallbackAction { {action: "continue"} }
+        fn callback(item: SseEvent) -> SseCallbackAction { {action: "continue"} }
         http::client::sse(
             {method: "PUT", url: "http://127.0.0.1:1/events"},
             callback
@@ -557,7 +557,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
 fn sse_admission_does_not_require_a_tokio_reactor() {
     let source = r#"
         use http;
-        fn callback(item: map) -> SseCallbackAction { {action: "continue"} }
+        fn callback(item: SseEvent) -> SseCallbackAction { {action: "continue"} }
         http::client::sse(
             {method: "GET", url: "http://127.0.0.1:1/events"},
             callback
@@ -581,9 +581,9 @@ async fn sse_accepts_post_with_body() {
     let source = format!(
         r#"
         use http;
-        fn callback(item: map) -> SseCallbackAction {{ {{action: "continue"}} }}
+        fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
         http::client::sse(
-            {{method: "POST", url: "http://127.0.0.1:{port}/events", body: "payload"}},
+            {{method: "POST", url: "http://127.0.0.1:{port}/events", body: {{ kind: "text", text: "payload" }}}},
             callback
         );
         "#
@@ -666,8 +666,8 @@ async fn sse_post_redirect_method_and_body_follow_http_rules() {
         let (port, requests, server) = redirect_server(status);
         let source = format!(
             r#"use http;
-            fn callback(item: map) -> SseCallbackAction {{ {{action: "continue"}} }}
-            http::client::sse({{method:"POST", url:"http://127.0.0.1:{port}/start", body:"payload"}}, callback);"#
+            fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
+            http::client::sse({{method:"POST", url:"http://127.0.0.1:{port}/start", body:{{ kind:"text", text:"payload" }}}}, callback);"#
         );
         run_sse_source(&source, config(port)).await.unwrap();
         let first = requests.recv().unwrap();
@@ -696,7 +696,7 @@ async fn sse_get_redirect_preserves_get_for_301_and_302() {
         let (port, requests, server) = redirect_server(status);
         let source = format!(
             r#"use http;
-            fn callback(item: map) -> SseCallbackAction {{ {{action: "continue"}} }}
+            fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
             http::client::sse({{method:"GET", url:"http://127.0.0.1:{port}/start"}}, callback);"#
         );
         run_sse_source(&source, config(port)).await.unwrap();
@@ -719,9 +719,9 @@ async fn sse_rejects_redirect_userinfo_before_reconnecting() {
     });
     let source = format!(
         r#"use http;
-        fn callback(item: map) -> SseCallbackAction {{ {{action: "continue"}} }}
+        fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
         http::client::sse(
-            {{method:"GET", url:"http://127.0.0.1:{port}/start", headers:{{Authorization:"Bearer secret", Cookie:"a=b"}}}},
+            {{method:"GET", url:"http://127.0.0.1:{port}/start", headers:[{{name:"Authorization", value:"Bearer secret"}}, {{name:"Cookie", value:"a=b"}}]}},
             callback
         );"#
     );
@@ -761,9 +761,9 @@ async fn sse_rejects_disallowed_redirect_targets_before_connecting() {
         let (source_port, requests, source_server) = recording_server(vec![vec![redirect]]);
         let source = format!(
             r#"use http;
-            fn callback(item: map) -> SseCallbackAction {{ {{action: "continue"}} }}
+            fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
             http::client::sse(
-                {{method:"GET", url:"http://127.0.0.1:{source_port}/start", headers:{{Authorization:"Bearer secret", Cookie:"a=b"}}}},
+                {{method:"GET", url:"http://127.0.0.1:{source_port}/start", headers:[{{name:"Authorization", value:"Bearer secret"}}, {{name:"Cookie", value:"a=b"}}]}},
                 callback
             );"#
         );
@@ -796,7 +796,7 @@ async fn sse_stop_retires_without_end_and_returns_stopped_summary() {
     ]);
     let source = format!(
         r#"use http;
-        fn stop(item: map) -> SseCallbackAction {{ {{action: "stop"}} }}
+        fn stop(item: SseEvent) -> SseCallbackAction {{ {{action: "stop"}} }}
         http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, stop);"#
     );
     let vm = run_sse_source(&source, config(port)).await.unwrap();
@@ -830,8 +830,8 @@ async fn sse_rejected_nested_admission_rolls_back_before_reset_reuse() {
     let source = format!(
         r#"
         use http;
-        fn inner(item: map) -> SseCallbackAction {{ {{action: "continue"}} }}
-        fn outer(item: map) -> SseCallbackAction {{
+        fn inner(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
+        fn outer(item: SseEvent) -> SseCallbackAction {{
             http::client::sse(
                 {{method: "GET", url: "http://127.0.0.1:{port}/inner"}},
                 inner
@@ -987,7 +987,7 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
     ] {
         let (port, server) = server(vec![head]);
         let source = format!(
-            r#"use http; fn go(item: map) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+            r#"use http; fn go(item: SseEvent) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
         );
         let error = match run_sse_source(&source, config(port)).await {
             Ok(_) => panic!("invalid SSE response must fail"),
@@ -1011,7 +1011,7 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
     let mut idle_config = config(port);
     idle_config.stream_idle_timeout = std::time::Duration::from_millis(20);
     let source = format!(
-        r#"use http; fn go(item: map) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+        r#"use http; fn go(item: SseEvent) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
     );
     let error = match run_sse_source(&source, idle_config).await {
         Ok(_) => panic!("idle SSE peer must time out"),
@@ -1032,7 +1032,7 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
     let mut opening_config = config(port);
     opening_config.stream_idle_timeout = std::time::Duration::from_millis(20);
     let source = format!(
-        r#"use http; fn go(item: map) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+        r#"use http; fn go(item: SseEvent) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
     );
     let error = match run_sse_source(&source, opening_config).await {
         Ok(_) => panic!("SSE response opening must obey idle timeout"),
@@ -1059,7 +1059,7 @@ async fn sse_script_timeout_shortens_the_host_stream_duration() {
     deadline_config.max_stream_duration = std::time::Duration::from_millis(200);
     deadline_config.stream_idle_timeout = std::time::Duration::from_millis(200);
     let source = format!(
-        r#"use http; fn go(item: map) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events","timeout_ms":20}}, go);"#
+        r#"use http; fn go(item: SseEvent) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events","timeout_ms":20}}, go);"#
     );
     let error = match run_sse_source(&source, deadline_config).await {
         Ok(_) => panic!("script deadline should shorten the host maximum"),
@@ -1083,7 +1083,7 @@ async fn sse_host_stream_duration_caps_script_timeout_while_opening() {
     deadline_config.max_stream_duration = std::time::Duration::from_millis(250);
     deadline_config.stream_idle_timeout = std::time::Duration::from_millis(800);
     let source = format!(
-        r#"use http; fn go(item: map) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events","timeout_ms":1000}}, go);"#
+        r#"use http; fn go(item: SseEvent) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events","timeout_ms":1000}}, go);"#
     );
     let error = match run_sse_source(&source, deadline_config).await {
         Ok(_) => panic!("host duration should cap the script timeout during opening"),
@@ -1120,7 +1120,7 @@ async fn sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout
     let source = format!(
         r#"use http;
         fn count_call() -> bool;
-        fn go(item: map) -> SseCallbackAction {{
+        fn go(item: SseEvent) -> SseCallbackAction {{
             {{action: if count_call() => {{"continue"}} else => {{"continue"}}}}
         }}
         http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
@@ -1358,7 +1358,7 @@ async fn sse_chunked_trailers_cannot_bypass_total_body_limits() {
     let mut stream_config = config(port);
     stream_config.max_stream_total_bytes = 9;
     let source = format!(
-        r#"use http; fn on_event(item: map) -> SseCallbackAction {{ {{action: "continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, on_event);"#
+        r#"use http; fn on_event(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, on_event);"#
     );
     let error = match run_sse_source(&source, stream_config).await {
         Ok(_) => panic!("oversized SSE trailers must be rejected"),
@@ -1376,7 +1376,7 @@ async fn sse_chunked_trailers_cannot_bypass_total_body_limits() {
 async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
     for status in [301, 302, 303, 307, 308] {
         let (target_port, target_requests, target) = recording_server(vec![vec![
-        b"HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream; Charset=UTF-8\r\nX-Obs: \x80\r\nContent-Length: 0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream; Charset=UTF-8\r\nX-Obs: \x80\r\nX-Repeat: first\r\nX-Repeat: second\r\nContent-Length: 0\r\n\r\n",
     ]]);
         let redirect = format!(
             "HTTP/1.1 {status} Redirect\r\nLocation: http://127.0.0.1:{target_port}/final\r\nContent-Length: 0\r\n\r\n"
@@ -1386,28 +1386,23 @@ async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
         let source_code = format!(
             r#"
         use http;
-        fn record(item: map) -> SseCallbackAction {{
-            if item["kind"] == "open" && item != {{
-                kind: "open",
-                status: 200,
-                headers: {{"content-type": "Text/Event-Stream; Charset=UTF-8", "x-obs": b"\x80", "content-length": "0"}},
-                url: "http://127.0.0.1:{target_port}/final"
-            }} {{ let _ = 1 / 0; }}
-            if item["kind"] == "end" && item != {{kind: "end"}} {{ let _ = 1 / 0; }}
+        fn record(item: SseEvent) -> SseCallbackAction {{
+            if item.kind == "open" && item.status != 200 {{ let _ = 1 / 0; }}
+            if item.kind == "end" && item.status != null {{ let _ = 1 / 0; }}
             {{action: "continue"}}
         }}
         http::client::sse(
-            {{method: "POST", url: "http://127.0.0.1:{source_port}/start", body: "payload", headers: {{
-                Authorization: "Bearer secret",
-                "Proxy-Authorization": "Basic proxy-secret",
-                Cookie: "a=b",
-                "X-Api-Key": "api-secret",
-                "X-Arbitrary": "custom-secret",
-                "Content-Type": "application/body",
-                Accept: "text/event-stream",
-                "Accept-Language": "en-US",
-                "Accept-Encoding": "identity"
-            }}}},
+            {{method: "POST", url: "http://127.0.0.1:{source_port}/start", body: {{ kind: "text", text: "payload" }}, headers: [
+                {{ name: "Authorization", value: "Bearer secret" }},
+                {{ name: "Proxy-Authorization", value: "Basic proxy-secret" }},
+                {{ name: "Cookie", value: "a=b" }},
+                {{ name: "X-Api-Key", value: "api-secret" }},
+                {{ name: "X-Arbitrary", value: "custom-secret" }},
+                {{ name: "Content-Type", value: "application/body" }},
+                {{ name: "Accept", value: "text/event-stream" }},
+                {{ name: "Accept-Language", value: "en-US" }},
+                {{ name: "Accept-Encoding", value: "identity" }}
+            ]}},
             record
         );
         "#
@@ -1423,14 +1418,63 @@ async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
                 ("status", Value::Int(200)),
                 (
                     "headers",
-                    map([
-                        (
-                            "content-type",
-                            Value::string("Text/Event-Stream; Charset=UTF-8"),
-                        ),
-                        ("x-obs", Value::bytes(vec![0x80])),
-                        ("content-length", Value::string("0")),
-                    ]),
+                    Value::Array(Arc::new(vec![
+                        map([
+                            ("name", Value::string("content-type"),),
+                            (
+                                "value",
+                                map([
+                                    ("kind", Value::string("text")),
+                                    ("text", Value::string("Text/Event-Stream; Charset=UTF-8")),
+                                    ("bytes", Value::Null),
+                                ]),
+                            ),
+                        ]),
+                        map([
+                            ("name", Value::string("x-obs")),
+                            (
+                                "value",
+                                map([
+                                    ("kind", Value::string("bytes")),
+                                    ("text", Value::Null),
+                                    ("bytes", Value::bytes(vec![0x80])),
+                                ]),
+                            ),
+                        ]),
+                        map([
+                            ("name", Value::string("x-repeat")),
+                            (
+                                "value",
+                                map([
+                                    ("kind", Value::string("text")),
+                                    ("text", Value::string("first")),
+                                    ("bytes", Value::Null),
+                                ]),
+                            ),
+                        ]),
+                        map([
+                            ("name", Value::string("x-repeat")),
+                            (
+                                "value",
+                                map([
+                                    ("kind", Value::string("text")),
+                                    ("text", Value::string("second")),
+                                    ("bytes", Value::Null),
+                                ]),
+                            ),
+                        ]),
+                        map([
+                            ("name", Value::string("content-length")),
+                            (
+                                "value",
+                                map([
+                                    ("kind", Value::string("text")),
+                                    ("text", Value::string("0")),
+                                    ("bytes", Value::Null),
+                                ]),
+                            ),
+                        ]),
+                    ])),
                 ),
                 ("url", Value::string(final_url)),
                 ("items", Value::Int(2)),
