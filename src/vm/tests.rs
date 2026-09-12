@@ -3455,7 +3455,7 @@ fn native_callable_abi_version_covers_direct_script_calls() {
 mod callable_resource_schema_tests {
     use super::*;
     use crate::bytecode::VmMap;
-    use crate::compiler::TypeSchema;
+    use crate::compiler::{StructDecl, TypeSchema};
     use crate::vm::resource::{CloseProgress, HostResource, ResourceCloseReason, ResourceHandle};
     use crate::{CallableKind, CallablePrototype, FunctionRegion, ScriptFunction};
 
@@ -3729,6 +3729,78 @@ mod callable_resource_schema_tests {
         (vm, callable)
     }
 
+    fn callable_vm_with_guest_named(
+        callee_body: &[u8],
+        constants: Vec<Value>,
+        parameter_schema: TypeSchema,
+        result_schema: TypeSchema,
+        guest: HashMap<String, StructDecl>,
+    ) -> (Vm, Value) {
+        let function_entry = 1u32;
+        let function_end = function_entry + callee_body.len() as u32;
+        let mut code = vec![OpCode::Ret as u8];
+        code.extend_from_slice(callee_body);
+        let program = Program::new(constants, code)
+            .with_local_count(0)
+            .with_callable_metadata(
+                vec![ScriptFunction {
+                    entry_ip: function_entry,
+                    end_ip: function_end,
+                }],
+                vec![CallablePrototype {
+                    kind: CallableKind::FunctionItem,
+                    target: CallableTarget::ScriptFunction(0),
+                    arity: 1,
+                    frame_local_count: 1,
+                    parameter_slots: vec![0],
+                    capture_source_slots: Vec::new(),
+                    capture_slots: Vec::new(),
+                    capture_modes: Vec::new(),
+                    self_slot: None,
+                    schema: Some(TypeSchema::Callable {
+                        params: vec![parameter_schema],
+                        result: Box::new(result_schema),
+                    }),
+                }],
+                vec![
+                    FunctionRegion {
+                        start_ip: 0,
+                        end_ip: function_entry,
+                        prototype_id: None,
+                    },
+                    FunctionRegion {
+                        start_ip: function_entry,
+                        end_ip: function_end,
+                        prototype_id: Some(0),
+                    },
+                ],
+                Vec::new(),
+            )
+            .with_named_struct_decls(guest);
+        let mut vm = Vm::new(program);
+        let callable = vm
+            .bind_callable_value(0, Vec::new())
+            .expect("callable should bind");
+        vm.run().expect("root program should halt");
+        (vm, callable)
+    }
+
+    fn point_guest_decl() -> HashMap<String, StructDecl> {
+        let mut fields = HashMap::new();
+        fields.insert("x".to_string(), TypeSchema::Int);
+        fields.insert("y".to_string(), TypeSchema::Int);
+        let mut guest = HashMap::new();
+        guest.insert(
+            "Point".to_string(),
+            StructDecl {
+                name: "Point".to_string(),
+                type_params: Vec::new(),
+                body_schema: TypeSchema::Object(fields),
+            },
+        );
+        guest
+    }
+
     fn named_handle_box(handle: i64, note: Option<&str>) -> Value {
         let mut object = VmMap::new();
         object.insert(Value::string("file"), Value::Int(handle));
@@ -3884,5 +3956,237 @@ mod callable_resource_schema_tests {
             .invoke_callable(callable, &[named_handle_box(41, None)])
             .expect_err("named return must reject invalid nested resource");
         assert_resource_schema_error(error, "invalid_resource_handle");
+    }
+
+    fn point_value(x: i64, y: i64) -> Value {
+        let mut object = VmMap::new();
+        object.insert(Value::string("x"), Value::Int(x));
+        object.insert(Value::string("y"), Value::Int(y));
+        Value::Map(object.into())
+    }
+
+    fn run_compiled(source: &str) -> crate::VmResult<Vec<Value>> {
+        let compiled = crate::compile_source(source).expect("source should compile");
+        let mut vm = Vm::new(compiled.program);
+        loop {
+            match vm.run()? {
+                VmStatus::Halted => break,
+                VmStatus::Yielded => continue,
+                VmStatus::Waiting(_) => panic!("compiled guest named program should not wait"),
+            }
+        }
+        Ok(vm.stack().to_vec())
+    }
+
+    #[test]
+    fn guest_named_struct_validates_callable_argument_without_host_catalog() {
+        let schema = TypeSchema::Named("Point".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            point_guest_decl(),
+        );
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[point_value(1, 2)])
+                .expect("guest Named argument should pass without host catalog"),
+            Value::Null
+        );
+
+        let error = vm
+            .invoke_callable(callable, &[Value::Int(1)])
+            .expect_err("guest Named must still require a map");
+        assert!(
+            matches!(error, VmError::TypeMismatch("callable argument schema")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn guest_named_struct_validates_callable_return_without_host_catalog() {
+        let schema = TypeSchema::Named("Point".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ldloc as u8, 0, OpCode::Ret as u8],
+            Vec::new(),
+            schema.clone(),
+            schema,
+            point_guest_decl(),
+        );
+        let returned = vm
+            .invoke_callable(callable, &[point_value(3, 4)])
+            .expect("guest Named return should pass without host catalog");
+        assert_eq!(returned, point_value(3, 4));
+    }
+
+    #[test]
+    fn guest_named_decls_do_not_accept_unknown_host_named() {
+        let schema = TypeSchema::Named("MissingBox".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            point_guest_decl(),
+        );
+        let error = vm
+            .invoke_callable(callable, &[point_value(1, 2)])
+            .expect_err("unknown host Named must stay fail-closed");
+        match error {
+            VmError::HostError(message) => {
+                assert!(
+                    message.contains("unknown named struct"),
+                    "unexpected host error: {message}"
+                );
+            }
+            other => panic!("expected HostError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guest_named_struct_validates_nested_resource_without_host_catalog() {
+        let mut fields = HashMap::new();
+        fields.insert("file".to_string(), TypeSchema::Resource(resource_key()));
+        let mut guest = HashMap::new();
+        guest.insert(
+            "HandleBox".to_string(),
+            StructDecl {
+                name: "HandleBox".to_string(),
+                type_params: Vec::new(),
+                body_schema: TypeSchema::Object(fields),
+            },
+        );
+        let schema = TypeSchema::Named("HandleBox".to_string(), Vec::new());
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            guest,
+        );
+        let handle = resource_handle(&mut vm);
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[named_handle_box(handle, None)])
+                .expect("guest Named nested resource should pass"),
+            Value::Null
+        );
+        let error = vm
+            .invoke_callable(callable, &[named_handle_box(41, None)])
+            .expect_err("guest Named must still reject invalid nested resources");
+        assert_resource_schema_error(error, "invalid_resource_handle");
+    }
+
+    #[test]
+    fn generic_guest_named_struct_instantiates_body() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "value".to_string(),
+            TypeSchema::GenericParam("T".to_string()),
+        );
+        let mut guest = HashMap::new();
+        guest.insert(
+            "Holder".to_string(),
+            StructDecl {
+                name: "Holder".to_string(),
+                type_params: vec!["T".to_string()],
+                body_schema: TypeSchema::Object(fields),
+            },
+        );
+        let schema = TypeSchema::Named("Holder".to_string(), vec![TypeSchema::Int]);
+        let (mut vm, callable) = callable_vm_with_guest_named(
+            &[OpCode::Ret as u8],
+            Vec::new(),
+            schema,
+            TypeSchema::Null,
+            guest,
+        );
+        let mut valid = VmMap::new();
+        valid.insert(Value::string("value"), Value::Int(7));
+        assert_eq!(
+            vm.invoke_callable(callable.clone(), &[Value::Map(valid.into())])
+                .expect("instantiated guest Named should pass"),
+            Value::Null
+        );
+
+        let error = vm
+            .invoke_callable(callable, &[Value::Int(7)])
+            .expect_err("generic guest Named must still require a map");
+        assert!(
+            matches!(error, VmError::TypeMismatch("callable argument schema")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn compiled_guest_named_callable_and_return_roundtrip() {
+        let stack = run_compiled(
+            r#"
+            struct Point { x: int, y: int }
+            fn ident(p: Point) -> Point { p }
+            ident({ x: 1, y: 2 });
+            "#,
+        )
+        .expect("compiled guest Named callable should run");
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0], point_value(1, 2));
+    }
+
+    #[test]
+    fn compiled_generic_guest_named_like_lru_state_runs() {
+        let stack = run_compiled(
+            r#"
+            struct Holder<T> { value: T }
+            fn ident(p: Holder<int>) -> Holder<int> { p }
+            ident({ value: 9 });
+            "#,
+        )
+        .expect("compiled generic guest Named should run");
+        assert_eq!(stack.len(), 1);
+        let mut expected = VmMap::new();
+        expected.insert(Value::string("value"), Value::Int(9));
+        assert_eq!(stack[0], Value::Map(expected.into()));
+    }
+
+    #[test]
+    fn compiled_nested_guest_named_struct_runs() {
+        let stack = run_compiled(
+            r#"
+            struct Inner { n: int }
+            struct Outer { inner: Inner }
+            fn ident(p: Outer) -> Outer { p }
+            ident({ inner: { n: 4 } });
+            "#,
+        )
+        .expect("compiled nested guest Named should run");
+        assert_eq!(stack.len(), 1);
+        assert!(matches!(stack[0], Value::Map(_)));
+    }
+
+    #[test]
+    fn vmbc_roundtrip_preserves_guest_named_struct_decls() {
+        let compiled = crate::compile_source(
+            r#"
+            struct Point { x: int, y: int }
+            fn ident(p: Point) -> Point { p }
+            ident({ x: 8, y: 9 });
+            "#,
+        )
+        .expect("source should compile");
+        assert!(
+            compiled.program.named_struct_decls.contains_key("Point"),
+            "codegen should attach guest struct decls"
+        );
+        let bytes = encode_program(&compiled.program).expect("program should encode");
+        let decoded = decode_program(&bytes).expect("program should decode");
+        assert!(
+            decoded.named_struct_decls.contains_key("Point"),
+            "VMBC should preserve guest struct decls"
+        );
+        let mut vm = Vm::new(decoded);
+        assert_eq!(
+            vm.run().expect("decoded program should halt"),
+            VmStatus::Halted
+        );
+        assert_eq!(vm.stack(), &[point_value(8, 9)]);
     }
 }

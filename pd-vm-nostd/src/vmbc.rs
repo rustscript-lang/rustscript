@@ -124,6 +124,9 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         exported_callables,
     ) = read_callable_metadata(&mut cursor)?;
     if !cursor.is_empty() {
+        skip_named_struct_decls(&mut cursor).map_err(|_| WireError::TrailingBytes)?;
+    }
+    if !cursor.is_empty() {
         return Err(WireError::TrailingBytes);
     }
     validate_call_script_operands(&code, &callable_prototypes)?;
@@ -284,6 +287,19 @@ fn skip_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireError> {
         17 => skip_resource_key(cursor),
         value => Err(WireError::InvalidValueType(value)),
     }
+}
+
+fn skip_named_struct_decls(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
+    let count = cursor.read_count("named struct decls", 1)?;
+    for _ in 0..count {
+        cursor.skip_string()?;
+        let param_count = cursor.read_count("named struct type params", 1)?;
+        for _ in 0..param_count {
+            cursor.skip_string()?;
+        }
+        skip_schema(cursor, 0)?;
+    }
+    Ok(())
 }
 
 fn skip_resource_key(cursor: &mut Cursor<'_>) -> Result<(), WireError> {

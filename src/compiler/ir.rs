@@ -430,7 +430,7 @@ pub struct ResolvedHostCall {
     pub host_return_type: HostTypeSchema,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StructDecl {
     pub name: String,
     pub type_params: Vec<String>,

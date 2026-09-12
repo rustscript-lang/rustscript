@@ -7,7 +7,7 @@ use crate::bytecode::{
     CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable,
     FunctionRegion, MAX_FRAME_LOCAL_COUNT, RootCallableBinding, ScriptFunction, TypeMap, ValueType,
 };
-use crate::compiler::ir::TypeSchema;
+use crate::compiler::ir::{StructDecl, TypeSchema};
 use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 use crate::host_api::{
     HostApiFingerprint, HostImportParam, HostImportSchema, HostParamPassing, HostStructField,
@@ -342,6 +342,7 @@ pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     write_type_map(&mut out, program.type_map.as_ref())?;
     write_debug_info(&mut out, program.debug.as_ref())?;
     write_callable_metadata(&mut out, program)?;
+    write_named_struct_decls(&mut out, program)?;
 
     Ok(out)
 }
@@ -426,6 +427,11 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         root_callable_bindings,
         exported_callables,
     ) = read_callable_metadata(&mut cursor)?;
+    let named_struct_decls = if cursor.is_eof() {
+        HashMap::new()
+    } else {
+        read_named_struct_decls(&mut cursor).map_err(|_| WireError::TrailingBytes)?
+    };
 
     if !cursor.is_eof() {
         return Err(WireError::TrailingBytes);
@@ -439,6 +445,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     program.function_regions = function_regions;
     program.root_callable_bindings = root_callable_bindings;
     program.exported_callables = exported_callables;
+    program.named_struct_decls = named_struct_decls;
     let type_map_local_count = program
         .type_map
         .as_ref()
@@ -1062,6 +1069,56 @@ fn write_callable_metadata(out: &mut Vec<u8>, program: &Program) -> Result<(), W
         out.extend_from_slice(&exported.local_slot.to_le_bytes());
     }
     Ok(())
+}
+
+fn write_named_struct_decls(out: &mut Vec<u8>, program: &Program) -> Result<(), WireError> {
+    if program.named_struct_decls.is_empty() {
+        return Ok(());
+    }
+    let mut decls = program.named_struct_decls.values().collect::<Vec<_>>();
+    decls.sort_unstable_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+    write_u32_count("named struct decls", decls.len(), out)?;
+    for decl in decls {
+        write_string("named struct name", &decl.name, out)?;
+        write_u32_count("named struct type params", decl.type_params.len(), out)?;
+        for type_param in &decl.type_params {
+            write_string("named struct type param", type_param, out)?;
+        }
+        write_schema(&decl.body_schema, out)?;
+    }
+    Ok(())
+}
+
+fn read_named_struct_decls(
+    cursor: &mut Cursor<'_>,
+) -> Result<HashMap<String, StructDecl>, WireError> {
+    let count = cursor.read_count("named struct decls", 1)?;
+    let mut decls = HashMap::new();
+    reserve_map(&mut decls, "named struct decls", count)?;
+    for _ in 0..count {
+        let name = cursor.read_string()?;
+        let param_count = cursor.read_count("named struct type params", 1)?;
+        let mut type_params = Vec::new();
+        reserve_vec(&mut type_params, "named struct type params", param_count)?;
+        for _ in 0..param_count {
+            type_params.push(cursor.read_string()?);
+        }
+        let body_schema = read_schema(cursor, 0)?;
+        if decls
+            .insert(
+                name.clone(),
+                StructDecl {
+                    name,
+                    type_params,
+                    body_schema,
+                },
+            )
+            .is_some()
+        {
+            return Err(WireError::InvalidValueType(0));
+        }
+    }
+    Ok(decls)
 }
 
 fn write_u16_list(field: &'static str, values: &[u16], out: &mut Vec<u8>) -> Result<(), WireError> {

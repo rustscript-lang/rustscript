@@ -259,6 +259,7 @@ impl Compiler {
         program.exported_callables = exported_callables;
         program.imports = self.host_imports;
         program = program.with_optional_host_import_schemas(self.host_import_schemas);
+        program = program.with_named_struct_decls(self.struct_schemas);
         Ok(program)
     }
 
