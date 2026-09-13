@@ -16,6 +16,19 @@ The embedding policy controls the allowed database root, unsafe-SQL capability, 
 ceilings. Configure that policy before opening a connection. Each operation is asynchronous;
 the VM resumes after the host operation completes.
 
+## Compiler and editor catalog boundary
+
+The typed SQLite catalog is a schema-only surface and does not construct a VM or link
+`rusqlite`. `sqlite_host_catalog` and the SQLite entries in `standard_host_catalog` remain
+available whenever the `runtime` feature is compiled, including builds without the `sqlite`
+feature. Catalog-aware compiler callers and the LSP use these declarations for named-struct
+field access and exact host signatures.
+
+The `sqlite` feature controls the executable SQLite module, generated SQLite namespace and
+callables, the `rusqlite` dependency, and SQLite registration exports. A runtime build without
+that feature can inspect the editor/compiler contract but has no SQLite implementation to bind;
+execution requires a build with `sqlite` enabled and the SQLite module registered.
+
 ## Open options (`SqliteOpenOptions`)
 
 ```rust

@@ -538,6 +538,18 @@ fn signature_help_shows_borrow_resource_and_value_params() {
         label.contains("sql: string"),
         "signature must show the value parameter: {label}"
     );
+    assert!(
+        label.contains("params: array<SqliteValue>"),
+        "signature must show typed SQLite parameters: {label}"
+    );
+    assert!(
+        label.contains("limits: SqliteLimits"),
+        "signature must show typed SQLite limits: {label}"
+    );
+    assert!(
+        label.contains("-> SqliteQueryResult"),
+        "signature must show the typed SQLite query result: {label}"
+    );
 }
 
 // ---------------------------------------------------------------------------
