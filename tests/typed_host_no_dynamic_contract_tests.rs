@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
     not(target_family = "wasm")
 ))]
 use vm::http_host_catalog;
-#[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
+#[cfg(feature = "runtime")]
 use vm::sqlite_host_catalog;
 #[cfg(feature = "runtime")]
 use vm::{HostApiCatalog, jit_host_catalog, standard_host_catalog};
