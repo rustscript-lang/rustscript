@@ -1,4 +1,5 @@
 use sqlite;
+use bytes;
 
 fn main() {
     let db = sqlite::open({
@@ -6,13 +7,36 @@ fn main() {
         mode: "memory",
         limits: { max_rows: 32 },
     });
-    sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
-    let inserted = sqlite::execute(&db, "INSERT INTO t VALUES (?)", [7]);
-    let queried = sqlite::query(&db, "SELECT a FROM t", [], {});
-    let n = inserted.rows_affected;
-    let id = inserted.last_insert_rowid;
-    let truncated = queried.truncated;
+
+    sqlite::execute(&db, "CREATE TABLE t (value, payload)", []);
+    let blob_payload = bytes::from_hex("000102");
+    sqlite::execute(&db, "INSERT INTO t VALUES (?1, ?2)", [
+        { kind: "int", int_value: 7 },
+        { kind: "blob", blob_value: blob_payload },
+    ]);
+
+    let queried = sqlite::query(&db, "SELECT value, payload FROM t", [], {});
+    let first = queried.rows[0].cells[0];
+    assert(first.kind == "int");
+    assert(first.int_value == 7);
+
+    let results = sqlite::transaction(&db, [
+        {
+            sql: "INSERT INTO t VALUES (?1, ?2)",
+            params: [
+                { kind: "text", text_value: "hello" },
+                { kind: "null" },
+            ],
+        },
+        {
+            sql: "SELECT value, payload FROM t ORDER BY rowid",
+            query: true,
+            limits: { max_rows: 32 },
+        },
+    ]);
+    assert(results[0].kind == "execute");
+    assert(results[1].kind == "query");
+    assert(results[1].query.rows[0].cells[0].int_value == 7);
+
     sqlite::close(db);
-    n + id;
-    truncated;
 }

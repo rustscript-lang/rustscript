@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 use vm::{
     HostApiCatalog, HostTypeSchema, http_host_catalog, jit_host_catalog, sqlite_host_catalog,
+    standard_host_catalog,
 };
 
 fn assert_no_public_dynamic_schema(catalog_name: &str, catalog: &HostApiCatalog) {
@@ -74,4 +75,5 @@ fn affected_public_host_catalogs_have_no_reachable_map_or_unknown() {
     assert_no_public_dynamic_schema("http", &http_host_catalog());
     assert_no_public_dynamic_schema("sqlite", &sqlite_host_catalog());
     assert_no_public_dynamic_schema("jit", &jit_host_catalog());
+    assert_no_public_dynamic_schema("standard", &standard_host_catalog());
 }

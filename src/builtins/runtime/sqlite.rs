@@ -1009,6 +1009,125 @@ fn validate_sql(sql: &str, limits: SqliteLimits, allow_unsafe_sql: bool) -> VmRe
     Ok(())
 }
 
+fn reject_unexpected_fields(map: &VmMap, allowed: &[&str], context: &'static str) -> VmResult<()> {
+    for (key, _) in map {
+        let Value::String(key) = key else {
+            return Err(VmError::TypeMismatch(context));
+        };
+        if !allowed.iter().any(|allowed| *allowed == key.as_str()) {
+            return Err(VmError::HostError(format!(
+                "{context} contains unknown field '{key}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn present_payload<'a>(map: &'a VmMap, key: &str) -> Option<&'a Value> {
+    match map_value(map, key) {
+        Some(Value::Null) | None => None,
+        Some(value) => Some(value),
+    }
+}
+
+fn sqlite_parameter_value(
+    value: &Value,
+    parameter_bytes: &mut usize,
+    limits: SqliteLimits,
+) -> VmResult<SqlValue> {
+    let Value::Map(map) = value else {
+        return Err(VmError::TypeMismatch("SQLite value"));
+    };
+    reject_unexpected_fields(
+        map,
+        &[
+            "kind",
+            "int_value",
+            "float_value",
+            "text_value",
+            "blob_value",
+        ],
+        "SQLite value",
+    )?;
+    let kind = match map_value(map, "kind") {
+        Some(Value::String(kind)) => kind.as_str(),
+        Some(Value::Null) | None => {
+            return Err(VmError::HostError("missing SQLite value kind".to_string()));
+        }
+        Some(_) => return Err(VmError::TypeMismatch("SQLite value kind")),
+    };
+    let payload_count = ["int_value", "float_value", "text_value", "blob_value"]
+        .into_iter()
+        .filter(|key| present_payload(map, key).is_some())
+        .count();
+    if payload_count > 1 {
+        return Err(VmError::HostError(
+            "SQLite value has multiple non-null payloads".to_string(),
+        ));
+    }
+    let selected_payload = match kind {
+        "null" => {
+            if payload_count != 0 {
+                return Err(VmError::HostError(
+                    "SQLite null value must not have a payload".to_string(),
+                ));
+            }
+            return Ok(SqlValue::Null);
+        }
+        "int" => present_payload(map, "int_value")
+            .ok_or_else(|| VmError::HostError("missing SQLite int_value".to_string()))?,
+        "float" => present_payload(map, "float_value")
+            .ok_or_else(|| VmError::HostError("missing SQLite float_value".to_string()))?,
+        "text" => present_payload(map, "text_value")
+            .ok_or_else(|| VmError::HostError("missing SQLite text_value".to_string()))?,
+        "blob" => present_payload(map, "blob_value")
+            .ok_or_else(|| VmError::HostError("missing SQLite blob_value".to_string()))?,
+        _ => {
+            return Err(VmError::HostError(format!(
+                "unknown SQLite value kind '{kind}'"
+            )));
+        }
+    };
+    match kind {
+        "int" => match selected_payload {
+            Value::Int(value) => Ok(SqlValue::Integer(*value)),
+            _ => Err(VmError::TypeMismatch("SQLite int_value payload")),
+        },
+        "float" => match selected_payload {
+            Value::Float(value) => Ok(SqlValue::Real(*value)),
+            _ => Err(VmError::TypeMismatch("SQLite float_value payload")),
+        },
+        "text" => match selected_payload {
+            Value::String(value) => {
+                *parameter_bytes = parameter_bytes.saturating_add(value.len());
+                if *parameter_bytes > limits.max_parameter_bytes {
+                    return Err(VmError::HostError(format!(
+                        "SQLite parameters exceed the configured {} byte limit",
+                        limits.max_parameter_bytes
+                    )));
+                }
+                Ok(SqlValue::Text(value.as_ref().clone()))
+            }
+            _ => Err(VmError::TypeMismatch("SQLite text_value payload")),
+        },
+        "blob" => match selected_payload {
+            Value::Bytes(value) => {
+                *parameter_bytes = parameter_bytes.saturating_add(value.len());
+                if *parameter_bytes > limits.max_parameter_bytes {
+                    return Err(VmError::HostError(format!(
+                        "SQLite parameters exceed the configured {} byte limit",
+                        limits.max_parameter_bytes
+                    )));
+                }
+                Ok(SqlValue::Blob(value.as_ref().clone()))
+            }
+            _ => Err(VmError::TypeMismatch("SQLite blob_value payload")),
+        },
+        "null" => unreachable!("null SQLite values return before payload decoding"),
+        _ => unreachable!("unknown SQLite value kinds return before payload decoding"),
+    }
+}
+
 fn sqlite_params(values: VmArrayRef<'_>, limits: SqliteLimits) -> VmResult<Vec<SqlValue>> {
     if values.len() > limits.max_parameters {
         return Err(VmError::HostError(
@@ -1018,32 +1137,7 @@ fn sqlite_params(values: VmArrayRef<'_>, limits: SqliteLimits) -> VmResult<Vec<S
     let mut bytes = 0usize;
     let mut params = Vec::with_capacity(values.len());
     for value in values {
-        let sql_value = match value {
-            Value::Null => SqlValue::Null,
-            Value::Int(value) => SqlValue::Integer(*value),
-            Value::Float(value) => SqlValue::Real(*value),
-            Value::String(value) => {
-                bytes = bytes.saturating_add(value.len());
-                SqlValue::Text(value.as_ref().clone())
-            }
-            Value::Bytes(value) => {
-                bytes = bytes.saturating_add(value.len());
-                SqlValue::Blob(value.as_ref().clone())
-            }
-            _ => {
-                return Err(VmError::HostError(
-                    "SQLite parameters support only null, int, float, string, and bytes"
-                        .to_string(),
-                ));
-            }
-        };
-        if bytes > limits.max_parameter_bytes {
-            return Err(VmError::HostError(format!(
-                "SQLite parameters exceed the configured {} byte limit",
-                limits.max_parameter_bytes
-            )));
-        }
-        params.push(sql_value);
+        params.push(sqlite_parameter_value(value, &mut bytes, limits)?);
     }
     Ok(params)
 }
@@ -1096,16 +1190,77 @@ fn estimate_value_bytes(value: &Value) -> usize {
     }
 }
 
-fn value_from_row(row: &rusqlite::Row<'_>, index: usize) -> Result<Value, rusqlite::Error> {
+fn sqlite_value_map(
+    kind: &str,
+    int_value: Option<i64>,
+    float_value: Option<f64>,
+    text_value: Option<String>,
+    blob_value: Option<Vec<u8>>,
+) -> Value {
+    Value::Map(Arc::new(VmMap::from_entries(vec![
+        (Value::string("kind"), Value::string(kind)),
+        (
+            Value::string("int_value"),
+            int_value.map_or(Value::Null, Value::Int),
+        ),
+        (
+            Value::string("float_value"),
+            float_value.map_or(Value::Null, Value::Float),
+        ),
+        (
+            Value::string("text_value"),
+            text_value.map_or(Value::Null, Value::string),
+        ),
+        (
+            Value::string("blob_value"),
+            blob_value.map_or(Value::Null, Value::bytes),
+        ),
+    ])))
+}
+
+struct EncodedSqliteValue {
+    value: Value,
+    bytes: usize,
+    integer: Option<i64>,
+}
+
+fn value_from_row(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> Result<EncodedSqliteValue, rusqlite::Error> {
     match row.get_ref(index)? {
-        ValueRef::Null => Ok(Value::Null),
-        ValueRef::Integer(value) => Ok(Value::Int(value)),
-        ValueRef::Real(value) => Ok(Value::Float(value)),
+        ValueRef::Null => Ok(EncodedSqliteValue {
+            value: sqlite_value_map("null", None, None, None, None),
+            bytes: 1,
+            integer: None,
+        }),
+        ValueRef::Integer(value) => Ok(EncodedSqliteValue {
+            value: sqlite_value_map("int", Some(value), None, None, None),
+            bytes: 8,
+            integer: Some(value),
+        }),
+        ValueRef::Real(value) => Ok(EncodedSqliteValue {
+            value: sqlite_value_map("float", None, Some(value), None, None),
+            bytes: 8,
+            integer: None,
+        }),
         ValueRef::Text(value) => match std::str::from_utf8(value) {
-            Ok(value) => Ok(Value::string(value)),
-            Err(_) => Ok(Value::bytes(value.to_vec())),
+            Ok(value) => Ok(EncodedSqliteValue {
+                value: sqlite_value_map("text", None, None, Some(value.to_string()), None),
+                bytes: value.len(),
+                integer: None,
+            }),
+            Err(_) => Ok(EncodedSqliteValue {
+                value: sqlite_value_map("blob", None, None, None, Some(value.to_vec())),
+                bytes: value.len(),
+                integer: None,
+            }),
         },
-        ValueRef::Blob(value) => Ok(Value::bytes(value.to_vec())),
+        ValueRef::Blob(value) => Ok(EncodedSqliteValue {
+            value: sqlite_value_map("blob", None, None, None, Some(value.to_vec())),
+            bytes: value.len(),
+            integer: None,
+        }),
     }
 }
 
@@ -1137,20 +1292,27 @@ fn query_with_connection(
         }
         let mut cells = Vec::with_capacity(column_count);
         let mut row_bytes = 0usize;
+        let mut row_cursor = None;
         for index in 0..column_count {
-            let value = value_from_row(row, index)?;
-            row_bytes = row_bytes.saturating_add(estimate_value_bytes(&value));
-            cells.push(value);
+            let encoded = value_from_row(row, index)?;
+            row_bytes = row_bytes.saturating_add(encoded.bytes);
+            if index == 0 {
+                row_cursor = encoded.integer;
+            }
+            cells.push(encoded.value);
         }
         if result_bytes.saturating_add(row_bytes) > limits.max_result_bytes {
             truncated = true;
             break;
         }
-        if let Some(Value::Int(cursor)) = cells.first() {
-            next_cursor = Some(*cursor);
+        if let Some(cursor) = row_cursor {
+            next_cursor = Some(cursor);
         }
         result_bytes = result_bytes.saturating_add(row_bytes);
-        values.push(Value::array(cells));
+        values.push(Value::Map(Arc::new(VmMap::from_entries(vec![(
+            Value::string("cells"),
+            Value::array(cells),
+        )]))));
     }
     let mut entries = vec![
         (Value::string("columns"), Value::array(columns)),
@@ -1185,6 +1347,20 @@ fn execute_with_connection(
             Value::Int(connection.last_insert_rowid()),
         ),
     ]))
+}
+
+fn transaction_result_value(kind: &str, execute: Option<VmMap>, query: Option<VmMap>) -> Value {
+    Value::Map(Arc::new(VmMap::from_entries(vec![
+        (Value::string("kind"), Value::string(kind)),
+        (
+            Value::string("execute"),
+            execute.map_or(Value::Null, |value| Value::Map(Arc::new(value))),
+        ),
+        (
+            Value::string("query"),
+            query.map_or(Value::Null, |value| Value::Map(Arc::new(value))),
+        ),
+    ])))
 }
 
 struct SqliteWorkerCompletion {
@@ -1509,17 +1685,20 @@ pub(super) fn builtin_sqlite_transaction_impl(
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let mut results = Vec::with_capacity(statements.len());
             for statement in statements {
-                let value = if statement.query {
-                    query_with_connection(
+                let result = if statement.query {
+                    let value = query_with_connection(
                         &transaction,
                         &statement.sql,
                         &statement.params,
                         statement.limits,
-                    )?
+                    )?;
+                    transaction_result_value("query", None, Some(value))
                 } else {
-                    execute_with_connection(&transaction, &statement.sql, &statement.params)?
+                    let value =
+                        execute_with_connection(&transaction, &statement.sql, &statement.params)?;
+                    transaction_result_value("execute", Some(value), None)
                 };
-                results.push(Value::Map(Arc::new(value)));
+                results.push(result);
             }
             transaction.commit()?;
             Ok(results)
