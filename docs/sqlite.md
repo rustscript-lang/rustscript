@@ -1,11 +1,8 @@
 # SQLite host API
 
-RustScript exposes SQLite as bounded host imports under the `sqlite` feature. Fixed-shape
-request and result objects are named structs at the catalog and compiler boundary. Runtime
-values remain maps; positional parameters and query rows stay arrays.
-
-Grant each imported callable explicitly. SQLite policy and capability bindings are snapshotted
-when a call is admitted.
+RustScript exposes bounded SQLite host functions when the `sqlite` feature is enabled. The
+public catalog uses named structs for options, parameters, rows, cells, and results. Connection
+arguments are borrowed for operations and consumed by `sqlite::close`.
 
 ## Imports
 
@@ -14,9 +11,10 @@ when a call is admitted.
 - `sqlite::query`
 - `sqlite::transaction`
 - `sqlite::close`
-- `sqlite::rows_affected`
-- `sqlite::truncated`
-- `sqlite::next_cursor`
+
+The embedding policy controls the allowed database root, unsafe-SQL capability, and host
+ceilings. Configure that policy before opening a connection. Each operation is asynchronous;
+the VM resumes after the host operation completes.
 
 ## Open options (`SqliteOpenOptions`)
 
@@ -30,22 +28,22 @@ let db = sqlite::open({
 });
 ```
 
-All fields are optional in object literals. Present `null` matches omission. Runtime still
-requires a non-empty `path`; `null` path is missing.
+All fields are optional in object literals. A missing field or `null` keeps the host default,
+except that `path` remains required at runtime for a usable connection.
 
-| Field | Compile-time | Runtime |
+| Field | Type | Runtime behavior |
 | --- | --- | --- |
-| `path` | optional string | required non-empty path; `null` is missing |
-| `mode` | optional string | `memory`, `read_only`, `read_write`, or `read_write_create`; omitted or `null` defaults to `read_write_create` |
-| `root` | optional string | optional filesystem root for path confinement; omitted or `null` uses the embedding policy |
-| `limits` | optional `SqliteLimits` | omitted or `null` keeps the embedding ceiling |
+| `path` | optional string | Required and non-empty; resolved under the embedding policy root |
+| `mode` | optional string | `memory`, `read_only`, `read_write`, or `read_write_create`; the last is the default |
+| `root` | optional string | Must match the embedding policy root when supplied |
+| `limits` | optional `SqliteLimits` | Per-connection ceilings; omitted fields keep the host ceiling |
 
-Unknown fields are rejected at compile time.
+Unknown fields are rejected by the named-struct compiler contract.
 
 ## Limits (`SqliteLimits`)
 
-Every implementation-defined ceiling is an optional int. Omitted or `null` keys keep the host
-ceiling. Present keys must be positive integers and cannot exceed the ceiling.
+Every limit is an optional int. Omitted or `null` fields keep the embedding ceiling. Supplied
+limits must be positive and cannot exceed that ceiling.
 
 - `max_connections`
 - `max_statements`
@@ -59,14 +57,61 @@ ceiling. Present keys must be positive integers and cannot exceed the ceiling.
 - `max_transaction_ms`
 - `busy_timeout_ms`
 
-Empty `{}` is valid. Extra keys are rejected.
+An empty `{}` is valid. Extra fields are rejected.
+
+## Values (`SqliteValue`)
+
+Parameters and result cells use the same tagged named struct:
+
+```text
+SqliteValue {
+    kind: string,
+    int_value: optional<int>,
+    float_value: optional<float>,
+    text_value: optional<string>,
+    blob_value: optional<bytes>,
+}
+```
+
+The five `kind` values and their selected payloads are:
+
+| `kind` | Required payload | Other payloads |
+| --- | --- | --- |
+| `"null"` | none | must be `null` or omitted |
+| `"int"` | `int_value` | must be `null` or omitted |
+| `"float"` | `float_value` | must be `null` or omitted |
+| `"text"` | `text_value` | must be `null` or omitted |
+| `"blob"` | `blob_value` | must be `null` or omitted |
+
+For example:
+
+```rust
+let values = [
+    { kind: "null" },
+    { kind: "int", int_value: 7 },
+    { kind: "float", float_value: 1.5 },
+    { kind: "text", text_value: "hello" },
+    { kind: "blob", blob_value: bytes::from_hex("000102") },
+];
+```
+
+The host validates this discriminator at runtime. It rejects an unknown `kind`, a missing
+selected payload, multiple non-null payloads, and a selected payload with the wrong type.
+`"null"` carries no payload. SQLite TEXT that is not valid UTF-8 is returned as `kind: "blob"`
+with its original bytes.
 
 ## Execute (`SqliteExecuteResult`)
 
+`sqlite::execute` takes an `array<SqliteValue>` and returns a `SqliteExecuteResult`:
+
 ```rust
-let inserted = sqlite::execute(&db, "INSERT INTO t VALUES (?)", [7]);
-let n = inserted.rows_affected;
-let id = inserted.last_insert_rowid;
+let inserted = sqlite::execute(
+    &db,
+    "INSERT INTO t (value) VALUES (?1)",
+    [{ kind: "int", int_value: 7 }],
+);
+let affected = inserted.rows_affected;
+let rowid = inserted.last_insert_rowid;
 ```
 
 | Field | Type |
@@ -74,56 +119,85 @@ let id = inserted.last_insert_rowid;
 | `rows_affected` | int |
 | `last_insert_rowid` | int |
 
-`sqlite::execute(connection, sql, params)` takes positional `params` as an array of dynamic
-cells, not a named struct. `sqlite::rows_affected(envelope)` still reads the execute result.
+The parameter count and decoded text/blob byte length are checked against the connection
+limits before the operation is scheduled.
 
-## Query (`SqliteQueryResult`)
+## Query (`SqliteQueryResult` and `SqliteRow`)
+
+`sqlite::query` takes an `array<SqliteValue>` and returns a `SqliteQueryResult`:
 
 ```rust
-let queried = sqlite::query(&db, "SELECT a FROM t", [], { max_rows: 32 });
-let columns = queried.columns;
-let rows = queried.rows;
-let truncated = queried.truncated;
+let queried = sqlite::query(
+    &db,
+    "SELECT value FROM t ORDER BY rowid",
+    [],
+    { max_rows: 32 },
+);
+
+let first_row = queried.rows[0];
+let first_cell = first_row.cells[0];
+if first_cell.kind == "int" {
+    let value = first_cell.int_value;
+}
 ```
 
 | Field | Type |
 | --- | --- |
 | `columns` | array of string |
-| `rows` | array of arrays of dynamic cells |
+| `rows` | array of `SqliteRow` |
 | `truncated` | bool |
-| `next_cursor` | optional int; `null` when absent |
+| `next_cursor` | optional int |
 
-Row cells stay positional arrays. Index `queried.rows[0]` for the first row. Do not treat rows
-as objects.
+Each `SqliteRow` has one field, `cells`, an array of `SqliteValue` in column order. Result
+limits are charged from the underlying column names and cell payloads, without counting the
+named-struct wrapper fields. `max_rows`, `max_columns`, and `max_result_bytes` can truncate a
+query; already accepted rows remain in the result. `next_cursor` is the first-column integer
+from the last accepted row, or `null` when no such value was accepted.
 
-`sqlite::truncated(envelope)` and `sqlite::next_cursor(envelope)` accept a query result.
-`sqlite::query` takes `SqliteLimits` as its fourth argument; `{}` keeps every ceiling.
+## Transactions (`SqliteStatement` and `SqliteTransactionResult`)
 
-## Transactions (`SqliteStatement`)
+A transaction receives an array of named `SqliteStatement` values. Each statement has a required
+`sql` string and optional typed `params`, `query`, and `limits` fields:
 
 ```rust
-sqlite::transaction(&db, [
-    { sql: "INSERT INTO t VALUES (1)", query: false },
-    { sql: "SELECT a FROM t", query: true, limits: { max_rows: 8 } },
+let results = sqlite::transaction(&db, [
+    {
+        sql: "INSERT INTO t (value) VALUES (?1)",
+        params: [{ kind: "int", int_value: 8 }],
+    },
+    {
+        sql: "SELECT value FROM t ORDER BY rowid",
+        query: true,
+        limits: { max_rows: 8 },
+    },
 ]);
 ```
 
-| Field | Compile-time | Runtime |
+| Field | Type | Runtime behavior |
 | --- | --- | --- |
-| `sql` | required string | required non-empty SQL |
-| `params` | optional positional array of dynamic cells | omitted or `null` is no parameters |
-| `query` | optional bool | omitted or `null` is execute (`false`) |
-| `limits` | optional `SqliteLimits` | omitted or `null` keeps the connection ceiling |
+| `sql` | string | Required non-empty SQL |
+| `params` | optional `array<SqliteValue>` | Omitted or `null` means no parameters |
+| `query` | optional bool | Omitted or `null` means execute; `true` returns a query result |
+| `limits` | optional `SqliteLimits` | Omitted or `null` keeps the connection ceiling |
 
-The transaction return is `array<unknown>` because execute and query envelopes mix. Params on
-`execute` / `query` / `SqliteStatement` stay dynamic arrays, not named structs.
+The return value is an `array<SqliteTransactionResult>` in statement order:
 
-## Runtime representation
+```text
+SqliteTransactionResult {
+    kind: string,
+    execute: optional<SqliteExecuteResult>,
+    query: optional<SqliteQueryResult>,
+}
+```
 
-Named struct identity is a compile-time schema. Successful host values are still maps:
+An execute statement produces `{ kind: "execute", execute: ... }`; a query statement produces
+`{ kind: "query", query: ... }`. The unselected envelope field is `null`. Discriminate with
+`kind` before using `execute` or `query`. The transaction remains atomic: statement order,
+rollback on failure, cancellation, deadlines, and result limits are preserved.
 
-- execute results expose `rows_affected` and `last_insert_rowid`
-- query envelopes expose `columns`, `rows`, `truncated`, and `next_cursor` (`null` when absent)
+## Resource lifecycle
 
-Field access (`inserted.rows_affected`) is the typed script surface. Extra or wrong-typed
-object-literal fields are compile errors.
+`sqlite::close(db)` consumes the connection, cancels pending operations on it, and waits for
+worker cleanup through the VM execution scope. VM reset closes remaining connections and retires
+pending SQLite operations. Handles are VM-local and generation-checked, so a closed or foreign
+handle cannot be reused.

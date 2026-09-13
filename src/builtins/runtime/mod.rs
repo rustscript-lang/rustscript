@@ -144,32 +144,72 @@ fn sqlite_execute_result_struct() -> HostStructSchema {
     .with_description("Result envelope for sqlite::execute. Runtime value remains a map.")
 }
 
-fn sqlite_query_result_struct() -> HostStructSchema {
+fn sqlite_value_struct() -> HostStructSchema {
+    HostStructSchema::new(
+        "SqliteValue",
+        vec![
+            HostStructField::new("kind", HostTypeSchema::String),
+            HostStructField::new("int_value", optional_type(HostTypeSchema::Int)),
+            HostStructField::new("float_value", optional_type(HostTypeSchema::Float)),
+            HostStructField::new("text_value", optional_type(HostTypeSchema::String)),
+            HostStructField::new("blob_value", optional_type(HostTypeSchema::Bytes)),
+        ],
+    )
+    .with_description(
+        "A tagged SQLite parameter or result cell. Exactly one payload matches kind, except null.",
+    )
+}
+
+fn sqlite_row_struct(value: &HostStructSchema) -> HostStructSchema {
+    HostStructSchema::new(
+        "SqliteRow",
+        vec![HostStructField::new("cells", array_type(value.as_type()))],
+    )
+    .with_description("One SQLite result row containing typed cells in column order.")
+}
+
+fn sqlite_query_result_struct(row: &HostStructSchema) -> HostStructSchema {
     HostStructSchema::new(
         "SqliteQueryResult",
         vec![
             HostStructField::new("columns", array_type(HostTypeSchema::String)),
-            HostStructField::new("rows", array_type(array_type(HostTypeSchema::Unknown))),
+            HostStructField::new("rows", array_type(row.as_type())),
             HostStructField::new("truncated", HostTypeSchema::Bool),
             HostStructField::new("next_cursor", optional_type(HostTypeSchema::Int)),
         ],
     )
-    .with_description(
-        "Query result envelope. Rows stay arrays of arrays; next_cursor is omitted when absent.",
-    )
+    .with_description("Query result envelope with typed rows; next_cursor is omitted when absent.")
 }
 
-fn sqlite_statement_struct(limits: &HostStructSchema) -> HostStructSchema {
+fn sqlite_statement_struct(
+    limits: &HostStructSchema,
+    value: &HostStructSchema,
+) -> HostStructSchema {
     HostStructSchema::new(
         "SqliteStatement",
         vec![
             HostStructField::new("sql", HostTypeSchema::String),
-            HostStructField::new("params", optional_type(array_type(HostTypeSchema::Unknown))),
+            HostStructField::new("params", optional_type(array_type(value.as_type()))),
             HostStructField::new("query", optional_type(HostTypeSchema::Bool)),
             HostStructField::new("limits", optional_type(limits.as_type())),
         ],
     )
-    .with_description("One sqlite::transaction statement. Positional params stay unknown.")
+    .with_description("One sqlite::transaction statement with optional typed parameters.")
+}
+
+fn sqlite_transaction_result_struct(
+    execute: &HostStructSchema,
+    query: &HostStructSchema,
+) -> HostStructSchema {
+    HostStructSchema::new(
+        "SqliteTransactionResult",
+        vec![
+            HostStructField::new("kind", HostTypeSchema::String),
+            HostStructField::new("execute", optional_type(execute.as_type())),
+            HostStructField::new("query", optional_type(query.as_type())),
+        ],
+    )
+    .with_description("A tagged ordered SQLite transaction result envelope.")
 }
 
 /// Returns the editor/compiler catalog for the SQLite host extension.
@@ -190,17 +230,22 @@ fn build_sqlite_host_catalog() -> Arc<HostApiCatalog> {
     let limits = sqlite_limits_struct();
     let open_options = sqlite_open_options_struct(&limits);
     let execute_result = sqlite_execute_result_struct();
-    let query_result = sqlite_query_result_struct();
-    let statement = sqlite_statement_struct(&limits);
+    let value = sqlite_value_struct();
+    let row = sqlite_row_struct(&value);
+    let query_result = sqlite_query_result_struct(&row);
+    let statement = sqlite_statement_struct(&limits, &value);
+    let transaction_result = sqlite_transaction_result_struct(&execute_result, &query_result);
     builder.named_struct(limits.clone());
     builder.named_struct(open_options.clone());
     builder.named_struct(execute_result.clone());
+    builder.named_struct(value.clone());
+    builder.named_struct(row.clone());
     builder.named_struct(query_result.clone());
     builder.named_struct(statement.clone());
+    builder.named_struct(transaction_result.clone());
 
-    // Positional params stay unknown (arrays of dynamic cells). Transaction
-    // results stay array<unknown> because execute and query envelopes mix.
-    // Fixed-shape maps are named structs; runtime values remain maps.
+    // Positional params, result cells, and mixed transaction outputs use named
+    // structs. Runtime values remain map/array carriers for these named types.
     builder.function(HostFunctionSchema::with_return(
         "sqlite::open",
         vec![HostParamSchema::value("options", open_options.as_type())],
@@ -215,7 +260,7 @@ fn build_sqlite_host_catalog() -> Arc<HostApiCatalog> {
                 HostParamPassing::Borrow,
             ),
             HostParamSchema::value("sql", HostTypeSchema::String),
-            HostParamSchema::value("params", HostTypeSchema::Unknown),
+            HostParamSchema::value("params", array_type(value.as_type())),
         ],
         execute_result.as_type(),
     ));
@@ -228,7 +273,7 @@ fn build_sqlite_host_catalog() -> Arc<HostApiCatalog> {
                 HostParamPassing::Borrow,
             ),
             HostParamSchema::value("sql", HostTypeSchema::String),
-            HostParamSchema::value("params", HostTypeSchema::Unknown),
+            HostParamSchema::value("params", array_type(value.as_type())),
             HostParamSchema::value("limits", limits.as_type()),
         ],
         query_result.as_type(),
@@ -243,7 +288,7 @@ fn build_sqlite_host_catalog() -> Arc<HostApiCatalog> {
             ),
             HostParamSchema::value("statements", array_type(statement.as_type())),
         ],
-        array_type(HostTypeSchema::Unknown),
+        array_type(transaction_result.as_type()),
     ));
     builder.function(HostFunctionSchema::with_return(
         "sqlite::close",

@@ -13,7 +13,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use vm::{SqliteHostExt, Vm, VmError, VmStatus, compile_source};
+use vm::{
+    CompileSourceFileOptions, HostFunctionRegistry, SqliteHostExt, Vm, VmError, VmStatus,
+    compile_source, compile_source_with_flavor_and_options,
+    register_sqlite_builtin_module_from_catalog, sqlite_host_catalog,
+};
 
 use super::vm_reset::reset_for_reuse_to_ready;
 
@@ -21,8 +25,17 @@ use super::vm_reset::reset_for_reuse_to_ready;
 /// value checks; a failed assert surfaces as a host error.
 fn run_sqlite_source(policy: vm::SqlitePolicy, source: &str) -> Result<(), VmError> {
     let wrapped = format!("use sqlite;\n{source}");
-    let compiled = compile_source(&wrapped).expect("source should compile");
-    let mut vm = Vm::new(compiled.program);
+    let catalog = sqlite_host_catalog();
+    let compiled = compile_source_with_flavor_and_options(
+        &wrapped,
+        vm::compiler::SourceFlavor::RustScript,
+        CompileSourceFileOptions::default().with_host_api_catalog(catalog.clone()),
+    )
+    .expect("source should compile");
+    let mut vm = Vm::try_new(compiled.program)?;
+    let mut registry = HostFunctionRegistry::empty();
+    register_sqlite_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
+    registry.bind_vm_cached(&mut vm)?;
     vm.configure_sqlite(policy);
 
     let mut status = vm.run()?;
@@ -37,6 +50,22 @@ fn run_sqlite_source(policy: vm::SqlitePolicy, source: &str) -> Result<(), VmErr
                 status = vm.resume()?;
             }
         }
+    }
+}
+
+/// Helper: run a legacy builtin SQLite source expecting a host error. This
+/// keeps handle-validation coverage on the builtin dispatch path, which does
+/// not use catalog resource passing.
+fn run_sqlite_builtin_host_error(policy: vm::SqlitePolicy, source: &str) -> String {
+    let wrapped = format!("use sqlite;\n{source}");
+    let compiled = compile_source(&wrapped).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.configure_sqlite(policy);
+    match vm.run() {
+        Ok(VmStatus::Halted) => panic!("expected host error, got success"),
+        Ok(other) => panic!("expected host error, got status: {other:?}"),
+        Err(VmError::HostError(message)) => message,
+        Err(other) => format!("{other:?}"),
     }
 }
 
@@ -78,27 +107,175 @@ fn sqlite_round_trip_supports_typed_values_and_ordered_transactions() {
         r#"
         use bytes;
         let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: { max_rows: 128, max_result_bytes: 65536, max_statements: 16, max_transaction_ms: 5000 } });
-        sqlite::execute(db, "CREATE TABLE values_table (id INTEGER PRIMARY KEY, n INTEGER, r REAL, s TEXT, b BLOB, z TEXT)", []);
+        sqlite::execute(&db, "CREATE TABLE values_table (id INTEGER PRIMARY KEY, n INTEGER, r REAL, s TEXT, b BLOB, z TEXT)", []);
         let blob_payload = bytes::from_hex("000102");
-        let ins = sqlite::execute(db, "INSERT INTO values_table (n, r, s, b, z) VALUES (?1, ?2, ?3, ?4, ?5)", {7, 1.5, "hello", blob_payload, null});
-        assert(ins["rows_affected"] == 1);
-        let rowset = sqlite::query(db, "SELECT n, r, s, b, z FROM values_table ORDER BY id", [], { max_rows: 8, max_result_bytes: 65536 });
-        assert(rowset["truncated"] == false);
-        assert(rowset["columns"] == {"n", "r", "s", "b", "z"});
-        assert(rowset["rows"] == { {7, 1.5, "hello", blob_payload, null} });
+        let ins = sqlite::execute(&db, "INSERT INTO values_table (n, r, s, b, z) VALUES (?1, ?2, ?3, ?4, ?5)", [
+            { kind: "int", int_value: 7, float_value: null, text_value: null, blob_value: null },
+            { kind: "float", int_value: null, float_value: 1.5, text_value: null, blob_value: null },
+            { kind: "text", int_value: null, float_value: null, text_value: "hello", blob_value: null },
+            { kind: "blob", int_value: null, float_value: null, text_value: null, blob_value: blob_payload },
+            { kind: "null", int_value: null, float_value: null, text_value: null, blob_value: null }
+        ]);
+        let affected = ins.rows_affected;
+        assert(affected == 1);
+        let rowset = sqlite::query(&db, "SELECT n, r, s, b, z FROM values_table ORDER BY id", [], { max_rows: 8, max_result_bytes: 65536 });
+        let truncated = rowset.truncated;
+        let next_cursor = rowset.next_cursor;
+        assert(truncated == false);
+        assert(next_cursor == 7);
+        let columns = rowset.columns;
+        assert(columns == {"n", "r", "s", "b", "z"});
+        let row = rowset.rows[0];
+        let cells = row.cells;
+        let int_cell = cells[0];
+        let int_kind = int_cell.kind;
+        let int_value = int_cell.int_value;
+        assert(int_kind == "int");
+        assert(int_value == 7);
+        let float_cell = cells[1];
+        let float_kind = float_cell.kind;
+        let float_value = float_cell.float_value;
+        assert(float_kind == "float");
+        assert(float_value == 1.5);
+        let text_cell = cells[2];
+        let text_kind = text_cell.kind;
+        let text_value = text_cell.text_value;
+        assert(text_kind == "text");
+        assert(text_value == "hello");
+        let blob_cell = cells[3];
+        let blob_kind = blob_cell.kind;
+        let blob_value = blob_cell.blob_value;
+        assert(blob_kind == "blob");
+        assert(blob_value == blob_payload);
+        let null_cell = cells[4];
+        let null_kind = null_cell.kind;
+        let null_int = null_cell.int_value;
+        assert(null_kind == "null");
+        assert(null_int == null);
 
-        let results = sqlite::transaction(db, {
-            { sql: "INSERT INTO values_table (n) VALUES (?1)", params: {8} },
-            { sql: "INSERT INTO values_table (n) VALUES (?1)", params: {9} }
+        let results = sqlite::transaction(&db, {
+            { sql: "INSERT INTO values_table (n) VALUES (?1)", params: [{ kind: "int", int_value: 8 }] },
+            { sql: "INSERT INTO values_table (n) VALUES (?1)", params: [{ kind: "int", int_value: 9 }] },
+            { sql: "SELECT n FROM values_table ORDER BY id", query: true, limits: { max_rows: 8, max_result_bytes: 65536 } }
         });
         assert(type(results) == "array");
-        let count = sqlite::query(db, "SELECT count(*) AS count FROM values_table", [], { max_rows: 8, max_result_bytes: 65536 });
-        assert(count["rows"] == { {3} });
+        let first_result = results[0];
+        let first_kind = first_result.kind;
+        assert(first_kind == "execute");
+        assert(first_result.execute.rows_affected == 1);
+        assert(first_result.query == null);
+        let second_result = results[1];
+        let second_kind = second_result.kind;
+        assert(second_kind == "execute");
+        let third_result = results[2];
+        let third_kind = third_result.kind;
+        assert(third_kind == "query");
+        assert(third_result.execute == null);
+        assert(third_result.query.rows[0].cells[0].int_value == 7);
+        let count = sqlite::query(&db, "SELECT count(*) AS count FROM values_table", [], { max_rows: 8, max_result_bytes: 65536 });
+        let count_row = count.rows[0];
+        let count_cells = count_row.cells;
+        let count_cell = count_cells[0];
+        let count_kind = count_cell.kind;
+        let count_value = count_cell.int_value;
+        assert(count_kind == "int");
+        assert(count_value == 3);
         sqlite::close(db);
         "#,
     )
     .expect("round-trip should succeed");
     fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+}
+
+#[test]
+fn sqlite_value_discriminators_reject_unknown_missing_and_multiple_payloads() {
+    let root = temporary_root("value-discriminators");
+    let policy = policy_for(&root);
+    for (value, expected) in [
+        (r#"{ kind: "unknown" }"#, "unknown SQLite value kind"),
+        (r#"{ kind: "int" }"#, "missing SQLite int_value"),
+        (
+            r#"{ kind: "int", int_value: 1, text_value: "extra" }"#,
+            "multiple non-null payloads",
+        ),
+    ] {
+        let source = format!(
+            r#"let db = sqlite::open({{ path: "state.db", mode: "read_write_create", limits: {{}} }});
+            sqlite::execute(&db, "SELECT ?", [{value}]);"#
+        );
+        let error = run_sqlite_host_error(policy.clone(), &source);
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} for {value}, got {error}"
+        );
+    }
+    fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+}
+
+#[test]
+fn sqlite_value_mismatched_payload_and_limits_are_rejected() {
+    let mismatch_root = temporary_root("value-mismatch");
+    let mismatch = run_sqlite_builtin_host_error(
+        policy_for(&mismatch_root),
+        r#"
+        let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: {} });
+        sqlite::execute(db, "SELECT ?", [{ kind: "int", int_value: "wrong" }]);
+        "#,
+    );
+    assert!(
+        mismatch.contains("SQLite int_value payload"),
+        "mismatched payload type must be rejected, got: {mismatch}"
+    );
+    fs::remove_dir_all(mismatch_root).expect("temporary mismatch root should be removed");
+
+    let count_root = temporary_root("parameter-count-limit");
+    let count = run_sqlite_host_error(
+        policy_for(&count_root),
+        r#"
+        let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: { max_parameters: 1 } });
+        sqlite::execute(&db, "SELECT ?1, ?2", [{ kind: "int", int_value: 1 }, { kind: "int", int_value: 2 }]);
+        "#,
+    );
+    assert!(
+        count.contains("parameter count") && count.contains("configured limit"),
+        "parameter count limit must be enforced, got: {count}"
+    );
+    fs::remove_dir_all(count_root).expect("temporary count root should be removed");
+
+    let bytes_root = temporary_root("parameter-bytes-limit");
+    let bytes = run_sqlite_host_error(
+        policy_for(&bytes_root),
+        r#"
+        let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: { max_parameter_bytes: 2 } });
+        sqlite::execute(&db, "SELECT ?1", [{ kind: "text", text_value: "abc" }]);
+        "#,
+    );
+    assert!(
+        bytes.contains("parameters exceed") && bytes.contains("2 byte limit"),
+        "parameter byte limit must be enforced, got: {bytes}"
+    );
+    fs::remove_dir_all(bytes_root).expect("temporary bytes root should be removed");
+}
+
+#[test]
+fn sqlite_invalid_utf8_text_is_returned_as_blob_value() {
+    let root = temporary_root("invalid-utf8");
+    let policy = policy_for(&root);
+    run_sqlite_source(
+        policy,
+        r#"
+        use bytes;
+        let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: {} });
+        let payload = bytes::from_hex("80ff");
+        let result = sqlite::query(&db, "SELECT CAST(?1 AS TEXT)", [{ kind: "blob", blob_value: payload }], {});
+        let cell = result.rows[0].cells[0];
+        assert(cell.kind == "blob");
+        assert(cell.blob_value == payload);
+        sqlite::close(db);
+        "#,
+    )
+    .expect("invalid UTF-8 SQLite TEXT should use the blob variant");
+    fs::remove_dir_all(root).expect("temporary invalid UTF-8 root should be removed");
 }
 
 #[test]
@@ -110,7 +287,7 @@ fn sqlite_enforces_read_only_vm_local_ids_and_sql_safety() {
         policy.clone(),
         r#"
         let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: {} });
-        sqlite::execute(db, "CREATE TABLE items (value INTEGER)", []);
+        sqlite::execute(&db, "CREATE TABLE items (value INTEGER)", []);
         "#,
     )
     .expect("writer should create the table");
@@ -119,7 +296,7 @@ fn sqlite_enforces_read_only_vm_local_ids_and_sql_safety() {
         policy.clone(),
         r#"
         let db = sqlite::open({ path: "state.db", mode: "read_only", limits: {} });
-        sqlite::execute(db, "INSERT INTO items (value) VALUES (1)", []);
+        sqlite::execute(&db, "INSERT INTO items (value) VALUES (1)", []);
         "#,
     );
     assert!(
@@ -138,7 +315,7 @@ fn sqlite_enforces_read_only_vm_local_ids_and_sql_safety() {
         let err = run_sqlite_host_error(
             policy.clone(),
             &format!(
-                "let db = sqlite::open({{ path: \"state.db\", mode: \"read_write_create\", limits: {{}} }});\n sqlite::execute(db, \"{bad}\", []);"
+                "let db = sqlite::open({{ path: \"state.db\", mode: \"read_write_create\", limits: {{}} }});\n sqlite::execute(&db, \"{bad}\", []);"
             ),
         );
         assert!(
@@ -150,7 +327,8 @@ fn sqlite_enforces_read_only_vm_local_ids_and_sql_safety() {
     }
 
     // A SQLite id from another VM must be rejected (foreign arena).
-    let other_err = run_sqlite_host_error(policy, "sqlite::execute(1234567, \"SELECT 1\", []);");
+    let other_err =
+        run_sqlite_builtin_host_error(policy, "sqlite::execute(1234567, \"SELECT 1\", []);");
     assert!(
         other_err.contains("unknown SQLite database")
             || other_err.contains("invalid sqlite handle"),
@@ -168,17 +346,25 @@ fn sqlite_query_reports_row_and_result_byte_truncation() {
         policy,
         r#"
         let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: { max_rows: 32, max_result_bytes: 32 } });
-        sqlite::execute(db, "CREATE TABLE items (value TEXT)", []);
-        sqlite::execute(db, "INSERT INTO items (value) VALUES (?1)", {"one"});
-        sqlite::execute(db, "INSERT INTO items (value) VALUES (?1)", {"two"});
-        sqlite::execute(db, "INSERT INTO items (value) VALUES (?1)", {"three"});
+        sqlite::execute(&db, "CREATE TABLE items (value TEXT)", []);
+        sqlite::execute(&db, "INSERT INTO items (value) VALUES (?1)", [{ kind: "text", text_value: "one" }]);
+        sqlite::execute(&db, "INSERT INTO items (value) VALUES (?1)", [{ kind: "text", text_value: "two" }]);
+        sqlite::execute(&db, "INSERT INTO items (value) VALUES (?1)", [{ kind: "text", text_value: "three" }]);
 
-        let row_limited = sqlite::query(db, "SELECT value FROM items ORDER BY rowid", [], { max_rows: 1, max_result_bytes: 65536 });
-        assert(row_limited["truncated"] == true);
-        assert(row_limited["rows"] == { {"one"} });
+        let row_limited = sqlite::query(&db, "SELECT value FROM items ORDER BY rowid", [], { max_rows: 1, max_result_bytes: 65536 });
+        let row_limited_truncated = row_limited.truncated;
+        assert(row_limited_truncated == true);
+        let row_limited_row = row_limited.rows[0];
+        let row_limited_cells = row_limited_row.cells;
+        let row_limited_cell = row_limited_cells[0];
+        let row_limited_kind = row_limited_cell.kind;
+        let row_limited_value = row_limited_cell.text_value;
+        assert(row_limited_kind == "text");
+        assert(row_limited_value == "one");
 
-        let byte_limited = sqlite::query(db, "SELECT value FROM items ORDER BY rowid", [], { max_rows: 32, max_result_bytes: 8 });
-        assert(byte_limited["truncated"] == true);
+        let byte_limited = sqlite::query(&db, "SELECT value FROM items ORDER BY rowid", [], { max_rows: 32, max_result_bytes: 8 });
+        let byte_limited_truncated = byte_limited.truncated;
+        assert(byte_limited_truncated == true);
         "#,
     )
     .expect("truncation should be reported");
@@ -190,7 +376,7 @@ fn sqlite_uses_typed_generation_checked_resource_handles() {
     let root = temporary_root("handles");
     let policy = policy_for(&root);
 
-    let err = run_sqlite_host_error(
+    let err = run_sqlite_builtin_host_error(
         policy,
         r#"
         let a = sqlite::open({ path: "handles.db", mode: "read_write_create", limits: {} });
@@ -236,7 +422,7 @@ fn sqlite_configure_and_clear_own_the_policy() {
         policy.clone(),
         r#"
         let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: {} });
-        sqlite::execute(db, "CREATE TABLE items (value INTEGER)", []);
+        sqlite::execute(&db, "CREATE TABLE items (value INTEGER)", []);
         "#,
     )
     .expect("configured policy should allow file opens");
@@ -274,12 +460,18 @@ fn sqlite_close_cancels_siblings_and_reset_retires_all() {
         policy.clone(),
         r#"
         let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: { max_transaction_ms: 10000, max_result_bytes: 65536 } });
-        sqlite::execute(db, "CREATE TABLE items (value INTEGER)", []);
-        let pending = sqlite::query(db, "WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 2000000) SELECT sum(value) FROM numbers", [], { max_rows: 1, max_result_bytes: 65536 });
+        sqlite::execute(&db, "CREATE TABLE items (value INTEGER)", []);
+        let pending = sqlite::query(&db, "WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 2000000) SELECT sum(value) FROM numbers", [], { max_rows: 1, max_result_bytes: 65536 });
         sqlite::close(db);
         let db2 = sqlite::open({ path: "state.db", mode: "read_write_create", limits: { max_transaction_ms: 10000, max_result_bytes: 65536 } });
-        let count = sqlite::query(db2, "SELECT count(*) AS count FROM items", [], {});
-        assert(count["rows"] == { {0} });
+        let count = sqlite::query(&db2, "SELECT count(*) AS count FROM items", [], {});
+        let count_row = count.rows[0];
+        let count_cells = count_row.cells;
+        let count_cell = count_cells[0];
+        let count_kind = count_cell.kind;
+        let count_value = count_cell.int_value;
+        assert(count_kind == "int");
+        assert(count_value == 0);
         sqlite::close(db2);
         "#,
     )
@@ -288,7 +480,7 @@ fn sqlite_close_cancels_siblings_and_reset_retires_all() {
     // VM reset retires all pending sqlite operations and closes every open
     // connection through the generic scope lifecycle.
     let compiled = compile_source(
-        "use sqlite;\nlet db = sqlite::open({ path: \"state.db\", mode: \"read_write_create\", limits: { max_transaction_ms: 10000, max_result_bytes: 65536 } });\nlet pending = sqlite::query(db, \"WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 2000000) SELECT sum(value) FROM numbers\", [], { max_rows: 1, max_result_bytes: 65536 });",
+        "use sqlite;\nlet db = sqlite::open({ path: \"state.db\", mode: \"read_write_create\", limits: { max_transaction_ms: 10000, max_result_bytes: 65536 } });\nlet pending = sqlite::query(&db, \"WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 2000000) SELECT sum(value) FROM numbers\", [], { max_rows: 1, max_result_bytes: 65536 });",
     )
     .expect("reset source should compile");
     let mut vm = Vm::new(compiled.program);
@@ -324,14 +516,20 @@ fn sqlite_pending_operation_slots_are_reclaimed_after_completion() {
         policy,
         r#"
         let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: { max_pending_operations: 4 } });
-        sqlite::execute(db, "CREATE TABLE items (value INTEGER)", []);
+        sqlite::execute(&db, "CREATE TABLE items (value INTEGER)", []);
         let mut i = 0;
         while i < 10 {
-            sqlite::execute(db, "INSERT INTO items (value) VALUES (?1)", {i});
+            sqlite::execute(&db, "INSERT INTO items (value) VALUES (?1)", [{ kind: "int", int_value: i }]);
             i = i + 1;
         }
-        let count = sqlite::query(db, "SELECT count(*) AS count FROM items", [], {});
-        assert(count["rows"] == { {10} });
+        let count = sqlite::query(&db, "SELECT count(*) AS count FROM items", [], {});
+        let count_row = count.rows[0];
+        let count_cells = count_row.cells;
+        let count_cell = count_cells[0];
+        let count_kind = count_cell.kind;
+        let count_value = count_cell.int_value;
+        assert(count_kind == "int");
+        assert(count_value == 10);
         sqlite::close(db);
         "#,
     )
@@ -344,7 +542,7 @@ fn sqlite_pending_reset_repeatedly_drains_workers_and_keeps_vm_reusable() {
     let root = temporary_root("reset-stress");
     let policy = policy_for(&root);
     let compiled = compile_source(
-        "use sqlite;\nlet db = sqlite::open({ path: \"state.db\", mode: \"read_write_create\", limits: { max_transaction_ms: 10000, max_result_bytes: 65536 } });\nlet pending = sqlite::query(db, \"WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 2000000) SELECT sum(value) FROM numbers\", [], { max_rows: 1, max_result_bytes: 65536 });",
+        "use sqlite;\nlet db = sqlite::open({ path: \"state.db\", mode: \"read_write_create\", limits: { max_transaction_ms: 10000, max_result_bytes: 65536 } });\nlet pending = sqlite::query(&db, \"WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 2000000) SELECT sum(value) FROM numbers\", [], { max_rows: 1, max_result_bytes: 65536 });",
     )
     .expect("stress source should compile");
     let mut vm = Vm::new(compiled.program);

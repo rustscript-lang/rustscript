@@ -249,7 +249,7 @@ const ENTRY_URI: &str = "file:///tmp/rustscript-lsp-fixture/main.rss";
 const CLEAN_SOURCE: &str = r#"use sqlite;
 fn main() {
     let db = sqlite::open({});
-    sqlite::query(&db, "SELECT 1", {}, {});
+    sqlite::query(&db, "SELECT 1", [], {});
 }
 "#;
 
@@ -258,7 +258,7 @@ fn main() {
 const WRONG_TYPE_SOURCE: &str = r#"use sqlite;
 fn main() {
     let db = sqlite::open({});
-    sqlite::query("NOT_A_DB", "SELECT 1", {}, {});
+    sqlite::query("NOT_A_DB", "SELECT 1", [], {});
 }
 "#;
 
@@ -739,7 +739,7 @@ fn run() {
 const MODULE_BAD_UTIL_SOURCE: &str = r#"use sqlite;
 pub fn helper() {
     let db = sqlite::open({});
-    sqlite::query("NOT_A_DB", "SELECT 1", {}, {});
+    sqlite::query("NOT_A_DB", "SELECT 1", [], {});
 }
 "#;
 
@@ -747,7 +747,7 @@ pub fn helper() {
 const MODULE_CLEAN_UTIL_SOURCE: &str = r#"use sqlite;
 pub fn helper() {
     let db = sqlite::open({});
-    sqlite::query(&db, "SELECT 1", {}, {});
+    sqlite::query(&db, "SELECT 1", [], {});
 }
 "#;
 
@@ -916,10 +916,10 @@ fn unicode_source_outbound_diagnostic_range_uses_utf16_columns() {
     client.request(1, "initialize", serde_json::json!({}));
     client.notify("initialized", serde_json::json!({}));
     // Same-line multibyte prefix, then a wrong-type call on the *same line*.
-    // `let s = "你好😀"; sqlite::query("NOT_A_DB", "SELECT 1", {}, {});`
+    // `let s = "你好😀"; sqlite::query("NOT_A_DB", "SELECT 1", [], {});`
     // The wrong-argument diagnostic must be reported with UTF-16 columns, so
     // a client re-navigating from the range lands on the callee.
-    let source = "use sqlite;\nlet s = \"\u{4f60}\u{597d}\u{1f600}\"; sqlite::query(\"NOT_A_DB\", \"SELECT 1\", {}, {});\n";
+    let source = "use sqlite;\nlet s = \"\u{4f60}\u{597d}\u{1f600}\"; sqlite::query(\"NOT_A_DB\", \"SELECT 1\", [], {});\n";
     open_doc(&mut client, ENTRY_URI, source);
     let params = client.recv_notification("textDocument/publishDiagnostics");
     let diagnostics = params["diagnostics"].as_array().expect("diagnostics array");
@@ -1474,7 +1474,7 @@ const DISK_UTIL_GOOD: &str = "pub fn helper() -> int { 41 }\n";
 const BUFFER_UTIL_GOOD: &str = "pub fn helper() -> int { 999 }\n";
 
 /// Unsaved buffer version of `util.rss` with a wrong-type call (diagnostic).
-const BUFFER_UTIL_BAD: &str = "use sqlite;\npub fn helper() -> int {\n    let db = sqlite::open({});\n    sqlite::query(\"NOT_A_DB\", \"SELECT 1\", {}, {});\n    0\n}\n";
+const BUFFER_UTIL_BAD: &str = "use sqlite;\npub fn helper() -> int {\n    let db = sqlite::open({});\n    sqlite::query(\"NOT_A_DB\", \"SELECT 1\", [], {});\n    0\n}\n";
 
 /// A syntax error in `util.rss` (unterminated block) whose parser span should
 /// be reported under the module URI.

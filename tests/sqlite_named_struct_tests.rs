@@ -1,7 +1,7 @@
 #![cfg(feature = "sqlite")]
 //! SQLite fixed-shape host maps are named structs at the catalog/compiler
-//! boundary. Runtime values remain maps; positional params and row arrays stay
-//! dynamic.
+//! boundary. Runtime values remain maps; positional params, row cells, and
+//! transaction results use named wrappers.
 
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
@@ -62,10 +62,27 @@ fn execute_result_fields() -> Vec<HostStructField> {
     ]
 }
 
+fn sqlite_value_fields() -> Vec<HostStructField> {
+    vec![
+        HostStructField::new("kind", HostTypeSchema::String),
+        HostStructField::new("int_value", opt(HostTypeSchema::Int)),
+        HostStructField::new("float_value", opt(HostTypeSchema::Float)),
+        HostStructField::new("text_value", opt(HostTypeSchema::String)),
+        HostStructField::new("blob_value", opt(HostTypeSchema::Bytes)),
+    ]
+}
+
+fn row_fields() -> Vec<HostStructField> {
+    vec![HostStructField::new(
+        "cells",
+        array(named("SqliteValue", sqlite_value_fields())),
+    )]
+}
+
 fn query_result_fields() -> Vec<HostStructField> {
     vec![
         HostStructField::new("columns", array(HostTypeSchema::String)),
-        HostStructField::new("rows", array(array(HostTypeSchema::Unknown))),
+        HostStructField::new("rows", array(named("SqliteRow", row_fields()))),
         HostStructField::new("truncated", HostTypeSchema::Bool),
         HostStructField::new("next_cursor", opt(HostTypeSchema::Int)),
     ]
@@ -74,9 +91,26 @@ fn query_result_fields() -> Vec<HostStructField> {
 fn statement_fields() -> Vec<HostStructField> {
     vec![
         HostStructField::new("sql", HostTypeSchema::String),
-        HostStructField::new("params", opt(array(HostTypeSchema::Unknown))),
+        HostStructField::new(
+            "params",
+            opt(array(named("SqliteValue", sqlite_value_fields()))),
+        ),
         HostStructField::new("query", opt(HostTypeSchema::Bool)),
         HostStructField::new("limits", opt(named("SqliteLimits", limits_fields()))),
+    ]
+}
+
+fn transaction_result_fields() -> Vec<HostStructField> {
+    vec![
+        HostStructField::new("kind", HostTypeSchema::String),
+        HostStructField::new(
+            "execute",
+            opt(named("SqliteExecuteResult", execute_result_fields())),
+        ),
+        HostStructField::new(
+            "query",
+            opt(named("SqliteQueryResult", query_result_fields())),
+        ),
     ]
 }
 
@@ -119,7 +153,7 @@ fn function_named<'a>(
 
 fn schema_contains_map(schema: &HostTypeSchema) -> bool {
     match schema {
-        HostTypeSchema::Map(_) => true,
+        HostTypeSchema::Map(_) | HostTypeSchema::Unknown => true,
         HostTypeSchema::Array(inner) | HostTypeSchema::Optional(inner) => {
             schema_contains_map(inner)
         }
@@ -140,8 +174,11 @@ fn sqlite_catalog_declares_fixed_shape_named_structs() {
         ("SqliteOpenOptions", open_options_fields()),
         ("SqliteLimits", limits_fields()),
         ("SqliteExecuteResult", execute_result_fields()),
+        ("SqliteValue", sqlite_value_fields()),
+        ("SqliteRow", row_fields()),
         ("SqliteQueryResult", query_result_fields()),
         ("SqliteStatement", statement_fields()),
+        ("SqliteTransactionResult", transaction_result_fields()),
     ] {
         let schema = catalog
             .struct_named(name)
@@ -161,7 +198,10 @@ fn sqlite_function_schemas_use_named_structs_not_maps() {
 
     let execute = function_named(&catalog, "sqlite::execute");
     assert_eq!(execute.params[2].name, "params");
-    assert_eq!(execute.params[2].ty, HostTypeSchema::Unknown);
+    assert_eq!(
+        execute.params[2].ty,
+        array(named("SqliteValue", sqlite_value_fields()))
+    );
     assert_eq!(
         execute.return_type,
         named("SqliteExecuteResult", execute_result_fields())
@@ -169,7 +209,10 @@ fn sqlite_function_schemas_use_named_structs_not_maps() {
 
     let query = function_named(&catalog, "sqlite::query");
     assert_eq!(query.params[2].name, "params");
-    assert_eq!(query.params[2].ty, HostTypeSchema::Unknown);
+    assert_eq!(
+        query.params[2].ty,
+        array(named("SqliteValue", sqlite_value_fields()))
+    );
     assert_eq!(query.params[3].ty, named("SqliteLimits", limits_fields()));
     assert_eq!(
         query.return_type,
@@ -181,7 +224,13 @@ fn sqlite_function_schemas_use_named_structs_not_maps() {
         transaction.params[1].ty,
         array(named("SqliteStatement", statement_fields()))
     );
-    assert_eq!(transaction.return_type, array(HostTypeSchema::Unknown));
+    assert_eq!(
+        transaction.return_type,
+        array(named(
+            "SqliteTransactionResult",
+            transaction_result_fields()
+        ))
+    );
 
     for function in catalog.functions() {
         assert!(
@@ -328,20 +377,56 @@ fn typed_field_access_on_execute_and_query_results_compiles() {
 }
 
 #[test]
-fn positional_params_and_row_arrays_remain_dynamic() {
+fn typed_params_rows_and_transaction_results_are_structured() {
     compile(
         r#"
         use sqlite;
         let db = sqlite::open({ path: ":memory:", mode: "memory" });
         sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
-        sqlite::execute(&db, "INSERT INTO t VALUES (?)", [7]);
+        sqlite::execute(&db, "INSERT INTO t VALUES (?)", [{ kind: "int", int_value: 7 }]);
         let queried = sqlite::query(&db, "SELECT a FROM t", [], {});
-        let first = queried.rows[0];
+        let first = queried.rows[0].cells[0];
+        assert(first.kind == "int");
+        assert(first.int_value == 7);
+        let results = sqlite::transaction(&db, [{ sql: "SELECT a FROM t", query: true }]);
+        let first_result = results[0];
+        assert(first_result.kind == "query");
+        assert(first_result.query.rows[0].cells[0].int_value == 7);
         sqlite::close(db);
         queried.truncated;
         "#,
     )
-    .expect("positional params and row arrays must stay indexable");
+    .expect("typed params, rows, and transaction results should be indexable");
+}
+
+#[test]
+fn raw_sqlite_scalar_params_are_rejected() {
+    let message = compile_err(
+        r#"
+        use sqlite;
+        let db = sqlite::open({ path: ":memory:", mode: "memory" });
+        sqlite::execute(&db, "SELECT ?", [7]);
+        "#,
+    );
+    assert!(
+        message.contains("sqlite::execute") && message.contains("SqliteValue"),
+        "raw scalar parameter diagnostic should name the typed value contract, got {message}"
+    );
+}
+
+#[test]
+fn wrong_nested_sqlite_value_shapes_are_rejected() {
+    let message = compile_err(
+        r#"
+        use sqlite;
+        let db = sqlite::open({ path: ":memory:", mode: "memory" });
+        sqlite::query(&db, "SELECT ?", [{ kind: "int", int_value: "wrong" }], {});
+        "#,
+    );
+    assert!(
+        message.contains("sqlite::query") && message.contains("int_value"),
+        "wrong nested payload diagnostic should name the typed field, got {message}"
+    );
 }
 
 fn noop_waker() -> Waker {
