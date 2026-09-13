@@ -7,11 +7,11 @@
 use std::collections::BTreeSet;
 
 use vm::{
-    HostApiCatalog, HostTypeSchema, http_host_catalog, jit_host_catalog, sqlite_host_catalog,
-    standard_host_catalog,
+    HostApiCatalog, HostStructField, HostTypeSchema, http_host_catalog, jit_host_catalog,
+    sqlite_host_catalog, standard_host_catalog,
 };
 
-fn assert_no_public_dynamic_schema(catalog_name: &str, catalog: &HostApiCatalog) {
+fn assert_no_public_dynamic_root(path: &str, schema: &HostTypeSchema) {
     fn visit(path: &str, schema: &HostTypeSchema, seen: &mut BTreeSet<String>) {
         match schema {
             HostTypeSchema::Map(_) | HostTypeSchema::Unknown => {
@@ -45,29 +45,51 @@ fn assert_no_public_dynamic_schema(catalog_name: &str, catalog: &HostApiCatalog)
         }
     }
 
+    visit(path, schema, &mut BTreeSet::new());
+}
+
+fn assert_no_public_dynamic_schema(catalog_name: &str, catalog: &HostApiCatalog) {
     for schema in catalog.structs() {
         for field in &schema.fields {
-            visit(
+            assert_no_public_dynamic_root(
                 &format!("{catalog_name}::{}.{}", schema.name, field.name),
                 &field.ty,
-                &mut BTreeSet::new(),
             );
         }
     }
     for function in catalog.functions() {
         for param in &function.params {
-            visit(
+            assert_no_public_dynamic_root(
                 &format!("{catalog_name}::{}({})", function.name, param.name),
                 &param.ty,
-                &mut BTreeSet::new(),
             );
         }
-        visit(
+        assert_no_public_dynamic_root(
             &format!("{catalog_name}::{} return", function.name),
             &function.return_type,
-            &mut BTreeSet::new(),
         );
     }
+}
+
+fn recursive_named_schema() -> HostTypeSchema {
+    HostTypeSchema::named_struct(
+        "RecursiveNode",
+        vec![
+            HostStructField::new("value", HostTypeSchema::Int),
+            HostStructField::new(
+                "next",
+                HostTypeSchema::Optional(Box::new(HostTypeSchema::named_struct(
+                    "RecursiveNode",
+                    Vec::new(),
+                ))),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn recursive_named_struct_walk_stops_at_repeated_named_type() {
+    assert_no_public_dynamic_root("recursive::node", &recursive_named_schema());
 }
 
 #[test]
