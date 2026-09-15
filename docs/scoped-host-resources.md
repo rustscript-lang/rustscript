@@ -211,11 +211,11 @@ against a different catalog is rejected at bind time.
 | Feature set | `src/vm` / resource / operation / scope | Standard builtins | Compiler / catalog |
 |---|---|---|---|
 | `pd-vm --no-default-features` | generic core only; no OS hosts | none | catalog wire types available |
-| `pd-vm --no-default-features --features runtime` | generic core only | `io::*` surface | `HostApiCatalog` snapshot |
+| `pd-vm --no-default-features --features runtime` | generic core only | `io::*` and `timer::*` surfaces | `HostApiCatalog` snapshot |
 | `+ sqlite` | generic core only (no `cfg(feature = "sqlite")` in `src/vm`) | SQLite builtin (rusqlite, optional dep) | sqlite surface in the catalog |
 | `+ http-client` | generic core only (no `cfg(feature = "http-client")` in `src/vm`) | HTTP/SSE builtin (hyper/rustls) | http surface in the catalog |
 | `pd-vm-nostd` | n/a (no compiler/VM; VMBC v14 plus v13 compatibility decoder) | none | decodes exact `HostImport` schemas |
-| `pd-vm-wasm` (`runtime` feature) | generic core compiled to wasm32 | io surface when enabled | — |
+| `pd-vm-wasm` (`runtime` feature) | generic core compiled to wasm32 | `io::*` and `timer::*` surfaces when enabled | — |
 
 The `sqlite` / `http-client` features only decide whether the same-crate standard builtin is
 compiled and registered by default; they never enter the resource/reset architecture. `src/vm`,

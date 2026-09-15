@@ -17,6 +17,7 @@ The complete language, runtime, and implementation guides live on the [RustScrip
 - [Callable-driven HTTP client contract](docs/http-client.md)
 - [Script call frames and callable values](docs/callable-runtime.md)
 - [Scoped host resources and the host extension SDK](docs/scoped-host-resources.md)
+- [Standard timer host module](docs/standard-timer-host.md)
 - [Compiler frontend syntax and feature support](src/compiler/frontends/README.md)
 
 ## Crate usage
