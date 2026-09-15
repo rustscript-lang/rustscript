@@ -32,6 +32,7 @@ mod standard_composition;
 pub use standard_composition::standard_composition;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+mod timer;
 mod typed;
 
 #[cfg(feature = "http-client")]
@@ -51,11 +52,17 @@ pub use sqlite::{
     SqliteExtension, SqliteHostExt, SqliteLimits, SqlitePolicy, register_sqlite_builtin_module,
     register_sqlite_builtin_module_from_catalog, sqlite_host_catalog,
 };
+pub use timer::{
+    DEFAULT_MAX_PENDING_TIMERS, DEFAULT_MAX_RUNNING_TIMERS, OwnedTimerCallback, TimerBackend,
+    TimerCallbackError, TimerCallbackStatus, TimerConfig, TimerExtension, TimerHostExt,
+    TimerHostState, TimerRegistration, register_timer_builtin_module,
+    register_timer_builtin_module_from_catalog, timer_host_catalog,
+};
 
 /// The authoritative standard host API catalog snapshot for this build.
 ///
 /// This is the single combined snapshot of every *enabled* standard host
-/// surface (SQLite, IO, HTTP, JIT), composed into one validated
+/// surface (SQLite, IO, HTTP, JIT, Timer), composed into one validated
 /// [`HostApiCatalog`]. The compiler's standard compile entry and the LSP
 /// consume this same snapshot, and the standard extensions register their
 /// exact imports against it — so the whole-catalog fingerprint embedded in a
@@ -65,7 +72,7 @@ pub use sqlite::{
 /// Composition is feature-gated per member:
 ///
 /// * `sqlite` feature → the SQLite surface is included;
-/// * `runtime` feature → the IO surface is included;
+/// * `runtime` feature → the IO and Timer surfaces are included;
 /// * `http-client` feature → the HTTP surface is included;
 /// * JIT builtins (always present under `runtime`) → the JIT config surface
 ///   is included.
@@ -112,6 +119,7 @@ fn standard_host_catalog_snapshot() -> &'static StandardHostCatalogSnapshot {
         #[cfg(feature = "http-client")]
         push(&mut builder, &http_host_catalog());
         push(&mut builder, &jit_host_catalog());
+        push(&mut builder, &timer_host_catalog());
         let catalog = Arc::new(
             builder
                 .build()
@@ -139,6 +147,7 @@ pub(crate) fn standard_host_registry() -> VmResult<HostFunctionRegistry> {
     #[cfg(feature = "sqlite")]
     register_sqlite_builtin_module(&mut registry)?;
     register_jit_builtin_module(&mut registry)?;
+    register_timer_builtin_module(&mut registry)?;
     Ok(registry)
 }
 

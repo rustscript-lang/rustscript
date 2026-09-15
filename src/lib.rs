@@ -29,6 +29,13 @@ pub use builtins::runtime::{
     BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg,
     return_one, take_arg,
 };
+#[cfg(feature = "runtime")]
+pub use builtins::runtime::{
+    DEFAULT_MAX_PENDING_TIMERS, DEFAULT_MAX_RUNNING_TIMERS, OwnedTimerCallback, TimerBackend,
+    TimerCallbackError, TimerCallbackStatus, TimerConfig, TimerExtension, TimerHostExt,
+    TimerHostState, TimerRegistration, register_timer_builtin_module,
+    register_timer_builtin_module_from_catalog, timer_host_catalog,
+};
 #[cfg(feature = "http-client")]
 pub use builtins::runtime::{
     HttpConfig, HttpHostExt, http_host_catalog, register_http_builtin_module,
