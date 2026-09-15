@@ -37,6 +37,7 @@ pub(crate) mod regex;
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub(crate) mod sqlite;
 pub(crate) mod standard_composition;
+mod timer;
 mod typed;
 
 pub use jit::{
@@ -44,6 +45,13 @@ pub use jit::{
 };
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub use sqlite::{register_sqlite_builtin_module, register_sqlite_builtin_module_from_catalog};
+pub use timer::{
+    DEFAULT_MAX_PENDING_TIMERS, DEFAULT_MAX_RUNNING_TIMERS, OwnedTimerCallback, TIMER_CALLBACK_ARG,
+    TimerBackend, TimerCallbackError, TimerCallbackState, TimerCallbackStatus, TimerConfig,
+    TimerCounts, TimerExtension, TimerHostExt, TimerHostState, TimerRegistration,
+    installed_timer_counts, register_owned_timer, register_timer_builtin_module,
+    register_timer_builtin_module_from_catalog, timer_host_catalog,
+};
 
 /// Returns the editor/compiler catalog for the built-in host extensions.
 ///
@@ -372,6 +380,21 @@ pub fn standard_host_catalog() -> Arc<HostApiCatalog> {
                 builder.named_struct(schema.clone());
             }
             for function in jit_catalog.functions() {
+                builder.function(function.clone());
+            }
+        }
+        {
+            // The standard timer surface: exact catalog entries whose owned
+            // callbacks are registered by `TimerExtension` /
+            // `register_timer_builtin_module`, exactly like the other exact
+            // adapter surfaces. A compiled program resolves the imports from
+            // this catalog; each call then fails at the runtime boundary until
+            // backend state is installed.
+            let timer_catalog = timer_host_catalog();
+            for schema in timer_catalog.structs() {
+                builder.named_struct(schema.clone());
+            }
+            for function in timer_catalog.functions() {
                 builder.function(function.clone());
             }
         }
