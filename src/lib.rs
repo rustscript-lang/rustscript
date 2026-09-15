@@ -26,6 +26,14 @@ pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, a
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
 #[cfg(all(feature = "runtime", feature = "sqlite", not(target_arch = "wasm32")))]
 pub use builtins::runtime::sqlite::{SqliteHostExt, SqliteLimits, SqlitePolicy};
+#[cfg(feature = "runtime")]
+pub use builtins::runtime::{
+    DEFAULT_MAX_PENDING_TIMERS, DEFAULT_MAX_RUNNING_TIMERS, OwnedTimerCallback, TIMER_CALLBACK_ARG,
+    TimerBackend, TimerCallbackError, TimerCallbackState, TimerCallbackStatus, TimerConfig,
+    TimerCounts, TimerExtension, TimerHostExt, TimerHostState, TimerRegistration,
+    installed_timer_counts, register_owned_timer, register_timer_builtin_module,
+    register_timer_builtin_module_from_catalog, timer_host_catalog,
+};
 #[cfg(all(feature = "runtime", feature = "sqlite", not(target_arch = "wasm32")))]
 pub use builtins::runtime::{
     register_sqlite_builtin_module, register_sqlite_builtin_module_from_catalog,
