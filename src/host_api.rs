@@ -196,9 +196,11 @@ fn validate_resource_key(name: &str) -> Result<(), ResourceTypeKeyError> {
 /// How a host function receives a parameter.
 ///
 /// When a parameter's type [`contains`][HostTypeSchema::contains_resource] a
-/// resource, **`Value` is forbidden** and the caller must chose one of
-/// `Borrow`, `BorrowMut` or `TakeOwned`. When it contains no resource, `Value`
-/// is required and a borrow/ownership mode is forbidden.
+/// resource, **`Value` is forbidden** and the caller must choose one of
+/// `Borrow`, `BorrowMut` or `TakeOwned`. A resource-free parameter normally uses
+/// `Value`; `TakeOwned` remains legal for an owned-dispatch registration and
+/// transfers the plain value itself. `Borrow` and `BorrowMut` have no meaning for
+/// resource-free values.
 ///
 /// Ownership modes compose with a parameter's *aggregate* resource content:
 ///
@@ -677,7 +679,12 @@ pub enum HostApiCatalogError {
         function: String,
         key: ResourceTypeKey,
     },
-    /// A borrow/ownership passing mode was used on a non-resource parameter.
+    /// A borrow passing mode was used on a non-resource parameter.
+    ///
+    /// `TakeOwned` is deliberately **not** covered: on a resource-free
+    /// parameter it declares an owned *value* transfer (callable, scalar, or
+    /// aggregate), which the owned-dispatch registry path honors. Borrowing a
+    /// plain value has no meaning, so `Borrow`/`BorrowMut` stay rejected.
     NonResourcePassingMode {
         function: String,
         parameter: String,
@@ -1067,8 +1074,14 @@ fn validate_surface(
                         parameter: param.name.clone(),
                     });
                 }
-            } else if param.passing.is_reference_mode() {
-                // A non-resource parameter must use `Value`.
+            } else if matches!(
+                param.passing,
+                HostParamPassing::Borrow | HostParamPassing::BorrowMut
+            ) {
+                // A non-resource parameter must use `Value`; `TakeOwned` is the
+                // one reference mode that is meaningful without a resource
+                // (an owned value transfer), and it is honored only by the
+                // owned-dispatch registry path.
                 return Err(HostApiCatalogError::NonResourcePassingMode {
                     function: function.name.clone(),
                     parameter: param.name.clone(),
@@ -1678,9 +1691,12 @@ mod tests {
     }
 
     #[test]
-    fn non_resource_take_owned_rejected() {
+    fn non_resource_take_owned_is_an_owned_value_transfer() {
+        // A resource-free `TakeOwned` parameter transfers the *value* itself
+        // (scalar, aggregate, or callable); only the owned-dispatch registry
+        // path honors it, and the catalog vocabulary must be able to express
+        // it. Borrow/BorrowMut on a resource-free parameter stay rejected.
         let mut builder = HostApiCatalog::builder();
-        builder.resource(io_file_resource());
         builder.function(HostFunctionSchema::with_return(
             "consume",
             vec![HostParamSchema::with_passing(
@@ -1690,12 +1706,48 @@ mod tests {
             )],
             HostTypeSchema::Int,
         ));
+        builder.function(HostFunctionSchema::with_return(
+            "register",
+            vec![HostParamSchema::with_passing(
+                "callback",
+                HostTypeSchema::Callable {
+                    params: vec![HostTypeSchema::Bool],
+                    result: Box::new(HostTypeSchema::Unknown),
+                },
+                HostParamPassing::TakeOwned,
+            )],
+            HostTypeSchema::Bool,
+        ));
+        let catalog = builder
+            .build()
+            .expect("owned value transfers must be expressible in the catalog");
+        assert_eq!(
+            catalog
+                .function("consume")
+                .expect("consume")
+                .params
+                .first()
+                .expect("one parameter")
+                .passing,
+            HostParamPassing::TakeOwned
+        );
+
+        let mut builder = HostApiCatalog::builder();
+        builder.function(HostFunctionSchema::with_return(
+            "join",
+            vec![HostParamSchema::with_passing(
+                "parts",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::String)),
+                HostParamPassing::BorrowMut,
+            )],
+            HostTypeSchema::Null,
+        ));
         assert_eq!(
             builder.build(),
             Err(HostApiCatalogError::NonResourcePassingMode {
-                function: "consume".to_string(),
-                parameter: "value".to_string(),
-                passing: HostParamPassing::TakeOwned,
+                function: "join".to_string(),
+                parameter: "parts".to_string(),
+                passing: HostParamPassing::BorrowMut,
             })
         );
     }

@@ -59,6 +59,8 @@ pub use bytecode::{
     HostImportSchema, NamedStructSchema, OpCode, Program, RootCallableBinding, ScriptFunction,
     TypeMap, Value, ValueType, VmMap,
 };
+#[cfg(feature = "runtime")]
+pub use vm::host::{HostOwnedFunction, OwnedHostCall, OwnedHostContext};
 pub fn builtin_call_index(name: &str) -> Option<u16> {
     use builtins::BuiltinFunction;
 
