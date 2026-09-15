@@ -130,6 +130,8 @@ pub use debugger::{
     run_recording_replay_command,
 };
 #[cfg(feature = "runtime")]
+pub use host_api::{HostOwnedFunction, OwnedHostCall, OwnedHostContext};
+#[cfg(feature = "runtime")]
 pub use jit::{
     JitAttempt, JitCallSiteProfile, JitConfig, JitExitProfile, JitMetrics, JitNyiDoc, JitNyiReason,
     JitSnapshot, JitTrace, JitTraceTerminal, TraceJitEngine,

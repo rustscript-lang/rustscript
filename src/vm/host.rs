@@ -4,8 +4,10 @@ use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::BuiltinFunction;
-use crate::host_api::{HostImportSchema, HostTypeSchema};
+use crate::host_api::{HostImportSchema, HostParamPassing, HostTypeSchema, ResourceTypeKey};
+use crate::vm::execution_scope::ExecutionScopeError;
 use crate::vm::operation::{OperationCancelReason, OperationId, OperationOutcome};
+use crate::vm::resource::error::{ResourceError, ResourceErrorCode};
 use crate::vm::resource::handle::ResourceHandle;
 use crate::vm::resource::table::ResourceTable;
 
@@ -108,6 +110,685 @@ pub trait HostStackFunction: Send {
 
 pub trait HostArgsFunction: Send {
     fn call(&mut self, args: &[Value]) -> VmResult<CallOutcome>;
+}
+
+// The public seam of this contract (the trait, the owned-call view, and the
+// factory context) is defined in `crate::host_api` so the crate root can
+// re-export it for embedding adapters; the dispatch below, the registry entry
+// kind, and every VM-coupled operation stay here, next to the VM invariants
+// they rely on.
+pub use crate::host_api::{HostOwnedFunction, OwnedHostCall, OwnedHostContext};
+
+type OwnedHostFactory = dyn Fn(OwnedHostContext<'_>) -> Box<dyn HostOwnedFunction> + Send + Sync;
+
+impl<'vm> OwnedHostCall<'vm> {
+    /// Creates a fresh, isolated VM that owns `callable` and its captured
+    /// callable graph.
+    ///
+    /// The fresh execution instance:
+    ///
+    /// * owns a brand-new execution instance, stack, resource table, waiting
+    ///   slot, and module-state store;
+    /// * reuses the *immutable* configuration of the calling VM — the same
+    ///   `Arc<Program>` and the same caller-provided standard-surface
+    ///   composition — and binds the host functions from `registry`;
+    /// * installs only the module state `configure` supplies;
+    /// * never copies the calling VM's frames, stack, locals, resources,
+    ///   waiting operation, callback queue, or request-local host state.
+    ///
+    /// A callable (or captured callable) whose prototype does not belong to
+    /// the source program is rejected: owned callable graphs are program-local
+    /// and are never portable across Program boundaries.
+    pub fn spawn_owned_callable_vm(
+        &mut self,
+        registry: &HostFunctionRegistry,
+        callable: &Value,
+        configure: impl FnOnce(&mut Vm) -> VmResult<()>,
+    ) -> VmResult<Vm> {
+        let program = Arc::clone(&self.vm.program);
+        let composition = self.vm.host.standard_composition.clone();
+        let mut owned = Vec::new();
+        let mut visited = Vec::new();
+        collect_owned_callable_graph(self.vm, callable, 0, &mut visited, &mut owned)?;
+        let mut vm = Vm::new_shared(Arc::clone(&program));
+        if let Some(composition) = composition {
+            vm.set_standard_composition(composition);
+        }
+        registry.bind_vm_cached(&mut vm)?;
+        configure(&mut vm)?;
+        vm.instance.owned_callables.extend(owned);
+        clear_owned_callable_vm_state(&mut vm);
+        Ok(vm)
+    }
+}
+
+impl Vm {
+    /// Reclaims an owned callable VM after a failed execution round.
+    ///
+    /// The callable graph is collected while the VM still owns it. Waiting
+    /// host work is then cancelled, the ordinary reusable-VM reset closes
+    /// run-scoped state, and the graph is adopted again only after the reset
+    /// reports reusable. Module state, host bindings, and immutable program
+    /// configuration remain attached to the VM across this operation.
+    pub(crate) fn recover_owned_callable(&mut self, callable: &Value) -> VmResult<()> {
+        let mut owned = Vec::new();
+        let mut visited = Vec::new();
+        collect_owned_callable_graph(self, callable, 0, &mut visited, &mut owned)?;
+
+        // Preserve a typed cancellation failure, but still run the reset: the
+        // scope close is the generic final cleanup path for any operation that
+        // could not be retired by the waiting-slot helper.
+        let cancellation =
+            self.cancel_waiting_host_op_with_reason(OperationCancelReason::Requested);
+        let reset = self.reset_for_reuse();
+        if !self.is_reusable() {
+            return Err(reset.err().unwrap_or(VmError::InvalidFrameState(
+                "owned callable vm is not reusable",
+            )));
+        }
+        self.instance.owned_callables.extend(owned);
+        clear_owned_callable_vm_state(self);
+        cancellation?;
+        reset?;
+        Ok(())
+    }
+}
+
+fn clear_owned_callable_vm_state(vm: &mut Vm) {
+    // `new_shared` and `reset_for_reuse` leave the normal root frame in
+    // place. An owned callable VM must remain halted so it never executes the
+    // source program as a second root invocation.
+    vm.instance.execution_frames.clear();
+    vm.instance.stack.clear();
+    vm.instance.host_return = None;
+    vm.instance.call_depth = 0;
+    vm.instance.ip = vm.program.code.len();
+}
+
+/// Maximum traversal depth of an owned callable graph (top-level callable,
+/// its capture cells, and every nested callable inside them).
+const MAX_OWNED_CALLABLE_GRAPH_DEPTH: u8 = 64;
+
+/// Depth- and cycle-bounded walk over an owned callable graph.
+///
+/// Cycles are legal (a closure may capture itself); every callable identity is
+/// visited once. A callable whose prototype id is absent from `program` is a
+/// structured rejection — the graph must belong to the program the fresh VM
+/// executes.
+fn collect_owned_callable_graph(
+    source: &Vm,
+    value: &Value,
+    depth: u8,
+    visited: &mut Vec<usize>,
+    owned: &mut Vec<std::sync::Weak<CallableValue>>,
+) -> VmResult<()> {
+    if depth > MAX_OWNED_CALLABLE_GRAPH_DEPTH {
+        return Err(VmError::HostError(
+            "owned callable graph exceeds the maximum traversal depth".to_string(),
+        ));
+    }
+    match value {
+        Value::Callable(callable) => {
+            if !source.owns_callable(value) {
+                return Err(VmError::InvalidFrameState(
+                    "callable does not belong to the source vm",
+                ));
+            }
+            let identity = Arc::as_ptr(callable) as usize;
+            if visited.contains(&identity) {
+                return Ok(());
+            }
+            visited.push(identity);
+            let prototype = source
+                .program
+                .callable_prototypes
+                .get(callable.prototype_id as usize)
+                .ok_or(VmError::InvalidCallablePrototype(callable.prototype_id))?;
+            if prototype.capture_source_slots.len() != prototype.capture_modes.len()
+                || prototype.capture_slots.len() != prototype.capture_modes.len()
+            {
+                return Err(VmError::InvalidFrameState(
+                    "callable capture layout mismatch",
+                ));
+            }
+            if let Some(environment) = &callable.env {
+                let cells = environment
+                    .cells
+                    .lock()
+                    .map_err(|_| VmError::InvalidFrameState("callable capture lock is poisoned"))?
+                    .clone();
+                if cells.len() != prototype.capture_modes.len() {
+                    return Err(VmError::InvalidFrameState(
+                        "callable environment layout mismatch",
+                    ));
+                }
+                for (source_slot, cell) in prototype.capture_source_slots.iter().zip(cells) {
+                    let captured = cell
+                        .lock()
+                        .map_err(|_| VmError::InvalidFrameState("capture cell lock is poisoned"))?
+                        .clone();
+                    validate_owned_capture(
+                        source,
+                        *source_slot,
+                        &captured,
+                        depth + 1,
+                        visited,
+                        owned,
+                    )?;
+                }
+            } else if !prototype.capture_modes.is_empty() {
+                return Err(VmError::InvalidFrameState(
+                    "callable capture environment is missing",
+                ));
+            }
+            owned.push(Arc::downgrade(callable));
+            Ok(())
+        }
+        Value::Array(values) => {
+            for item in values.iter() {
+                collect_owned_callable_graph(source, item, depth + 1, visited, owned)?;
+            }
+            Ok(())
+        }
+        Value::Map(map) => {
+            for (key, item) in map.iter() {
+                collect_owned_callable_graph(source, key, depth + 1, visited, owned)?;
+                collect_owned_callable_graph(source, item, depth + 1, visited, owned)?;
+            }
+            Ok(())
+        }
+        Value::Null
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::Bool(_)
+        | Value::String(_)
+        | Value::Bytes(_) => Ok(()),
+    }
+}
+
+fn validate_owned_capture(
+    source: &Vm,
+    source_slot: u16,
+    captured: &Value,
+    depth: u8,
+    visited: &mut Vec<usize>,
+    owned: &mut Vec<std::sync::Weak<CallableValue>>,
+) -> VmResult<()> {
+    let schema = source
+        .program
+        .type_map
+        .as_ref()
+        .and_then(|type_map| type_map.local_schemas.get(usize::from(source_slot)))
+        .and_then(|schema| schema.as_ref());
+    if schema.is_some_and(|schema| {
+        schema.contains_resource_with_named_types(&source.program.named_struct_decls)
+    }) {
+        return Err(VmError::HostError(
+            "owned callable graph contains a resource-bearing capture".to_string(),
+        ));
+    }
+    collect_owned_callable_graph(source, captured, depth, visited, owned)
+}
+
+/// Maximum schema depth of the registration-time resource classification walk.
+///
+/// A schema that nests deeper than this is rejected at registration instead of
+/// being classified as resource-free: classification is fail-closed, so an
+/// unobservable schema can never slip past the passing-mode contract.
+const MAX_REGISTRATION_SCHEMA_DEPTH: u8 = 64;
+
+/// Resource-access mode of one resource-passing argument occurrence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResourceAccessMode {
+    Borrow,
+    BorrowMut,
+    TakeOwned,
+}
+
+/// Maps a catalog passing mode onto its resource-access mode; `Value` is not a
+/// resource operation and returns `None`.
+fn passing_to_access_mode(passing: HostParamPassing) -> Option<ResourceAccessMode> {
+    match passing {
+        HostParamPassing::Value => None,
+        HostParamPassing::Borrow => Some(ResourceAccessMode::Borrow),
+        HostParamPassing::BorrowMut => Some(ResourceAccessMode::BorrowMut),
+        HostParamPassing::TakeOwned => Some(ResourceAccessMode::TakeOwned),
+    }
+}
+
+/// Depth-bounded, named-aware probe for a resource occurrence in a host schema.
+///
+/// Named structs are walked through their inline field bodies and callable
+/// signatures through their parameters and result, so a resource nested
+/// anywhere inside a parameter schema is classified exactly like a directly
+/// nested one. The walk is fail-closed: a schema it cannot fully observe
+/// (depth overflow) is an error, never a "contains no resource" answer.
+fn host_schema_contains_resource(schema: &HostTypeSchema) -> Result<bool, String> {
+    let mut pending: Vec<(&HostTypeSchema, u8)> = vec![(schema, 0)];
+    while let Some((current, depth)) = pending.pop() {
+        if depth > MAX_REGISTRATION_SCHEMA_DEPTH {
+            return Err(format!(
+                "schema is nested deeper than the supported limit of \
+                 {MAX_REGISTRATION_SCHEMA_DEPTH} levels"
+            ));
+        }
+        match current {
+            HostTypeSchema::Resource(_) => return Ok(true),
+            HostTypeSchema::Array(inner)
+            | HostTypeSchema::Map(inner)
+            | HostTypeSchema::Optional(inner) => pending.push((inner, depth + 1)),
+            HostTypeSchema::Callable { params, result } => {
+                pending.push((result, depth + 1));
+                for param in params {
+                    pending.push((param, depth + 1));
+                }
+            }
+            HostTypeSchema::Named { fields, .. } => {
+                for field in fields {
+                    pending.push((&field.ty, depth + 1));
+                }
+            }
+            HostTypeSchema::Unknown
+            | HostTypeSchema::Null
+            | HostTypeSchema::Int
+            | HostTypeSchema::Float
+            | HostTypeSchema::Number
+            | HostTypeSchema::Bool
+            | HostTypeSchema::String
+            | HostTypeSchema::Bytes => {}
+        }
+    }
+    Ok(false)
+}
+
+/// The expected key of a *directly addressable* resource-passing schema.
+///
+/// Only a direct `Resource(key)` or a single `Optional<Resource(key)>` is
+/// addressable by the handle ABI (a `Null` argument legally skips the optional
+/// layer). A resource nested inside an aggregate, named struct, or callable
+/// signature has no addressable handle and is rejected at registration, so it
+/// can never reach the call-time contract.
+fn addressable_host_resource_key(schema: &HostTypeSchema) -> Option<(ResourceTypeKey, bool)> {
+    match schema {
+        HostTypeSchema::Resource(key) => Some((key.clone(), false)),
+        HostTypeSchema::Optional(inner) => match inner.as_ref() {
+            HostTypeSchema::Resource(key) => Some((key.clone(), true)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Registration-time passing-mode contract of one catalog schema.
+///
+/// `owned_value_transfer` is set only by
+/// [`HostFunctionRegistry::register_exact_owned`]: a resource-free `TakeOwned`
+/// parameter is then a legitimate owned *value* transfer (callable, scalar, or
+/// aggregate) instead of the silent-drop hazard every other registration kind
+/// would create.
+///
+/// Every rejection is a structured message; the caller wraps it in the
+/// registry's own structured schema error, so a refused registration never
+/// mutates the registry.
+fn validate_registration_passing(
+    schema: &HostImportSchema,
+    owned_value_transfer: bool,
+) -> Result<(), String> {
+    for param in &schema.params {
+        let has_resource = host_schema_contains_resource(&param.schema).map_err(|detail| {
+            format!(
+                "parameter '{}' schema could not be classified as a resource or value: {detail}",
+                param.name
+            )
+        })?;
+        if !has_resource {
+            match param.passing {
+                HostParamPassing::Value => {}
+                HostParamPassing::TakeOwned if owned_value_transfer => {}
+                _ => {
+                    return Err(format!(
+                        "parameter '{}' declares {:?} passing but its schema {:#?} contains no \
+                         resource; non-resource parameters must use Value, and a resource-free \
+                         TakeOwned transfer is only legal on the owned-dispatch registration \
+                         path",
+                        param.name, param.passing, param.schema,
+                    ));
+                }
+            }
+            continue;
+        }
+        if param.passing == HostParamPassing::Value {
+            return Err(format!(
+                "parameter '{}' carries a resource (schema {:#?}); resource parameters must use \
+                 Borrow/BorrowMut/TakeOwned",
+                param.name, param.schema,
+            ));
+        }
+        if owned_value_transfer && addressable_host_resource_key(&param.schema).is_none() {
+            return Err(format!(
+                "resource-passing parameter '{}' schema {:#?} is not directly addressable by the \
+                 handle ABI",
+                param.name, param.schema,
+            ));
+        }
+    }
+    let return_has_resource = host_schema_contains_resource(&schema.return_type)
+        .map_err(|detail| format!("return schema could not be classified: {detail}"))?;
+    if return_has_resource
+        && owned_value_transfer
+        && addressable_host_resource_key(&schema.return_type).is_none()
+    {
+        return Err(format!(
+            "exact return schema {:#?} contains a resource nested inside an aggregate; only \
+             Resource(key) and Optional<Resource(key>) returns are representable by the handle ABI",
+            schema.return_type,
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a registered schema needs the guarded call wrapper.
+///
+/// A schema needs the guard exactly when it declares an addressable
+/// resource-passing parameter: those are the only arguments whose preflight,
+/// alias graph, and post-call commit the dispatcher must enforce. A
+/// resource-free `TakeOwned` parameter is an owned value transfer and needs no
+/// resource contract.
+fn schema_requires_guard(schema: &HostImportSchema) -> bool {
+    schema.params.iter().any(|param| {
+        param.passing != HostParamPassing::Value
+            && addressable_host_resource_key(&param.schema).is_some()
+    })
+}
+
+/// One resource-passing argument occurrence in a host call.
+#[derive(Clone, Debug)]
+struct ExactResourceSpec {
+    /// Argument index in the (drained) call argument list.
+    arg_index: usize,
+    handle: ResourceHandle,
+    key: ResourceTypeKey,
+    mode: ResourceAccessMode,
+}
+
+fn invalid_resource_handle_error(message: String) -> VmError {
+    VmError::ExecutionScope(ExecutionScopeError::Resource(ResourceError::new(
+        ResourceErrorCode::InvalidResourceHandle,
+        "resource::exact_call",
+        message,
+    )))
+}
+
+fn resource_error(error: ResourceError) -> VmError {
+    VmError::ExecutionScope(ExecutionScopeError::Resource(error))
+}
+
+/// Decodes one raw handle argument into a validated [`ResourceHandle`].
+///
+/// Only the handle ABI's `int` encoding is accepted; anything else is a
+/// structured invalid-handle rejection raised before the host function runs.
+fn resource_handle_argument(value: &Value) -> VmResult<ResourceHandle> {
+    let Value::Int(raw) = value else {
+        return Err(invalid_resource_handle_error(format!(
+            "resource argument must be a handle token, got {value:?}"
+        )));
+    };
+    let raw = u64::try_from(*raw).map_err(|_| {
+        invalid_resource_handle_error(
+            "resource handle token must be a positive signed integer".to_string(),
+        )
+    })?;
+    ResourceHandle::from_raw(raw).map_err(resource_error)
+}
+
+fn resource_access_conflict_error(left: &ExactResourceSpec, right: &ExactResourceSpec) -> VmError {
+    resource_error(
+        ResourceError::new(
+            ResourceErrorCode::ResourceAccessConflict,
+            "resource::exact_call",
+            format!(
+                "resource argument {} and {} alias handle {} with conflicting access modes \
+                 {:?}/{:?}",
+                left.arg_index,
+                right.arg_index,
+                left.handle.raw(),
+                left.mode,
+                right.mode,
+            ),
+        )
+        .with_value(left.handle.raw()),
+    )
+}
+
+fn consumed_borrowed_resource_error(spec: &ExactResourceSpec) -> VmError {
+    resource_error(
+        ResourceError::new(
+            ResourceErrorCode::ResourceAccessConflict,
+            "resource::exact_call",
+            format!(
+                "resource argument at index {} declared {:?} was consumed by the host function",
+                spec.arg_index, spec.mode,
+            ),
+        )
+        .with_value(spec.handle.raw()),
+    )
+}
+
+/// The single type-erased resource contract of one host call with
+/// resource-passing parameters.
+///
+/// 1. **build** extracts every resource-passing occurrence from the schema and
+///    the raw arguments (addressability is guaranteed at registration), decodes
+///    each handle, and rejects illegal same-handle aliases;
+/// 2. **validate** checks every occurrence against the live execution scope
+///    before the user function runs — read-only, zero mutation, so a bad
+///    argument never reaches the host function;
+/// 3. **commit** runs after the function returns: a declared `TakeOwned` that
+///    was consumed passes, a declared `TakeOwned` still live in the table is
+///    reported and reclaimed exactly once (never closed twice), and a
+///    `Borrow`/`BorrowMut` argument the function consumed is a structured
+///    [`ResourceErrorCode::ResourceAccessConflict`].
+#[derive(Debug)]
+struct ExactHostCallContract {
+    specs: Vec<ExactResourceSpec>,
+}
+
+impl ExactHostCallContract {
+    /// Builds the contract from the import schema and raw arguments.
+    ///
+    /// Any failure is structured and consumes nothing: the whole argument list
+    /// is restored by the owned dispatch because nothing was taken.
+    fn build(schema: &HostImportSchema, args: &[Value]) -> VmResult<Self> {
+        let mut specs = Vec::new();
+        for (index, param) in schema.params.iter().enumerate() {
+            let Some(mode) = passing_to_access_mode(param.passing) else {
+                // `Value` parameters are not resource operations; a
+                // resource-bearing `Value` parameter is rejected at
+                // registration.
+                continue;
+            };
+            let has_resource = host_schema_contains_resource(&param.schema).map_err(|detail| {
+                VmError::HostError(format!(
+                    "host call parameter '{}' schema cannot be classified: {detail}",
+                    param.name
+                ))
+            })?;
+            if !has_resource {
+                // A resource-free `TakeOwned` parameter is an owned *value*
+                // transfer (legal only on the owned-dispatch path). Reaching
+                // call time with any other resource-passing mode means the
+                // registration funnel was bypassed, so refuse to run rather
+                // than silently dropping the declared mode.
+                if mode == ResourceAccessMode::TakeOwned {
+                    continue;
+                }
+                return Err(VmError::HostError(format!(
+                    "resource-passing parameter '{}' declares {mode:?} but its schema {:#?} \
+                     contains no resource",
+                    param.name, param.schema,
+                )));
+            }
+            let Some((key, optional)) = addressable_host_resource_key(&param.schema) else {
+                return Err(VmError::HostError(format!(
+                    "resource-passing parameter '{}' schema {:#?} is not directly addressable by \
+                     the handle ABI",
+                    param.name, param.schema,
+                )));
+            };
+            let value = args.get(index).ok_or_else(|| {
+                invalid_resource_handle_error(format!(
+                    "exact host call is missing argument at index {index}"
+                ))
+            })?;
+            if optional && matches!(value, Value::Null) {
+                // Legal skip for Optional(Resource).
+                continue;
+            }
+            let handle = resource_handle_argument(value)?;
+            specs.push(ExactResourceSpec {
+                arg_index: index,
+                handle,
+                key,
+                mode,
+            });
+        }
+        // Alias graph: only shared `Borrow` + shared `Borrow` is legal for one
+        // handle. Duplicate `TakeOwned`, `TakeOwned` + `Borrow`/`BorrowMut`, and
+        // `BorrowMut` + `Borrow` all reject here, before the host function runs.
+        for (index, left) in specs.iter().enumerate() {
+            for right in specs.iter().skip(index + 1) {
+                if left.handle != right.handle {
+                    continue;
+                }
+                if left.mode == ResourceAccessMode::Borrow
+                    && right.mode == ResourceAccessMode::Borrow
+                {
+                    continue;
+                }
+                return Err(resource_access_conflict_error(left, right));
+            }
+        }
+        Ok(Self { specs })
+    }
+
+    /// Read-only pre-call validation of every occurrence against the live
+    /// execution scope.
+    ///
+    /// The table's declared-key probe observes the handle encoding, arena,
+    /// slot generation, concrete/declared key, and open state without
+    /// borrowing, taking, closing, or otherwise mutating the resource.
+    fn validate(&self, vm: &Vm) -> VmResult<()> {
+        for spec in &self.specs {
+            vm.host
+                .execution_scope
+                .resources()
+                .validate_resource_type_key(spec.handle, &spec.key)
+                .map_err(resource_error)?;
+        }
+        Ok(())
+    }
+
+    /// Whether one occurrence is still live (open) in the execution scope.
+    ///
+    /// After a successful preflight this is the consumption probe: a consumed
+    /// (taken) or closed resource is no longer live.
+    fn is_live(vm: &Vm, spec: &ExactResourceSpec) -> bool {
+        vm.host
+            .execution_scope
+            .resources()
+            .validate_resource_type_key(spec.handle, &spec.key)
+            .is_ok()
+    }
+
+    /// Post-call commit / cleanup. Returns the first structured error, if any.
+    ///
+    /// - A declared `TakeOwned` that is no longer live was consumed by this
+    ///   invocation.
+    /// - A declared `TakeOwned` still live is reported and reclaimed exactly
+    ///   once: the guard takes the drained argument so the declared move is
+    ///   honored and the guest never gets a stale handle back. The resource
+    ///   itself stays owned by this execution scope and is released exactly
+    ///   once by the ordinary scope close, which retires each live resource
+    ///   with a single `begin_close` — the reclaim never closes it twice.
+    /// - A `Borrow`/`BorrowMut` argument that is no longer live was consumed
+    ///   by the host function and is a structured access conflict.
+    fn commit(&self, call: &mut OwnedHostCall<'_>) -> Option<VmError> {
+        let mut first_error = None;
+        for spec in &self.specs {
+            if Self::is_live(call.vm_ref(), spec) {
+                match spec.mode {
+                    ResourceAccessMode::TakeOwned => {
+                        first_error.get_or_insert_with(|| {
+                            // A4's resource table has no type-erased
+                            // "not consumed" code and no type-erased close:
+                            // the failure is reported as a structured host
+                            // error naming the argument, handle, and key.
+                            VmError::HostError(format!(
+                                "declared TakeOwned argument at index {} (handle {}, key {}) was \
+                                 not consumed by the host function; the argument is reclaimed \
+                                 and its resource is released by the scope close",
+                                spec.arg_index,
+                                spec.handle.raw(),
+                                spec.key,
+                            ))
+                        });
+                        // Reclaim exactly once: honour the declared move so the
+                        // unconsumed handle is never handed back to the guest.
+                        if !call.is_taken(spec.arg_index) {
+                            let _ = call.take_arg(spec.arg_index);
+                        }
+                    }
+                    ResourceAccessMode::Borrow | ResourceAccessMode::BorrowMut => {}
+                }
+                continue;
+            }
+            if matches!(
+                spec.mode,
+                ResourceAccessMode::Borrow | ResourceAccessMode::BorrowMut
+            ) {
+                first_error.get_or_insert_with(|| consumed_borrowed_resource_error(spec));
+            }
+        }
+        first_error
+    }
+}
+
+/// Owned-dispatch sibling of the ordinary guarded host call wrapper.
+///
+/// Resource-bearing exact schemas keep their full preflight/commit contract
+/// when they are registered through
+/// [`HostFunctionRegistry::register_exact_owned`]: the argument list is the
+/// owned call's already drained argument list, and a resource-free `TakeOwned`
+/// value transfer is simply not a resource operation.
+struct GuardedOwnedHostFunction {
+    inner: Box<dyn HostOwnedFunction>,
+    schema: HostImportSchema,
+}
+
+impl HostOwnedFunction for GuardedOwnedHostFunction {
+    fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+        let contract = ExactHostCallContract::build(&self.schema, call.args())?;
+        contract.validate(call.vm_ref())?;
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.inner.call(call)));
+        match outcome {
+            Ok(Ok(outcome)) => match contract.commit(call) {
+                Some(error) => Err(error),
+                None => Ok(outcome),
+            },
+            Ok(Err(error)) => {
+                // The host function failed: the primary error is preserved,
+                // while an unconsumed owned resource is still reclaimed (and a
+                // consumed borrowed resource still reported is secondary).
+                let _ = contract.commit(call);
+                Err(error)
+            }
+            Err(payload) => {
+                let _ = contract.commit(call);
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
 }
 
 /// Terminal state supplied to [`HostAsyncBridge::cleanup_op`].
@@ -224,6 +905,9 @@ enum RegistryEntryKind {
     ArgsFactory(Arc<HostArgsFactory>),
     ArgsStatic(StaticHostArgsFunction),
     ArgsStaticNonYielding(StaticHostArgsFunction),
+    /// Owned-dispatch entry: the factory receives the registry at bind time and
+    /// produces a per-VM owned host function that consumes its arguments.
+    OwnedFactory(Arc<OwnedHostFactory>),
 }
 
 #[derive(Clone)]
@@ -712,6 +1396,21 @@ impl HostFunctionRegistry {
                 detail: error.to_string(),
             });
         }
+        // Passing-mode / resource-shape contract. Only the owned-dispatch entry
+        // kind permits a resource-free `TakeOwned` parameter (an owned value
+        // transfer); every other path keeps the structural rejection, and a
+        // guarded owned registration additionally requires every
+        // resource-bearing parameter and return to be directly addressable by
+        // the handle ABI.
+        if let Err(detail) = validate_registration_passing(
+            &schema,
+            matches!(kind, RegistryEntryKind::OwnedFactory(_)),
+        ) {
+            return Err(RegistrySchemaError::InvalidSchema {
+                name: schema.name.clone(),
+                detail,
+            });
+        }
         let arity =
             u8::try_from(schema.arity()).map_err(|_| RegistrySchemaError::InvalidArity {
                 name: schema.name.clone(),
@@ -795,6 +1494,47 @@ impl HostFunctionRegistry {
             )));
         }
         self.register_catalog_static(schema, function)
+            .map_err(|error| VmError::HostError(error.to_string()))
+    }
+
+    /// Registers an exact host function whose dispatch drains the call operands
+    /// and transfers ownership of the arguments the function takes.
+    ///
+    /// The exact schema follows the same registration identity check as every
+    /// other exact entry (`name`/`arity` must match the schema), plus one
+    /// owned-dispatch allowance: a `TakeOwned` parameter may carry a
+    /// *resource-free* schema (a callable, scalar, or aggregate value) and is
+    /// then transferred as an owned value rather than an addressable handle.
+    ///
+    /// Resource-bearing parameters are fully supported: every `Borrow`,
+    /// `BorrowMut`, and `TakeOwned` parameter that carries a resource is
+    /// wrapped by the guarded owned contract — read-only pre-call preflight
+    /// against the live execution scope, alias/conflict validation of the
+    /// handle graph, and a post-call commit that reports an unconsumed
+    /// `TakeOwned` argument and reclaims it exactly once while a consumed
+    /// `Borrow`/`BorrowMut` argument is a structured access conflict. Such a
+    /// parameter and any resource-bearing return must be directly addressable
+    /// by the handle ABI (`Resource(key)` or `Optional<Resource(key)>`); a
+    /// nested resource is rejected at registration.
+    ///
+    /// `factory` runs once per bind and receives the registry through
+    /// [`OwnedHostContext`], so an owned host function can retain the
+    /// immutable registry/binding configuration it needs to spawn an isolated
+    /// owned-value execution VM. Registering the same name+schema twice is an
+    /// explicit error (no silent replacement).
+    pub fn register_exact_owned(
+        &mut self,
+        name: &str,
+        arity: u8,
+        schema: HostImportSchema,
+        factory: impl Fn(OwnedHostContext<'_>) -> Box<dyn HostOwnedFunction> + Send + Sync + 'static,
+    ) -> VmResult<u16> {
+        if schema.name != name || schema.arity() != usize::from(arity) {
+            return Err(VmError::HostError(format!(
+                "host schema for '{name}' does not match its exact adapter identity"
+            )));
+        }
+        self.register_catalog_entry(schema, RegistryEntryKind::OwnedFactory(Arc::new(factory)))
             .map_err(|error| VmError::HostError(error.to_string()))
     }
 
@@ -1170,6 +1910,19 @@ impl HostFunctionRegistry {
                 RegistryEntryKind::ArgsStaticNonYielding(function) => {
                     vm.register_static_non_yielding_args_function(*function);
                 }
+                RegistryEntryKind::OwnedFactory(factory) => {
+                    let function = factory(OwnedHostContext { registry: self });
+                    let function: Box<dyn HostOwnedFunction> = match entry.schema.as_ref() {
+                        Some(schema) if schema_requires_guard(schema) => {
+                            Box::new(GuardedOwnedHostFunction {
+                                inner: function,
+                                schema: schema.clone(),
+                            })
+                        }
+                        _ => function,
+                    };
+                    vm.register_owned_function(function);
+                }
             }
             let host_slot = vm.host.host_function_schemas.len() - 1;
             if let Some(schema) = vm.host.host_function_schemas.get_mut(host_slot) {
@@ -1195,6 +1948,11 @@ pub(super) enum VmHostFunction {
     ArgsDynamic(Box<dyn HostArgsFunction>),
     ArgsStatic(StaticHostArgsFunction),
     ArgsStaticNonYielding(StaticHostArgsFunction),
+    /// Owned-dispatch binding: the call operands are drained from the guest
+    /// operand stack and ownership of the taken arguments transfers to the
+    /// function. The option is empty only while the function is executing;
+    /// this avoids borrowing a registry vector across `HostOwnedFunction::call`.
+    OwnedDynamic(Option<Box<dyn HostOwnedFunction>>),
 }
 
 pub(super) enum HostCallExecOutcome {
@@ -1736,6 +2494,22 @@ impl Vm {
         self.host
             .host_functions
             .push(VmHostFunction::ArgsStaticNonYielding(function));
+        self.host.host_function_schemas.push(None);
+        self.host.resolved_calls_dirty = true;
+        index
+    }
+
+    /// Registers an owned-dispatch host function on this VM.
+    ///
+    /// Owned bindings are normally created by
+    /// [`HostFunctionRegistry::register_exact_owned`] and installed through
+    /// the registry bind; this entry point exists for the bind path itself and
+    /// for embeddings that compose their own slot table.
+    pub fn register_owned_function(&mut self, function: Box<dyn HostOwnedFunction>) -> u16 {
+        let index = self.host.host_functions.len() as u16;
+        self.host
+            .host_functions
+            .push(VmHostFunction::OwnedDynamic(Some(function)));
         self.host.host_function_schemas.push(None);
         self.host.resolved_calls_dirty = true;
         index
@@ -2543,6 +3317,14 @@ impl Vm {
                 expected_return_type,
                 expected_return_schema.as_ref(),
             )
+        } else if self.bound_host_function_is_owned(resolved_index)? {
+            self.execute_bound_owned_host_function(
+                resolved_index,
+                argc,
+                call_ip,
+                expected_return_type,
+                expected_return_schema.as_ref(),
+            )
         } else {
             self.execute_bound_host_function_from_stack(
                 resolved_index,
@@ -3069,7 +3851,8 @@ impl Vm {
                 | VmHostFunction::StackStatic(_)
                 | VmHostFunction::ArgsDynamic(_)
                 | VmHostFunction::ArgsStatic(_)
-                | VmHostFunction::ArgsStaticNonYielding(_) => unreachable!(),
+                | VmHostFunction::ArgsStaticNonYielding(_)
+                | VmHostFunction::OwnedDynamic(_) => unreachable!(),
             }
         };
         self.instance.call_depth = self.instance.call_depth.saturating_sub(1);
@@ -3160,6 +3943,191 @@ impl Vm {
         ))
     }
 
+    /// Whether the resolved slot is an owned-dispatch binding.
+    fn bound_host_function_is_owned(&self, resolved_index: u16) -> VmResult<bool> {
+        let function = self
+            .host
+            .host_functions
+            .get(resolved_index as usize)
+            .ok_or(VmError::InvalidCall(resolved_index))?;
+        Ok(matches!(function, VmHostFunction::OwnedDynamic(_)))
+    }
+
+    /// Executes an owned host function: the call operands are drained from the
+    /// operand stack into an [`OwnedHostCall`] and ownership of the arguments
+    /// the function takes transfers to it.
+    ///
+    /// Contract:
+    ///
+    /// * every failure path — a host error, a panic, a rejected `Yield`, or a
+    ///   rejected exact return — restores every argument the host did **not**
+    ///   take to the operand stack exactly once, so nothing is lost and
+    ///   nothing is dropped twice;
+    /// * arguments the host took stay consumed on those paths, and values the
+    ///   handler pushed onto the operand stack remain on it;
+    /// * a successful call leaves the guest source consumed (the taken
+    ///   arguments moved into the host, the rest released);
+    /// * `Yield` is unsupported for owned dispatch: the drained operands
+    ///   cannot be re-executed, so the outcome is rejected as a structured
+    ///   [`VmError::HostError`] and the instruction pointer is left past the
+    ///   call instruction rather than rewound for a retry;
+    /// * `Halt`, `Pending`, and return validation follow the ordinary
+    ///   bound-host-call contract;
+    /// * panic handling unwinds without restoring already-taken arguments
+    ///   (they are owned by the host at that point) while still restoring the
+    ///   untaken remainder through the same failure path.
+    pub(super) fn execute_bound_owned_host_function(
+        &mut self,
+        resolved_index: u16,
+        argc: usize,
+        call_ip: usize,
+        expected_return_type: Option<ValueType>,
+        expected_return_schema: Option<&HostImportSchema>,
+    ) -> VmResult<HostCallExecOutcome> {
+        let arg_start = self
+            .instance
+            .stack
+            .len()
+            .checked_sub(argc)
+            .ok_or(VmError::StackUnderflow)?;
+        // Take the owned function out of its option slot before borrowing the
+        // VM. The slot remains present as `OwnedDynamic(None)`, which rejects
+        // same-slot re-entry without holding a vector borrow across the call.
+        let mut function = {
+            let slot = self
+                .host
+                .host_functions
+                .get_mut(resolved_index as usize)
+                .ok_or(VmError::InvalidCall(resolved_index))?;
+            match slot {
+                VmHostFunction::OwnedDynamic(function) => function.take().ok_or_else(|| {
+                    VmError::HostError("owned host function is already executing".to_string())
+                })?,
+                _ => unreachable!("owned dispatch requires an owned host function"),
+            }
+        };
+
+        let mut saved_stack = std::mem::take(&mut self.instance.stack);
+        self.instance.call_depth += 1;
+        let args = saved_stack.split_off(arg_start);
+        let (call_result, untaken) = {
+            let mut call = OwnedHostCall::new(self, args);
+            let call_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| function.call(&mut call)));
+            let depth = call.vm().instance.call_depth;
+            call.vm().instance.call_depth = depth.saturating_sub(1);
+            // Values not taken by the host are kept for every failure path —
+            // an ordinary error, a panic, a rejected `Yield`, and a rejected
+            // return all restore them exactly once. A successful
+            // `Return`/`Halt`/`Pending` call owns every value it took, and the
+            // remaining drained values are released when this vector drops.
+            let untaken = call.into_untaken_args();
+            (call_result, untaken)
+        };
+
+        // Restore the function after the call has released every borrow of the
+        // VM. Appending is the defensive fallback for a host handler that
+        // replaces its slot while mutating the registration vector; the
+        // function remains owned and is never dropped or used through a stale
+        // pointer. Normal append-only mutation retains the original slot.
+        let mut function = Some(function);
+        let restored = match self.host.host_functions.get_mut(resolved_index as usize) {
+            Some(VmHostFunction::OwnedDynamic(slot)) if slot.is_none() => {
+                *slot = function.take();
+                true
+            }
+            _ => false,
+        };
+        if !restored {
+            self.host
+                .host_functions
+                .push(VmHostFunction::OwnedDynamic(function));
+            self.host.host_function_schemas.push(None);
+        }
+
+        let mut host_stack = std::mem::take(&mut self.instance.stack);
+        let outcome = match call_result {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(err)) => {
+                let mut untaken = untaken;
+                saved_stack.append(&mut untaken);
+                saved_stack.append(&mut host_stack);
+                self.instance.stack = saved_stack;
+                return Err(err);
+            }
+            Err(payload) => {
+                let mut untaken = untaken;
+                saved_stack.append(&mut untaken);
+                saved_stack.append(&mut host_stack);
+                self.instance.stack = saved_stack;
+                std::panic::resume_unwind(payload);
+            }
+        };
+
+        match outcome {
+            CallOutcome::Return(values) => {
+                // Validate BEFORE any stack mutation. The owned call has
+                // already accepted (and possibly taken) its operands, so a
+                // rejected return restores every argument the host did not
+                // take exactly once — the same failure contract as an `Err`
+                // outcome — while arguments the host took stay consumed and
+                // the host stack keeps every value the handler pushed.
+                if let Err(error) = validate_host_call_return(
+                    &values,
+                    expected_return_type,
+                    expected_return_schema,
+                    &self.program,
+                    self.host.execution_scope.resources(),
+                ) {
+                    let mut untaken = untaken;
+                    saved_stack.append(&mut untaken);
+                    saved_stack.append(&mut host_stack);
+                    self.instance.stack = saved_stack;
+                    return Err(error);
+                }
+                saved_stack.append(&mut host_stack);
+                values.push_onto_stack(&mut saved_stack);
+                self.instance.stack = saved_stack;
+                Ok(HostCallExecOutcome::Returned)
+            }
+            CallOutcome::Halt => {
+                saved_stack.append(&mut host_stack);
+                self.instance.stack = saved_stack;
+                Ok(HostCallExecOutcome::Halted)
+            }
+            CallOutcome::Yield => {
+                // Owned dispatch drains the call operands before the handler
+                // runs, so a yielded call cannot be re-executed: its arguments
+                // no longer exist on the guest stack. Reject the outcome as a
+                // structured error and restore every untaken argument through
+                // the ordinary failure path; values the handler already took
+                // remain owned by the handler. The instruction pointer stays
+                // past the call instruction — it is never rewound for a retry.
+                let mut untaken = untaken;
+                saved_stack.append(&mut untaken);
+                saved_stack.append(&mut host_stack);
+                self.instance.stack = saved_stack;
+                Err(VmError::HostError(
+                    "owned host function returned yield, which owned dispatch does not support"
+                        .to_string(),
+                ))
+            }
+            CallOutcome::Pending(op_id) => {
+                saved_stack.append(&mut host_stack);
+                self.instance.stack = saved_stack;
+                let resume_ip = self.call_resume_ip(call_ip)?;
+                self.set_waiting_host_op_with_return(
+                    op_id,
+                    self.host_call_pending_source(op_id),
+                    expected_return_type,
+                    expected_return_schema,
+                )?;
+                self.instance.ip = resume_ip;
+                Ok(HostCallExecOutcome::Pending(op_id))
+            }
+        }
+    }
+
     #[inline(always)]
     fn execute_static_non_yielding_args_host_function(
         &mut self,
@@ -3221,7 +4189,8 @@ impl Vm {
                 VmHostFunction::Dynamic(_)
                 | VmHostFunction::Static(_)
                 | VmHostFunction::StackDynamic(_)
-                | VmHostFunction::StackStatic(_) => unreachable!(),
+                | VmHostFunction::StackStatic(_)
+                | VmHostFunction::OwnedDynamic(_) => unreachable!(),
             }
         };
         self.instance.call_depth = self.instance.call_depth.saturating_sub(1);
@@ -3312,7 +4281,8 @@ impl Vm {
                 | VmHostFunction::Static(_)
                 | VmHostFunction::ArgsDynamic(_)
                 | VmHostFunction::ArgsStatic(_)
-                | VmHostFunction::ArgsStaticNonYielding(_) => unreachable!(),
+                | VmHostFunction::ArgsStaticNonYielding(_)
+                | VmHostFunction::OwnedDynamic(_) => unreachable!(),
             }
         };
         self.instance.call_depth = self.instance.call_depth.saturating_sub(1);
@@ -3857,5 +4827,2312 @@ mod tests {
             super::RegistrySchemaError::InvalidSchema { .. }
         ));
         assert!(registry.catalog_by_schema.is_empty());
+    }
+}
+
+/// Generic owned-value dispatch: the owned-call view, callable-graph transfer,
+/// and registration admission. Domain-facing behaviour (a real embedding that
+/// registers a callback and drives a private VM) is covered by the integration
+/// tests of the modules that build on this seam.
+#[cfg(test)]
+mod owned_dispatch_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::bytecode::{
+        CallableEnvironment, CallableKind, CallablePrototype, CallableTarget, HostImport, Program,
+        TypeMap, ValueType,
+    };
+    use crate::compiler::TypeSchema;
+    use crate::host_api::{HostApiFingerprint, HostParamPassing, HostTypeSchema};
+
+    struct NoopOwned;
+
+    impl HostOwnedFunction for NoopOwned {
+        fn call(&mut self, _call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            Ok(CallOutcome::Return(CallReturn::none()))
+        }
+    }
+
+    fn owned_schema(params: Vec<HostImportParam>, return_type: HostTypeSchema) -> HostImportSchema {
+        HostImportSchema {
+            name: "test::register".to_string(),
+            params,
+            return_type,
+            fingerprint: HostApiFingerprint::from_wire(0),
+        }
+    }
+
+    fn named_schema(
+        name: &str,
+        params: Vec<HostImportParam>,
+        return_type: HostTypeSchema,
+    ) -> HostImportSchema {
+        HostImportSchema {
+            name: name.to_string(),
+            params,
+            return_type,
+            fingerprint: HostApiFingerprint::from_wire(0),
+        }
+    }
+
+    fn take_callable_param(name: &str) -> HostImportParam {
+        HostImportParam {
+            name: name.to_string(),
+            schema: HostTypeSchema::Callable {
+                params: vec![HostTypeSchema::Bool],
+                result: Box::new(HostTypeSchema::Unknown),
+            },
+            passing: HostParamPassing::TakeOwned,
+        }
+    }
+
+    fn register_owned(
+        registry: &mut HostFunctionRegistry,
+        schema: HostImportSchema,
+    ) -> VmResult<u16> {
+        let name = schema.name.clone();
+        let arity = schema.arity() as u8;
+        registry.register_exact_owned(&name, arity, schema, |_context| Box::new(NoopOwned))
+    }
+
+    #[test]
+    fn owned_host_call_can_restore_a_taken_argument() {
+        let mut source = Vm::try_new(Program::new(Vec::new(), vec![])).expect("source VM");
+        let mut call =
+            OwnedHostCall::new(&mut source, vec![Value::Int(7), Value::string("callback")]);
+        assert_eq!(call.args().len(), 2);
+        assert_eq!(call.arg(0), Some(&Value::Int(7)));
+        assert!(!call.is_taken(0));
+        let value = call.take_arg(1).expect("take argument");
+        assert!(call.is_taken(1));
+        assert_eq!(call.arg(1), Some(&Value::Null));
+        call.restore_arg(1, value).expect("restore argument");
+        assert!(!call.is_taken(1));
+        assert_eq!(
+            call.into_untaken_args(),
+            vec![Value::Int(7), Value::string("callback")]
+        );
+    }
+
+    #[test]
+    fn owned_host_call_rejects_missing_and_double_taking() {
+        let mut source = Vm::try_new(Program::new(Vec::new(), vec![])).expect("source VM");
+        let mut call = OwnedHostCall::new(&mut source, vec![Value::Int(1)]);
+        assert!(call.take_arg(3).is_err(), "missing index must fault");
+        call.take_arg(0).expect("first take");
+        assert!(call.take_arg(0).is_err(), "double take must fault");
+        assert!(
+            call.restore_arg(1, Value::Int(0)).is_err(),
+            "restoring an untaken index must fault"
+        );
+        assert_eq!(call.into_untaken_args(), Vec::<Value>::new());
+    }
+
+    #[test]
+    fn owned_registration_accepts_a_resource_bearing_take_owned_schema() {
+        let key = crate::host_api::ResourceTypeKey::new("test.handle").expect("key");
+        let schema = owned_schema(
+            vec![HostImportParam {
+                name: "handle".to_string(),
+                schema: HostTypeSchema::Resource(key.clone()),
+                passing: HostParamPassing::TakeOwned,
+            }],
+            HostTypeSchema::Bool,
+        );
+        let mut registry = HostFunctionRegistry::empty();
+        let slot = register_owned(&mut registry, schema).expect("resource-bearing owned schema");
+        assert_eq!(slot, 0);
+        assert!(
+            schema_requires_guard(
+                registry
+                    .entries
+                    .first()
+                    .and_then(|entry| entry.schema.as_ref())
+                    .expect("registered schema")
+            ),
+            "a resource-bearing parameter must select the guarded owned wrapper"
+        );
+    }
+
+    #[test]
+    fn owned_registration_accepts_a_mixed_value_resource_callable_schema() {
+        let key = crate::host_api::ResourceTypeKey::new("test.handle").expect("key");
+        let schema = owned_schema(
+            vec![
+                HostImportParam {
+                    name: "delay".to_string(),
+                    schema: HostTypeSchema::Int,
+                    passing: HostParamPassing::Value,
+                },
+                HostImportParam {
+                    name: "handle".to_string(),
+                    schema: HostTypeSchema::Optional(Box::new(HostTypeSchema::Resource(
+                        key.clone(),
+                    ))),
+                    passing: HostParamPassing::Borrow,
+                },
+                HostImportParam {
+                    name: "sink".to_string(),
+                    schema: HostTypeSchema::Resource(key),
+                    passing: HostParamPassing::BorrowMut,
+                },
+                take_callable_param("callback"),
+            ],
+            HostTypeSchema::Bool,
+        );
+        let mut registry = HostFunctionRegistry::empty();
+        register_owned(&mut registry, schema).expect("mixed owned schema");
+        assert!(schema_requires_guard(
+            registry
+                .entries
+                .first()
+                .and_then(|entry| entry.schema.as_ref())
+                .expect("registered schema")
+        ));
+    }
+
+    #[test]
+    fn owned_registration_rejects_a_nested_resource_parameter() {
+        let key = crate::host_api::ResourceTypeKey::new("test.handle").expect("key");
+        let schema = owned_schema(
+            vec![HostImportParam {
+                name: "handle".to_string(),
+                schema: HostTypeSchema::Array(Box::new(HostTypeSchema::Resource(key))),
+                passing: HostParamPassing::TakeOwned,
+            }],
+            HostTypeSchema::Bool,
+        );
+        let mut registry = HostFunctionRegistry::empty();
+        let error = register_owned(&mut registry, schema).expect_err("nested resource parameter");
+        assert!(
+            matches!(&error, VmError::HostError(message) if message.contains("directly addressable")),
+            "unexpected error: {error}"
+        );
+        assert!(registry.entries.is_empty(), "rejection must not mutate");
+    }
+
+    #[test]
+    fn owned_registration_rejects_a_named_nested_resource_parameter() {
+        let key = crate::host_api::ResourceTypeKey::new("test.handle").expect("key");
+        let schema = owned_schema(
+            vec![HostImportParam {
+                name: "handle".to_string(),
+                schema: crate::host_api::HostTypeSchema::named_struct(
+                    "Envelope",
+                    vec![crate::host_api::HostStructField::new(
+                        "inner",
+                        HostTypeSchema::Resource(key),
+                    )],
+                ),
+                passing: HostParamPassing::TakeOwned,
+            }],
+            HostTypeSchema::Bool,
+        );
+        let mut registry = HostFunctionRegistry::empty();
+        let error =
+            register_owned(&mut registry, schema).expect_err("named nested resource parameter");
+        assert!(
+            matches!(&error, VmError::HostError(message) if message.contains("directly addressable")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn owned_registration_rejects_a_nested_resource_return() {
+        let key = crate::host_api::ResourceTypeKey::new("test.handle").expect("key");
+        let schema = owned_schema(
+            vec![take_callable_param("callback")],
+            HostTypeSchema::Array(Box::new(HostTypeSchema::Resource(key))),
+        );
+        let mut registry = HostFunctionRegistry::empty();
+        let error = register_owned(&mut registry, schema).expect_err("nested resource return");
+        assert!(
+            matches!(&error, VmError::HostError(message) if message.contains("return schema")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn owned_registration_rejects_a_resource_value_parameter() {
+        let key = crate::host_api::ResourceTypeKey::new("test.handle").expect("key");
+        let schema = owned_schema(
+            vec![HostImportParam {
+                name: "handle".to_string(),
+                schema: HostTypeSchema::Resource(key),
+                passing: HostParamPassing::Value,
+            }],
+            HostTypeSchema::Bool,
+        );
+        let mut registry = HostFunctionRegistry::empty();
+        let error = register_owned(&mut registry, schema).expect_err("resource passed by value");
+        assert!(
+            matches!(&error, VmError::HostError(message) if message.contains("Borrow/BorrowMut/TakeOwned")),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn assert_rejected_ordinary_registration(
+        registry: &mut HostFunctionRegistry,
+        schema: HostImportSchema,
+        expected: &str,
+    ) {
+        let error = registry
+            .register_catalog_static(schema, |_vm, _args| {
+                Ok(CallOutcome::Return(CallReturn::none()))
+            })
+            .expect_err("an ordinary registration must not declare an owned value transfer");
+        let RegistrySchemaError::InvalidSchema { detail, .. } = &error else {
+            panic!("expected a structured schema rejection, got: {error:?}");
+        };
+        assert!(
+            detail.contains(expected),
+            "unexpected rejection detail: {detail}"
+        );
+        assert!(registry.entries.is_empty(), "rejection must not mutate");
+    }
+
+    #[test]
+    fn plain_registration_still_rejects_resource_free_take_owned() {
+        let mut registry = HostFunctionRegistry::empty();
+        let schema = owned_schema(vec![take_callable_param("callback")], HostTypeSchema::Bool);
+        assert_rejected_ordinary_registration(&mut registry, schema, "contains no resource");
+    }
+
+    #[test]
+    fn plain_registration_still_rejects_resource_free_borrow_and_borrow_mut() {
+        for passing in [HostParamPassing::Borrow, HostParamPassing::BorrowMut] {
+            let mut registry = HostFunctionRegistry::empty();
+            let schema = owned_schema(
+                vec![HostImportParam {
+                    name: "value".to_string(),
+                    schema: HostTypeSchema::String,
+                    passing,
+                }],
+                HostTypeSchema::Bool,
+            );
+            assert_rejected_ordinary_registration(&mut registry, schema, "contains no resource");
+        }
+    }
+
+    #[test]
+    fn plain_registration_rejects_a_resource_passed_by_value() {
+        let key = crate::host_api::ResourceTypeKey::new("test.handle").expect("key");
+        let mut registry = HostFunctionRegistry::empty();
+        let schema = owned_schema(
+            vec![HostImportParam {
+                name: "handle".to_string(),
+                schema: HostTypeSchema::Resource(key),
+                passing: HostParamPassing::Value,
+            }],
+            HostTypeSchema::Bool,
+        );
+        assert_rejected_ordinary_registration(&mut registry, schema, "Borrow/BorrowMut/TakeOwned");
+    }
+
+    #[test]
+    fn plain_registration_still_accepts_a_resource_bearing_borrow() {
+        let key = crate::host_api::ResourceTypeKey::new("test.handle").expect("key");
+        let mut registry = HostFunctionRegistry::empty();
+        let schema = owned_schema(
+            vec![HostImportParam {
+                name: "handle".to_string(),
+                schema: HostTypeSchema::Resource(key),
+                passing: HostParamPassing::Borrow,
+            }],
+            HostTypeSchema::Bool,
+        );
+        registry
+            .register_catalog_static(schema, |_vm, _args| {
+                Ok(CallOutcome::Return(CallReturn::none()))
+            })
+            .expect("an ordinary resource-passing registration keeps its own contract");
+    }
+
+    #[test]
+    fn owned_registration_requires_the_exact_name_and_arity_identity() {
+        let schema = owned_schema(vec![take_callable_param("callback")], HostTypeSchema::Bool);
+        let mut registry = HostFunctionRegistry::empty();
+        let error = registry
+            .register_exact_owned("test::other", 1, schema.clone(), |_context| {
+                Box::new(NoopOwned)
+            })
+            .expect_err("name mismatch");
+        assert!(matches!(error, VmError::HostError(_)));
+        let error = registry
+            .register_exact_owned("test::register", 2, schema, |_context| Box::new(NoopOwned))
+            .expect_err("arity mismatch");
+        assert!(matches!(error, VmError::HostError(_)));
+        assert!(registry.entries.is_empty(), "rejection must not mutate");
+    }
+
+    #[test]
+    fn owned_registration_accepts_a_resource_free_take_owned_schema_once() {
+        let schema = owned_schema(vec![take_callable_param("callback")], HostTypeSchema::Bool);
+        let mut registry = HostFunctionRegistry::empty();
+        let slot = register_owned(&mut registry, schema.clone()).expect("owned registration");
+        assert_eq!(slot, 0);
+        let error = register_owned(&mut registry, schema).expect_err("duplicate");
+        assert!(
+            matches!(error, VmError::HostError(_)),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn owned_callable_preserves_resource_free_capture_graphs() {
+        let program = capture_program(
+            vec![TypeSchema::ArrayTuple(vec![
+                TypeSchema::String,
+                TypeSchema::Callable {
+                    params: Vec::new(),
+                    result: Box::new(TypeSchema::Unknown),
+                },
+            ])],
+            vec![
+                capture_prototype(vec![0], vec![crate::CaptureBindingMode::Move]),
+                capture_prototype(Vec::new(), Vec::new()),
+            ],
+        );
+        let mut source = Vm::try_new(program).expect("source VM");
+        let (nested, nested_owned) = closure_value(1, Vec::new());
+        let (outer, outer_owned) = closure_value(
+            0,
+            vec![Value::array(vec![Value::string("capture"), nested])],
+        );
+        source
+            .instance
+            .owned_callables
+            .extend([Arc::downgrade(&nested_owned), Arc::downgrade(&outer_owned)]);
+        source.instance.locals[0] = outer.clone();
+        let registry = HostFunctionRegistry::empty();
+        let mut call = OwnedHostCall::new(&mut source, Vec::new());
+        let child = call
+            .spawn_owned_callable_vm(&registry, &outer, |_vm| Ok(()))
+            .expect("resource-free capture graph must transfer");
+        assert!(child.owns_callable(&outer));
+        assert!(child.owns_callable(&nested_owned_value(&outer)));
+    }
+
+    #[test]
+    fn owned_callable_rejects_foreign_and_resource_bearing_captures() {
+        let key = crate::host_api::ResourceTypeKey::new("test.capture").expect("key");
+        let program = capture_program(
+            vec![TypeSchema::Array(Box::new(TypeSchema::Resource(key)))],
+            vec![capture_prototype(
+                vec![0],
+                vec![crate::CaptureBindingMode::Move],
+            )],
+        );
+        let mut source = Vm::try_new(program).expect("source VM");
+        let (callable, owned) = closure_value(0, vec![Value::array(vec![Value::Int(7)])]);
+        source.instance.owned_callables.push(Arc::downgrade(&owned));
+        source.instance.locals[0] = callable.clone();
+        let registry = HostFunctionRegistry::empty();
+        let mut call = OwnedHostCall::new(&mut source, Vec::new());
+        let error = match call.spawn_owned_callable_vm(&registry, &callable, |_vm| Ok(())) {
+            Ok(_) => panic!("resource-bearing capture must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, VmError::HostError(message) if message.contains("resource-bearing capture")),
+            "unexpected error: {error}"
+        );
+
+        // A callable the source VM does not own is foreign: owned graphs are
+        // program-local and are never portable across VM boundaries.
+        let foreign = closure_value(0, Vec::new()).0;
+        let error = match call.spawn_owned_callable_vm(&registry, &foreign, |_vm| Ok(())) {
+            Ok(_) => panic!("foreign callable must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, VmError::InvalidFrameState(message) if message.contains("source vm")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn owned_callable_graph_cycle_is_visited_once() {
+        let callable_schema = TypeSchema::Callable {
+            params: Vec::new(),
+            result: Box::new(TypeSchema::Unknown),
+        };
+        let program = capture_program(
+            vec![callable_schema],
+            vec![capture_prototype(
+                vec![0],
+                vec![crate::CaptureBindingMode::Borrow],
+            )],
+        );
+        let mut source = Vm::try_new(program).expect("source VM");
+        let environment = Arc::new(CallableEnvironment {
+            cells: Mutex::new(Vec::new()),
+        });
+        let callable = Arc::new(CallableValue {
+            prototype_id: 0,
+            kind: CallableKind::Closure,
+            env: Some(Arc::clone(&environment)),
+        });
+        *environment.cells.lock().expect("cycle cells") =
+            vec![Arc::new(Mutex::new(Value::Callable(Arc::clone(&callable))))];
+        let value = Value::Callable(Arc::clone(&callable));
+        source
+            .instance
+            .owned_callables
+            .push(Arc::downgrade(&callable));
+        source.instance.locals[0] = value.clone();
+        let registry = HostFunctionRegistry::empty();
+        let mut call = OwnedHostCall::new(&mut source, Vec::new());
+        let child = call
+            .spawn_owned_callable_vm(&registry, &value, |_vm| Ok(()))
+            .expect("cyclic resource-free graph must transfer");
+        assert!(child.owns_callable(&value));
+    }
+
+    #[test]
+    fn owned_callable_rejects_a_prototype_outside_the_source_program() {
+        let program = capture_program(
+            vec![TypeSchema::Callable {
+                params: Vec::new(),
+                result: Box::new(TypeSchema::Unknown),
+            }],
+            vec![capture_prototype(Vec::new(), Vec::new())],
+        );
+        let mut source = Vm::try_new(program).expect("source VM");
+        let (callable, owned) = closure_value(9, Vec::new());
+        source.instance.owned_callables.push(Arc::downgrade(&owned));
+        source.instance.locals[0] = callable.clone();
+        let registry = HostFunctionRegistry::empty();
+        let mut call = OwnedHostCall::new(&mut source, Vec::new());
+        let error = match call.spawn_owned_callable_vm(&registry, &callable, |_vm| Ok(())) {
+            Ok(_) => panic!("unknown prototype must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, VmError::InvalidCallablePrototype(9)),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn nested_owned_value(outer: &Value) -> Value {
+        let Value::Callable(callable) = outer else {
+            panic!("expected outer callable");
+        };
+        let environment = callable.env.as_ref().expect("outer environment");
+        let cells = environment.cells.lock().expect("capture cells");
+        let Value::Array(values) = &*cells[0].lock().expect("capture cell") else {
+            panic!("expected aggregate capture");
+        };
+        values[1].clone()
+    }
+
+    fn capture_program(
+        local_schemas: Vec<TypeSchema>,
+        prototypes: Vec<CallablePrototype>,
+    ) -> Program {
+        let local_count = local_schemas.len();
+        let mut program = Program::new(vec![], vec![]).with_local_count(local_count);
+        program.type_map = Some(TypeMap {
+            strict_types: true,
+            local_types: vec![ValueType::Unknown; local_count],
+            local_schemas: local_schemas.into_iter().map(Some).collect(),
+            callable_slots: vec![true; local_count],
+            optional_slots: vec![false; local_count],
+            operand_types: HashMap::new(),
+        });
+        program.callable_prototypes = prototypes;
+        program
+    }
+
+    fn closure_value(prototype_id: u32, captures: Vec<Value>) -> (Value, Arc<CallableValue>) {
+        let callable = Arc::new(CallableValue {
+            prototype_id,
+            kind: CallableKind::Closure,
+            env: (!captures.is_empty()).then(|| {
+                Arc::new(CallableEnvironment {
+                    cells: Mutex::new(
+                        captures
+                            .into_iter()
+                            .map(|value| Arc::new(Mutex::new(value)))
+                            .collect(),
+                    ),
+                })
+            }),
+        });
+        (Value::Callable(Arc::clone(&callable)), callable)
+    }
+
+    fn capture_prototype(
+        source_slots: Vec<u16>,
+        modes: Vec<crate::CaptureBindingMode>,
+    ) -> CallablePrototype {
+        CallablePrototype {
+            kind: CallableKind::Closure,
+            target: CallableTarget::ScriptFunction(0),
+            arity: 0,
+            frame_local_count: 1,
+            parameter_slots: Vec::new(),
+            capture_slots: (0..source_slots.len()).map(|slot| slot as u16).collect(),
+            capture_source_slots: source_slots,
+            capture_modes: modes,
+            self_slot: None,
+            schema: None,
+        }
+    }
+
+    /// One script callable prototype (zero captures) so the guest can build a
+    /// real `Value::Callable` for the owned transfer.
+    fn one_callable_prototype() -> CallablePrototype {
+        CallablePrototype {
+            kind: CallableKind::Closure,
+            target: CallableTarget::ScriptFunction(0),
+            arity: 1,
+            frame_local_count: 2,
+            parameter_slots: vec![0],
+            capture_source_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
+            self_slot: None,
+            schema: None,
+        }
+    }
+
+    fn owned_import(schema: &HostImportSchema) -> HostImport {
+        HostImport {
+            name: schema.name.clone(),
+            arity: schema.arity() as u8,
+            return_type: ValueType::Unknown,
+        }
+    }
+
+    fn bound_vm(program: Program, registry: &HostFunctionRegistry) -> Vm {
+        let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
+        registry.bind_vm_cached(&mut vm).expect("bind registry");
+        vm
+    }
+
+    /// Program that pushes `int_arg`, builds prototype 0's callable, and calls
+    /// import slot 0 with `(int_arg, callable)`.
+    fn owned_call_program(schema: &HostImportSchema, int_arg: i64) -> Program {
+        let mut code = crate::BytecodeBuilder::new();
+        code.ldc(0);
+        code.ldc(1);
+        code.call(BuiltinFunction::ArrayNew.call_index(), 0);
+        code.call(BuiltinFunction::BindCallable.call_index(), 2);
+        code.call(0, 2);
+        code.ret();
+        let mut program = Program::with_imports_and_debug(
+            vec![Value::Int(int_arg), Value::Int(0)],
+            code.finish(),
+            vec![owned_import(schema)],
+            None,
+        )
+        .with_host_import_schemas(vec![schema.clone()])
+        .expect("host import schemas");
+        program.callable_prototypes = vec![one_callable_prototype()];
+        program
+    }
+
+    fn owned_call_twice_program(schema: &HostImportSchema, int_arg: i64) -> Program {
+        let mut code = crate::BytecodeBuilder::new();
+        for _ in 0..2 {
+            code.ldc(0);
+            code.ldc(1);
+            code.call(BuiltinFunction::ArrayNew.call_index(), 0);
+            code.call(BuiltinFunction::BindCallable.call_index(), 2);
+            code.call(0, 2);
+        }
+        code.ret();
+        let mut program = Program::with_imports_and_debug(
+            vec![Value::Int(int_arg), Value::Int(0)],
+            code.finish(),
+            vec![owned_import(schema)],
+            None,
+        )
+        .with_host_import_schemas(vec![schema.clone()])
+        .expect("host import schemas");
+        program.callable_prototypes = vec![one_callable_prototype()];
+        program
+    }
+
+    /// What one owned host call observed.
+    #[derive(Default)]
+    struct Seen {
+        callable: Option<Value>,
+        second_take_failed: bool,
+    }
+
+    /// An owned host function that takes the callable argument (index 1) and
+    /// records what it saw. `fail` makes it fail after taking ownership.
+    struct OwnedSpy {
+        seen: Arc<Mutex<Seen>>,
+        fail: bool,
+    }
+
+    impl HostOwnedFunction for OwnedSpy {
+        fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            let value = call.take_arg(1)?;
+            let mut seen = self.seen.lock().expect("seen lock");
+            seen.second_take_failed = call.take_arg(1).is_err();
+            seen.callable = Some(value);
+            drop(seen);
+            if self.fail {
+                return Err(VmError::HostError(
+                    "owned spy rejected the call".to_string(),
+                ));
+            }
+            Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
+        }
+    }
+
+    /// Exercises a host-side handoff that must roll back after provenance
+    /// validation fails.
+    struct RollbackOwned {
+        registry: HostFunctionRegistry,
+    }
+
+    impl HostOwnedFunction for RollbackOwned {
+        fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            let callback = call.take_arg(1)?;
+            let Value::Callable(source_callable) = &callback else {
+                return Err(VmError::TypeMismatch("callable"));
+            };
+            let foreign = Value::Callable(Arc::new(CallableValue {
+                prototype_id: source_callable.prototype_id,
+                kind: source_callable.kind,
+                env: None,
+            }));
+            let error = match call.spawn_owned_callable_vm(&self.registry, &foreign, |_vm| Ok(())) {
+                Ok(_) => panic!("foreign callable must fail provenance validation"),
+                Err(error) => error,
+            };
+            call.restore_arg(1, callback)?;
+            Err(error)
+        }
+    }
+
+    /// Records the isolated VM the owned call spawned.
+    #[derive(Default)]
+    struct SpawnProbe {
+        owns_callable: Option<bool>,
+        frames: Option<usize>,
+        stack_empty: Option<bool>,
+        source_unchanged: Option<bool>,
+    }
+
+    struct SpawningSpy {
+        registry: HostFunctionRegistry,
+        probe: Arc<Mutex<SpawnProbe>>,
+    }
+
+    impl HostOwnedFunction for SpawningSpy {
+        fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            let callable = call.take_arg(1)?;
+            let before = {
+                let vm = call.vm_ref();
+                (
+                    vm.instance.execution_frames.len(),
+                    vm.instance.stack.len(),
+                    vm.instance.locals.len(),
+                )
+            };
+            let fresh = call.spawn_owned_callable_vm(&self.registry, &callable, |_vm| Ok(()))?;
+            let after = {
+                let vm = call.vm_ref();
+                (
+                    vm.instance.execution_frames.len(),
+                    vm.instance.stack.len(),
+                    vm.instance.locals.len(),
+                )
+            };
+            let mut probe = self.probe.lock().expect("probe lock");
+            probe.owns_callable = Some(fresh.owns_callable(&callable));
+            probe.frames = Some(fresh.instance.execution_frames.len());
+            probe.stack_empty = Some(fresh.instance.stack.is_empty());
+            probe.source_unchanged = Some(before == after);
+            Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
+        }
+    }
+
+    struct NoopHost;
+
+    impl HostFunction for NoopHost {
+        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+            Ok(CallOutcome::Return(CallReturn::none()))
+        }
+    }
+
+    struct MutatingOwned {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl HostOwnedFunction for MutatingOwned {
+        fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _ = call.take_arg(1)?;
+            call.vm().register_function(Box::new(NoopHost));
+            Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
+        }
+    }
+
+    struct PanickingOwned {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for PanickingOwned {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl HostOwnedFunction for PanickingOwned {
+        fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            let _ = call.take_arg(1)?;
+            panic!("owned host panic");
+        }
+    }
+
+    /// An owned host function that takes the callable argument and then
+    /// returns `CallOutcome::Yield`.
+    ///
+    /// Owned dispatch drains the call operands before the handler runs, so
+    /// there is no operand stack left to re-execute the call from: the outcome
+    /// must be rejected as a structured error and never dispatched again.
+    struct YieldingOwned {
+        calls: Arc<AtomicUsize>,
+        entry_ip: Arc<AtomicUsize>,
+        held: Arc<Mutex<Option<Value>>>,
+    }
+
+    impl HostOwnedFunction for YieldingOwned {
+        fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entry_ip.store(call.vm_ref().ip(), Ordering::SeqCst);
+            let callable = call.take_arg(1)?;
+            *self.held.lock().expect("held callback") = Some(callable);
+            Ok(CallOutcome::Yield)
+        }
+    }
+
+    fn callable_take_schema() -> HostImportSchema {
+        owned_schema(
+            vec![
+                HostImportParam {
+                    name: "delay".to_string(),
+                    schema: HostTypeSchema::Int,
+                    passing: HostParamPassing::Value,
+                },
+                take_callable_param("callback"),
+            ],
+            HostTypeSchema::Bool,
+        )
+    }
+
+    #[test]
+    fn owned_dispatch_transfers_the_callable_exactly_once() {
+        let schema = callable_take_schema();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let spy_seen = Arc::clone(&seen);
+        let mut registry = HostFunctionRegistry::empty();
+        registry
+            .register_exact_owned("test::register", 2, schema.clone(), move |_context| {
+                Box::new(OwnedSpy {
+                    seen: Arc::clone(&spy_seen),
+                    fail: false,
+                })
+            })
+            .expect("register owned");
+
+        let mut vm = bound_vm(owned_call_program(&schema, 41), &registry);
+        assert_eq!(
+            vm.run().expect("the owned call must succeed"),
+            VmStatus::Halted
+        );
+
+        let seen = seen.lock().expect("seen lock");
+        assert!(
+            matches!(seen.callable, Some(Value::Callable(_))),
+            "the host must receive the callable value itself"
+        );
+        assert!(
+            seen.second_take_failed,
+            "a second take of the same argument must be rejected"
+        );
+        drop(seen);
+        assert_eq!(
+            vm.instance.stack,
+            vec![Value::Bool(true)],
+            "a successful owned call leaves the guest operands consumed and the return value on \
+             the stack"
+        );
+    }
+
+    #[test]
+    fn owned_dispatch_rejects_yield_and_restores_untaken_arguments() {
+        let schema = callable_take_schema();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entry_ip = Arc::new(AtomicUsize::new(0));
+        let held = Arc::new(Mutex::new(None));
+        let (factory_calls, factory_ip, factory_held) =
+            (Arc::clone(&calls), Arc::clone(&entry_ip), Arc::clone(&held));
+        let mut registry = HostFunctionRegistry::empty();
+        registry
+            .register_exact_owned("test::register", 2, schema.clone(), move |_context| {
+                Box::new(YieldingOwned {
+                    calls: Arc::clone(&factory_calls),
+                    entry_ip: Arc::clone(&factory_ip),
+                    held: Arc::clone(&factory_held),
+                })
+            })
+            .expect("register owned");
+
+        let mut vm = bound_vm(owned_call_program(&schema, 41), &registry);
+        let error = vm
+            .run()
+            .expect_err("an owned handler yield must be rejected, not dispatched again");
+        assert!(
+            matches!(&error, VmError::HostError(message) if message.contains("yield")),
+            "expected a structured owned-yield rejection, got: {error}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(
+                held.lock().expect("held callback").as_ref(),
+                Some(Value::Callable(_))
+            ),
+            "the callable the handler took stays owned by the handler"
+        );
+        assert_eq!(
+            vm.instance.stack,
+            vec![Value::Int(41)],
+            "the untaken delay argument must be restored exactly once"
+        );
+        assert_eq!(
+            vm.ip(),
+            entry_ip.load(Ordering::SeqCst),
+            "the rejected dispatch must not rewind the instruction pointer for an unsafe retry"
+        );
+        let _ = vm.resume();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a repeated resume must not silently re-dispatch the owned handler"
+        );
+    }
+
+    #[test]
+    fn failed_owned_call_restores_untaken_arguments_without_double_drop() {
+        let schema = callable_take_schema();
+        let mut registry = HostFunctionRegistry::empty();
+        registry
+            .register_exact_owned("test::register", 2, schema.clone(), move |_context| {
+                Box::new(OwnedSpy {
+                    seen: Arc::new(Mutex::new(Seen::default())),
+                    fail: true,
+                })
+            })
+            .expect("register owned");
+
+        let mut vm = bound_vm(owned_call_program(&schema, 41), &registry);
+        let error = vm.run().expect_err("the owned call must fail");
+        assert!(matches!(error, VmError::HostError(ref message) if message.contains("rejected")));
+        assert_eq!(
+            vm.instance.stack,
+            vec![Value::Int(41)],
+            "an error before host acceptance restores every argument the host did not take; the \
+             taken callable stays with the host"
+        );
+    }
+
+    #[test]
+    fn failed_owned_call_rolls_back_after_provenance_validation() {
+        let schema = callable_take_schema();
+        let mut registry = HostFunctionRegistry::empty();
+        registry
+            .register_exact_owned("test::register", 2, schema.clone(), move |context| {
+                Box::new(RollbackOwned {
+                    registry: context.registry().clone(),
+                })
+            })
+            .expect("register owned");
+
+        let mut vm = bound_vm(owned_call_program(&schema, 41), &registry);
+        let error = vm.run().expect_err("the provenance failure must fail");
+        assert!(
+            matches!(error, VmError::InvalidFrameState(message) if message.contains("source vm"))
+        );
+        assert_eq!(vm.instance.stack.len(), 2);
+        assert!(matches!(vm.instance.stack[1], Value::Callable(_)));
+    }
+
+    #[test]
+    fn owned_call_spawns_an_isolated_callable_vm() {
+        let schema = callable_take_schema();
+        let probe = Arc::new(Mutex::new(SpawnProbe::default()));
+        let spy_probe = Arc::clone(&probe);
+        let mut registry = HostFunctionRegistry::empty();
+        registry
+            .register_exact_owned("test::register", 2, schema.clone(), move |context| {
+                Box::new(SpawningSpy {
+                    registry: context.registry().clone(),
+                    probe: Arc::clone(&spy_probe),
+                })
+            })
+            .expect("register owned");
+
+        let mut vm = bound_vm(owned_call_program(&schema, 41), &registry);
+        assert_eq!(
+            vm.run().expect("the spawning owned call must succeed"),
+            VmStatus::Halted
+        );
+        let probe = probe.lock().expect("probe lock");
+        assert_eq!(
+            probe.owns_callable,
+            Some(true),
+            "the fresh VM must own the transferred callable graph"
+        );
+        assert_eq!(
+            probe.frames,
+            Some(0),
+            "the fresh VM starts halted with no execution frames; no source frames were copied"
+        );
+        assert_eq!(
+            probe.stack_empty,
+            Some(true),
+            "the fresh VM starts with an empty operand stack"
+        );
+        assert_eq!(
+            probe.source_unchanged,
+            Some(true),
+            "spawning the owned VM must leave the source VM's frames, stack, and locals untouched"
+        );
+    }
+
+    #[test]
+    fn spawned_vm_rejects_a_foreign_callable_with_a_colliding_prototype_id() {
+        let mut program = Program::new(vec![], vec![]).with_local_count(1);
+        program.callable_prototypes = vec![one_callable_prototype()];
+        let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
+        let source_callable = Arc::new(CallableValue {
+            prototype_id: 0,
+            kind: CallableKind::Closure,
+            env: None,
+        });
+        vm.instance
+            .owned_callables
+            .push(Arc::downgrade(&source_callable));
+        vm.instance.locals[0] = Value::Callable(Arc::clone(&source_callable));
+        let foreign = Value::Callable(Arc::new(CallableValue {
+            prototype_id: 0,
+            kind: CallableKind::Closure,
+            env: None,
+        }));
+        let mut call = OwnedHostCall::new(&mut vm, vec![]);
+        let registry = HostFunctionRegistry::empty();
+        let result = call.spawn_owned_callable_vm(&registry, &foreign, |_vm| Ok(()));
+        match result {
+            Ok(_) => panic!("a foreign callable with a colliding prototype must be rejected"),
+            Err(error) => assert!(
+                matches!(error, VmError::InvalidFrameState(message) if message.contains("source vm")),
+                "expected a source-provenance rejection, got: {error}"
+            ),
+        }
+    }
+
+    #[test]
+    fn owned_dispatch_restores_function_after_handler_mutates_host_vector() {
+        let schema = callable_take_schema();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::clone(&calls);
+        let mut registry = HostFunctionRegistry::empty();
+        registry
+            .register_exact_owned("test::register", 2, schema.clone(), move |_context| {
+                Box::new(MutatingOwned {
+                    calls: Arc::clone(&factory_calls),
+                })
+            })
+            .expect("register owned");
+        let mut vm = bound_vm(owned_call_twice_program(&schema, 41), &registry);
+        assert_eq!(
+            vm.run().expect("mutating calls must succeed"),
+            VmStatus::Halted
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            vm.host.host_functions.len() >= 3,
+            "the handler must have been able to append registrations without invalidating dispatch"
+        );
+    }
+
+    #[test]
+    fn owned_dispatch_restores_function_and_untaken_values_after_panic() {
+        let schema = callable_take_schema();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let factory_drops = Arc::clone(&drops);
+        let mut registry = HostFunctionRegistry::empty();
+        registry
+            .register_exact_owned("test::register", 2, schema.clone(), move |_context| {
+                Box::new(PanickingOwned {
+                    drops: Arc::clone(&factory_drops),
+                })
+            })
+            .expect("register owned");
+        let mut vm = bound_vm(owned_call_program(&schema, 41), &registry);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.run()));
+        assert!(
+            result.is_err(),
+            "the existing owned-call panic contract must propagate"
+        );
+        assert_eq!(vm.instance.stack, vec![Value::Int(41)]);
+        assert!(matches!(
+            vm.host.host_functions.first(),
+            Some(VmHostFunction::OwnedDynamic(Some(_)))
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(vm);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn owned_dispatch_keeps_legacy_host_kinds_untouched() {
+        // A `Value`-only exact registration continues to dispatch through the
+        // borrowed-slice path and declares no ownership.
+        let schema = named_schema(
+            "test::echo",
+            vec![HostImportParam {
+                name: "value".to_string(),
+                schema: HostTypeSchema::Int,
+                passing: HostParamPassing::Value,
+            }],
+            HostTypeSchema::Int,
+        );
+        let mut registry = HostFunctionRegistry::empty();
+        registry
+            .register_exact_static("test::echo", 1, schema.clone(), |_vm, args| {
+                Ok(CallOutcome::Return(CallReturn::one(
+                    args.first().cloned().unwrap_or(Value::Null),
+                )))
+            })
+            .expect("register exact static");
+
+        let mut code = crate::BytecodeBuilder::new();
+        code.ldc(0);
+        code.call(0, 1);
+        code.ret();
+        let program = Program::with_imports_and_debug(
+            vec![Value::Int(7)],
+            code.finish(),
+            vec![HostImport {
+                name: "test::echo".to_string(),
+                arity: 1,
+                return_type: ValueType::Int,
+            }],
+            None,
+        )
+        .with_host_import_schemas(vec![schema])
+        .expect("host import schemas");
+        let mut vm = bound_vm(program, &registry);
+        assert_eq!(vm.run().expect("run"), VmStatus::Halted);
+        assert_eq!(vm.instance.stack, vec![Value::Int(7)]);
+    }
+
+    /// The `HostApiBuilder` catalog gate accepts a resource-free `TakeOwned`
+    /// parameter through the same host-schema vocabulary.
+    #[test]
+    fn host_catalog_schema_vocabulary_models_owned_callable_transfer() {
+        let param = crate::host_api::HostParamSchema::with_passing(
+            "callback",
+            HostTypeSchema::Callable {
+                params: vec![HostTypeSchema::Bool],
+                result: Box::new(HostTypeSchema::Unknown),
+            },
+            HostParamPassing::TakeOwned,
+        );
+        assert_eq!(param.passing, HostParamPassing::TakeOwned);
+        assert!(!param.ty.contains_resource());
+    }
+}
+/// Owned-dispatch behaviour tests for resource-bearing `TakeOwned` /
+/// `Borrow` / `BorrowMut` parameters and exact resource returns.
+///
+/// Ported from the masterline `owned_resource_dispatch_tests` module: the
+/// guarded preflight/commit contract is exercised through real `Vm::run`
+/// programs, with the resource table's own typed API used for consumption.
+#[cfg(test)]
+mod owned_resource_dispatch_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::Poll;
+
+    use super::*;
+    use crate::bytecode::{
+        CallableEnvironment, CallableKind, CallablePrototype, CallableTarget, CallableValue,
+        HostImport, Program, TypeMap,
+    };
+    use crate::compiler::TypeSchema;
+    use crate::host_api::{HostApiFingerprint, HostParamPassing, HostTypeSchema, ResourceTypeKey};
+    use crate::vm::resource::{CloseProgress, HostResource, ResourceCloseReason, ResourceResult};
+
+    fn bound_vm(program: Program, registry: &HostFunctionRegistry) -> Vm {
+        let mut vm = Vm::try_new(program).expect("test VM construction must not fail");
+        registry.bind_vm_cached(&mut vm).expect("bind registry");
+        vm
+    }
+
+    fn resource_schema(
+        name: &str,
+        params: Vec<HostImportParam>,
+        return_type: HostTypeSchema,
+    ) -> HostImportSchema {
+        HostImportSchema {
+            name: name.to_string(),
+            params,
+            return_type,
+            fingerprint: HostApiFingerprint::from_wire(0),
+        }
+    }
+
+    fn guard_key() -> ResourceTypeKey {
+        ResourceTypeKey::new("test.guard").expect("resource key")
+    }
+
+    fn other_key() -> ResourceTypeKey {
+        ResourceTypeKey::new("test.other").expect("resource key")
+    }
+
+    fn value_param(name: &str, schema: HostTypeSchema) -> HostImportParam {
+        HostImportParam {
+            name: name.to_string(),
+            schema,
+            passing: HostParamPassing::Value,
+        }
+    }
+
+    fn take_param(name: &str, schema: HostTypeSchema) -> HostImportParam {
+        HostImportParam {
+            name: name.to_string(),
+            schema,
+            passing: HostParamPassing::TakeOwned,
+        }
+    }
+
+    fn borrow_mut_param(name: &str, schema: HostTypeSchema) -> HostImportParam {
+        HostImportParam {
+            name: name.to_string(),
+            schema,
+            passing: HostParamPassing::BorrowMut,
+        }
+    }
+
+    fn callable_schema() -> HostTypeSchema {
+        HostTypeSchema::Callable {
+            params: vec![HostTypeSchema::Bool],
+            result: Box::new(HostTypeSchema::Unknown),
+        }
+    }
+
+    fn import(schema: &HostImportSchema) -> HostImport {
+        HostImport {
+            name: schema.name.clone(),
+            arity: schema.arity() as u8,
+            return_type: ValueType::Unknown,
+        }
+    }
+
+    /// A resource whose live key is `test.guard`; closing it is observable.
+    struct GuardResource {
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl HostResource for GuardResource {
+        fn resource_type_key() -> Option<ResourceTypeKey> {
+            Some(guard_key())
+        }
+
+        fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(CloseProgress::Ready)
+        }
+
+        fn poll_close(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<ResourceResult<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A resource whose live key is `test.other`; closing it is observable.
+    struct OtherResource {
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl HostResource for OtherResource {
+        fn resource_type_key() -> Option<ResourceTypeKey> {
+            Some(other_key())
+        }
+
+        fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(CloseProgress::Ready)
+        }
+
+        fn poll_close(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<ResourceResult<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// What one owned resource call observed.
+    #[derive(Default)]
+    struct Seen {
+        calls: usize,
+        first_arg: Option<Value>,
+        second_arg: Option<Value>,
+        second_take_failed: bool,
+        handle: Option<u64>,
+        callable: Option<Value>,
+        fresh_owns_callable: Option<bool>,
+        consumed: bool,
+        host_marker: bool,
+    }
+
+    /// `test::ping`: pushes a guard-keyed resource and returns its raw handle
+    /// as an `Int`. The exact `Resource(test.guard)` return transfer marks the
+    /// handle guest-owned before the guest uses it.
+    struct PingGuard {
+        closes: Arc<AtomicUsize>,
+        recorded: Arc<Mutex<Option<u64>>>,
+    }
+
+    impl HostFunction for PingGuard {
+        fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+            let handle = vm
+                .host_context()
+                .push_resource(GuardResource {
+                    closes: Arc::clone(&self.closes),
+                })
+                .expect("push guard resource")
+                .handle();
+            *self.recorded.lock().expect("ping record") = Some(handle.raw());
+            Ok(CallOutcome::Return(CallReturn::one(Value::Int(
+                handle.raw() as i64,
+            ))))
+        }
+    }
+
+    /// `test::ping` variant that returns a resource of the *other* key.
+    struct PingOther {
+        closes: Arc<AtomicUsize>,
+        recorded: Arc<Mutex<Option<u64>>>,
+    }
+
+    impl HostFunction for PingOther {
+        fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+            let handle = vm
+                .host_context()
+                .push_resource(OtherResource {
+                    closes: Arc::clone(&self.closes),
+                })
+                .expect("push other resource")
+                .handle();
+            *self.recorded.lock().expect("ping record") = Some(handle.raw());
+            Ok(CallOutcome::Return(CallReturn::one(Value::Int(
+                handle.raw() as i64,
+            ))))
+        }
+    }
+
+    fn register_guard_ping(
+        registry: &mut HostFunctionRegistry,
+        closes: Arc<AtomicUsize>,
+        recorded: Arc<Mutex<Option<u64>>>,
+    ) -> HostImportSchema {
+        let schema = resource_schema("test::ping", vec![], HostTypeSchema::Resource(guard_key()));
+        registry
+            .register_catalog(schema.clone(), move || {
+                Box::new(PingGuard {
+                    closes: Arc::clone(&closes),
+                    recorded: Arc::clone(&recorded),
+                })
+            })
+            .expect("register guard ping");
+        schema
+    }
+
+    fn register_other_ping(
+        registry: &mut HostFunctionRegistry,
+        closes: Arc<AtomicUsize>,
+        recorded: Arc<Mutex<Option<u64>>>,
+    ) -> HostImportSchema {
+        let schema = resource_schema("test::ping", vec![], HostTypeSchema::Resource(other_key()));
+        registry
+            .register_catalog(schema.clone(), move || {
+                Box::new(PingOther {
+                    closes: Arc::clone(&closes),
+                    recorded: Arc::clone(&recorded),
+                })
+            })
+            .expect("register other ping");
+        schema
+    }
+
+    /// One script callable prototype (zero captures) so the guest can build a
+    /// real `Value::Callable` for the owned transfer.
+    fn one_callable_prototype() -> CallablePrototype {
+        CallablePrototype {
+            kind: CallableKind::Closure,
+            target: CallableTarget::ScriptFunction(0),
+            arity: 1,
+            frame_local_count: 2,
+            parameter_slots: vec![0],
+            capture_source_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
+            self_slot: None,
+            schema: None,
+        }
+    }
+
+    /// `test::ping()` first, then the arity-2 owned import with the int value
+    /// in slot 0, so the drained arguments are `[Int, handle]`.
+    fn ping_then_int_program(
+        ping: HostImportSchema,
+        take: HostImportSchema,
+        int_arg: i64,
+    ) -> Program {
+        let mut code = crate::BytecodeBuilder::new();
+        code.ldc(0);
+        code.call(0, 0);
+        code.call(1, 2);
+        code.ret();
+        Program::with_imports_and_debug(
+            vec![Value::Int(int_arg)],
+            code.finish(),
+            vec![import(&ping), import(&take)],
+            None,
+        )
+        .with_host_import_schemas(vec![ping, take])
+        .expect("host import schemas")
+    }
+
+    /// `test::ping()` first, then the arity-2 owned import with the callable in
+    /// slot 1, so the drained arguments are `[handle, callable]`.
+    fn ping_then_callable_program(ping: HostImportSchema, take: HostImportSchema) -> Program {
+        let mut code = crate::BytecodeBuilder::new();
+        code.call(0, 0);
+        code.ldc(0);
+        code.call(BuiltinFunction::ArrayNew.call_index(), 0);
+        code.call(BuiltinFunction::BindCallable.call_index(), 2);
+        code.call(1, 2);
+        code.ret();
+        let mut program = Program::with_imports_and_debug(
+            vec![Value::Int(0)],
+            code.finish(),
+            vec![import(&ping), import(&take)],
+            None,
+        )
+        .with_host_import_schemas(vec![ping, take])
+        .expect("host import schemas");
+        program.callable_prototypes = vec![one_callable_prototype()];
+        program
+    }
+
+    /// The arity-2 owned import called with raw constant arguments, so an
+    /// invalid handle can be passed without a resource-producing host.
+    fn plain_take_program(take: HostImportSchema, args: Vec<Value>) -> Program {
+        let mut code = crate::BytecodeBuilder::new();
+        for index in 0..args.len() {
+            code.ldc(index as u32);
+        }
+        code.call(0, args.len() as u8);
+        code.ret();
+        Program::with_imports_and_debug(args, code.finish(), vec![import(&take)], None)
+            .with_host_import_schemas(vec![take])
+            .expect("host import schemas")
+    }
+
+    /// `[Int, callable]` arguments built entirely by the guest.
+    fn int_then_callable_program(take: HostImportSchema, int_arg: i64) -> Program {
+        let mut code = crate::BytecodeBuilder::new();
+        code.ldc(0);
+        code.ldc(1);
+        code.call(BuiltinFunction::ArrayNew.call_index(), 0);
+        code.call(BuiltinFunction::BindCallable.call_index(), 2);
+        code.call(0, 2);
+        code.ret();
+        let mut program = Program::with_imports_and_debug(
+            vec![Value::Int(int_arg), Value::Int(0)],
+            code.finish(),
+            vec![import(&take)],
+            None,
+        )
+        .with_host_import_schemas(vec![take])
+        .expect("host import schemas");
+        program.callable_prototypes = vec![one_callable_prototype()];
+        program
+    }
+
+    fn resource_error_code(error: &VmError) -> Option<ResourceErrorCode> {
+        match error {
+            VmError::ExecutionScope(ExecutionScopeError::Resource(error)) => Some(error.code()),
+            _ => None,
+        }
+    }
+
+    /// Whether `raw` still names a live (open) resource of `key` in the scope.
+    fn is_live(vm: &Vm, raw: u64, key: &ResourceTypeKey) -> bool {
+        let handle = ResourceHandle::from_raw(raw).expect("valid raw handle");
+        vm.host
+            .execution_scope
+            .resources()
+            .validate_resource_type_key(handle, key)
+            .is_ok()
+    }
+
+    /// `(delay: Int, resource: Resource(test.guard) TakeOwned) -> bool`.
+    ///
+    /// The handler reads both arguments in declaration order, takes the
+    /// resource argument (never the int), and optionally consumes the table
+    /// entry through the scope's own typed take.
+    struct TakeIntThenResource {
+        seen: Arc<Mutex<Seen>>,
+        consume: bool,
+    }
+
+    impl HostOwnedFunction for TakeIntThenResource {
+        fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            let first = call.arg(0).cloned().unwrap_or(Value::Null);
+            let second = call.arg(1).cloned().unwrap_or(Value::Null);
+            {
+                let mut seen = self.seen.lock().expect("seen");
+                seen.calls += 1;
+                seen.first_arg = Some(first);
+                seen.second_arg = Some(second);
+            }
+            let handle_value = call.take_arg(1)?;
+            let handle = resource_handle_argument(&handle_value)?;
+            let repeat_take_failed = call.take_arg(1).is_err();
+            {
+                let mut seen = self.seen.lock().expect("seen");
+                seen.second_take_failed = repeat_take_failed;
+                seen.handle = Some(handle.raw());
+            }
+            if self.consume {
+                let taken = call
+                    .vm()
+                    .host_context()
+                    .take_resource::<GuardResource>(handle)
+                    .map_err(|error| VmError::HostError(error.to_string()))?;
+                drop(taken);
+                self.seen.lock().expect("seen").consumed = true;
+            }
+            Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
+        }
+    }
+
+    /// `(resource: Resource TakeOwned, callback: Callable TakeOwned) -> bool`.
+    ///
+    /// Takes both arguments in declaration order; optionally consumes the
+    /// resource and spawns the isolated owned-callable VM for the callable.
+    struct TakeResourceThenCallable {
+        seen: Arc<Mutex<Seen>>,
+        registry: HostFunctionRegistry,
+        consume: bool,
+        spawn: bool,
+    }
+
+    impl HostOwnedFunction for TakeResourceThenCallable {
+        fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            let first = call.arg(0).cloned().unwrap_or(Value::Null);
+            let second = call.arg(1).cloned().unwrap_or(Value::Null);
+            {
+                let mut seen = self.seen.lock().expect("seen");
+                seen.calls += 1;
+                seen.first_arg = Some(first);
+                seen.second_arg = Some(second);
+            }
+            let handle_value = call.take_arg(0)?;
+            let handle = resource_handle_argument(&handle_value)?;
+            let callable = call.take_arg(1)?;
+            let repeat_take_failed = call.take_arg(1).is_err();
+            {
+                let mut seen = self.seen.lock().expect("seen");
+                seen.second_take_failed = repeat_take_failed;
+                seen.handle = Some(handle.raw());
+                seen.callable = Some(callable.clone());
+            }
+            if self.spawn {
+                let fresh =
+                    call.spawn_owned_callable_vm(&self.registry, &callable, |_vm| Ok(()))?;
+                self.seen.lock().expect("seen").fresh_owns_callable =
+                    Some(fresh.owns_callable(&callable));
+            }
+            if self.consume {
+                let taken = call
+                    .vm()
+                    .host_context()
+                    .take_resource::<GuardResource>(handle)
+                    .map_err(|error| VmError::HostError(error.to_string()))?;
+                drop(taken);
+                self.seen.lock().expect("seen").consumed = true;
+            }
+            Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
+        }
+    }
+
+    /// `(resource: Resource(test.guard) BorrowMut, callback: Callable TakeOwned)
+    /// -> bool`: the handler illegally consumes the borrowed resource.
+    struct ConsumeBorrowedResource {
+        seen: Arc<Mutex<Seen>>,
+    }
+
+    impl HostOwnedFunction for ConsumeBorrowedResource {
+        fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            {
+                let mut seen = self.seen.lock().expect("seen");
+                seen.calls += 1;
+                seen.first_arg = call.arg(0).cloned();
+                seen.second_arg = call.arg(1).cloned();
+            }
+            let handle_value = call.arg(0).cloned().unwrap_or(Value::Null);
+            let handle = resource_handle_argument(&handle_value)?;
+            let callable = call.take_arg(1)?;
+            self.seen.lock().expect("seen").callable = Some(callable);
+            let taken = call
+                .vm()
+                .host_context()
+                .take_resource::<GuardResource>(handle)
+                .map_err(|error| VmError::HostError(error.to_string()))?;
+            drop(taken);
+            self.seen.lock().expect("seen").consumed = true;
+            Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
+        }
+    }
+
+    /// Owned handler that takes the callable and returns an exact `Resource`
+    /// return that is not a handle at all.
+    struct BadReturnValue {
+        seen: Arc<Mutex<Seen>>,
+    }
+
+    impl HostOwnedFunction for BadReturnValue {
+        fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            {
+                let mut seen = self.seen.lock().expect("seen");
+                seen.calls += 1;
+                seen.first_arg = call.arg(0).cloned();
+            }
+            let callable = call.take_arg(1)?;
+            let repeat_take_failed = call.take_arg(1).is_err();
+            {
+                let mut seen = self.seen.lock().expect("seen");
+                seen.second_take_failed = repeat_take_failed;
+                seen.callable = Some(callable);
+            }
+            Ok(CallOutcome::Return(CallReturn::one(Value::string(
+                "not a resource handle",
+            ))))
+        }
+    }
+
+    /// Owned handler that takes the callable and returns a live handle of the
+    /// wrong key, so the exact return *validates* as a handle but fails the
+    /// resource-key transfer.
+    struct BadReturnKey {
+        seen: Arc<Mutex<Seen>>,
+    }
+
+    impl HostOwnedFunction for BadReturnKey {
+        fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            {
+                let mut seen = self.seen.lock().expect("seen");
+                seen.calls += 1;
+                seen.first_arg = call.arg(0).cloned();
+            }
+            let callable = call.take_arg(1)?;
+            let handle = call
+                .vm()
+                .host_context()
+                .push_resource(OtherResource {
+                    closes: Arc::new(AtomicUsize::new(0)),
+                })
+                .expect("push other resource")
+                .handle();
+            let repeat_take_failed = call.take_arg(1).is_err();
+            {
+                let mut seen = self.seen.lock().expect("seen");
+                seen.second_take_failed = repeat_take_failed;
+                seen.callable = Some(callable);
+                seen.handle = Some(handle.raw());
+            }
+            Ok(CallOutcome::Return(CallReturn::one(Value::Int(
+                handle.raw() as i64,
+            ))))
+        }
+    }
+
+    /// Owned handler that takes the callable, leaves a value on the operand
+    /// stack, and then returns an invalid exact resource return.
+    struct BadReturnWithHostStack {
+        seen: Arc<Mutex<Seen>>,
+    }
+
+    impl HostOwnedFunction for BadReturnWithHostStack {
+        fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            let callable = call.take_arg(1)?;
+            let repeat_take_failed = call.take_arg(1).is_err();
+            {
+                let mut seen = self.seen.lock().expect("seen");
+                seen.calls += 1;
+                seen.first_arg = call.arg(0).cloned();
+                seen.second_take_failed = repeat_take_failed;
+                seen.callable = Some(callable);
+                seen.host_marker = true;
+            }
+            call.vm().instance.stack.push(Value::Int(7));
+            Ok(CallOutcome::Return(CallReturn::one(Value::string(
+                "not a resource handle",
+            ))))
+        }
+    }
+
+    /// `(delay: Int, callback: Callable TakeOwned) -> Resource(test.guard)`.
+    fn int_callable_resource_schema() -> HostImportSchema {
+        resource_schema(
+            "test::take",
+            vec![
+                value_param("delay", HostTypeSchema::Int),
+                take_param("callback", callable_schema()),
+            ],
+            HostTypeSchema::Resource(guard_key()),
+        )
+    }
+
+    fn register_bad_return(
+        registry: &mut HostFunctionRegistry,
+        schema: HostImportSchema,
+        seen: &Arc<Mutex<Seen>>,
+        bad: fn(Arc<Mutex<Seen>>) -> Box<dyn HostOwnedFunction>,
+    ) {
+        let seen_for_factory = Arc::clone(seen);
+        registry
+            .register_exact_owned("test::take", 2, schema, move |_context| {
+                bad(Arc::clone(&seen_for_factory))
+            })
+            .expect("register owned resource-return take");
+    }
+
+    /// A wrong-key handle must be rejected by the pre-call contract before the
+    /// host function runs; every drained argument returns to the guest and the
+    /// resource is neither consumed nor closed.
+    #[test]
+    fn owned_int_resource_preflight_rejects_wrong_key_without_calling_host() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let ping_raw = Arc::new(Mutex::new(None));
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let take_schema = resource_schema(
+            "test::take",
+            vec![
+                value_param("delay", HostTypeSchema::Int),
+                take_param("resource", HostTypeSchema::Resource(guard_key())),
+            ],
+            HostTypeSchema::Bool,
+        );
+        let mut registry = HostFunctionRegistry::empty();
+        let ping_schema =
+            register_other_ping(&mut registry, Arc::clone(&closes), Arc::clone(&ping_raw));
+        let seen_for_factory = Arc::clone(&seen);
+        registry
+            .register_exact_owned("test::take", 2, take_schema.clone(), move |_context| {
+                Box::new(TakeIntThenResource {
+                    seen: Arc::clone(&seen_for_factory),
+                    consume: true,
+                })
+            })
+            .expect("register owned resource take");
+
+        let mut vm = bound_vm(
+            ping_then_int_program(ping_schema, take_schema, 41),
+            &registry,
+        );
+        let error = vm
+            .run()
+            .expect_err("a wrong-key resource must not reach the host");
+        assert_eq!(
+            resource_error_code(&error),
+            Some(ResourceErrorCode::ResourceTypeKeyMismatch),
+            "expected a structured key mismatch, got: {error}"
+        );
+        assert_eq!(
+            seen.lock().expect("seen").calls,
+            0,
+            "the pre-call contract must reject the handle before the host runs"
+        );
+        let raw = ping_raw
+            .lock()
+            .expect("ping record")
+            .expect("ping recorded a handle");
+        assert!(
+            is_live(&vm, raw, &other_key()),
+            "a rejected preflight must leave the guest-owned resource untouched"
+        );
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            0,
+            "a rejected preflight must not consume or close the resource"
+        );
+        assert_eq!(
+            vm.instance.stack,
+            vec![Value::Int(41), Value::Int(raw as i64)],
+            "the host took nothing, so every drained argument must be restored exactly once"
+        );
+    }
+
+    /// A non-handle argument must be rejected by the pre-call contract before
+    /// the host function runs, restoring both drained arguments.
+    #[test]
+    fn owned_int_resource_preflight_rejects_invalid_handle_without_calling_host() {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let take_schema = resource_schema(
+            "test::take",
+            vec![
+                value_param("delay", HostTypeSchema::Int),
+                take_param("resource", HostTypeSchema::Resource(guard_key())),
+            ],
+            HostTypeSchema::Bool,
+        );
+        let mut registry = HostFunctionRegistry::empty();
+        let seen_for_factory = Arc::clone(&seen);
+        registry
+            .register_exact_owned("test::take", 2, take_schema.clone(), move |_context| {
+                Box::new(TakeIntThenResource {
+                    seen: Arc::clone(&seen_for_factory),
+                    consume: true,
+                })
+            })
+            .expect("register owned resource take");
+
+        let invalid = Value::string("not a resource handle");
+        let mut vm = bound_vm(
+            plain_take_program(take_schema, vec![Value::Int(41), invalid.clone()]),
+            &registry,
+        );
+        let error = vm
+            .run()
+            .expect_err("an invalid handle must not reach the host");
+        assert_eq!(
+            resource_error_code(&error),
+            Some(ResourceErrorCode::InvalidResourceHandle),
+            "expected a structured invalid-handle rejection, got: {error}"
+        );
+        assert_eq!(
+            seen.lock().expect("seen").calls,
+            0,
+            "an invalid handle must be rejected before the host runs"
+        );
+        assert_eq!(
+            vm.instance.stack,
+            vec![Value::Int(41), invalid],
+            "both untaken arguments must be restored exactly once"
+        );
+    }
+
+    /// A declared `TakeOwned` resource is transferred exactly once: both
+    /// argument slots reach the host in declaration order, a repeat take is
+    /// rejected, the consumed resource is no longer live, and it is never
+    /// closed by the call itself.
+    #[test]
+    fn owned_int_resource_transfers_and_consumes_exactly_once() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let ping_raw = Arc::new(Mutex::new(None));
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let take_schema = resource_schema(
+            "test::take",
+            vec![
+                value_param("delay", HostTypeSchema::Int),
+                take_param("resource", HostTypeSchema::Resource(guard_key())),
+            ],
+            HostTypeSchema::Bool,
+        );
+        let mut registry = HostFunctionRegistry::empty();
+        let ping_schema =
+            register_guard_ping(&mut registry, Arc::clone(&closes), Arc::clone(&ping_raw));
+        let seen_for_factory = Arc::clone(&seen);
+        registry
+            .register_exact_owned("test::take", 2, take_schema.clone(), move |_context| {
+                Box::new(TakeIntThenResource {
+                    seen: Arc::clone(&seen_for_factory),
+                    consume: true,
+                })
+            })
+            .expect("register owned resource take");
+
+        let mut vm = bound_vm(
+            ping_then_int_program(ping_schema, take_schema, 41),
+            &registry,
+        );
+        assert_eq!(
+            vm.run().expect("the owned resource call must succeed"),
+            VmStatus::Halted
+        );
+
+        let raw = ping_raw
+            .lock()
+            .expect("ping record")
+            .expect("ping recorded a handle");
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.calls, 1);
+        assert_eq!(
+            seen.first_arg,
+            Some(Value::Int(41)),
+            "argument slot 0 must carry the delay value"
+        );
+        assert_eq!(
+            seen.second_arg,
+            Some(Value::Int(raw as i64)),
+            "argument slot 1 must carry the resource handle"
+        );
+        assert!(seen.second_take_failed, "a repeat take must be rejected");
+        assert_eq!(seen.handle, Some(raw));
+        assert!(seen.consumed, "the handler consumed the resource");
+        drop(seen);
+        assert!(
+            !is_live(&vm, raw, &guard_key()),
+            "the consumed resource must no longer be live"
+        );
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            0,
+            "a consumed resource must not be closed by the call"
+        );
+        assert_eq!(
+            vm.instance.stack,
+            vec![Value::Bool(true)],
+            "untaken arguments are released on success and the return value lands on the stack"
+        );
+    }
+
+    /// A resource and a callable declared `TakeOwned` transfer both arguments
+    /// exactly once, and the spawned isolated VM owns the callable graph.
+    #[test]
+    fn owned_resource_callable_transfers_both_arguments_exactly_once() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let ping_raw = Arc::new(Mutex::new(None));
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let take_schema = resource_schema(
+            "test::take",
+            vec![
+                take_param("resource", HostTypeSchema::Resource(guard_key())),
+                take_param("callback", callable_schema()),
+            ],
+            HostTypeSchema::Bool,
+        );
+        let mut registry = HostFunctionRegistry::empty();
+        let ping_schema =
+            register_guard_ping(&mut registry, Arc::clone(&closes), Arc::clone(&ping_raw));
+        let seen_for_factory = Arc::clone(&seen);
+        registry
+            .register_exact_owned("test::take", 2, take_schema.clone(), move |context| {
+                Box::new(TakeResourceThenCallable {
+                    seen: Arc::clone(&seen_for_factory),
+                    registry: context.registry().clone(),
+                    consume: true,
+                    spawn: true,
+                })
+            })
+            .expect("register owned resource+callable take");
+
+        let mut vm = bound_vm(
+            ping_then_callable_program(ping_schema, take_schema),
+            &registry,
+        );
+        assert_eq!(
+            vm.run()
+                .expect("the owned resource+callable call must succeed"),
+            VmStatus::Halted
+        );
+
+        let raw = ping_raw
+            .lock()
+            .expect("ping record")
+            .expect("ping recorded a handle");
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.calls, 1);
+        assert_eq!(seen.first_arg, Some(Value::Int(raw as i64)));
+        assert!(
+            matches!(seen.second_arg, Some(Value::Callable(_))),
+            "argument slot 1 must carry the callable value"
+        );
+        assert!(matches!(seen.callable, Some(Value::Callable(_))));
+        assert!(seen.second_take_failed, "a repeat take must be rejected");
+        assert_eq!(
+            seen.fresh_owns_callable,
+            Some(true),
+            "the spawned VM must own the transferred callable graph"
+        );
+        assert!(seen.consumed);
+        drop(seen);
+        assert!(!is_live(&vm, raw, &guard_key()));
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        assert_eq!(vm.instance.stack, vec![Value::Bool(true)]);
+    }
+
+    /// A declared `TakeOwned` that the host did not consume is reported and
+    /// reclaimed by the commit: the guest never gets the handle back, the
+    /// untaken arguments are restored exactly once, and the resource is only
+    /// released by the ordinary scope close.
+    #[test]
+    fn owned_resource_commit_reclaims_an_unconsumed_resource() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let ping_raw = Arc::new(Mutex::new(None));
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let take_schema = resource_schema(
+            "test::take",
+            vec![
+                value_param("delay", HostTypeSchema::Int),
+                take_param("resource", HostTypeSchema::Resource(guard_key())),
+            ],
+            HostTypeSchema::Bool,
+        );
+        let mut registry = HostFunctionRegistry::empty();
+        let ping_schema =
+            register_guard_ping(&mut registry, Arc::clone(&closes), Arc::clone(&ping_raw));
+        let seen_for_factory = Arc::clone(&seen);
+        registry
+            .register_exact_owned("test::take", 2, take_schema.clone(), move |_context| {
+                Box::new(TakeIntThenResource {
+                    seen: Arc::clone(&seen_for_factory),
+                    consume: false,
+                })
+            })
+            .expect("register owned resource take");
+
+        let mut vm = bound_vm(
+            ping_then_int_program(ping_schema, take_schema, 41),
+            &registry,
+        );
+        let error = vm
+            .run()
+            .expect_err("a declared take that was not consumed must fail the call");
+        assert!(
+            matches!(&error, VmError::HostError(message) if message.contains("was not consumed")),
+            "expected a structured not-consumed rejection, got: {error}"
+        );
+        let raw = ping_raw
+            .lock()
+            .expect("ping record")
+            .expect("ping recorded a handle");
+        assert!(
+            is_live(&vm, raw, &guard_key()),
+            "the reclaimed resource stays in the scope until the scope close releases it"
+        );
+        assert_eq!(
+            vm.instance.stack,
+            vec![Value::Int(41)],
+            "the reclaimed handle is never handed back and the untaken delay argument is \
+             restored exactly once"
+        );
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            0,
+            "the reclaim itself must not close the resource twice"
+        );
+        drop(vm);
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            1,
+            "the scope close releases the reclaimed resource exactly once"
+        );
+    }
+
+    /// A `BorrowMut` argument the host function consumed is a structured
+    /// access conflict reported by the commit; the illegal consumption itself
+    /// is not undone and the untaken borrowed argument is restored once.
+    #[test]
+    fn owned_resource_commit_reports_a_consumed_borrowed_resource() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let ping_raw = Arc::new(Mutex::new(None));
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let take_schema = resource_schema(
+            "test::take",
+            vec![
+                borrow_mut_param("resource", HostTypeSchema::Resource(guard_key())),
+                take_param("callback", callable_schema()),
+            ],
+            HostTypeSchema::Bool,
+        );
+        let mut registry = HostFunctionRegistry::empty();
+        let ping_schema =
+            register_guard_ping(&mut registry, Arc::clone(&closes), Arc::clone(&ping_raw));
+        let seen_for_factory = Arc::clone(&seen);
+        registry
+            .register_exact_owned("test::take", 2, take_schema.clone(), move |_context| {
+                Box::new(ConsumeBorrowedResource {
+                    seen: Arc::clone(&seen_for_factory),
+                })
+            })
+            .expect("register owned borrowed-resource take");
+
+        let mut vm = bound_vm(
+            ping_then_callable_program(ping_schema, take_schema),
+            &registry,
+        );
+        let error = vm
+            .run()
+            .expect_err("consuming a borrowed argument must fail the commit");
+        assert_eq!(
+            resource_error_code(&error),
+            Some(ResourceErrorCode::ResourceAccessConflict),
+            "expected a structured borrow conflict, got: {error}"
+        );
+        let raw = ping_raw
+            .lock()
+            .expect("ping record")
+            .expect("ping recorded a handle");
+        assert!(
+            !is_live(&vm, raw, &guard_key()),
+            "the illegal consumption itself is not undone by the commit"
+        );
+        assert_eq!(
+            vm.instance.stack,
+            vec![Value::Int(raw as i64)],
+            "the untaken (borrowed) argument must be restored exactly once"
+        );
+    }
+
+    /// The exact return is rejected by *validation* (not a handle): the host
+    /// already accepted and took its argument, so the taken callable stays
+    /// consumed while every untaken argument is restored exactly once.
+    #[test]
+    fn owned_dispatch_restores_untaken_arguments_on_a_rejected_resource_return() {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let take_schema = int_callable_resource_schema();
+        let mut registry = HostFunctionRegistry::empty();
+        register_bad_return(&mut registry, take_schema.clone(), &seen, |seen| {
+            Box::new(BadReturnValue { seen })
+        });
+
+        let mut vm = bound_vm(int_then_callable_program(take_schema, 41), &registry);
+        let error = vm
+            .run()
+            .expect_err("a non-handle exact resource return must be rejected");
+        assert!(
+            matches!(&error, VmError::TypeMismatch(message) if *message == "resource"),
+            "expected a structured resource-handle rejection, got: {error}"
+        );
+        let seen = seen.lock().expect("seen");
+        assert_eq!(seen.calls, 1);
+        assert!(seen.second_take_failed);
+        assert!(
+            matches!(seen.callable, Some(Value::Callable(_))),
+            "the argument the host took stays consumed by the host"
+        );
+        drop(seen);
+        assert_eq!(
+            vm.instance.stack,
+            vec![Value::Int(41)],
+            "the untaken delay argument must be restored exactly once after a rejected exact \
+             return; nothing is dropped twice"
+        );
+    }
+
+    /// The exact return validates as a handle but its resource-key transfer
+    /// fails: the taken callable stays consumed, the untaken delay is
+    /// restored, and the wrongly-keyed resource is never transferred to the
+    /// guest.
+    #[test]
+    fn owned_dispatch_restores_untaken_arguments_on_a_failed_ownership_transfer() {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let take_schema = int_callable_resource_schema();
+        let mut registry = HostFunctionRegistry::empty();
+        register_bad_return(&mut registry, take_schema.clone(), &seen, |seen| {
+            Box::new(BadReturnKey { seen })
+        });
+
+        let mut vm = bound_vm(int_then_callable_program(take_schema, 41), &registry);
+        let error = vm
+            .run()
+            .expect_err("a key-mismatched exact resource return must be rejected");
+        assert!(
+            matches!(&error, VmError::HostError(message) if message.contains("resource_type_key_mismatch")),
+            "expected a structured key mismatch, got: {error}"
+        );
+        let raw = seen
+            .lock()
+            .expect("seen")
+            .handle
+            .expect("the handler recorded its returned handle");
+        assert!(
+            is_live(&vm, raw, &other_key()),
+            "a failed ownership transfer must leave the resource live under its own key"
+        );
+        assert_eq!(
+            vm.instance.stack,
+            vec![Value::Int(41)],
+            "the untaken delay argument must be restored exactly once"
+        );
+        assert!(
+            matches!(
+                seen.lock().expect("seen").callable,
+                Some(Value::Callable(_))
+            ),
+            "the argument the host took stays consumed by the host"
+        );
+    }
+
+    /// A rejected exact return keeps the values the host pushed onto the
+    /// operand stack and restores the untaken arguments exactly once.
+    #[test]
+    fn owned_dispatch_preserves_the_host_stack_on_a_rejected_resource_return() {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let take_schema = int_callable_resource_schema();
+        let mut registry = HostFunctionRegistry::empty();
+        register_bad_return(&mut registry, take_schema.clone(), &seen, |seen| {
+            Box::new(BadReturnWithHostStack { seen })
+        });
+
+        let mut vm = bound_vm(int_then_callable_program(take_schema, 41), &registry);
+        let _ = vm
+            .run()
+            .expect_err("a non-handle exact resource return must be rejected");
+        assert!(
+            seen.lock().expect("seen").host_marker,
+            "the handler must have pushed its stack value"
+        );
+        assert_eq!(
+            vm.instance.stack,
+            vec![Value::Int(41), Value::Int(7)],
+            "the restored untaken argument precedes the preserved host-stack value"
+        );
+    }
+
+    // ---- nested owned-callable capture graph probes ---------------------------
+
+    fn capture_program(
+        local_schemas: Vec<TypeSchema>,
+        prototypes: Vec<CallablePrototype>,
+    ) -> Program {
+        let local_count = local_schemas.len();
+        let mut program = Program::new(vec![], vec![]).with_local_count(local_count);
+        program.type_map = Some(TypeMap {
+            strict_types: true,
+            local_types: vec![ValueType::Unknown; local_count],
+            local_schemas: local_schemas.into_iter().map(Some).collect(),
+            callable_slots: vec![true; local_count],
+            optional_slots: vec![false; local_count],
+            operand_types: HashMap::new(),
+        });
+        program.callable_prototypes = prototypes;
+        program
+    }
+
+    fn closure_value(prototype_id: u32, captures: Vec<Value>) -> (Value, Arc<CallableValue>) {
+        let callable = Arc::new(CallableValue {
+            prototype_id,
+            kind: CallableKind::Closure,
+            env: (!captures.is_empty()).then(|| {
+                Arc::new(CallableEnvironment {
+                    cells: Mutex::new(
+                        captures
+                            .into_iter()
+                            .map(|value| Arc::new(Mutex::new(value)))
+                            .collect(),
+                    ),
+                })
+            }),
+        });
+        (Value::Callable(Arc::clone(&callable)), callable)
+    }
+
+    fn capture_prototype(
+        source_slots: Vec<u16>,
+        modes: Vec<crate::CaptureBindingMode>,
+    ) -> CallablePrototype {
+        CallablePrototype {
+            kind: CallableKind::Closure,
+            target: CallableTarget::ScriptFunction(0),
+            arity: 0,
+            frame_local_count: 1,
+            parameter_slots: Vec::new(),
+            capture_slots: (0..source_slots.len()).map(|slot| slot as u16).collect(),
+            capture_source_slots: source_slots,
+            capture_modes: modes,
+            self_slot: None,
+            schema: None,
+        }
+    }
+
+    /// Resource-bearing capture rejection is schema-only, and it applies inside a
+    /// nested callable capture too: the host path never reads or moves the source
+    /// VM's resource table.
+    #[test]
+    fn owned_callable_rejects_resource_in_nested_non_move_callable_capture() {
+        let key = crate::host_api::ResourceTypeKey::new("test.nested_capture").expect("key");
+        let nested_schema = TypeSchema::Callable {
+            params: Vec::new(),
+            result: Box::new(TypeSchema::Unknown),
+        };
+        let program = capture_program(
+            vec![nested_schema, TypeSchema::Resource(key)],
+            vec![
+                capture_prototype(vec![0], vec![crate::CaptureBindingMode::Borrow]),
+                capture_prototype(vec![1], vec![crate::CaptureBindingMode::Move]),
+            ],
+        );
+        let mut source = Vm::try_new(program).expect("source VM");
+        let (nested, nested_owned) = closure_value(1, vec![Value::Int(11)]);
+        let (outer, outer_owned) = closure_value(0, vec![nested]);
+        source
+            .instance
+            .owned_callables
+            .extend([Arc::downgrade(&nested_owned), Arc::downgrade(&outer_owned)]);
+        source.instance.locals[0] = outer.clone();
+        let registry = HostFunctionRegistry::empty();
+        let mut call = OwnedHostCall::new(&mut source, Vec::new());
+        let result = call.spawn_owned_callable_vm(&registry, &outer, |_vm| Ok(()));
+        let error = match result {
+            Ok(_) => panic!("nested resource capture must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, VmError::HostError(message) if message.contains("resource-bearing capture")),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A foreign callable captured *inside* the owned graph is rejected with the
+    /// source-provenance rejection: owned graphs are program-local and are never
+    /// portable across VM boundaries, however deeply they are nested.
+    #[test]
+    fn owned_callable_rejects_nested_foreign_callable() {
+        let callable_schema = TypeSchema::Callable {
+            params: Vec::new(),
+            result: Box::new(TypeSchema::Unknown),
+        };
+        let program = capture_program(
+            vec![callable_schema],
+            vec![capture_prototype(
+                vec![0],
+                vec![crate::CaptureBindingMode::Borrow],
+            )],
+        );
+        let mut source = Vm::try_new(program).expect("source VM");
+        let foreign = closure_value(0, Vec::new()).0;
+        let (outer, outer_owned) = closure_value(0, vec![foreign]);
+        source
+            .instance
+            .owned_callables
+            .push(Arc::downgrade(&outer_owned));
+        source.instance.locals[0] = outer.clone();
+        let registry = HostFunctionRegistry::empty();
+        let mut call = OwnedHostCall::new(&mut source, Vec::new());
+        let result = call.spawn_owned_callable_vm(&registry, &outer, |_vm| Ok(()));
+        let error = match result {
+            Ok(_) => panic!("nested foreign callable must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, VmError::InvalidFrameState(message) if message.contains("source vm")),
+            "unexpected nested provenance error: {error}"
+        );
     }
 }
