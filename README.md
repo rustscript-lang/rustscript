@@ -13,6 +13,7 @@ The complete language, runtime, and implementation guides live on the [RustScrip
 - [VM and compiler internals](https://rustscript.org/docs/reference/rustscript/internals/)
 - [RSS language](https://rustscript.org/docs/reference/rss/)
 - [Host functions](https://rustscript.org/docs/reference/host-functions/)
+- [Standard timer host module](docs/standard-timer-host.md)
 - [Runtime controls and artifacts](https://rustscript.org/docs/reference/runtime-controls/)
 - [Compiler frontend syntax and feature support](src/compiler/frontends/README.md)
 
