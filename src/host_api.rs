@@ -25,7 +25,16 @@
 //!   resource**, directly or recursively (`Optional`, `Array`, `Map`,
 //!   `Callable`, named struct fields), must use an explicit borrow/ownership
 //!   passing mode; `Value` is forbidden. A parameter whose type contains **no**
-//!   resource must use `Value`; a borrow/ownership mode is forbidden.
+//!   resource must use `Value`; a borrowing mode is forbidden. A resource-free
+//!   `TakeOwned` parameter is the one exception: it declares an owned *value*
+//!   transfer, which the owned-dispatch registry path honors.
+//! * **Runtime-gated owned-dispatch view.** [`HostOwnedFunction`],
+//!   [`OwnedHostCall`] and [`OwnedHostContext`] are the public seam of the
+//!   owned-value dispatch contract. They are the only items in this module
+//!   that name `crate::vm` types (and are therefore `runtime`-gated): they
+//!   live here so the crate root can re-export them for embedding adapters,
+//!   while the dispatch and every VM invariant stay in `crate::vm::host`.
+//!   All of the catalog model above remains VM-independent.
 //! * **Overloading.** Host functions may legally share a name with distinct
 //!   argument signatures (standard builtins such as `len` dispatch for string,
 //!   array, bytes and map). Overloads must differ in their **argument type /
@@ -49,6 +58,11 @@
 //! convenience equality key, not a MAC.
 
 use std::fmt;
+
+#[cfg(feature = "runtime")]
+use crate::bytecode::Value;
+#[cfg(feature = "runtime")]
+use crate::vm::{CallOutcome, HostFunctionRegistry, Vm, VmError, VmResult};
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, VariantAccess, Visitor};
 use serde::ser::{SerializeStruct, SerializeStructVariant};
@@ -309,9 +323,11 @@ fn validate_resource_key(name: &str) -> Result<(), ResourceTypeKeyError> {
 /// How a host function receives a parameter.
 ///
 /// When a parameter's type [`contains`][HostTypeSchema::contains_resource] a
-/// resource, **`Value` is forbidden** and the caller must chose one of
-/// `Borrow`, `BorrowMut` or `TakeOwned`. When it contains no resource, `Value`
-/// is required and a borrow/ownership mode is forbidden.
+/// resource, **`Value` is forbidden** and the caller must choose one of
+/// `Borrow`, `BorrowMut` or `TakeOwned`. A resource-free parameter normally
+/// uses `Value`; `TakeOwned` remains legal for an owned-dispatch registration
+/// and transfers the plain value itself. `Borrow` and `BorrowMut` have no
+/// meaning for resource-free values.
 ///
 /// Ownership modes compose with a parameter's *aggregate* resource content:
 ///
@@ -2587,7 +2603,12 @@ pub enum HostApiCatalogError {
         function: String,
         key: ResourceTypeKey,
     },
-    /// A borrow/ownership passing mode was used on a non-resource parameter.
+    /// A borrow passing mode was used on a non-resource parameter.
+    ///
+    /// `TakeOwned` is deliberately **not** covered: on a resource-free
+    /// parameter it declares an owned *value* transfer (callable, scalar, or
+    /// aggregate), which the owned-dispatch registry path honors. Borrowing a
+    /// plain value has no meaning, so `Borrow`/`BorrowMut` stay rejected.
     NonResourcePassingMode {
         function: String,
         parameter: String,
@@ -3399,8 +3420,14 @@ fn validate_surface(
                         parameter: param.name.clone(),
                     });
                 }
-            } else if param.passing.is_reference_mode() {
-                // A non-resource parameter must use `Value`.
+            } else if matches!(
+                param.passing,
+                HostParamPassing::Borrow | HostParamPassing::BorrowMut
+            ) {
+                // A non-resource parameter must use `Value`; `TakeOwned` is the
+                // one reference mode that is meaningful without a resource
+                // (an owned value transfer), and it is honored only by the
+                // owned-dispatch registry path.
                 return Err(HostApiCatalogError::NonResourcePassingMode {
                     function: function.name.clone(),
                     parameter: param.name.clone(),
@@ -3772,6 +3799,181 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     }
     hash
 }
+
+// ---------------------------------------------------------------------------
+// Owned-dispatch call view
+// ---------------------------------------------------------------------------
+//
+// An *owned host function* receives exclusive ownership of its call arguments:
+// the registry drains the call operands from the guest operand stack into an
+// [`OwnedHostCall`] before the handler runs and transfers the arguments the
+// handler takes. Embeddings declare such a binding with
+// `HostFunctionRegistry::register_exact_owned` and implement
+// [`HostOwnedFunction`] for their adapter.
+//
+// These three types are the public seam of that contract, so they live in this
+// module — the crate's public host-API vocabulary — and are re-exported at the
+// crate root. The dispatch itself (operand draining, transactional rollback,
+// the rejected-`Yield` contract, the guarded wrapper) and the VM-coupled
+// operations live in `crate::vm::host`, which owns every VM invariant they
+// rely on. Only the VM-coupled operations depend on `Vm`; the definitions are
+// therefore runtime-gated so this module stays VM-independent without the
+// `runtime` feature.
+
+/// A host function that receives exclusive ownership of its call arguments.
+///
+/// The dispatch drains the call operands from the guest operand stack into an
+/// [`OwnedHostCall`] before the function runs. Arguments the function takes
+/// through [`OwnedHostCall::take_arg`] are owned by the host for good;
+/// arguments it leaves untaken stay guest-owned — they are restored to the
+/// operand stack when the call fails and released when the call succeeds.
+///
+/// This is the *generic* owned-value seam: the registry teaches the VM to
+/// transfer callable / scalar / aggregate values exactly once, without any
+/// domain-specific knowledge entering `src/vm`.
+///
+/// Handlers must not return [`CallOutcome::Yield`]: owned dispatch has already
+/// drained the call operands, so a yielded call cannot be re-executed and the
+/// outcome is rejected as a host error (with the untaken arguments restored).
+#[cfg(feature = "runtime")]
+pub trait HostOwnedFunction: Send {
+    /// Runs one owned host call. `call` carries the drained arguments and the
+    /// live VM; the function takes ownership of the arguments it needs.
+    fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome>;
+}
+
+/// Registry-supplied context for one owned host-function instance.
+///
+/// The context is handed to the registration factory when a registry binds a
+/// VM, so an owned host function can retain the immutable registry/binding
+/// configuration it needs to spawn an isolated owned-value execution VM
+/// later. It deliberately carries nothing else: no host state, no execution
+/// frames, no request-local data.
+#[cfg(feature = "runtime")]
+pub struct OwnedHostContext<'a> {
+    pub(crate) registry: &'a HostFunctionRegistry,
+}
+
+#[cfg(feature = "runtime")]
+impl<'a> OwnedHostContext<'a> {
+    /// The registry this instance was created from.
+    ///
+    /// Cloning the registry is cheap: a clone shares the immutable entry
+    /// table, capability profile, and composition with its source.
+    pub fn registry(&self) -> &'a HostFunctionRegistry {
+        self.registry
+    }
+}
+
+/// One in-flight owned host call: the live VM plus the drained call arguments.
+///
+/// `args` holds the operand-stack tail the call consumed, in declaration
+/// order. Taking an argument transfers ownership to the host and clears the
+/// argument slot, so the untaken remainder is exactly what the dispatch
+/// restores when the call fails without double drop.
+///
+/// The VM-coupled operation ([`Self::spawn_owned_callable_vm`]) is implemented
+/// in `crate::vm::host` next to the dispatch that creates this value; it is
+/// never constructed directly by an embedding.
+#[cfg(feature = "runtime")]
+pub struct OwnedHostCall<'vm> {
+    pub(crate) vm: &'vm mut Vm,
+    pub(crate) args: Vec<Value>,
+    pub(crate) taken: Vec<bool>,
+}
+
+#[cfg(feature = "runtime")]
+impl<'vm> OwnedHostCall<'vm> {
+    pub(crate) fn new(vm: &'vm mut Vm, args: Vec<Value>) -> Self {
+        let taken = vec![false; args.len()];
+        Self { vm, args, taken }
+    }
+
+    /// Mutable access to the calling VM.
+    ///
+    /// An owned host function must not re-enter VM execution on this VM: the
+    /// call is dispatched with the source VM's frames and pending operation
+    /// still live. Structurally different work belongs on a fresh VM created
+    /// through [`Self::spawn_owned_callable_vm`].
+    pub fn vm(&mut self) -> &mut Vm {
+        self.vm
+    }
+
+    /// Read-only access to the calling VM.
+    pub fn vm_ref(&self) -> &Vm {
+        self.vm
+    }
+
+    /// Every call argument, in declaration order. Taken arguments read
+    /// [`Value::Null`].
+    pub fn args(&self) -> &[Value] {
+        &self.args
+    }
+
+    /// One call argument by index.
+    pub fn arg(&self, index: usize) -> Option<&Value> {
+        self.args.get(index)
+    }
+
+    /// Whether the host already took ownership of `index`.
+    pub fn is_taken(&self, index: usize) -> bool {
+        self.taken.get(index).copied().unwrap_or(false)
+    }
+
+    /// Takes ownership of argument `index`.
+    ///
+    /// The value moves out of the call into the host and the guest slot is
+    /// cleared. Taking the same index twice, or taking a missing index, is a
+    /// host error and leaves ownership unchanged.
+    pub fn take_arg(&mut self, index: usize) -> VmResult<Value> {
+        let Some(taken) = self.taken.get_mut(index) else {
+            return Err(VmError::HostError(format!(
+                "owned host call has no argument at index {index}"
+            )));
+        };
+        if *taken {
+            return Err(VmError::HostError(format!(
+                "owned host call argument {index} was already taken"
+            )));
+        }
+        *taken = true;
+        Ok(std::mem::replace(&mut self.args[index], Value::Null))
+    }
+
+    /// Restores a previously taken argument to the owned call.
+    ///
+    /// This is the transactional rollback primitive for a host that has
+    /// accepted an argument tentatively but cannot complete its handoff. The
+    /// value is placed back in its original slot and the slot becomes untaken,
+    /// so the normal dispatch failure path restores it to the guest exactly
+    /// once. Only an argument that this call already took may be restored.
+    pub fn restore_arg(&mut self, index: usize, value: Value) -> VmResult<()> {
+        let Some(taken) = self.taken.get_mut(index) else {
+            return Err(VmError::HostError(format!(
+                "owned host call has no argument at index {index}"
+            )));
+        };
+        if !*taken {
+            return Err(VmError::HostError(format!(
+                "owned host call argument {index} was not taken"
+            )));
+        }
+        self.args[index] = value;
+        *taken = false;
+        Ok(())
+    }
+
+    /// The untaken arguments, in declaration order, as the dispatch restores
+    /// them when this call fails.
+    pub(crate) fn into_untaken_args(self) -> Vec<Value> {
+        self.args
+            .into_iter()
+            .zip(self.taken)
+            .filter_map(|(value, taken)| (!taken).then_some(value))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4070,9 +4272,12 @@ mod tests {
     }
 
     #[test]
-    fn non_resource_take_owned_rejected() {
+    fn non_resource_take_owned_is_an_owned_value_transfer() {
+        // A resource-free `TakeOwned` parameter transfers the *value* itself
+        // (scalar, aggregate, or callable); only the owned-dispatch registry
+        // path honors it, and the catalog vocabulary must be able to express
+        // it. Borrow/BorrowMut on a resource-free parameter stay rejected.
         let mut builder = HostApiCatalog::builder();
-        builder.resource(io_file_resource());
         builder.function(HostFunctionSchema::with_return(
             "consume",
             vec![HostParamSchema::with_passing(
@@ -4082,12 +4287,48 @@ mod tests {
             )],
             HostTypeSchema::Int,
         ));
+        builder.function(HostFunctionSchema::with_return(
+            "register",
+            vec![HostParamSchema::with_passing(
+                "callback",
+                HostTypeSchema::Callable {
+                    params: vec![HostTypeSchema::Bool],
+                    result: Box::new(HostTypeSchema::Unknown),
+                },
+                HostParamPassing::TakeOwned,
+            )],
+            HostTypeSchema::Bool,
+        ));
+        let catalog = builder
+            .build()
+            .expect("owned value transfers must be expressible in the catalog");
+        assert_eq!(
+            catalog
+                .function("consume")
+                .expect("consume")
+                .params
+                .first()
+                .expect("one parameter")
+                .passing,
+            HostParamPassing::TakeOwned
+        );
+
+        let mut builder = HostApiCatalog::builder();
+        builder.function(HostFunctionSchema::with_return(
+            "join",
+            vec![HostParamSchema::with_passing(
+                "parts",
+                HostTypeSchema::Array(Box::new(HostTypeSchema::String)),
+                HostParamPassing::BorrowMut,
+            )],
+            HostTypeSchema::Null,
+        ));
         assert_eq!(
             builder.build(),
             Err(HostApiCatalogError::NonResourcePassingMode {
-                function: "consume".to_string(),
-                parameter: "value".to_string(),
-                passing: HostParamPassing::TakeOwned,
+                function: "join".to_string(),
+                parameter: "parts".to_string(),
+                passing: HostParamPassing::BorrowMut,
             })
         );
     }
