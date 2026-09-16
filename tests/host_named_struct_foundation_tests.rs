@@ -15,7 +15,7 @@ use vm::host_api::{
 };
 use vm::{
     CallOutcome, CallReturn, CompiledProgram, HostExtension, HostFunctionRegistry, SourcePathError,
-    SourcePosition, Vm, analyze_source_from_string_with_options,
+    SourcePosition, Value, Vm, VmResult, analyze_source_from_string_with_options,
 };
 
 fn point_fields() -> Vec<HostStructField> {
@@ -427,4 +427,72 @@ fn install_named_struct_schemas_merges_and_rejects_conflicts() {
         ),
         "rejected conflict must leave the original HandleBox body in place"
     );
+}
+
+use pd_host_function::pd_host_function;
+use vm::{HostNamedStruct, HostStructField as NamedField};
+
+struct GeneratedPoint {
+    x: i64,
+    y: i64,
+}
+
+impl HostNamedStruct for GeneratedPoint {
+    const NAME: &'static str = "Point";
+
+    fn host_struct_fields() -> Vec<NamedField> {
+        vec![
+            NamedField::new("x", HostTypeSchema::Int),
+            NamedField::new("y", HostTypeSchema::Int),
+        ]
+    }
+}
+
+mod named_struct_generated_parent {
+    use super::*;
+    use vm::{Value, VmError, VmResult};
+
+    pub trait FromArg: Sized {
+        fn from_arg(value: &Value, label: &str) -> VmResult<Self>;
+    }
+
+    impl FromArg for GeneratedPoint {
+        fn from_arg(_value: &Value, _label: &str) -> VmResult<Self> {
+            Ok(GeneratedPoint { x: 1, y: 2 })
+        }
+    }
+
+    pub fn arg<T: FromArg>(args: &[Value], index: usize, label: &str) -> VmResult<T> {
+        args.get(index)
+            .ok_or_else(|| VmError::HostError(format!("missing {label}")))
+            .and_then(|value| T::from_arg(value, label))
+    }
+
+    pub fn borrow_arg<T: FromArg>(args: &[Value], index: usize, label: &str) -> VmResult<T> {
+        arg(args, index, label)
+    }
+
+    pub mod functions {
+        use super::*;
+
+        /// Takes a named point without collapsing it to Unknown.
+        #[pd_host_function(name = "geo::take_point")]
+        fn take_point(#[pd_host_named_struct] p: GeneratedPoint) -> i64 {
+            p.x + p.y
+        }
+    }
+}
+
+#[test]
+fn generated_named_struct_param_keeps_fixed_shape() {
+    let descriptor = named_struct_generated_parent::functions::take_point_descriptor();
+    match &descriptor.schema.params[0].ty {
+        HostTypeSchema::Named { name, fields } => {
+            assert_eq!(name, "Point");
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].name, "x");
+            assert_eq!(fields[1].name, "y");
+        }
+        other => panic!("expected named struct, got {other:?}"),
+    }
 }

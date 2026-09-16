@@ -4,8 +4,6 @@
 //! guest resource effects, deterministic module aggregation, and
 //! transactional installation.
 
-use std::sync::Arc;
-
 use vm::catalog_import_schemas;
 use vm::host_api::{
     HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
@@ -495,9 +493,13 @@ fn host_module_install_rolls_back_on_later_conflict() {
         .expect("seed existing function");
     assert!(registry.contains_name("demo::read_counter"));
 
+    let plan_before = registry
+        .prepare_shared_plan(&[])
+        .expect("baseline plan should build");
+
     let module = HostModuleDescriptor {
         name: "demo",
-        functions: &[read_counter_descriptor, add_descriptor],
+        functions: &[add_descriptor, read_counter_descriptor],
         resources: &[],
     };
     let error = module
@@ -510,7 +512,15 @@ fn host_module_install_rolls_back_on_later_conflict() {
     assert!(registry.contains_name("demo::read_counter"));
     assert!(
         !registry.contains_name("demo::add"),
-        "partial install must not leak the later function"
+        "a function that registered in the staged snapshot must be absent after rollback"
+    );
+
+    let plan_after = registry
+        .prepare_shared_plan(&[])
+        .expect("plan after failed install should still build");
+    assert!(
+        std::sync::Arc::ptr_eq(&plan_before, &plan_after),
+        "failed install must leave registry generation and cache identity unchanged"
     );
 }
 
@@ -570,7 +580,677 @@ fn conflicting_host_resource_types_fail_before_registry_mutation() {
     assert!(!registry.contains_name("demo::add"));
 }
 
-#[allow(dead_code)]
-fn _keep_arc_import_for_later_descriptor_install(catalog: HostApiCatalog) -> Arc<HostApiCatalog> {
-    Arc::new(catalog)
+fn args_noop(_args: &[vm::Value]) -> vm::VmResult<vm::CallOutcome> {
+    Ok(vm::CallOutcome::Return(vm::CallReturn::None))
+}
+
+fn yield_args(_args: &[vm::Value]) -> vm::VmResult<vm::CallOutcome> {
+    Ok(vm::CallOutcome::Yield)
+}
+
+fn assert_registry_unmodified(
+    registry: &vm::HostFunctionRegistry,
+    plan_before: &std::sync::Arc<vm::HostBindingPlan>,
+    unexpected: &[&str],
+) {
+    for name in unexpected {
+        assert!(
+            !registry.contains_name(name),
+            "{name} must be absent after a failed install"
+        );
+    }
+    let plan_after = registry
+        .prepare_shared_plan(&[])
+        .expect("plan after failed install should still build");
+    assert!(
+        std::sync::Arc::ptr_eq(plan_before, &plan_after),
+        "failed install must leave registry generation and cache identity unchanged"
+    );
+}
+
+#[test]
+fn in_module_duplicate_function_identity_leaves_registry_unchanged() {
+    use vm::HostFunctionRegistry;
+    use vm::host_extension::HostModuleDescriptor;
+
+    let mut registry = HostFunctionRegistry::empty();
+    let plan_before = registry
+        .prepare_shared_plan(&[])
+        .expect("baseline plan should build");
+    let error = HostModuleDescriptor::install_descriptors(
+        &mut registry,
+        &[add_descriptor(), add_descriptor()],
+    )
+    .expect_err("duplicate function identity in one module must fail");
+    assert!(
+        error.to_string().contains("demo::add"),
+        "duplicate identity diagnostic should name the function, got {error}"
+    );
+    assert_registry_unmodified(&registry, &plan_before, &["demo::add"]);
+}
+
+#[test]
+fn restricted_registry_installs_descriptor_module() {
+    use vm::HostFunctionRegistry;
+    use vm::host_extension::HostModuleDescriptor;
+
+    let module = HostModuleDescriptor {
+        name: "demo",
+        functions: &[add_descriptor],
+        resources: &[],
+    };
+    let mut registry = HostFunctionRegistry::restricted();
+    let catalog = module
+        .install(&mut registry)
+        .expect("restricted registry should still accept descriptor install");
+    assert!(registry.contains_name("demo::add"));
+    assert_eq!(catalog.fingerprint(), value_only_catalog().fingerprint());
+}
+
+#[test]
+fn adapter_binding_mismatch_rolls_back_successful_staged_adapter() {
+    use vm::HostFunctionRegistry;
+    use vm::host_extension::{
+        HostAdapterDescriptor, HostBindingDescriptor, HostBindingKind, HostFunctionDescriptor,
+        HostModuleDescriptor,
+    };
+
+    let mut registry = HostFunctionRegistry::empty();
+    let plan_before = registry
+        .prepare_shared_plan(&[])
+        .expect("baseline plan should build");
+    let error = HostModuleDescriptor::install_descriptors(
+        &mut registry,
+        &[
+            add_descriptor(),
+            HostFunctionDescriptor {
+                schema: HostFunctionSchema::with_return(
+                    "demo::mismatch",
+                    vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+                    HostTypeSchema::Int,
+                ),
+                binding: HostBindingDescriptor {
+                    kind: HostBindingKind::StaticStack,
+                },
+                effects: vec![],
+                adapter: HostAdapterDescriptor::StaticArgs(args_noop),
+                resource_types: vec![],
+            },
+        ],
+    )
+    .expect_err("binding/adapter mismatch must fail");
+    assert!(
+        error.to_string().contains("demo::mismatch"),
+        "mismatch diagnostic should name the function, got {error}"
+    );
+    assert_registry_unmodified(&registry, &plan_before, &["demo::add", "demo::mismatch"]);
+}
+
+#[test]
+fn named_struct_field_conflict_is_rejected_before_registry_mutation() {
+    use vm::HostFunctionRegistry;
+    use vm::host_extension::HostModuleDescriptor;
+
+    let origin = stack_descriptor(
+        HostFunctionSchema::with_return(
+            "geo::origin",
+            vec![],
+            HostTypeSchema::named_struct(
+                "Point",
+                vec![
+                    HostStructField::new("x", HostTypeSchema::Int),
+                    HostStructField::new("y", HostTypeSchema::Int),
+                ],
+            ),
+        ),
+        vec![],
+    );
+    let shifted = stack_descriptor(
+        HostFunctionSchema::with_return(
+            "geo::shifted",
+            vec![],
+            HostTypeSchema::named_struct(
+                "Point",
+                vec![
+                    HostStructField::new("x", HostTypeSchema::Int),
+                    HostStructField::new("z", HostTypeSchema::Int),
+                ],
+            ),
+        ),
+        vec![],
+    );
+    let mut registry = HostFunctionRegistry::empty();
+    let plan_before = registry
+        .prepare_shared_plan(&[])
+        .expect("baseline plan should build");
+    let error = HostModuleDescriptor::install_descriptors(&mut registry, &[origin, shifted])
+        .expect_err("conflicting named-struct fields must fail");
+    assert!(
+        error.to_string().contains("Point"),
+        "field-conflict diagnostic should name the struct, got {error}"
+    );
+    assert_registry_unmodified(&registry, &plan_before, &["geo::origin", "geo::shifted"]);
+}
+
+#[test]
+fn duplicate_compatible_resource_declarations_succeed() {
+    use vm::host_extension::{HostFunctionDescriptor, HostResourceTypeMeta};
+
+    fn counter_meta() -> HostResourceTypeMeta {
+        use vm::host_extension::HostResourceType;
+        use vm::resource::{CloseProgress, HostResource, ResourceCloseReason};
+        struct Counter;
+        impl HostResource for Counter {
+            fn begin_close(
+                &mut self,
+                _reason: ResourceCloseReason,
+            ) -> vm::resource::ResourceResult<CloseProgress> {
+                Ok(CloseProgress::Ready)
+            }
+        }
+        impl HostResourceType for Counter {
+            const KEY: &'static str = "demo.counter";
+            const DESCRIPTION: &'static str = "An external counter resource";
+        }
+        HostResourceTypeMeta::of::<Counter>()
+    }
+
+    let mut first = read_counter_descriptor();
+    first.resource_types = vec![counter_meta()];
+    let mut second = stack_descriptor(
+        HostFunctionSchema::with_return(
+            "demo::peek_counter",
+            vec![HostParamSchema::with_passing(
+                "counter",
+                HostTypeSchema::Resource(counter_key()),
+                HostParamPassing::Borrow,
+            )],
+            HostTypeSchema::Int,
+        ),
+        vec![vm::host_api::HostEffect::GuestResource(
+            vm::host_api::ResourceEffect::borrow(counter_key()),
+        )],
+    );
+    second.resource_types = vec![counter_meta()];
+    let catalog = HostFunctionDescriptor::collect_catalog(&[first, second])
+        .expect("identical resource declarations must dedupe");
+    assert!(catalog.has_resource(&counter_key()));
+    assert_eq!(
+        catalog
+            .resources()
+            .iter()
+            .filter(|resource| resource.key == counter_key())
+            .count(),
+        1
+    );
+    assert_eq!(
+        catalog
+            .resources()
+            .iter()
+            .find(|resource| resource.key == counter_key())
+            .map(|resource| resource.description.as_str()),
+        Some("An external counter resource")
+    );
+}
+
+#[test]
+fn resource_description_conflict_is_rejected() {
+    use vm::host_extension::{HostFunctionDescriptor, HostResourceType, HostResourceTypeMeta};
+    use vm::resource::{CloseProgress, HostResource, ResourceCloseReason};
+
+    struct Counter;
+    impl HostResource for Counter {
+        fn begin_close(
+            &mut self,
+            _reason: ResourceCloseReason,
+        ) -> vm::resource::ResourceResult<CloseProgress> {
+            Ok(CloseProgress::Ready)
+        }
+    }
+    impl HostResourceType for Counter {
+        const KEY: &'static str = "demo.counter";
+        const DESCRIPTION: &'static str = "counter A";
+    }
+
+    let mut first = read_counter_descriptor();
+    first.resource_types = vec![HostResourceTypeMeta::of::<Counter>()];
+    let mut second = add_descriptor();
+    second.resource_types = vec![HostResourceTypeMeta {
+        schema: ResourceTypeSchema::new(counter_key(), "counter B"),
+        type_id: std::any::TypeId::of::<Counter>(),
+        type_name: std::any::type_name::<Counter>(),
+    }];
+    let error = HostFunctionDescriptor::collect_catalog(&[first, second])
+        .expect_err("same type with a different description must fail");
+    assert!(
+        error.to_string().contains("demo.counter"),
+        "description conflict should name the key, got {error}"
+    );
+}
+
+fn expected_effects_from_schema(schema: &HostFunctionSchema) -> Vec<vm::host_api::ResourceEffect> {
+    use vm::host_api::ResourceEffect;
+    let mut expected = Vec::new();
+    for param in &schema.params {
+        if let HostTypeSchema::Resource(key) = &param.ty {
+            expected.push(match param.passing {
+                HostParamPassing::Borrow => ResourceEffect::borrow(key.clone()),
+                HostParamPassing::BorrowMut => ResourceEffect::borrow_mut(key.clone()),
+                HostParamPassing::TakeOwned => ResourceEffect::take_owned(key.clone()),
+                HostParamPassing::Value => continue,
+            });
+        }
+    }
+    if let HostTypeSchema::Resource(key) = &schema.return_type {
+        expected.push(ResourceEffect::create(key.clone()));
+    }
+    expected
+}
+
+#[test]
+fn collect_catalog_rejects_missing_guest_resource_effect() {
+    use vm::host_extension::HostFunctionDescriptor;
+
+    let descriptor = stack_descriptor(
+        HostFunctionSchema::with_return(
+            "demo::read_counter",
+            vec![HostParamSchema::with_passing(
+                "counter",
+                HostTypeSchema::Resource(counter_key()),
+                HostParamPassing::Borrow,
+            )],
+            HostTypeSchema::Int,
+        ),
+        vec![],
+    );
+    let error = HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&descriptor))
+        .expect_err("missing guest-resource effect must fail");
+    assert!(
+        error.to_string().contains("demo::read_counter"),
+        "missing-effect diagnostic should name the function, got {error}"
+    );
+}
+
+#[test]
+fn collect_catalog_rejects_extra_duplicate_wrong_key_and_wrong_mode_effects() {
+    use vm::host_api::{HostEffect, ResourceEffect};
+    use vm::host_extension::HostFunctionDescriptor;
+
+    let schema = HostFunctionSchema::with_return(
+        "demo::read_counter",
+        vec![HostParamSchema::with_passing(
+            "counter",
+            HostTypeSchema::Resource(counter_key()),
+            HostParamPassing::Borrow,
+        )],
+        HostTypeSchema::Int,
+    );
+    let extra = stack_descriptor(
+        schema.clone(),
+        vec![
+            HostEffect::GuestResource(ResourceEffect::borrow(counter_key())),
+            HostEffect::GuestResource(ResourceEffect::borrow(
+                ResourceTypeKey::new("demo.widget").expect("key"),
+            )),
+        ],
+    );
+    let extra_error = HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&extra))
+        .expect_err("extra guest-resource effect must fail");
+    assert!(extra_error.to_string().contains("demo::read_counter"));
+
+    let duplicate = stack_descriptor(
+        schema.clone(),
+        vec![
+            HostEffect::GuestResource(ResourceEffect::borrow(counter_key())),
+            HostEffect::GuestResource(ResourceEffect::borrow(counter_key())),
+        ],
+    );
+    let duplicate_error = HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&duplicate))
+        .expect_err("duplicate guest-resource effect must fail");
+    assert!(duplicate_error.to_string().contains("demo::read_counter"));
+
+    let wrong_key = stack_descriptor(
+        schema.clone(),
+        vec![HostEffect::GuestResource(ResourceEffect::borrow(
+            ResourceTypeKey::new("demo.widget").expect("key"),
+        ))],
+    );
+    let wrong_key_error = HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&wrong_key))
+        .expect_err("wrong-key guest-resource effect must fail");
+    assert!(wrong_key_error.to_string().contains("demo::read_counter"));
+
+    let wrong_mode = stack_descriptor(
+        schema,
+        vec![HostEffect::GuestResource(ResourceEffect::borrow_mut(
+            counter_key(),
+        ))],
+    );
+    let wrong_mode_error =
+        HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&wrong_mode))
+            .expect_err("wrong-mode guest-resource effect must fail");
+    assert!(wrong_mode_error.to_string().contains("demo::read_counter"));
+}
+
+#[test]
+fn collect_catalog_rejects_create_and_return_mismatches() {
+    use vm::host_api::{HostEffect, ResourceEffect};
+    use vm::host_extension::HostFunctionDescriptor;
+
+    let create_on_param = stack_descriptor(
+        HostFunctionSchema::with_return(
+            "demo::read_counter",
+            vec![HostParamSchema::with_passing(
+                "counter",
+                HostTypeSchema::Resource(counter_key()),
+                HostParamPassing::Borrow,
+            )],
+            HostTypeSchema::Int,
+        ),
+        vec![HostEffect::GuestResource(ResourceEffect::create(
+            counter_key(),
+        ))],
+    );
+    HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&create_on_param))
+        .expect_err("create effect on a parameter must fail");
+
+    let missing_create = stack_descriptor(
+        HostFunctionSchema::with_return(
+            "demo::make_counter",
+            vec![HostParamSchema::value("seed", HostTypeSchema::Int)],
+            HostTypeSchema::Resource(counter_key()),
+        ),
+        vec![],
+    );
+    HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&missing_create))
+        .expect_err("resource return without create effect must fail");
+
+    let wrong_create_key = stack_descriptor(
+        HostFunctionSchema::with_return(
+            "demo::make_counter",
+            vec![HostParamSchema::value("seed", HostTypeSchema::Int)],
+            HostTypeSchema::Resource(counter_key()),
+        ),
+        vec![HostEffect::GuestResource(ResourceEffect::create(
+            ResourceTypeKey::new("demo.widget").expect("key"),
+        ))],
+    );
+    HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&wrong_create_key))
+        .expect_err("create effect with the wrong key must fail");
+}
+
+#[test]
+fn inferred_borrow_mut_take_and_create_effects_match_schema() {
+    use vm::host_api::{HostEffect, ResourceEffect};
+    use vm::host_extension::HostFunctionDescriptor;
+
+    let borrow = read_counter_descriptor();
+    assert_eq!(
+        expected_effects_from_schema(&borrow.schema),
+        vec![ResourceEffect::borrow(counter_key())]
+    );
+    HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&borrow))
+        .expect("inferred borrow effect should match schema");
+
+    let borrow_mut = stack_descriptor(
+        HostFunctionSchema::with_return(
+            "demo::bump_counter",
+            vec![HostParamSchema::with_passing(
+                "counter",
+                HostTypeSchema::Resource(counter_key()),
+                HostParamPassing::BorrowMut,
+            )],
+            HostTypeSchema::Int,
+        ),
+        vec![HostEffect::GuestResource(ResourceEffect::borrow_mut(
+            counter_key(),
+        ))],
+    );
+    HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&borrow_mut))
+        .expect("inferred borrow_mut effect should match schema");
+
+    let take = stack_descriptor(
+        HostFunctionSchema::with_return(
+            "demo::take_counter",
+            vec![HostParamSchema::with_passing(
+                "counter",
+                HostTypeSchema::Resource(counter_key()),
+                HostParamPassing::TakeOwned,
+            )],
+            HostTypeSchema::Int,
+        ),
+        vec![HostEffect::GuestResource(ResourceEffect::take_owned(
+            counter_key(),
+        ))],
+    );
+    HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&take))
+        .expect("inferred take effect should match schema");
+
+    let create = stack_descriptor(
+        HostFunctionSchema::with_return(
+            "demo::make_counter",
+            vec![HostParamSchema::value("seed", HostTypeSchema::Int)],
+            HostTypeSchema::Resource(counter_key()),
+        ),
+        vec![HostEffect::GuestResource(ResourceEffect::create(
+            counter_key(),
+        ))],
+    );
+    HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&create))
+        .expect("inferred create effect should match schema");
+}
+
+#[test]
+fn host_module_preserves_declaration_order_and_module_resource_metadata() {
+    use vm::host_extension::{HostModuleDescriptor, HostResourceType, HostResourceTypeMeta};
+    use vm::resource::{CloseProgress, HostResource, ResourceCloseReason};
+
+    struct Counter;
+    impl HostResource for Counter {
+        fn begin_close(
+            &mut self,
+            _reason: ResourceCloseReason,
+        ) -> vm::resource::ResourceResult<CloseProgress> {
+            Ok(CloseProgress::Ready)
+        }
+    }
+    impl HostResourceType for Counter {
+        const KEY: &'static str = "demo.counter";
+        const DESCRIPTION: &'static str = "module counter";
+    }
+    fn counter_resource() -> HostResourceTypeMeta {
+        HostResourceTypeMeta::of::<Counter>()
+    }
+
+    let module = HostModuleDescriptor {
+        name: "demo",
+        functions: &[add_descriptor, read_counter_descriptor],
+        resources: &[counter_resource],
+    };
+    let descriptors = module.descriptors();
+    assert!(
+        descriptors[0].resource_types.is_empty(),
+        "module resources must not be stuffed onto the first function descriptor"
+    );
+    let catalog = module.catalog().expect("module catalog");
+    assert_eq!(
+        catalog
+            .functions()
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["demo::add", "demo::read_counter"]
+    );
+    let resource = catalog
+        .resources()
+        .iter()
+        .find(|resource| resource.key == counter_key())
+        .expect("module resource");
+    assert_eq!(resource.description, "module counter");
+}
+
+#[test]
+fn empty_function_module_reports_a_clear_install_error() {
+    use vm::HostFunctionRegistry;
+    use vm::host_extension::{HostModuleDescriptor, HostResourceType, HostResourceTypeMeta};
+    use vm::resource::{CloseProgress, HostResource, ResourceCloseReason};
+
+    struct Counter;
+    impl HostResource for Counter {
+        fn begin_close(
+            &mut self,
+            _reason: ResourceCloseReason,
+        ) -> vm::resource::ResourceResult<CloseProgress> {
+            Ok(CloseProgress::Ready)
+        }
+    }
+    impl HostResourceType for Counter {
+        const KEY: &'static str = "demo.counter";
+        const DESCRIPTION: &'static str = "module counter";
+    }
+    fn counter_resource() -> HostResourceTypeMeta {
+        HostResourceTypeMeta::of::<Counter>()
+    }
+
+    let module = HostModuleDescriptor {
+        name: "demo",
+        functions: &[],
+        resources: &[counter_resource],
+    };
+    let catalog = module
+        .catalog()
+        .expect("resource-only catalog should still build");
+    assert!(catalog.has_resource(&counter_key()));
+    let mut registry = HostFunctionRegistry::empty();
+    let error = module
+        .install(&mut registry)
+        .expect_err("installing a module with no functions must fail closed");
+    assert!(
+        error.to_string().contains("demo") && error.to_string().contains("function"),
+        "empty-function diagnostic should name the module, got {error}"
+    );
+}
+
+#[test]
+fn non_yielding_binding_rejects_yield_unlike_ordinary_static_args() {
+    use vm::host_extension::{
+        HostAdapterDescriptor, HostBindingDescriptor, HostBindingKind, HostFunctionDescriptor,
+        HostModuleDescriptor,
+    };
+    use vm::{HostFunctionRegistry, HostImport, Program, Value, Vm, VmError, VmStatus};
+
+    let schema = HostFunctionSchema::with_return("demo::tick", vec![], HostTypeSchema::Int);
+    let non_yielding = HostFunctionDescriptor {
+        schema: schema.clone(),
+        binding: HostBindingDescriptor {
+            kind: HostBindingKind::StaticNonYieldingArgs,
+        },
+        effects: vec![],
+        adapter: HostAdapterDescriptor::StaticNonYieldingArgs(yield_args),
+        resource_types: vec![],
+    };
+    let mut registry = HostFunctionRegistry::empty();
+    HostModuleDescriptor::install_descriptors(&mut registry, std::slice::from_ref(&non_yielding))
+        .expect("non-yielding descriptor should install");
+
+    let import = catalog_import_schemas(
+        &HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&non_yielding))
+            .expect("catalog"),
+        "demo::tick",
+    )
+    .into_iter()
+    .next()
+    .expect("schema");
+    let mut bytecode = vm::BytecodeBuilder::new();
+    bytecode.call(0, 0);
+    bytecode.ret();
+    let program = Program::with_imports_and_debug(
+        Vec::new(),
+        bytecode.finish(),
+        vec![HostImport {
+            name: "demo::tick".to_string(),
+            arity: 0,
+            return_type: vm::ValueType::Int,
+        }],
+        None,
+    )
+    .with_host_import_schemas(vec![import])
+    .expect("schema metadata");
+    let mut vm = Vm::new(program);
+    registry.bind_vm_cached(&mut vm).expect("bind");
+    let error = match vm.run() {
+        Err(error) => error,
+        Ok(status) => panic!("non-yielding yield must be a host error, got {status:?}"),
+    };
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("yield")
+            || matches!(error, VmError::HostError(_)),
+        "non-yielding adapter must reject Yield, got {error}"
+    );
+
+    let ordinary = HostFunctionDescriptor {
+        schema,
+        binding: HostBindingDescriptor {
+            kind: HostBindingKind::StaticArgs,
+        },
+        effects: vec![],
+        adapter: HostAdapterDescriptor::StaticArgs(yield_args),
+        resource_types: vec![],
+    };
+    let mut args_registry = HostFunctionRegistry::empty();
+    HostModuleDescriptor::install_descriptors(&mut args_registry, std::slice::from_ref(&ordinary))
+        .expect("ordinary StaticArgs descriptor should install");
+    let import = catalog_import_schemas(
+        &HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&ordinary)).expect("catalog"),
+        "demo::tick",
+    )
+    .into_iter()
+    .next()
+    .expect("schema");
+    let mut bytecode = vm::BytecodeBuilder::new();
+    bytecode.call(0, 0);
+    bytecode.ret();
+    let program = Program::with_imports_and_debug(
+        Vec::new(),
+        bytecode.finish(),
+        vec![HostImport {
+            name: "demo::tick".to_string(),
+            arity: 0,
+            return_type: vm::ValueType::Int,
+        }],
+        None,
+    )
+    .with_host_import_schemas(vec![import])
+    .expect("schema metadata");
+    let mut vm = Vm::new(program);
+    args_registry.bind_vm_cached(&mut vm).expect("bind");
+    assert_eq!(
+        vm.run().expect("ordinary StaticArgs may yield"),
+        VmStatus::Yielded
+    );
+    let _ = Value::Null;
+}
+
+#[test]
+fn invalid_resource_type_key_is_fallible() {
+    use vm::host_extension::{HostResourceType, HostResourceTypeMeta};
+    use vm::resource::{CloseProgress, HostResource, ResourceCloseReason};
+
+    struct Bad;
+    impl HostResource for Bad {
+        fn begin_close(
+            &mut self,
+            _reason: ResourceCloseReason,
+        ) -> vm::resource::ResourceResult<CloseProgress> {
+            Ok(CloseProgress::Ready)
+        }
+    }
+    impl HostResourceType for Bad {
+        const KEY: &'static str = "!!!";
+        const DESCRIPTION: &'static str = "bad";
+    }
+    let error = HostResourceTypeMeta::try_of::<Bad>().expect_err("invalid key must fail closed");
+    assert!(
+        error.to_string().contains("!!!") || error.to_string().contains("invalid"),
+        "fallible metadata should name the invalid key, got {error}"
+    );
 }

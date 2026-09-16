@@ -1474,6 +1474,11 @@ impl HostFunctionRegistry {
         F: FnOnce(&mut Self) -> VmResult<R>,
     {
         let mut staged = self.clone();
+        // Clone shares the generation AtomicU64. Staging must not bump the live
+        // counter if this call later rolls back.
+        staged.registry_generation = Arc::new(AtomicU64::new(
+            self.registry_generation.load(Ordering::Relaxed),
+        ));
         let result = register(&mut staged)?;
         *self = staged;
         Ok(result)
