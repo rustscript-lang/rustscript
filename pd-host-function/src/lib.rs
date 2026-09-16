@@ -1,12 +1,13 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    Error, FnArg, ItemFn, LitStr, Meta, Pat, PatIdent, ReturnType, Token, Type, parse_macro_input,
-    punctuated::Punctuated,
+    Error, FnArg, GenericArgument, ItemFn, LitStr, Meta, Pat, PatIdent, PathArguments, ReturnType,
+    Token, Type, parse_macro_input, punctuated::Punctuated,
 };
 
 use pd_host_schema::{
-    ResourceMode, ResourceReturnKind, ResourceSpec, borrowed_resource_return, resource_spec,
+    ResourceMode, ResourceReturnKind, ResourceSpec, borrowed_resource_return, resource_return_kind,
+    resource_spec,
 };
 
 #[proc_macro_attribute]
@@ -22,7 +23,7 @@ fn expand_pd_host_function(
     attr: Punctuated<Meta, Token![,]>,
     mut item: ItemFn,
 ) -> Result<proc_macro2::TokenStream, Error> {
-    parse_name_arg(&attr)?;
+    let guest_name = parse_name_arg(&attr)?;
     let is_async = item.sig.asyncness.is_some();
     let docs = doc_string(&item.attrs);
     let mut resource_params = Vec::<(String, ResourceSpec)>::new();
@@ -107,9 +108,21 @@ fn expand_pd_host_function(
             });
         }
     }
+    let descriptor = if is_async {
+        quote!()
+    } else {
+        generate_host_function_descriptor(
+            &item,
+            &wrapper_name,
+            &guest_name,
+            &docs,
+            &resource_params,
+        )?
+    };
     Ok(quote! {
         #item
         #wrapper
+        #descriptor
     })
 }
 
@@ -778,6 +791,271 @@ fn type_label(ty: &Type) -> Result<String, Error> {
     pd_host_schema::type_label(ty).map_err(|message| Error::new_spanned(ty, message))
 }
 
+fn generate_host_function_descriptor(
+    item: &ItemFn,
+    wrapper_name: &syn::Ident,
+    guest_name: &LitStr,
+    docs: &str,
+    resource_params: &[(String, ResourceSpec)],
+) -> Result<proc_macro2::TokenStream, Error> {
+    let descriptor_name =
+        syn::Ident::new(&format!("{wrapper_name}_descriptor"), wrapper_name.span());
+    let adapter_name =
+        syn::Ident::new(&format!("{wrapper_name}_host_adapter"), wrapper_name.span());
+    let needs_vm = item.sig.inputs.iter().any(is_vm_context_param) || !resource_params.is_empty();
+
+    let mut param_tokens = Vec::new();
+    let mut effect_tokens = Vec::new();
+    let mut resource_meta_tokens = Vec::new();
+    for input in &item.sig.inputs {
+        let FnArg::Typed(pat_type) = input else {
+            continue;
+        };
+        if is_host_context_param(input) || is_vm_context_param(input) {
+            continue;
+        }
+        let Pat::Ident(PatIdent { ident, .. }) = pat_type.pat.as_ref() else {
+            continue;
+        };
+        let param_name = ident.to_string();
+        if let Some((_, spec)) = resource_params.iter().find(|(name, _)| name == &param_name) {
+            let key_expr = resource_key_tokens(spec);
+            let passing = match spec.mode {
+                ResourceMode::Borrow => quote!(crate::host_api::HostParamPassing::Borrow),
+                ResourceMode::BorrowMut => quote!(crate::host_api::HostParamPassing::BorrowMut),
+                ResourceMode::TakeOwned => quote!(crate::host_api::HostParamPassing::TakeOwned),
+                ResourceMode::Value => quote!(crate::host_api::HostParamPassing::Value),
+            };
+            param_tokens.push(quote! {
+                crate::host_api::HostParamSchema::with_passing(
+                    #param_name,
+                    crate::host_api::HostTypeSchema::Resource(#key_expr),
+                    #passing,
+                )
+            });
+            if let Some(effect) = resource_effect_tokens(spec.mode, &key_expr) {
+                effect_tokens.push(effect);
+            }
+            let inner = &spec.inner;
+            resource_meta_tokens.push(quote! {
+                crate::vm::host_extension::HostResourceTypeMeta {
+                    schema: crate::host_api::ResourceTypeSchema::new(#key_expr, ""),
+                    type_id: ::std::any::TypeId::of::<#inner>(),
+                    type_name: ::std::any::type_name::<#inner>(),
+                }
+            });
+        } else {
+            let schema = host_type_schema_tokens(&pat_type.ty)?;
+            param_tokens.push(quote! {
+                crate::host_api::HostParamSchema::value(#param_name, #schema)
+            });
+        }
+    }
+
+    let (return_schema, return_effect, return_meta) = return_schema_tokens(&item.sig.output)?;
+    if let Some(effect) = return_effect {
+        effect_tokens.push(effect);
+    }
+    if let Some(meta) = return_meta {
+        resource_meta_tokens.push(meta);
+    }
+
+    let (binding_kind, adapter, adapter_fn) = if needs_vm {
+        (
+            quote!(crate::vm::host_extension::HostBindingKind::StaticStack),
+            quote!(crate::vm::host_extension::HostAdapterDescriptor::StaticStack(#adapter_name)),
+            quote! {
+                #[allow(dead_code)]
+                fn #adapter_name(
+                    vm: &mut crate::vm::Vm,
+                    args: &[crate::vm::Value],
+                ) -> crate::vm::VmResult<crate::vm::CallOutcome> {
+                    crate::vm::host_extension::host_descriptor_call_outcome(
+                        #wrapper_name(vm, args),
+                    )
+                }
+            },
+        )
+    } else {
+        (
+            quote!(crate::vm::host_extension::HostBindingKind::StaticArgs),
+            quote!(crate::vm::host_extension::HostAdapterDescriptor::StaticArgs(#adapter_name)),
+            quote! {
+                #[allow(dead_code)]
+                fn #adapter_name(
+                    args: &[crate::vm::Value],
+                ) -> crate::vm::VmResult<crate::vm::CallOutcome> {
+                    crate::vm::host_extension::host_descriptor_call_outcome(#wrapper_name(args))
+                }
+            },
+        )
+    };
+
+    Ok(quote! {
+        #adapter_fn
+
+        #[allow(dead_code)]
+        pub fn #descriptor_name() -> crate::vm::host_extension::HostFunctionDescriptor {
+            crate::vm::host_extension::HostFunctionDescriptor {
+                schema: crate::host_api::HostFunctionSchema::with_return(
+                    #guest_name,
+                    vec![#(#param_tokens),*],
+                    #return_schema,
+                )
+                .with_description(#docs),
+                binding: crate::vm::host_extension::HostBindingDescriptor {
+                    kind: #binding_kind,
+                },
+                effects: vec![#(#effect_tokens),*],
+                adapter: #adapter,
+                resource_types: vec![#(#resource_meta_tokens),*],
+            }
+        }
+    })
+}
+
+fn resource_key_tokens(spec: &ResourceSpec) -> proc_macro2::TokenStream {
+    if let Some(key) = &spec.key {
+        quote! {
+            crate::host_api::ResourceTypeKey::new(#key).expect("validated resource type key")
+        }
+    } else {
+        let inner = &spec.inner;
+        quote! {
+            <#inner as crate::resource::HostResource>::resource_type_key()
+                .expect("resource type key required to build a host function descriptor")
+        }
+    }
+}
+
+fn resource_effect_tokens(
+    mode: ResourceMode,
+    key_expr: &proc_macro2::TokenStream,
+) -> Option<proc_macro2::TokenStream> {
+    let ctor = match mode {
+        ResourceMode::Borrow => quote!(borrow),
+        ResourceMode::BorrowMut => quote!(borrow_mut),
+        ResourceMode::TakeOwned => quote!(take_owned),
+        ResourceMode::Value => return None,
+    };
+    Some(quote! {
+        crate::host_api::HostEffect::GuestResource(crate::host_api::ResourceEffect::#ctor(#key_expr))
+    })
+}
+
+fn return_schema_tokens(
+    output: &ReturnType,
+) -> Result<
+    (
+        proc_macro2::TokenStream,
+        Option<proc_macro2::TokenStream>,
+        Option<proc_macro2::TokenStream>,
+    ),
+    Error,
+> {
+    let ReturnType::Type(_, ty) = output else {
+        return Ok((quote!(crate::host_api::HostTypeSchema::Null), None, None));
+    };
+    let surface = unwrap_transparent_return(ty);
+    if resource_return_kind(surface) == Some(ResourceReturnKind::Owned) {
+        let inner = last_generic_type(surface).ok_or_else(|| {
+            Error::new_spanned(surface, "Resource return must have a type argument")
+        })?;
+        let key_expr = quote! {
+            <#inner as crate::resource::HostResource>::resource_type_key()
+                .expect("resource type key required to build a host function descriptor")
+        };
+        return Ok((
+            quote!(crate::host_api::HostTypeSchema::Resource(#key_expr)),
+            Some(quote! {
+                crate::host_api::HostEffect::GuestResource(
+                    crate::host_api::ResourceEffect::create(#key_expr)
+                )
+            }),
+            Some(quote! {
+                crate::vm::host_extension::HostResourceTypeMeta {
+                    schema: crate::host_api::ResourceTypeSchema::new(#key_expr, ""),
+                    type_id: ::std::any::TypeId::of::<#inner>(),
+                    type_name: ::std::any::type_name::<#inner>(),
+                }
+            }),
+        ));
+    }
+    Ok((host_type_schema_tokens(ty)?, None, None))
+}
+
+fn unwrap_transparent_return(ty: &Type) -> &Type {
+    match ty {
+        Type::Group(group) => unwrap_transparent_return(&group.elem),
+        Type::Paren(paren) => unwrap_transparent_return(&paren.elem),
+        Type::Path(path) => {
+            let Some(segment) = path.path.segments.last() else {
+                return ty;
+            };
+            match segment.ident.to_string().as_str() {
+                "VmResult" | "HostCallResult" | "HostFutureOutput" => first_type_arg(segment)
+                    .map(unwrap_transparent_return)
+                    .unwrap_or(ty),
+                _ => ty,
+            }
+        }
+        _ => ty,
+    }
+}
+
+fn first_type_arg(segment: &syn::PathSegment) -> Option<&Type> {
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    args.args.iter().find_map(|argument| match argument {
+        GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    })
+}
+
+fn last_generic_type(ty: &Type) -> Option<&Type> {
+    let Type::Path(path) = ty else {
+        return None;
+    };
+    let segment = path.path.segments.last()?;
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    args.args.iter().rev().find_map(|argument| match argument {
+        GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    })
+}
+
+fn host_type_schema_tokens(ty: &Type) -> Result<proc_macro2::TokenStream, Error> {
+    let label = type_label(ty)?;
+    host_type_schema_from_label(&label, ty)
+}
+
+fn host_type_schema_from_label(label: &str, _ty: &Type) -> Result<proc_macro2::TokenStream, Error> {
+    if let Some(inner) = label.strip_suffix(" | null") {
+        let inner_tokens = host_type_schema_from_label(inner, _ty)?;
+        return Ok(quote!(crate::host_api::HostTypeSchema::Optional(Box::new(#inner_tokens))));
+    }
+    Ok(match label {
+        "int" => quote!(crate::host_api::HostTypeSchema::Int),
+        "float" => quote!(crate::host_api::HostTypeSchema::Float),
+        "bool" => quote!(crate::host_api::HostTypeSchema::Bool),
+        "string" => quote!(crate::host_api::HostTypeSchema::String),
+        "bytes" => quote!(crate::host_api::HostTypeSchema::Bytes),
+        "number" => quote!(crate::host_api::HostTypeSchema::Number),
+        "null" => quote!(crate::host_api::HostTypeSchema::Null),
+        "any" | "unknown" => quote!(crate::host_api::HostTypeSchema::Unknown),
+        "array" => quote!(crate::host_api::HostTypeSchema::Array(Box::new(
+            crate::host_api::HostTypeSchema::Unknown
+        ))),
+        "map" => quote!(crate::host_api::HostTypeSchema::Map(Box::new(
+            crate::host_api::HostTypeSchema::Unknown
+        ))),
+        _ => quote!(crate::host_api::HostTypeSchema::Unknown),
+    })
+}
+
 fn is_vm_context_type(ty: &Type) -> bool {
     match ty {
         Type::Group(group) => is_vm_context_type(&group.elem),
@@ -980,6 +1258,27 @@ mod tests {
         assert!(expanded.contains("vm : & mut super :: super :: Vm"));
         assert!(expanded.contains("borrow_resource"));
         assert!(expanded.contains("ResourceHandle :: from_raw"));
+    }
+
+    #[test]
+    fn resource_function_generates_host_function_descriptor() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::peek_counter");
+        let item: ItemFn = parse_quote! {
+            /// Peeks a counter resource by immutable borrow.
+            fn peek_counter(
+                #[pd_host_resource(passing = "borrow", key = "demo.counter")]
+                counter: ResourceRef<'_, Counter>,
+            ) -> VmResult<i64> {
+                todo!()
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item).unwrap().to_string();
+        assert!(expanded.contains("HostFunctionDescriptor"));
+        assert!(expanded.contains("peek_counter_descriptor"));
+        assert!(expanded.contains("ResourceEffect"));
+        assert!(expanded.contains("GuestResource"));
+        assert!(expanded.contains("HostBindingKind :: StaticStack"));
+        assert!(expanded.contains("demo.counter"));
     }
 
     #[test]
