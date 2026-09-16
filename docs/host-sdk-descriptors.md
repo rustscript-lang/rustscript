@@ -161,10 +161,9 @@ catalog entry:
 #[pd_host_function(
     name = "io::open",
     contract = super::io_open_contract,  // declared next to the function
-    runtime_owned_pending                // pending op owned by the runtime registries
 )]
 pub(super) fn builtin_io_open(vm: &mut Vm, path: &str, mode: &str) -> VmResult<HostCallResult<i64>> {
-    /* unchanged runtime path; the raw `i64` is the scope token */
+    /* unchanged runtime path; the returned id is a driver-scheduled pending op */
 }
 
 fn io_open_contract() -> vm::HostFunctionSchema {
@@ -177,6 +176,25 @@ fn io_open_contract() -> vm::HostFunctionSchema {
         vm::HostTypeSchema::Resource(io_file_key()), // typed `io.file` resource
     )
 }
+```
+
+The raw-handle functions of a module that schedules its own operation driver
+declare the contract alone. `runtime_owned_pending` is a separate opt-in for the
+adapter class whose pending operation is owned by the generic VM
+operation/stream registries instead of a registered driver — the standard
+example is the HTTP request and the SQLite statement family:
+
+```rust
+/// Streams one HTTP request, resolved by the runtime registries.
+#[pd_host_function(
+    name = "http::client::request",
+    contract = http_request_contract,
+    runtime_owned_pending
+)]
+pub(super) fn builtin_http_client_request(
+    vm: &mut Vm,
+    request: VmMapHandle,
+) -> VmResult<HostCallResult<VmMap>> { /* ... */ }
 ```
 
 What the contract does and does not change:
@@ -194,10 +212,10 @@ What the contract does and does not change:
   source. Deriving the contract's key from that declaration (as above) keeps the
   two from drifting.
 
-`runtime_owned_pending` selects the stack dispatch class whose pending operation
-is resolved by the generic VM operation/stream registries rather than by a
-registered operation driver. It requires a stack-shaped signature and is only
-valid alongside a declared contract.
+`runtime_owned_pending` requires a stack-shaped signature and is only valid
+alongside a declared contract. `io::*` (and `sqlite::open`) do **not** use it:
+they schedule a concrete operation driver in the execution scope and declare
+only `contract`.
 
 ## 4. Installing a module
 
@@ -268,8 +286,11 @@ let mut modules: Vec<StandardHostModule> = vec![ /* always-present modules */ ];
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
 modules.push(super::http::http_host_module());
 modules.push(super::io::io_host_module());
-#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
-modules.push(super::sqlite::sqlite_host_module());
+// The SQLite catalog surface is composed in every build; the `sqlite` feature
+// only selects whether its adapters are the real host functions or the
+// fail-closed stubs, so there is no gate here.
+modules.push(super::sqlite_schema::sqlite_standard_host_module());
+modules.push(super::timer::timer_host_module());
 modules.sort_by_key(|module| module.name);
 ```
 
@@ -282,8 +303,11 @@ Each module declares two things:
 
 `tests/standard_host_descriptor_arch_tests.rs` proves that the two agree: every
 standard `#[pd_host_function]` has exactly one descriptor owner, every ownership
-list belongs to a composed module, a gated module never leaks into the derived
-catalog, and the published catalog fingerprints are byte-for-byte unchanged.
+list is declared by a file that belongs to a module `standard_host_modules()`
+composes (a module this build's gates turn off is the only exemption, and it is
+stated in the guard), no gated module leaks into the derived catalog, and the
+published catalog fingerprints are byte-for-byte unchanged for the composed
+module set.
 
 ## 7. Compatibility window
 
