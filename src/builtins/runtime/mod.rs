@@ -21,10 +21,7 @@ mod host;
 pub(crate) mod host_modules;
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
 pub(crate) mod http;
-#[cfg(not(target_arch = "wasm32"))]
 mod io;
-#[cfg(target_arch = "wasm32")]
-mod io_wasm;
 mod jit;
 mod json;
 mod map_iter;
@@ -107,9 +104,6 @@ pub fn standard_host_modules() -> &'static [StandardHostModule] {
 pub fn standard_catalog_modules() -> Vec<crate::host_extension::HostModuleDescriptor> {
     host_modules::standard_catalog_modules()
 }
-
-#[cfg(target_arch = "wasm32")]
-use io_wasm as io;
 
 #[allow(unused_imports)]
 pub(crate) use context::{RuntimeContext, RuntimeContextConfig, STREAM_EMIT_NAME};

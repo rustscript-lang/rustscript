@@ -64,8 +64,8 @@ struct IoResource {
 }
 
 impl crate::host_extension::HostResourceType for IoResource {
-    const KEY: &'static str = "io.file";
-    const DESCRIPTION: &'static str = "An open file handle";
+    const KEY: &'static str = super::IO_FILE_KEY;
+    const DESCRIPTION: &'static str = super::IO_FILE_DESCRIPTION;
 }
 
 /// The canonical declaration for the `io.file` resource type.

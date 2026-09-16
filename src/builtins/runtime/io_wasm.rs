@@ -1,18 +1,26 @@
+//! The wasm32 IO backend of the standard `io` host module.
+//!
+//! The module itself (guest contracts, catalog surface, descriptor ownership
+//! list, and `io.file` resource metadata) is owned by `io/mod.rs`; this backend
+//! only supplies the adapter implementations for a target without a file
+//! system. Every entry point fails closed with a host error, so the guest
+//! surface and the compiled contracts stay identical to the native backends.
+
 use pd_host_function::pd_host_function;
 
-use super::HostCallResult;
+use super::{HostCallResult, IO_FILE_DESCRIPTION, IO_FILE_KEY};
 use crate::vm::{Vm, VmError, VmResult};
 
 /// The wasm32 IO backend keeps no scope resource, but the guest-visible
 /// `io.file` resource type is part of the standard catalog on every target, so
-/// the declaration lives here for this build.
+/// this build binds the canonical declaration to a marker handle type.
 pub(crate) struct WasmIoFileHandle;
 
 impl crate::vm::resource::HostResource for WasmIoFileHandle {}
 
 impl crate::host_extension::HostResourceType for WasmIoFileHandle {
-    const KEY: &'static str = "io.file";
-    const DESCRIPTION: &'static str = "An open file handle";
+    const KEY: &'static str = IO_FILE_KEY;
+    const DESCRIPTION: &'static str = IO_FILE_DESCRIPTION;
 }
 
 /// The canonical declaration for the `io.file` resource type.
