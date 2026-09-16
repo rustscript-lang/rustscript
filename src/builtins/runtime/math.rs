@@ -352,6 +352,62 @@ pub(super) fn builtin_math_mul_add_impl(
     left.as_f64().mul_add(right.as_f64(), addend.as_f64())
 }
 
+// ---- standard host module ownership ---------------------------------------
+
+/// The standard `math` host module: one descriptor owner per host
+/// function.
+pub(super) fn math_host_module() -> super::host_modules::StandardHostModule {
+    const OWNED: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+        builtin_math_pi_descriptor,
+        builtin_math_tau_descriptor,
+        builtin_math_e_descriptor,
+        builtin_math_epsilon_descriptor,
+        builtin_math_inf_descriptor,
+        builtin_math_neg_inf_descriptor,
+        builtin_math_nan_descriptor,
+        builtin_math_abs_descriptor,
+        builtin_math_sqrt_descriptor,
+        builtin_math_cbrt_descriptor,
+        builtin_math_exp_descriptor,
+        builtin_math_exp2_descriptor,
+        builtin_math_ln_descriptor,
+        builtin_math_ln_1p_descriptor,
+        builtin_math_log2_descriptor,
+        builtin_math_log10_descriptor,
+        builtin_math_sin_descriptor,
+        builtin_math_cos_descriptor,
+        builtin_math_tan_descriptor,
+        builtin_math_asin_descriptor,
+        builtin_math_acos_descriptor,
+        builtin_math_atan_descriptor,
+        builtin_math_sinh_descriptor,
+        builtin_math_cosh_descriptor,
+        builtin_math_tanh_descriptor,
+        builtin_math_floor_descriptor,
+        builtin_math_ceil_descriptor,
+        builtin_math_round_descriptor,
+        builtin_math_trunc_descriptor,
+        builtin_math_fract_descriptor,
+        builtin_math_signum_descriptor,
+        builtin_math_to_degrees_descriptor,
+        builtin_math_to_radians_descriptor,
+        builtin_math_is_nan_descriptor,
+        builtin_math_is_infinite_descriptor,
+        builtin_math_is_finite_descriptor,
+        builtin_math_atan2_descriptor,
+        builtin_math_powf_descriptor,
+        builtin_math_powi_descriptor,
+        builtin_math_hypot_descriptor,
+        builtin_math_log_descriptor,
+        builtin_math_min_descriptor,
+        builtin_math_max_descriptor,
+        builtin_math_copysign_descriptor,
+        builtin_math_clamp_descriptor,
+        builtin_math_mul_add_descriptor,
+    ];
+    super::host_modules::descriptor_only_module("math", OWNED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{builtin_math_clamp, builtin_math_is_nan, builtin_math_powi, builtin_math_sqrt};

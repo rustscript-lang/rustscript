@@ -129,6 +129,25 @@ fn nibble_to_hex(value: u8) -> char {
     }
 }
 
+// ---- standard host module ownership ---------------------------------------
+
+/// The standard `bytes` host module: one descriptor owner per host
+/// function.
+pub(super) fn bytes_host_module() -> super::host_modules::StandardHostModule {
+    const OWNED: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+        builtin_bytes_from_utf8_descriptor,
+        builtin_bytes_to_utf8_descriptor,
+        builtin_bytes_to_utf8_lossy_descriptor,
+        builtin_bytes_from_hex_descriptor,
+        builtin_bytes_to_hex_descriptor,
+        builtin_bytes_from_base64_descriptor,
+        builtin_bytes_to_base64_descriptor,
+        builtin_bytes_from_array_u8_descriptor,
+        builtin_bytes_to_array_u8_descriptor,
+    ];
+    super::host_modules::descriptor_only_module("bytes", OWNED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

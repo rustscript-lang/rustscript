@@ -7,11 +7,10 @@ use super::typed::{VmMap, VmMapHandle};
 use super::{borrow_arg, take_arg};
 use crate::HostCallResult;
 use crate::host_api::{
-    HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
-    HostStructField, HostStructSchema, HostTypeSchema, ResourceTypeSchema,
+    HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema, HostStructField,
+    HostStructSchema, HostTypeSchema,
 };
-use crate::vm::resource::HostResource;
-use crate::vm::{CallOutcome, CallReturn, HostFunctionRegistry, Value, Vm, VmError, VmResult};
+use crate::vm::{HostFunctionRegistry, Vm, VmError, VmResult};
 
 mod config;
 pub(super) mod policy;
@@ -21,6 +20,18 @@ pub(super) mod sse;
 pub use config::HttpConfig;
 use policy::{ConnectionAdmission, ConnectionPermit};
 pub use request::{HttpRequestResource, HttpResponseResource};
+
+impl crate::host_extension::HostResourceType for HttpRequestResource {
+    const KEY: &'static str = "http.request";
+    const DESCRIPTION: &'static str =
+        "An in-flight HTTP request under the configured network policy";
+}
+
+impl crate::host_extension::HostResourceType for HttpResponseResource {
+    const KEY: &'static str = "http.response";
+    const DESCRIPTION: &'static str = "An open HTTP response body stream";
+}
+
 pub(crate) use sse::SseStreamResource;
 
 const DEFAULT_MAX_HTTP_IN_FLIGHT: usize = 64;
@@ -168,90 +179,119 @@ impl HttpRequestContext {
 /// fingerprints embedded in compiled `HostImport`s match the schemas
 /// registered by [`HttpExtension`] byte-for-byte.
 pub fn http_host_catalog() -> Arc<HostApiCatalog> {
-    Arc::clone(HTTP_HOST_CATALOG.get_or_init(build_http_host_catalog))
+    Arc::clone(HTTP_HOST_CATALOG.get_or_init(|| {
+        super::host_modules::module_catalog(
+            "http",
+            HTTP_CATALOG_FUNCTIONS,
+            &[
+                http_request_resource,
+                http_response_resource,
+                sse_stream_resource,
+            ],
+            HTTP_NAMED_STRUCTS,
+        )
+    }))
 }
 
 static HTTP_HOST_CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
 
-fn build_http_host_catalog() -> Arc<HostApiCatalog> {
-    let request_key = HttpRequestResource::resource_type_key()
-        .expect("http.request resource type key must be valid");
-    let response_key = HttpResponseResource::resource_type_key()
-        .expect("http.response resource type key must be valid");
-    let sse_key =
-        SseStreamResource::resource_type_key().expect("http.sse resource type key must be valid");
-    let mut builder = HostApiBuilder::new();
-    builder.resource(ResourceTypeSchema::new(
-        request_key.clone(),
-        "An in-flight HTTP request under the configured network policy",
-    ));
-    builder.resource(ResourceTypeSchema::new(
-        response_key.clone(),
-        "An open HTTP response body stream",
-    ));
-    builder.resource(ResourceTypeSchema::new(
-        sse_key.clone(),
-        "An incremental SSE stream reader over an open response body stream",
-    ));
-
-    let http_request_header = http_request_header_struct();
-    let http_header_value = http_header_value_struct();
-    let http_response_header = http_response_header_struct(&http_header_value);
-    let http_request_body = http_request_body_struct();
-    let sse_event = sse_event_struct(&http_response_header);
-    let http_request = http_request_struct(&http_request_header, &http_request_body);
-    let http_response = http_response_struct(&http_response_header);
-    let sse_request = sse_request_struct(&http_request_header, &http_request_body);
-    let sse_callback_action = sse_callback_action_struct();
-    let sse_summary = sse_summary_struct(&http_response_header);
-    builder.named_struct(http_request_header.clone());
-    builder.named_struct(http_header_value.clone());
-    builder.named_struct(http_response_header.clone());
-    builder.named_struct(http_request_body.clone());
-    builder.named_struct(sse_event.clone());
-    builder.named_struct(http_request.clone());
-    builder.named_struct(sse_request.clone());
-    builder.named_struct(http_response.clone());
-    builder.named_struct(sse_callback_action.clone());
-    builder.named_struct(sse_summary.clone());
-
-    // Public headers, request bodies, and SSE events use named records and
-    // typed arrays. Runtime values remain map/array carriers for these named
-    // structs. The discriminator payload invariants are enforced by the HTTP
-    // runtime adapters before transport or callback execution.
-    builder.function(HostFunctionSchema::with_return(
+/// Guest contract for `http::client::request`.
+///
+/// The runtime drives a pending operation under the configured network policy;
+/// the guest contract is the typed `http.request` resource it opens and the
+/// typed `HttpResponse` it resolves to.
+fn http_request_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
         "http::client::request",
-        vec![HostParamSchema::value("request", http_request.as_type())],
-        http_response.as_type(),
-    ));
-    builder.function(HostFunctionSchema::with_return(
+        vec![HostParamSchema::value(
+            "request",
+            http_request_struct(&http_request_header_struct(), &http_request_body_struct())
+                .as_type(),
+        )],
+        http_response_struct(&http_response_header_struct(&http_header_value_struct())).as_type(),
+    )
+}
+
+/// Guest contract for `http::client::sse`.
+///
+/// The callback observes one typed `SseEvent` and returns a typed
+/// `SseCallbackAction`; the stream resolves to a typed `SseSummary`.
+fn http_sse_contract() -> HostFunctionSchema {
+    let response_header = http_response_header_struct(&http_header_value_struct());
+    let callback = HostTypeSchema::Callable {
+        params: vec![sse_event_struct(&response_header).as_type()],
+        result: Box::new(sse_callback_action_struct().as_type()),
+    };
+    HostFunctionSchema::with_return(
         "http::client::sse",
         vec![
-            HostParamSchema::value("request", sse_request.as_type()),
-            HostParamSchema::with_passing(
-                "on_event",
-                HostTypeSchema::Callable {
-                    params: vec![sse_event.as_type()],
-                    result: Box::new(sse_callback_action.as_type()),
-                },
-                HostParamPassing::Value,
+            HostParamSchema::value(
+                "request",
+                sse_request_struct(&http_request_header_struct(), &http_request_body_struct())
+                    .as_type(),
             ),
+            HostParamSchema::with_passing("on_event", callback, HostParamPassing::Value),
         ],
-        sse_summary.as_type(),
-    ));
+        sse_summary_struct(&response_header).as_type(),
+    )
+}
 
-    Arc::new(builder.build().expect("http catalog must build"))
+/// The HTTP named structs, in the published declaration order.
+///
+/// The bodies come from the descriptors; this list is the published order and
+/// documentation, so a descriptor-derived catalog renders identically.
+const HTTP_NAMED_STRUCTS: &[(&str, &str)] = &[
+    ("HttpRequestHeader", ""),
+    ("HttpHeaderValue", ""),
+    ("HttpResponseHeader", ""),
+    ("HttpRequestBody", ""),
+    ("SseEvent", ""),
+    ("HttpRequest", ""),
+    ("SseRequest", ""),
+    ("HttpResponse", ""),
+    ("SseCallbackAction", ""),
+    ("SseSummary", ""),
+];
+
+/// The HTTP host catalog surface: one descriptor per `http::client::*` member.
+const HTTP_CATALOG_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+    builtin_http_client_request_descriptor,
+    sse::builtin_http_client_sse_descriptor,
+];
+
+fn http_catalog_module() -> crate::host_extension::HostModuleDescriptor {
+    super::host_modules::catalog_module(
+        "http",
+        HTTP_CATALOG_FUNCTIONS,
+        &[
+            http_request_resource,
+            http_response_resource,
+            sse_stream_resource,
+        ],
+    )
+}
+
+/// The standard `http` host module.
+pub(super) fn http_host_module() -> super::host_modules::StandardHostModule {
+    use super::host_modules::StandardHostModule;
+
+    StandardHostModule {
+        name: "http",
+        catalog: http_catalog_module,
+        owned: HTTP_CATALOG_FUNCTIONS,
+        named_structs: HTTP_NAMED_STRUCTS,
+    }
 }
 
 fn opt(inner: HostTypeSchema) -> HostTypeSchema {
     HostTypeSchema::Optional(Box::new(inner))
 }
 
-fn array(inner: HostTypeSchema) -> HostTypeSchema {
+pub(super) fn array(inner: HostTypeSchema) -> HostTypeSchema {
     HostTypeSchema::Array(Box::new(inner))
 }
 
-fn http_request_header_struct() -> HostStructSchema {
+pub(super) fn http_request_header_struct() -> HostStructSchema {
     HostStructSchema::new(
         "HttpRequestHeader",
         vec![
@@ -261,7 +301,7 @@ fn http_request_header_struct() -> HostStructSchema {
     )
 }
 
-fn http_header_value_struct() -> HostStructSchema {
+pub(super) fn http_header_value_struct() -> HostStructSchema {
     HostStructSchema::new(
         "HttpHeaderValue",
         vec![
@@ -272,7 +312,7 @@ fn http_header_value_struct() -> HostStructSchema {
     )
 }
 
-fn http_response_header_struct(header_value: &HostStructSchema) -> HostStructSchema {
+pub(super) fn http_response_header_struct(header_value: &HostStructSchema) -> HostStructSchema {
     HostStructSchema::new(
         "HttpResponseHeader",
         vec![
@@ -282,7 +322,7 @@ fn http_response_header_struct(header_value: &HostStructSchema) -> HostStructSch
     )
 }
 
-fn http_request_body_struct() -> HostStructSchema {
+pub(super) fn http_request_body_struct() -> HostStructSchema {
     HostStructSchema::new(
         "HttpRequestBody",
         vec![
@@ -293,7 +333,7 @@ fn http_request_body_struct() -> HostStructSchema {
     )
 }
 
-fn sse_event_struct(response_header: &HostStructSchema) -> HostStructSchema {
+pub(super) fn sse_event_struct(response_header: &HostStructSchema) -> HostStructSchema {
     HostStructSchema::new(
         "SseEvent",
         vec![
@@ -309,7 +349,7 @@ fn sse_event_struct(response_header: &HostStructSchema) -> HostStructSchema {
     )
 }
 
-fn http_request_struct(
+pub(super) fn http_request_struct(
     request_header: &HostStructSchema,
     request_body: &HostStructSchema,
 ) -> HostStructSchema {
@@ -324,7 +364,7 @@ fn http_request_struct(
     )
 }
 
-fn sse_request_struct(
+pub(super) fn sse_request_struct(
     request_header: &HostStructSchema,
     request_body: &HostStructSchema,
 ) -> HostStructSchema {
@@ -333,7 +373,7 @@ fn sse_request_struct(
     HostStructSchema::new("SseRequest", fields)
 }
 
-fn http_response_struct(response_header: &HostStructSchema) -> HostStructSchema {
+pub(super) fn http_response_struct(response_header: &HostStructSchema) -> HostStructSchema {
     HostStructSchema::new(
         "HttpResponse",
         vec![
@@ -345,14 +385,14 @@ fn http_response_struct(response_header: &HostStructSchema) -> HostStructSchema 
     )
 }
 
-fn sse_callback_action_struct() -> HostStructSchema {
+pub(super) fn sse_callback_action_struct() -> HostStructSchema {
     HostStructSchema::new(
         "SseCallbackAction",
         vec![HostStructField::new("action", HostTypeSchema::String)],
     )
 }
 
-fn sse_summary_struct(response_header: &HostStructSchema) -> HostStructSchema {
+pub(super) fn sse_summary_struct(response_header: &HostStructSchema) -> HostStructSchema {
     HostStructSchema::new(
         "SseSummary",
         vec![
@@ -367,27 +407,19 @@ fn sse_summary_struct(response_header: &HostStructSchema) -> HostStructSchema {
     )
 }
 
-struct HttpAdapterContract {
-    name: &'static str,
-    arity: u8,
-    adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
-    runtime_owned_pending: bool,
+/// The canonical declarations for the HTTP resource types.
+pub(super) fn http_request_resource() -> crate::host_extension::HostResourceTypeMeta {
+    crate::host_extension::HostResourceTypeMeta::of::<HttpRequestResource>()
 }
 
-const HTTP_ADAPTER_CONTRACTS: &[HttpAdapterContract] = &[
-    HttpAdapterContract {
-        name: "http::client::request",
-        arity: 1,
-        adapter: request_adapter,
-        runtime_owned_pending: true,
-    },
-    HttpAdapterContract {
-        name: "http::client::sse",
-        arity: 2,
-        adapter: sse_adapter,
-        runtime_owned_pending: true,
-    },
-];
+pub(super) fn http_response_resource() -> crate::host_extension::HostResourceTypeMeta {
+    crate::host_extension::HostResourceTypeMeta::of::<HttpResponseResource>()
+}
+
+pub(super) fn sse_stream_resource() -> crate::host_extension::HostResourceTypeMeta {
+    crate::host_extension::HostResourceTypeMeta::of::<SseStreamResource>()
+}
+
 /// Registers every HTTP host function into `registry` using the exact
 /// catalog schema path and the authoritative [`standard_host_catalog`]
 /// snapshot.
@@ -410,47 +442,21 @@ pub fn register_http_builtin_module(registry: &mut HostFunctionRegistry) -> VmRe
 /// compile against an HTTP subcatalog (or their own composite) rather than
 /// the standard combined snapshot: the schemas are extracted from the
 /// supplied `catalog`, so the registered exact fingerprint matches what the
-/// matching compile emitted. Every required request/SSE member is preflighted
-/// against its adapter contract (including labels, passing modes, resource keys
-/// and return schema), and all mutations are published atomically. Missing or
+/// matching compile emitted, and the adapters are the module descriptors
+/// themselves. Every required request/SSE member is preflighted against its
+/// descriptor contract (labels, passing modes, resource keys and return
+/// schema), and all mutations are published atomically. Missing or
 /// incompatible members return a typed
 /// [`crate::vm::HostImportBindingError`] before registry state changes.
 pub fn register_http_builtin_module_from_catalog(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
-    let contract = http_host_catalog();
-    let catalog_fingerprint = catalog.fingerprint();
-    let contract_fingerprint = contract.fingerprint();
-    let schemas = HTTP_ADAPTER_CONTRACTS
-        .iter()
-        .map(|entry| {
-            crate::vm::host_extension::validate_catalog_import_schemas_with_fingerprints(
-                catalog,
-                &contract,
-                entry.name,
-                catalog_fingerprint,
-                contract_fingerprint,
-            )
-            .map(|schemas| (entry, schemas))
-        })
-        .collect::<VmResult<Vec<_>>>()?;
-
-    registry.transactionally(|staged| {
-        staged.install_named_struct_schemas(
-            crate::vm::host_extension::catalog_named_struct_schemas(catalog),
-        )?;
-        for (entry, schemas) in &schemas {
-            for schema in schemas.iter().cloned() {
-                staged.register_exact_static(entry.name, entry.arity, schema, entry.adapter)?;
-            }
-            staged.authorize_registered_builtin_import(entry.name);
-            if entry.runtime_owned_pending {
-                staged.mark_exact_runtime_owned_pending(entry.name)?;
-            }
-        }
-        Ok(())
-    })
+    http_host_module()
+        .catalog_module()
+        .expect("the HTTP module publishes a catalog surface")
+        .install_from_catalog(registry, catalog)
+        .map(|_| ())
 }
 
 /// Standard [`HostExtension`] registering HTTP through the exact catalog
@@ -467,24 +473,6 @@ impl crate::vm::HostExtension for HttpExtension {
     }
 }
 
-fn request_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    match builtin_http_client_request(vm, args)? {
-        HostCallResult::Return(value) => Ok(CallOutcome::Return(CallReturn::One(Value::Map(
-            Arc::new(value),
-        )))),
-        HostCallResult::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
-    }
-}
-
-fn sse_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    match sse::builtin_http_client_sse(vm, args)? {
-        HostCallResult::Return(value) => Ok(CallOutcome::Return(CallReturn::One(Value::Map(
-            Arc::new(value),
-        )))),
-        HostCallResult::Pending(op_id) => Ok(CallOutcome::Pending(op_id)),
-    }
-}
-
 /// Starts an HTTP request under the VM's configured network policy.
 ///
 /// The request is a named `HttpRequest` record with `method`, `url`, optional
@@ -494,7 +482,11 @@ fn sse_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
 /// the unused payload field is null. The response is a named `HttpResponse`
 /// record with `status`, typed `HttpResponseHeader` entries in `headers`, raw
 /// response `body` bytes, and the final validated `url`.
-#[pd_host_function(name = "http::client::request")]
+#[pd_host_function(
+    name = "http::client::request",
+    contract = http_request_contract,
+    runtime_owned_pending
+)]
 pub(super) fn builtin_http_client_request(
     vm: &mut Vm,
     request: VmMapHandle,
@@ -671,21 +663,21 @@ mod contract_tests {
     #[test]
     fn adapter_contract_covers_catalog_and_every_registered_schema() {
         let catalog = http_host_catalog();
-        let contract_names: std::collections::BTreeSet<&str> = HTTP_ADAPTER_CONTRACTS
+        let contract_names: std::collections::BTreeSet<String> = HTTP_CATALOG_FUNCTIONS
             .iter()
-            .map(|entry| entry.name)
+            .map(|factory| factory().schema.name)
             .collect();
-        let catalog_names: std::collections::BTreeSet<&str> = catalog
+        let catalog_names: std::collections::BTreeSet<String> = catalog
             .functions()
             .iter()
-            .map(|function| function.name.as_str())
+            .map(|function| function.name.clone())
             .collect();
         assert_eq!(contract_names, catalog_names);
 
         let mut registry = HostFunctionRegistry::empty();
         register_http_builtin_module_from_catalog(&mut registry, &catalog).expect("register HTTP");
-        for entry in HTTP_ADAPTER_CONTRACTS {
-            let schemas = crate::vm::host_extension::catalog_import_schemas(&catalog, entry.name);
+        for name in &contract_names {
+            let schemas = crate::vm::host_extension::catalog_import_schemas(&catalog, name);
             let imports = schemas
                 .iter()
                 .map(|schema| HostImport {
@@ -700,7 +692,7 @@ mod contract_tests {
                     .prepare_plan_with_schemas(&imports, &schema_slots)
                     .is_ok(),
                 "{}",
-                entry.name
+                name
             );
         }
     }

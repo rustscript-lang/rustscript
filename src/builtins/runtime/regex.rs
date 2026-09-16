@@ -125,6 +125,21 @@ pub(super) fn builtin_re_captures(
     Ok(groups)
 }
 
+// ---- standard host module ownership ---------------------------------------
+
+/// The standard `regex` host module: one descriptor owner per host
+/// function.
+pub(super) fn regex_host_module() -> super::host_modules::StandardHostModule {
+    const OWNED: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+        builtin_re_match_descriptor,
+        builtin_re_find_descriptor,
+        builtin_re_replace_descriptor,
+        builtin_re_split_descriptor,
+        builtin_re_captures_descriptor,
+    ];
+    super::host_modules::descriptor_only_module("regex", OWNED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::cache::REGEX_CACHE_EFFECT;

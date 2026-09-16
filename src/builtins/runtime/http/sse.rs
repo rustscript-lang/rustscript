@@ -1229,6 +1229,12 @@ pub(crate) struct SseStreamResource {
     shared: Arc<SseShared>,
 }
 
+impl crate::host_extension::HostResourceType for SseStreamResource {
+    const KEY: &'static str = "http.sse";
+    const DESCRIPTION: &'static str =
+        "An incremental SSE stream reader over an open response body stream";
+}
+
 impl HostResource for SseStreamResource {
     fn resource_type_key() -> Option<ResourceTypeKey> {
         ResourceTypeKey::new("http.sse").ok()
@@ -1334,7 +1340,7 @@ impl HostOperation for SseScopeOperation {
 }
 
 /// Streams one bounded SSE item into one script callback at a time.
-#[pd_host_function(name = "http::client::sse")]
+#[pd_host_function(name = "http::client::sse", contract = super::http_sse_contract, runtime_owned_pending)]
 pub(super) fn builtin_http_client_sse(
     vm: &mut Vm,
     request: VmMapHandle,

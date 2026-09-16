@@ -5,13 +5,10 @@ use pd_host_function::pd_host_function;
 use super::typed::VmMapHandle;
 use super::{CallOutcome, FromVmValue, VmMap, return_one};
 use crate::host_api::{
-    HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamSchema, HostStructField,
-    HostStructSchema, HostTypeSchema,
+    HostApiCatalog, HostFunctionSchema, HostParamSchema, HostStructField, HostStructSchema,
+    HostTypeSchema,
 };
-use crate::vm::{
-    HostFunctionRegistry, Value, Vm, VmError, VmResult, catalog_named_struct_schemas,
-    host_extension,
-};
+use crate::vm::{HostFunctionRegistry, Value, Vm, VmError, VmResult};
 
 const GET_CONFIG: &str = "jit::get_config";
 const SET_CONFIG: &str = "jit::set_config";
@@ -52,7 +49,7 @@ fn apply_jit_config(
 
 /// Sets the JIT runtime configuration from positional `enabled`,
 /// `hot_loop_threshold`, and `max_trace_len` arguments.
-#[pd_host_function(name = "jit::set_config")]
+#[pd_host_function(name = "jit::set_config", contract = jit_set_config_positional_contract)]
 pub(super) fn builtin_jit_set_config(
     vm: &mut Vm,
     enabled: bool,
@@ -79,8 +76,8 @@ fn set_config_from_map(vm: &mut Vm, config: &VmMap) -> VmResult<VmMap> {
     ))
 }
 
-/// Returns the current JIT runtime configuration as a `JitConfig` map.
-#[pd_host_function(name = "jit::get_config")]
+/// Returns the current JIT runtime configuration as a typed `JitConfig`.
+#[pd_host_function(name = "jit::get_config", contract = jit_get_config_contract)]
 pub(super) fn builtin_jit_get_config(vm: &mut Vm) -> VmResult<VmMap> {
     Ok(config_as_map(vm))
 }
@@ -145,79 +142,75 @@ fn jit_config_struct() -> HostStructSchema {
     .with_description("JIT runtime configuration.")
 }
 
-fn build_jit_host_catalog() -> HostApiCatalog {
-    let config = jit_config_struct();
-    let config_ty = config.as_type();
-    let mut builder = HostApiBuilder::new();
-    builder.named_struct(config);
-    builder.function(
-        HostFunctionSchema::with_return(GET_CONFIG, vec![], config_ty.clone())
-            .with_description("Returns the current JIT runtime configuration."),
-    );
-    builder.function(
-        HostFunctionSchema::with_return(
-            SET_CONFIG,
-            vec![HostParamSchema::value("config", config_ty.clone())],
-            config_ty.clone(),
-        )
-        .with_description("Sets the JIT runtime configuration from a JitConfig value."),
-    );
-    builder.function(
-        HostFunctionSchema::with_return(
-            SET_CONFIG,
-            vec![
-                HostParamSchema::value("enabled", HostTypeSchema::Bool),
-                HostParamSchema::value("hot_loop_threshold", HostTypeSchema::Int),
-                HostParamSchema::value("max_trace_len", HostTypeSchema::Int),
-            ],
-            config_ty,
-        )
-        .with_description(
-            "Sets the JIT runtime configuration from enabled, hot_loop_threshold, and max_trace_len.",
-        ),
-    );
-    builder.build().expect("JIT host catalog must be valid")
+/// Guest contract for `jit::set_config` positional form.
+fn jit_set_config_positional_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        SET_CONFIG,
+        vec![
+            HostParamSchema::value("enabled", HostTypeSchema::Bool),
+            HostParamSchema::value("hot_loop_threshold", HostTypeSchema::Int),
+            HostParamSchema::value("max_trace_len", HostTypeSchema::Int),
+        ],
+        jit_config_struct().as_type(),
+    )
+    .with_description(
+        "Sets the JIT runtime configuration from enabled, hot_loop_threshold, and max_trace_len.",
+    )
 }
 
-static JIT_HOST_CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
+/// Guest contract for `jit::get_config`.
+fn jit_get_config_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(GET_CONFIG, vec![], jit_config_struct().as_type())
+        .with_description("Returns the current JIT runtime configuration.")
+}
 
-/// JIT host catalog: `jit::get_config` returns named `JitConfig`;
+/// The `jit::set_config` overload that accepts a `JitConfig` value.
+///
+/// The positional overload is generated from
+/// `#[pd_host_function(name = "jit::set_config", contract = ...)]`; this named
+/// overload has no Rust mirror to infer from, so it is declared as an explicit
+/// descriptor next to the module's other descriptors. It still carries its own
+/// schema, adapter, and binding class, so there is no parallel catalog entry.
+fn jit_set_config_named_descriptor() -> crate::host_extension::HostFunctionDescriptor {
+    use crate::host_extension::{
+        HostAdapterDescriptor, HostBindingDescriptor, HostBindingKind, HostFunctionDescriptor,
+    };
+
+    HostFunctionDescriptor {
+        schema: HostFunctionSchema::with_return(
+            SET_CONFIG,
+            vec![HostParamSchema::value(
+                "config",
+                jit_config_struct().as_type(),
+            )],
+            jit_config_struct().as_type(),
+        )
+        .with_description("Sets the JIT runtime configuration from a JitConfig value."),
+        binding: HostBindingDescriptor {
+            kind: HostBindingKind::StaticStack,
+        },
+        effects: Vec::new(),
+        adapter: HostAdapterDescriptor::StaticStack(set_config_named_adapter),
+        resource_types: Vec::new(),
+    }
+}
+
+/// Documentation for the named structs this module's catalog declares.
+const JIT_NAMED_STRUCTS: &[(&str, &str)] = &[("JitConfig", "JIT runtime configuration.")];
+
+/// The JIT host catalog surface: `jit::get_config` returns named `JitConfig`;
 /// `jit::set_config` accepts that struct or the positional `(bool, int, int)`
 /// overload.
 ///
-/// Runtime values remain maps. Other `jit::*` members stay namespaced builtins.
-pub fn jit_host_catalog() -> Arc<HostApiCatalog> {
-    Arc::clone(JIT_HOST_CATALOG.get_or_init(|| Arc::new(build_jit_host_catalog())))
-}
-
-struct JitAdapterContract {
-    name: &'static str,
-    arity: u8,
-    adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
-}
-
-const JIT_ADAPTER_CONTRACTS: &[JitAdapterContract] = &[
-    JitAdapterContract {
-        name: GET_CONFIG,
-        arity: 0,
-        adapter: get_config_adapter,
-    },
-    JitAdapterContract {
-        name: SET_CONFIG,
-        arity: 1,
-        adapter: set_config_named_adapter,
-    },
-    JitAdapterContract {
-        name: SET_CONFIG,
-        arity: 3,
-        adapter: set_config_positional_adapter,
-    },
+/// Runtime values remain maps. Other `jit::*` members stay namespaced builtins
+/// and are owned by this module without a catalog entry.
+const JIT_CATALOG_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+    builtin_jit_get_config_descriptor,
+    jit_set_config_named_descriptor,
+    builtin_jit_set_config_descriptor,
 ];
 
-fn get_config_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let map = builtin_jit_get_config(vm, args)?;
-    Ok(CallOutcome::Return(return_one(map)))
-}
+static JIT_HOST_CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
 
 fn set_config_named_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
     let config = args
@@ -228,9 +221,36 @@ fn set_config_named_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome
     Ok(CallOutcome::Return(return_one(map)))
 }
 
-fn set_config_positional_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let map = builtin_jit_set_config(vm, args)?;
-    Ok(CallOutcome::Return(return_one(map)))
+/// JIT host catalog derived from the module descriptors.
+pub fn jit_host_catalog() -> Arc<HostApiCatalog> {
+    Arc::clone(JIT_HOST_CATALOG.get_or_init(|| {
+        super::host_modules::module_catalog("jit", JIT_CATALOG_FUNCTIONS, &[], JIT_NAMED_STRUCTS)
+    }))
+}
+
+/// The standard `jit` host module: the catalog surface plus every owned
+/// function.
+pub(super) fn jit_host_module() -> super::host_modules::StandardHostModule {
+    use super::host_modules::{StandardHostModule, catalog_module};
+
+    const OWNED: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+        builtin_jit_set_config_descriptor,
+        builtin_jit_get_config_descriptor,
+        builtin_jit_set_enabled_descriptor,
+        builtin_jit_get_enabled_descriptor,
+        builtin_jit_set_hot_loop_threshold_descriptor,
+        builtin_jit_get_hot_loop_threshold_descriptor,
+        builtin_jit_set_max_trace_len_descriptor,
+        builtin_jit_get_max_trace_len_descriptor,
+        jit_set_config_named_descriptor,
+    ];
+
+    StandardHostModule {
+        name: "jit",
+        catalog: || catalog_module("jit", JIT_CATALOG_FUNCTIONS, &[]),
+        owned: OWNED,
+        named_structs: JIT_NAMED_STRUCTS,
+    }
 }
 
 /// Registers `jit::get_config` / `jit::set_config` from [`standard_host_catalog`].
@@ -242,62 +262,18 @@ pub fn register_jit_builtin_module(registry: &mut HostFunctionRegistry) -> VmRes
 /// Registers JIT config functions using schemas from `catalog`.
 ///
 /// `catalog` must declare the same `JitConfig` shape and `jit::get_config` /
-/// `jit::set_config` overloads as [`jit_host_catalog`]; registered fingerprints
-/// match the supplied catalog so exact compile/bind pairs.
+/// `jit::set_config` overloads as [`jit_host_catalog`]; the registered adapters
+/// are the module descriptors, so a compile/bind pair always agrees on
+/// identity.
 pub fn register_jit_builtin_module_from_catalog(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
-    let contract = jit_host_catalog();
-    let catalog_fingerprint = catalog.fingerprint();
-    let contract_fingerprint = contract.fingerprint();
-    let mut seen = Vec::<&'static str>::new();
-    let schemas = JIT_ADAPTER_CONTRACTS
-        .iter()
-        .map(|entry| {
-            if seen.contains(&entry.name) {
-                return Ok((entry, Vec::new()));
-            }
-            seen.push(entry.name);
-            host_extension::validate_catalog_import_schemas_with_fingerprints(
-                catalog,
-                &contract,
-                entry.name,
-                catalog_fingerprint,
-                contract_fingerprint,
-            )
-            .map(|schemas| (entry, schemas))
-        })
-        .collect::<VmResult<Vec<_>>>()?;
-
-    registry.transactionally(|staged| {
-        staged.install_named_struct_schemas(catalog_named_struct_schemas(catalog))?;
-        for (entry, schemas) in &schemas {
-            if schemas.is_empty() {
-                continue;
-            }
-            for schema in schemas.iter().cloned() {
-                let Some(matching) = JIT_ADAPTER_CONTRACTS.iter().find(|contract| {
-                    contract.name == entry.name
-                        && usize::from(contract.arity) == schema.params.len()
-                }) else {
-                    return Err(VmError::HostError(format!(
-                        "missing JIT adapter for {} arity {}",
-                        entry.name,
-                        schema.params.len()
-                    )));
-                };
-                staged.register_exact_static(
-                    matching.name,
-                    matching.arity,
-                    schema,
-                    matching.adapter,
-                )?;
-            }
-            staged.authorize_registered_builtin_import(entry.name);
-        }
-        Ok(())
-    })
+    jit_host_module()
+        .catalog_module()
+        .expect("the JIT module publishes a catalog surface")
+        .install_from_catalog(registry, catalog)
+        .map(|_| ())
 }
 
 #[cfg(test)]

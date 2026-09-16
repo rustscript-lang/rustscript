@@ -80,3 +80,98 @@ pub(super) use super::io_wasm::*;
 pub(crate) use async_io::*;
 #[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
 pub(crate) use blocking::*;
+
+// ---- guest contracts -------------------------------------------------------
+
+use crate::host_api::{
+    HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema, ResourceTypeKey,
+};
+
+/// The `io.file` resource key, derived from its single canonical declaration.
+///
+/// The guest contracts below name the key through this helper, so a contract
+/// cannot drift from the resource type it refers to.
+fn io_file_key() -> ResourceTypeKey {
+    io_file_resource().schema.key
+}
+
+/// Guest contract for `io::open`.
+///
+/// The runtime signature carries the raw scope-token `i64` for the opened
+/// handle; the guest contract is the typed `io.file` resource it denotes.
+fn io_open_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        "io::open",
+        vec![
+            HostParamSchema::value("path", HostTypeSchema::String),
+            HostParamSchema::value("mode", HostTypeSchema::String),
+        ],
+        HostTypeSchema::Resource(io_file_key()),
+    )
+}
+
+/// Guest contract for `io::read_all`.
+fn io_read_all_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        "io::read_all",
+        vec![HostParamSchema::with_passing(
+            "handle",
+            HostTypeSchema::Resource(io_file_key()),
+            HostParamPassing::Borrow,
+        )],
+        HostTypeSchema::String,
+    )
+}
+
+/// Guest contract for `io::close`.
+fn io_close_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        "io::close",
+        vec![HostParamSchema::with_passing(
+            "handle",
+            HostTypeSchema::Resource(io_file_key()),
+            HostParamPassing::TakeOwned,
+        )],
+        HostTypeSchema::Bool,
+    )
+}
+
+/// The functions this module publishes as the `io` guest catalog surface.
+///
+/// The compatibility surface is exactly the resource-bearing set; the
+/// remaining `io::*` members stay dispatched through the generated
+/// namespaced-builtin path and are owned by this module without a catalog
+/// entry.
+const IO_CATALOG_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+    builtin_io_open_descriptor,
+    builtin_io_read_all_descriptor,
+    builtin_io_close_descriptor,
+];
+
+fn io_catalog_module() -> crate::host_extension::HostModuleDescriptor {
+    super::host_modules::catalog_module("io", IO_CATALOG_FUNCTIONS, &[io_file_resource])
+}
+
+/// The standard `io` host module: the catalog surface plus every owned
+/// function of the selected backend.
+pub(super) fn io_host_module() -> super::host_modules::StandardHostModule {
+    use super::host_modules::StandardHostModule;
+
+    const OWNED: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+        builtin_io_open_descriptor,
+        builtin_io_popen_descriptor,
+        builtin_io_read_all_descriptor,
+        builtin_io_read_line_descriptor,
+        builtin_io_write_descriptor,
+        builtin_io_flush_descriptor,
+        builtin_io_close_descriptor,
+        builtin_io_exists_descriptor,
+    ];
+
+    StandardHostModule {
+        name: "io",
+        catalog: io_catalog_module,
+        owned: OWNED,
+        named_structs: &[],
+    }
+}

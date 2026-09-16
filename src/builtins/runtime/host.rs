@@ -62,6 +62,20 @@ fn runtime_exit_impl() -> VmResult<CallOutcome> {
     Ok(CallOutcome::Halt)
 }
 
+// ---- standard host module ownership ---------------------------------------
+
+/// The standard `runtime` host module: one descriptor owner per host
+/// function.
+pub(super) fn runtime_host_module() -> super::host_modules::StandardHostModule {
+    const OWNED: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+        runtime_print_descriptor,
+        runtime_println_descriptor,
+        runtime_sleep_descriptor,
+        runtime_exit_descriptor,
+    ];
+    super::host_modules::descriptor_only_module("runtime", OWNED)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};

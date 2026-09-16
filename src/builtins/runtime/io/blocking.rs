@@ -251,6 +251,16 @@ impl IoResource {
     }
 }
 
+impl crate::host_extension::HostResourceType for IoResource {
+    const KEY: &'static str = "io.file";
+    const DESCRIPTION: &'static str = "An open file handle";
+}
+
+/// The canonical declaration for the `io.file` resource type.
+pub(crate) fn io_file_resource() -> crate::host_extension::HostResourceTypeMeta {
+    crate::host_extension::HostResourceTypeMeta::of::<IoResource>()
+}
+
 impl HostResource for IoResource {
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         // Marking closed while holding the same admission lock used by worker
@@ -775,7 +785,7 @@ fn finish_io_worker(shared: &IoOpShared, handle: IoHandleLease, result: VmResult
 }
 
 /// Opens a file handle for runtime I/O.
-#[pd_host_function(name = "io::open")]
+#[pd_host_function(name = "io::open", contract = super::io_open_contract)]
 pub(super) fn builtin_io_open(
     vm: &mut Vm,
     path: &str,
@@ -899,7 +909,7 @@ pub(super) fn builtin_io_popen(
 }
 
 /// Reads all remaining text from an I/O handle.
-#[pd_host_function(name = "io::read_all")]
+#[pd_host_function(name = "io::read_all", contract = super::io_read_all_contract)]
 pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<String>> {
     let (_handle, resource) = io_resource_for_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, "io::read_all", move |shared| {
@@ -1060,7 +1070,7 @@ pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCall
 }
 
 /// Closes an I/O handle.
-#[pd_host_function(name = "io::close")]
+#[pd_host_function(name = "io::close", contract = super::io_close_contract)]
 pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
     let (target, resource) = io_resource_for_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, "io::close", move |shared| {

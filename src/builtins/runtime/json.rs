@@ -164,3 +164,15 @@ impl<'de> Visitor<'de> for JsonValueVisitor {
         Ok(DecodedJsonValue(Value::map(entries)))
     }
 }
+
+// ---- standard host module ownership ---------------------------------------
+
+/// The standard `json` host module: one descriptor owner per host
+/// function.
+pub(super) fn json_host_module() -> super::host_modules::StandardHostModule {
+    const OWNED: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+        builtin_json_encode_descriptor,
+        builtin_json_decode_descriptor,
+    ];
+    super::host_modules::descriptor_only_module("json", OWNED)
+}
