@@ -24,7 +24,6 @@ mod map_iter;
 pub(crate) mod native;
 pub mod operation;
 pub mod program;
-pub(crate) mod regex_cache;
 pub mod resource;
 mod run_context;
 pub mod runtime;
@@ -1194,40 +1193,6 @@ impl Vm {
     #[inline(always)]
     fn interruption_enabled(&self) -> bool {
         self.run_ctx.interrupt_mode != InterruptMode::None
-    }
-
-    /// Returns the maximum number of compiled regular expressions retained by this VM.
-    ///
-    /// New VMs default to 512 entries. A capacity of zero disables caching.
-    pub fn regex_cache_capacity(&self) -> usize {
-        self.engine.regex_cache.capacity()
-    }
-
-    /// Changes this VM's compiled regular-expression cache capacity.
-    ///
-    /// Shrinking evicts least-recently-used entries immediately. Setting zero clears
-    /// all entries and disables caching until a positive capacity is configured.
-    pub fn set_regex_cache_capacity(&mut self, capacity: usize) {
-        self.engine.regex_cache.set_capacity(capacity);
-    }
-
-    pub fn regex_cache_entry_count(&self) -> usize {
-        self.engine.regex_cache.len()
-    }
-
-    pub fn regex_cache_compile_count(&self) -> u64 {
-        self.engine.regex_cache.compile_count()
-    }
-
-    pub fn regex_cache_hit_count(&self) -> u64 {
-        self.engine.regex_cache.hit_count()
-    }
-
-    pub(crate) fn cached_regex(
-        &mut self,
-        pattern: &str,
-    ) -> Result<std::sync::Arc<regex::Regex>, regex::Error> {
-        self.engine.regex_cache.get_or_compile(pattern)
     }
 
     pub fn set_jit_native_bridge_stats_enabled(&mut self, enabled: bool) {

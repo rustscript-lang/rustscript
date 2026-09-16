@@ -65,14 +65,14 @@ pub use builtins::runtime::{
     BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg,
     return_one, take_arg,
 };
-#[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
-pub use builtins::runtime::{IoHostExt, IoPolicy};
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
-    io_host_catalog, jit_host_catalog, register_jit_builtin_module,
-    register_jit_builtin_module_from_catalog, sqlite_host_catalog, standard_composition,
-    standard_host_catalog, standard_host_catalog_fingerprint,
+    DEFAULT_REGEX_CACHE_CAPACITY, RegexCache, RegexCacheVmExt, io_host_catalog, jit_host_catalog,
+    register_jit_builtin_module, register_jit_builtin_module_from_catalog, sqlite_host_catalog,
+    standard_composition, standard_host_catalog, standard_host_catalog_fingerprint,
 };
+#[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
+pub use builtins::runtime::{IoHostExt, IoPolicy};
 pub use builtins::{
     BUILTIN_CATALOG, BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec,
     CallableDef, CallableParam, CallableParamType, CallableSignature, HostExecution,

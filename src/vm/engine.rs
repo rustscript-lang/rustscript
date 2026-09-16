@@ -2,8 +2,7 @@
 //!
 //! [`Engine`] owns the code-generation backends and their caches: the trace
 //! JIT engine, native traces and their counters, the optional AOT program,
-//! the regex cache, program-derived decode caches, and code-generation
-//! telemetry. It holds no per-run interpreter state and no host bindings, so
+//! program-derived decode caches, and code-generation telemetry. It holds no per-run interpreter state and no host bindings, so
 //! it can be shared across runs (and, by construction, reused by any number of
 //! instances that never share stacks or resources).
 //!
@@ -15,7 +14,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::regex_cache::RegexCache;
 use crate::bytecode::{DecodedInstructionData, Program};
 use crate::vm::aot;
 use crate::vm::jit;
@@ -53,7 +51,6 @@ pub(crate) struct Engine {
     pub(crate) jit_native_bridge_counts: HashMap<&'static str, u64>,
     pub(crate) program_cache_key: u64,
     pub(crate) program_cache_key_ready: bool,
-    pub(crate) regex_cache: RegexCache,
     pub(crate) decoded_instruction_data: Arc<DecodedInstructionData>,
     pub(crate) operand_type_hints: Option<Arc<[u8]>>,
     // Native ABI mirrors: the JIT/AOT code generators load these addresses by
@@ -98,7 +95,6 @@ impl Engine {
             jit_native_bridge_counts: HashMap::new(),
             program_cache_key: 0,
             program_cache_key_ready: false,
-            regex_cache: RegexCache::default(),
             decoded_instruction_data: program.shared_decoded_instruction_data(),
             operand_type_hints: program.shared_operand_type_hints(),
             program_constants_ptr: program.constants.as_ptr() as usize,
