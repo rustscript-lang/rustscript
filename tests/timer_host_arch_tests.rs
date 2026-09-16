@@ -20,8 +20,13 @@ const TIMER_HOST_MODULE: &str = "src/builtins/runtime/timer.rs";
 
 /// Production files allowed to reference the timer module (composition and
 /// public re-exports only — never timer *implementation* symbols).
+///
+/// `host_modules.rs` is the deterministic standard host-module aggregation: it
+/// is the composition layer that selects the timer module for a build, so it
+/// belongs here for the same reason `runtime/mod.rs` does.
 const TIMER_COMPOSITION_FILES: &[&str] = &[
     "src/builtins/runtime/mod.rs",
+    "src/builtins/runtime/host_modules.rs",
     "src/builtins/runtime/standard_composition.rs",
     "src/lib.rs",
 ];

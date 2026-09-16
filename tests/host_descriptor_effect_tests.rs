@@ -1482,3 +1482,244 @@ fn module_state_requirements_install_onto_a_vm_before_first_use() {
         .expect("the installed provider resolves the state");
     assert!(context.host_state::<TuningCache>().is_some());
 }
+
+/// A minimal concrete resource used by the owned-dispatch descriptor tests.
+#[derive(Debug)]
+struct OwnedTestResource;
+
+impl vm::resource::HostResource for OwnedTestResource {}
+
+impl vm::host_extension::HostResourceType for OwnedTestResource {
+    const KEY: &'static str = "demo.owned_resource";
+    const DESCRIPTION: &'static str = "An owned-dispatch test resource";
+}
+
+fn owned_test_resource_meta() -> vm::host_extension::HostResourceTypeMeta {
+    vm::host_extension::HostResourceTypeMeta::of::<OwnedTestResource>()
+}
+
+/// Owned-dispatch adapter for the descriptor tests below.
+///
+/// Counts dispatched calls and transfers the `TakeOwned` operand, proving the
+/// descriptor routes through the owned path (operand drain + ownership
+/// transfer) rather than borrowed/static dispatch.
+#[derive(Default)]
+struct OwnedRecorder {
+    calls: usize,
+}
+
+impl vm::HostOwnedFunction for OwnedRecorder {
+    fn call(&mut self, call: &mut vm::OwnedHostCall<'_>) -> vm::VmResult<vm::CallOutcome> {
+        self.calls += 1;
+        let transferred = call.take_arg(1)?;
+        let value = match transferred {
+            vm::Value::Int(value) => value,
+            other => panic!("the owned argument must transfer as an int, got {other:?}"),
+        };
+        Ok(vm::CallOutcome::Return(vm::CallReturn::one(
+            vm::Value::Int(value),
+        )))
+    }
+}
+
+struct OwnedRecorderFactory;
+
+impl vm::HostOwnedAdapterFactory for OwnedRecorderFactory {
+    fn create(&self, context: vm::OwnedHostContext<'_>) -> Box<dyn vm::HostOwnedFunction> {
+        let _registry = context.registry();
+        Box::new(OwnedRecorder::default())
+    }
+}
+
+static OWNED_RECORDER_FACTORY: OwnedRecorderFactory = OwnedRecorderFactory;
+
+fn owned_take_descriptor() -> vm::host_extension::HostFunctionDescriptor {
+    use vm::host_extension::{
+        HostAdapterDescriptor, HostBindingDescriptor, HostBindingKind, HostFunctionDescriptor,
+    };
+
+    let callback = HostTypeSchema::Callable {
+        params: vec![HostTypeSchema::Bool],
+        result: Box::new(HostTypeSchema::Unknown),
+    };
+    HostFunctionDescriptor {
+        schema: HostFunctionSchema::with_return(
+            "demo::every",
+            vec![
+                HostParamSchema::value("interval_ms", HostTypeSchema::Int),
+                HostParamSchema::with_passing("callback", callback, HostParamPassing::TakeOwned),
+            ],
+            HostTypeSchema::Bool,
+        )
+        .with_description("Registers an owned callback."),
+        binding: HostBindingDescriptor {
+            kind: HostBindingKind::Owned,
+        },
+        effects: vec![],
+        adapter: HostAdapterDescriptor::Owned(&OWNED_RECORDER_FACTORY),
+        resource_types: vec![],
+    }
+}
+
+#[test]
+fn owned_adapter_descriptor_installs_through_the_exact_owned_registry() {
+    use vm::host_extension::HostModuleDescriptor;
+
+    let module = HostModuleDescriptor {
+        name: "demo.owned",
+        functions: &[owned_take_descriptor],
+        resources: &[owned_test_resource_meta],
+    };
+
+    let mut registry = vm::HostFunctionRegistry::empty();
+    let installed = module
+        .install(&mut registry)
+        .expect("an owned descriptor installs transactionally");
+    assert!(registry.contains_name("demo::every"));
+    assert_eq!(installed.resources().len(), 1);
+
+    // Owned dispatch is created once per bind; registering the same
+    // name+schema twice is an explicit error rather than a silent
+    // replacement, and the failed install rolls the registry back.
+    let error = module
+        .install(&mut registry)
+        .expect_err("a duplicate owned entry must fail");
+    assert!(
+        error.to_string().contains("demo::every"),
+        "the duplicate-owner error must name the function: {error}"
+    );
+
+    // A fresh registry accepts the same module.
+    let mut second = vm::HostFunctionRegistry::empty();
+    registry_module()
+        .install(&mut second)
+        .expect("a fresh registry installs the owned module");
+    assert!(second.contains_name("demo::every"));
+}
+
+fn registry_module() -> vm::host_extension::HostModuleDescriptor {
+    vm::host_extension::HostModuleDescriptor {
+        name: "demo.owned",
+        functions: &[owned_take_descriptor],
+        resources: &[],
+    }
+}
+
+#[test]
+fn owned_descriptor_keeps_the_take_owned_contract_and_adapter() {
+    let module = registry_module();
+    let catalog = module.catalog().expect("owned module catalog");
+    let schemas = vm::catalog_import_schemas(&catalog, "demo::every");
+    assert_eq!(
+        schemas[0].params[1].passing,
+        HostParamPassing::TakeOwned,
+        "the owned contract must keep the take-owned passing mode"
+    );
+
+    let descriptor = (module.functions[0])();
+    assert_eq!(
+        descriptor.binding.kind,
+        vm::host_extension::HostBindingKind::Owned,
+        "an owned descriptor must not route through borrowed/static dispatch"
+    );
+    assert!(
+        matches!(
+            descriptor.adapter,
+            vm::host_extension::HostAdapterDescriptor::Owned(_)
+        ),
+        "the owned adapter factory must be retained verbatim"
+    );
+}
+
+#[test]
+fn runtime_owned_pending_descriptors_mark_the_registered_import() {
+    use vm::host_extension::{
+        HostAdapterDescriptor, HostBindingDescriptor, HostBindingKind, HostFunctionDescriptor,
+        HostModuleDescriptor,
+    };
+
+    fn pending_request_descriptor() -> HostFunctionDescriptor {
+        HostFunctionDescriptor {
+            schema: HostFunctionSchema::with_return(
+                "demo::request",
+                vec![HostParamSchema::value("request", HostTypeSchema::String)],
+                HostTypeSchema::String,
+            ),
+            binding: HostBindingDescriptor {
+                kind: HostBindingKind::StaticStackRuntimeOwned,
+            },
+            effects: vec![],
+            adapter: HostAdapterDescriptor::StaticStackRuntimeOwned(noop_host),
+            resource_types: vec![],
+        }
+    }
+
+    let module = HostModuleDescriptor {
+        name: "demo.pending",
+        functions: &[pending_request_descriptor],
+        resources: &[],
+    };
+    let mut registry = vm::HostFunctionRegistry::empty();
+    module
+        .install(&mut registry)
+        .expect("a runtime-owned pending descriptor installs");
+    assert!(registry.contains_name("demo::request"));
+
+    // A mismatched binding/adapter pair still fails closed.
+    let mismatched = HostFunctionDescriptor {
+        binding: HostBindingDescriptor {
+            kind: HostBindingKind::StaticStackRuntimeOwned,
+        },
+        adapter: HostAdapterDescriptor::StaticStack(noop_host),
+        ..pending_request_descriptor()
+    };
+    let mut target = vm::HostFunctionRegistry::empty();
+    let error = HostModuleDescriptor::install_descriptors(&mut target, &[mismatched])
+        .expect_err("a binding/adapter mismatch must fail closed");
+    assert!(
+        error.to_string().contains("binding/adapter mismatch"),
+        "{error}"
+    );
+}
+
+#[test]
+fn module_install_from_catalog_keeps_caller_identity_and_restricted_policy() {
+    use vm::host_extension::HostModuleDescriptor;
+
+    let module = HostModuleDescriptor {
+        name: "demo.exact",
+        functions: &[read_counter_descriptor, add_descriptor],
+        resources: &[],
+    };
+    let catalog = module.catalog().expect("module catalog");
+
+    // Compile-side identity: the caller catalog is authoritative, and a
+    // restricted registry still receives the module's own imports.
+    let mut registry = vm::HostFunctionRegistry::restricted();
+    module
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("installing against the caller catalog must succeed");
+    assert!(registry.contains_name("demo::read_counter"));
+    assert!(registry.contains_name("demo::add"));
+
+    // A caller catalog that disagrees with a descriptor fails before any
+    // registry mutation.
+    let mut skewed = HostApiBuilder::new();
+    skewed.function(HostFunctionSchema::with_return(
+        "demo::add",
+        vec![
+            HostParamSchema::value("lhs", HostTypeSchema::Int),
+            HostParamSchema::value("rhs", HostTypeSchema::Int),
+        ],
+        HostTypeSchema::String,
+    ));
+    let skewed = skewed.build().expect("skewed catalog validates");
+    let mut target = vm::HostFunctionRegistry::empty();
+    let error = module
+        .install_from_catalog(&mut target, &skewed)
+        .expect_err("a skewed caller catalog must fail the module");
+    assert!(
+        !target.contains_name("demo::add"),
+        "a rejected module must leave the registry unchanged: {error}"
+    );
+}
