@@ -1,0 +1,5 @@
+error: host functions cannot combine `&mut Vm` with hidden host state parameters; the generated HostContext holds the same mutable VM borrow
+  --> tests/ui/fail/sync_vm_hidden_state.rs:28:17
+   |
+28 |             vm: &mut Vm,
+   |                 ^^^^^^^

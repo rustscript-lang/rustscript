@@ -57,6 +57,7 @@
 //! an attacker can influence catalog bytes. Treat `HostApiFingerprint` as a
 //! convenience equality key, not a MAC.
 
+use std::any::{Any, TypeId};
 use std::fmt;
 
 #[cfg(feature = "runtime")]
@@ -422,16 +423,349 @@ impl ResourceEffect {
     }
 }
 
+/// Marker bound for one concrete chunk of host-private per-VM state.
+///
+/// Host-private state is keyed by the concrete Rust type and is invisible to
+/// guest arity, [`HostFunctionSchema`], catalog fingerprints, and VMBC. It is
+/// *runtime-only* metadata (like [`ResourceEffect`]), so it stays outside the
+/// serializable catalog model even though it lives in this module.
+///
+/// A type declares its own canonical identity and lazy initializer, so a host
+/// function that names `HostStateRef<'_, T>` / `HostStateMut<'_, T>` carries
+/// exactly one requirement whose provider is `T::provider()`. Installation
+/// deduplicates identical providers and rejects conflicting ones *before* any
+/// registry or VM mutation.
+pub trait HostState: Any + Send + 'static {
+    /// Stable state identity used for diagnostics and conflict detection.
+    ///
+    /// Two different concrete types must never share one key.
+    const KEY: &'static str;
+
+    /// Canonical lazy initializer for the per-VM instance.
+    ///
+    /// Runs at most once per VM, on first access, unless the embedder
+    /// preconfigured the state through
+    /// [`HostContext::set_host_state`](crate::vm::HostContext::set_host_state).
+    /// A returned error message surfaces as a deterministic host error naming
+    /// the calling function, the effect, and this type — never a panic.
+    fn initialize() -> Result<Self, String>
+    where
+        Self: Sized;
+
+    /// Canonical provider descriptor for this state type.
+    ///
+    /// Derived from [`Self::KEY`], [`TypeId`], and [`Self::initialize`], so a
+    /// state type has exactly one canonical provider and provider identity is
+    /// stable across modules and compilation units.
+    fn provider() -> HostStateProvider
+    where
+        Self: Sized,
+    {
+        HostStateProvider::of::<Self>()
+    }
+}
+
+/// Lifetime of one host-private state instance.
+///
+/// The generic VM core owns per-VM state for the lifetime of its `Vm`: it
+/// survives execution-scope reset/close, stays isolated between VMs, and
+/// drops exactly once with its VM. The enum makes that contract explicit so
+/// descriptor aggregation can reject an unsupported lifetime instead of
+/// silently downgrading it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HostStateLifetime {
+    /// One instance per VM, alive for the lifetime of that VM.
+    Vm,
+}
+
+impl HostStateLifetime {
+    /// Stable label used in diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vm => "vm",
+        }
+    }
+}
+
+impl fmt::Display for HostStateLifetime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Type-erased provider descriptor for one concrete host-private state type.
+///
+/// Identity is the tuple of declared key, concrete [`TypeId`], and lifetime.
+/// Equal identity means equal requirement, which keeps provider conflict
+/// detection deterministic: a second concrete type claiming a key is rejected,
+/// while repeated mentions of one type deduplicate.
+///
+/// The initializer address is deliberately **not** part of the identity.
+/// Monomorphized function addresses are not a stable cross-codegen-unit
+/// identity, and a state type's canonical initializer comes from
+/// [`HostState::initialize`], so no two providers for one type can differ.
+#[derive(Clone, Copy)]
+pub struct HostStateProvider {
+    key: &'static str,
+    type_id: TypeId,
+    type_name: &'static str,
+    lifetime: HostStateLifetime,
+    init: fn() -> Result<Box<dyn Any + Send>, String>,
+}
+
+impl HostStateProvider {
+    /// Canonical provider of `T`.
+    pub fn of<T: HostState>() -> Self {
+        Self {
+            key: T::KEY,
+            type_id: TypeId::of::<T>(),
+            type_name: std::any::type_name::<T>(),
+            lifetime: HostStateLifetime::Vm,
+            init: boxed_state_init::<T>,
+        }
+    }
+
+    /// Declared state key ([`HostState::KEY`]).
+    pub fn key(&self) -> &'static str {
+        self.key
+    }
+
+    /// Concrete state type identity.
+    pub fn type_id(&self) -> TypeId {
+        self.type_id
+    }
+
+    /// Diagnostic name of the concrete state type.
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+
+    /// Declared lifetime of the state instance.
+    pub fn lifetime(&self) -> HostStateLifetime {
+        self.lifetime
+    }
+
+    /// Whether both providers describe exactly the same requirement.
+    pub fn is_same_requirement(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    /// Runs the lazy initializer, boxing the typed value for the state table.
+    pub fn initialize(&self) -> Result<Box<dyn Any + Send>, String> {
+        (self.init)()
+    }
+}
+
+impl PartialEq for HostStateProvider {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.type_id == other.type_id && self.lifetime == other.lifetime
+    }
+}
+
+impl Eq for HostStateProvider {}
+
+impl std::hash::Hash for HostStateProvider {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key.hash(state);
+        self.type_id.hash(state);
+        self.lifetime.hash(state);
+    }
+}
+
+impl fmt::Debug for HostStateProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostStateProvider")
+            .field("key", &self.key)
+            .field("type_name", &self.type_name)
+            .field("lifetime", &self.lifetime)
+            .finish_non_exhaustive()
+    }
+}
+
+fn boxed_state_init<T: HostState>() -> Result<Box<dyn Any + Send>, String> {
+    T::initialize().map(|value| Box::new(value) as Box<dyn Any + Send>)
+}
+
 /// Host-private state requirement. Hidden from guest arity and fingerprints.
 ///
-/// Core A records the type so descriptors can carry private effects later;
-/// generic host-state storage is installed by a later core.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// The variant carries the access mode (shared read / exclusive write); the
+/// [`HostStateProvider`] carries type identity, key, lifetime, and lazy
+/// initializer. Neither appears in [`HostFunctionSchema`] nor in a catalog
+/// fingerprint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HostStateEffect {
-    /// Shared read of per-VM private state identified by `type_name`.
-    Read { type_name: &'static str },
-    /// Exclusive write of per-VM private state identified by `type_name`.
-    Write { type_name: &'static str },
+    /// Shared read of per-VM private state.
+    Read(HostStateProvider),
+    /// Exclusive write of per-VM private state.
+    Write(HostStateProvider),
+}
+
+impl HostStateEffect {
+    /// Shared-read requirement for `T`.
+    pub fn read<T: HostState>() -> Self {
+        Self::Read(T::provider())
+    }
+
+    /// Exclusive-write requirement for `T`.
+    pub fn write<T: HostState>() -> Self {
+        Self::Write(T::provider())
+    }
+
+    /// Provider carrying this effect's state identity.
+    pub fn provider(&self) -> &HostStateProvider {
+        match self {
+            Self::Read(provider) | Self::Write(provider) => provider,
+        }
+    }
+
+    /// Declared state key of this effect.
+    pub fn key(&self) -> &'static str {
+        self.provider().key()
+    }
+
+    /// Diagnostic type name of this effect's state type.
+    pub fn type_name(&self) -> &'static str {
+        self.provider().type_name()
+    }
+
+    /// Declared lifetime of this effect's state.
+    pub fn lifetime(&self) -> HostStateLifetime {
+        self.provider().lifetime()
+    }
+
+    /// Whether this effect requires exclusive mutable access.
+    pub fn is_write(&self) -> bool {
+        matches!(self, Self::Write(_))
+    }
+
+    /// Whether both effects require exactly the same state, regardless of mode.
+    pub fn is_same_state(&self, other: &Self) -> bool {
+        self.provider().is_same_requirement(other.provider())
+    }
+}
+
+/// Deduplicated per-VM state requirement exposed by a module descriptor.
+///
+/// Requirements are the installable, resolvable form of [`HostStateEffect`]:
+/// identical providers collapse into one requirement, and a state that is
+/// written anywhere in a module is reported as `write`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HostStateRequirement {
+    /// Canonical provider of the required state.
+    pub provider: HostStateProvider,
+    /// Whether any function requiring this state needs mutable access.
+    pub write: bool,
+}
+
+impl HostStateRequirement {
+    /// Requirement for one effect.
+    pub fn of_effect(effect: &HostStateEffect) -> Self {
+        Self {
+            provider: *effect.provider(),
+            write: effect.is_write(),
+        }
+    }
+
+    /// Declared state key.
+    pub fn key(&self) -> &'static str {
+        self.provider.key()
+    }
+
+    /// Diagnostic name of the concrete state type.
+    pub fn type_name(&self) -> &'static str {
+        self.provider.type_name()
+    }
+
+    /// Declared lifetime of the state instance.
+    pub fn lifetime(&self) -> HostStateLifetime {
+        self.provider.lifetime()
+    }
+
+    /// Merges a second requirement for the same state (write wins).
+    fn merge(&mut self, other: &Self) {
+        self.write = self.write || other.write;
+    }
+}
+
+/// Conflicting host-private state requirements.
+///
+/// Raised while aggregating descriptors or installing a requirement list —
+/// before any registry or VM mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostStateRequirementError {
+    /// Two concrete types claim the same state key.
+    ProviderKeyConflict {
+        /// The contested state key.
+        key: &'static str,
+        /// Type that already owns the key.
+        existing_type: &'static str,
+        /// Type attempting to claim it.
+        conflicting_type: &'static str,
+    },
+    /// One concrete type has two different providers (initializer/lifetime).
+    ProviderConflict {
+        /// The contested state key.
+        key: &'static str,
+        /// Diagnostic name of the concrete state type.
+        type_name: &'static str,
+    },
+}
+
+impl fmt::Display for HostStateRequirementError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProviderKeyConflict {
+                key,
+                existing_type,
+                conflicting_type,
+            } => write!(
+                formatter,
+                "host state key `{key}` is already provided for type `{existing_type}`; \
+                 type `{conflicting_type}` cannot claim the same key"
+            ),
+            Self::ProviderConflict { key, type_name } => write!(
+                formatter,
+                "host state `{key}` has conflicting providers for type `{type_name}`; \
+                 identical requirements must share one initializer and lifetime"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HostStateRequirementError {}
+
+/// Deduplicates state requirements and rejects conflicting providers.
+///
+/// Requirements for one state merge (a state written anywhere is reported as a
+/// write). Two concrete types claiming one key, or one type with two different
+/// providers, fail closed. Output order follows first appearance so
+/// diagnostics stay deterministic.
+pub fn dedupe_host_state_requirements(
+    requirements: &[HostStateRequirement],
+) -> Result<Vec<HostStateRequirement>, HostStateRequirementError> {
+    let mut merged: Vec<HostStateRequirement> = Vec::new();
+    for requirement in requirements {
+        let key = requirement.key();
+        let type_name = requirement.type_name();
+        match merged.iter_mut().find(|seen| seen.key() == key) {
+            Some(existing) => {
+                if existing.type_name() != type_name {
+                    return Err(HostStateRequirementError::ProviderKeyConflict {
+                        key,
+                        existing_type: existing.type_name(),
+                        conflicting_type: type_name,
+                    });
+                }
+                if existing.provider.lifetime() != requirement.provider.lifetime() {
+                    return Err(HostStateRequirementError::ProviderConflict { key, type_name });
+                }
+                existing.merge(requirement);
+            }
+            None => merged.push(*requirement),
+        }
+    }
+    Ok(merged)
 }
 
 /// Runtime-only host function effect.
@@ -470,6 +804,14 @@ impl HostEffect {
         match self {
             Self::GuestResource(effect) => Some(effect),
             Self::HostState(_) => None,
+        }
+    }
+
+    /// Host-private state effect, if this is one.
+    pub fn host_state(&self) -> Option<&HostStateEffect> {
+        match self {
+            Self::HostState(effect) => Some(effect),
+            Self::GuestResource(_) => None,
         }
     }
 }
@@ -2772,6 +3114,15 @@ pub enum HostApiCatalogError {
         type_name: &'static str,
         reason: String,
     },
+    /// Host-private state requirements conflict across the aggregated module.
+    ///
+    /// Detected before any registry or VM mutation: identical providers
+    /// deduplicate, but a second concrete type claiming one state key (or an
+    /// incompatible lifetime) fails the whole module.
+    HostStateRequirement {
+        function: String,
+        error: HostStateRequirementError,
+    },
 }
 
 impl fmt::Display for HostApiCatalogError {
@@ -2854,6 +3205,10 @@ impl fmt::Display for HostApiCatalogError {
             Self::InvalidResourceTypeKey { type_name, reason } => write!(
                 f,
                 "host resource type `{type_name}` has an invalid resource type key: {reason}"
+            ),
+            Self::HostStateRequirement { function, error } => write!(
+                f,
+                "host function `{function}` declares conflicting host-private state: {error}"
             ),
         }
     }

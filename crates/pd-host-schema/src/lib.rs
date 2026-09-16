@@ -181,6 +181,91 @@ impl ResourceMode {
 /// macro's `"resource"` label and the runtime `HostTypeSchema::Resource`).
 pub const RESOURCE_SCHEMA_LABEL: &str = "resource";
 
+/// Access mode of one hidden host-private state parameter.
+///
+/// Mirrors `pd_vm::host_api::HostStateEffect`'s read/write split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateMode {
+    /// `HostStateRef<'_, T>` — shared read of the per-VM state.
+    Read,
+    /// `HostStateMut<'_, T>` — exclusive write of the per-VM state.
+    Write,
+}
+
+impl StateMode {
+    /// Schema/effect label emitted into host metadata.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+/// Parsed hidden host-private state parameter metadata.
+///
+/// A state parameter is *never* a guest parameter: it does not appear in the
+/// guest arity, `HostFunctionSchema`, catalog fingerprint, or VMBC. It is
+/// resolved per VM from the generic host-state table before the host function
+/// body runs.
+#[derive(Clone, Debug)]
+pub struct StateSpec {
+    /// Access mode implied by the wrapper.
+    pub mode: StateMode,
+    /// Concrete state type (`T` of `HostStateRef<'_, T>` / `HostStateMut<'_, T>`).
+    pub inner: Type,
+}
+
+impl StateSpec {
+    /// Whether this parameter requests an exclusive (mutable) state borrow.
+    pub fn is_write(&self) -> bool {
+        matches!(self.mode, StateMode::Write)
+    }
+}
+
+/// Recognizes a hidden host-private state parameter.
+///
+/// The only canonical forms are `HostStateRef<'_, T>` and
+/// `HostStateMut<'_, T>`; both are deliberately spelled the same way in the
+/// proc macro and the build script so the generated wrapper, the descriptor,
+/// and the guest schema cannot drift.
+pub fn state_spec(ty: &Type) -> Option<StateSpec> {
+    let wrapper = path_last_ident(ty)?;
+    let mode = match wrapper.as_str() {
+        "HostStateRef" => StateMode::Read,
+        "HostStateMut" => StateMode::Write,
+        _ => return None,
+    };
+    let inner = single_type_argument(ty)?;
+    Some(StateSpec { mode, inner })
+}
+
+/// Returns `true` when `ty` is a hidden host-state parameter wrapper.
+pub fn is_state_parameter(ty: &Type) -> bool {
+    state_spec(ty).is_some()
+}
+
+/// The single generic type argument of a wrapper path, if it has exactly one.
+fn single_type_argument(ty: &Type) -> Option<Type> {
+    let ty = unwrap_surface(ty);
+    let Type::Path(path) = ty else {
+        return None;
+    };
+    let segment = path.path.segments.last()?;
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    let mut types = args.args.iter().filter_map(|argument| match argument {
+        GenericArgument::Type(ty) => Some(ty.clone()),
+        _ => None,
+    });
+    let first = types.next()?;
+    if types.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
 /// Parsed resource parameter/return metadata.
 #[derive(Clone, Debug)]
 pub struct ResourceSpec {

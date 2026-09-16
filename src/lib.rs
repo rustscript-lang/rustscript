@@ -150,7 +150,7 @@ pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]
 pub use vm::host_extension::{
     HostAdapterDescriptor, HostBindingDescriptor, HostBindingKind, HostFunctionDescriptor,
-    HostModuleDescriptor, HostResourceType, HostResourceTypeMeta,
+    HostModuleDescriptor, HostResourceType, HostResourceTypeMeta, install_host_state_requirements,
 };
 #[cfg(feature = "runtime")]
 pub use vm::resource::{Resource, ResourceHandle, ResourceMut, ResourceOwned, ResourceRef};
@@ -162,13 +162,15 @@ pub use vm::{
     HostAsyncBridge, HostAsyncOpTerminal, HostBindingPlan, HostContext, HostContextError,
     HostContextErrorKind, HostContextResult, HostExtension, HostFunction, HostFunctionRegistry,
     HostFuture, HostFutureOutput, HostImportParam, HostImportSchema, HostModule, HostModuleState,
-    HostOpId, HostStackFunction, IntoScriptValue, Invocation, InvocationError, InvocationItem,
-    InvocationPoll, QueuedScriptInvocation, RegistrySchemaError, ResourceCloseReason, ScriptArgs,
-    ScriptCallback, ScriptResult, StandardSurfaceComposition, StaticHostArgsFunction,
-    StaticHostFunction, StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus,
-    VmYieldReason, async_host, catalog_import_schemas, catalog_import_schemas_into,
-    catalog_named_struct_schemas, execution_scope, host_context, host_extension, operation,
-    register_catalog_function, register_catalog_static_function, register_host_extension, resource,
+    HostOpId, HostStackFunction, HostState, HostStateError, HostStateLifetime, HostStateMut,
+    HostStateProvider, HostStateRef, HostStateRequirement, HostStateRequirementError,
+    IntoScriptValue, Invocation, InvocationError, InvocationItem, InvocationPoll,
+    QueuedScriptInvocation, RegistrySchemaError, ResourceCloseReason, ScriptArgs, ScriptCallback,
+    ScriptResult, StandardSurfaceComposition, StaticHostArgsFunction, StaticHostFunction,
+    StaticHostStackFunction, Store, Vm, VmError, VmResult, VmStatus, VmYieldReason, async_host,
+    catalog_import_schemas, catalog_import_schemas_into, catalog_named_struct_schemas,
+    execution_scope, host_context, host_extension, operation, register_catalog_function,
+    register_catalog_static_function, register_host_extension, resource,
     validate_catalog_import_schemas, validate_catalog_import_schemas_with_fingerprints,
 };
 #[cfg(feature = "runtime")]

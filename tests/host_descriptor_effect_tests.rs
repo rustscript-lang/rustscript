@@ -1254,3 +1254,231 @@ fn invalid_resource_type_key_is_fallible() {
         "fallible metadata should name the invalid key, got {error}"
     );
 }
+
+// ── Host-private state effects ──────────────────────────────────────────────
+
+/// A per-VM state type used by the descriptor state-effect tests.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TuningCache {
+    value: i64,
+}
+
+impl vm::host_api::HostState for TuningCache {
+    const KEY: &'static str = "demo.tuning_cache";
+
+    fn initialize() -> Result<Self, String> {
+        Ok(Self::default())
+    }
+}
+
+/// A second state type that claims no key shared with `TuningCache`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AuditLog {
+    lines: u64,
+}
+
+impl vm::host_api::HostState for AuditLog {
+    const KEY: &'static str = "demo.audit_log";
+
+    fn initialize() -> Result<Self, String> {
+        Ok(Self::default())
+    }
+}
+
+/// A state type that (incorrectly) claims `TuningCache`'s key.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ImpostorCache {
+    value: i64,
+}
+
+impl vm::host_api::HostState for ImpostorCache {
+    const KEY: &'static str = "demo.tuning_cache";
+
+    fn initialize() -> Result<Self, String> {
+        Ok(Self::default())
+    }
+}
+
+fn state_effect_descriptor(
+    name: &str,
+    effects: Vec<vm::host_api::HostEffect>,
+) -> vm::host_extension::HostFunctionDescriptor {
+    stack_descriptor(
+        HostFunctionSchema::with_return(name, vec![], HostTypeSchema::Int),
+        effects,
+    )
+}
+
+#[test]
+fn hidden_state_effects_never_change_guest_schema_or_fingerprint() {
+    use vm::host_api::{HostEffect, HostStateEffect};
+    use vm::host_extension::HostFunctionDescriptor;
+
+    let with_state = state_effect_descriptor(
+        "demo::cached_tick",
+        vec![HostEffect::HostState(
+            HostStateEffect::write::<TuningCache>(),
+        )],
+    );
+    let without_state = state_effect_descriptor("demo::cached_tick", Vec::new());
+
+    assert_eq!(
+        with_state.schema.params, without_state.schema.params,
+        "host-private state must not add guest parameters"
+    );
+    assert_eq!(
+        with_state.schema.return_type,
+        without_state.schema.return_type
+    );
+
+    let state_catalog = HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&with_state))
+        .expect("state-declaring descriptors aggregate");
+    let plain_catalog =
+        HostFunctionDescriptor::collect_catalog(std::slice::from_ref(&without_state))
+            .expect("descriptors without state aggregate");
+    assert_eq!(
+        state_catalog.fingerprint(),
+        plain_catalog.fingerprint(),
+        "host-private state must stay out of the catalog fingerprint"
+    );
+
+    let requirements = with_state.state_requirements();
+    assert_eq!(requirements.len(), 1);
+    assert_eq!(requirements[0].key(), "demo.tuning_cache");
+    assert!(
+        requirements[0].write,
+        "a write effect is reported as a write"
+    );
+    assert_eq!(
+        requirements[0].lifetime(),
+        vm::host_api::HostStateLifetime::Vm
+    );
+
+    let read = HostStateEffect::read::<TuningCache>();
+    assert!(read.is_same_state(&HostStateEffect::write::<TuningCache>()));
+    assert!(!read.is_write());
+    assert!(!read.is_same_state(&HostStateEffect::read::<AuditLog>()));
+}
+
+#[test]
+fn module_state_requirements_deduplicate_and_keep_write_semantics() {
+    use vm::host_api::{HostEffect, HostStateEffect};
+    use vm::host_extension::HostModuleDescriptor;
+
+    fn read_tuning() -> vm::host_extension::HostFunctionDescriptor {
+        state_effect_descriptor(
+            "demo::read_tuning",
+            vec![HostEffect::HostState(HostStateEffect::read::<TuningCache>())],
+        )
+    }
+
+    fn write_tuning() -> vm::host_extension::HostFunctionDescriptor {
+        state_effect_descriptor(
+            "demo::write_tuning",
+            vec![HostEffect::HostState(
+                HostStateEffect::write::<TuningCache>(),
+            )],
+        )
+    }
+
+    let module = HostModuleDescriptor {
+        name: "demo.state",
+        functions: &[read_tuning, write_tuning],
+        resources: &[],
+    };
+    let requirements = module
+        .state_requirements()
+        .expect("identical providers deduplicate");
+    assert_eq!(requirements.len(), 1, "one state, one requirement");
+    assert!(requirements[0].write, "the write requirement wins");
+}
+
+#[test]
+fn module_state_requirements_reject_conflicting_providers_before_registry_mutation() {
+    use vm::HostFunctionRegistry;
+    use vm::host_api::{HostEffect, HostStateEffect};
+    use vm::host_extension::HostModuleDescriptor;
+
+    fn read_tuning() -> vm::host_extension::HostFunctionDescriptor {
+        state_effect_descriptor(
+            "demo::read_tuning",
+            vec![HostEffect::HostState(HostStateEffect::read::<TuningCache>())],
+        )
+    }
+
+    fn read_impostor() -> vm::host_extension::HostFunctionDescriptor {
+        state_effect_descriptor(
+            "demo::read_impostor",
+            vec![HostEffect::HostState(
+                HostStateEffect::read::<ImpostorCache>(),
+            )],
+        )
+    }
+
+    let module = HostModuleDescriptor {
+        name: "demo.conflict",
+        functions: &[read_tuning, read_impostor],
+        resources: &[],
+    };
+    let error = module
+        .state_requirements()
+        .expect_err("a conflicting state key must fail the module");
+    let message = error.to_string();
+    assert!(
+        message.contains("demo.tuning_cache")
+            && message.contains("TuningCache")
+            && message.contains("ImpostorCache"),
+        "diagnostic must name the conflicting key and both types: {message}"
+    );
+
+    let mut registry = HostFunctionRegistry::empty();
+    let install_error = module
+        .install(&mut registry)
+        .expect_err("a conflicting module must not install");
+    assert!(
+        install_error.to_string().contains("demo.tuning_cache"),
+        "install must surface the state conflict: {install_error}"
+    );
+    assert!(
+        !registry.contains_name("demo::read_tuning")
+            && !registry.contains_name("demo::read_impostor"),
+        "a rejected module must leave the registry unchanged"
+    );
+}
+
+#[test]
+fn module_state_requirements_install_onto_a_vm_before_first_use() {
+    use vm::host_api::{HostEffect, HostStateEffect};
+    use vm::host_extension::HostModuleDescriptor;
+    use vm::{Program, Vm};
+
+    fn read_tuning() -> vm::host_extension::HostFunctionDescriptor {
+        state_effect_descriptor(
+            "demo::read_tuning",
+            vec![HostEffect::HostState(HostStateEffect::read::<TuningCache>())],
+        )
+    }
+
+    let module = HostModuleDescriptor {
+        name: "demo.state",
+        functions: &[read_tuning],
+        resources: &[],
+    };
+    let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
+    let mut vm = Vm::new(program);
+
+    let installed = module
+        .install_state_requirements(&mut vm)
+        .expect("state requirements install");
+    assert_eq!(installed.len(), 1);
+    assert!(
+        vm.host_state::<TuningCache>().is_none(),
+        "installing requirements must not create the value"
+    );
+
+    let mut context = vm.host_context();
+    context
+        .ensure_host_state::<TuningCache>("demo::read_tuning", "state read")
+        .expect("the installed provider resolves the state");
+    assert!(context.host_state::<TuningCache>().is_some());
+}

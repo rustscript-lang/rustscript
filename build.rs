@@ -337,6 +337,14 @@ pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
     }) {
         return HostBindingKind::StaticStack;
     }
+    if function.sig.inputs.iter().any(|input| match input {
+        FnArg::Typed(pat_type) => pd_host_schema::state_spec(&pat_type.ty).is_some(),
+        _ => false,
+    }) {
+        // A hidden state parameter resolves through the VM's generic
+        // host-state table, which requires the vm-aware stack adapter.
+        return HostBindingKind::StaticStack;
+    }
     let return_type = normalized_return_type(&function.sig.output);
     if matches!(
         plain_path_type(&return_type).as_deref(),
@@ -1984,6 +1992,11 @@ fn generated_wrapper_decl(function: &ItemFn) -> WrapperDecl {
         if is_vm_context_type(&pat_type.ty) {
             needs_vm = true;
         }
+        if pd_host_schema::state_spec(&pat_type.ty).is_some() {
+            // Hidden host state resolves through the VM's generic host-state
+            // table, so the generated wrapper always takes the VM.
+            needs_vm = true;
+        }
         if pd_host_schema::resource_spec(&pat_type.ty, &pat_type.attrs)
             .unwrap_or_else(|message| panic!("unsupported callable resource parameter: {message}"))
             .is_some()
@@ -2021,6 +2034,12 @@ pub(crate) fn parse_callable_params(function: &ItemFn) -> Vec<CallableParamDecl>
                 return None;
             }
             if is_vm_context_type(&pat_type.ty) {
+                return None;
+            }
+            if pd_host_schema::state_spec(&pat_type.ty).is_some() {
+                // Hidden host-private state parameters never reach the guest
+                // arity: the generated wrapper resolves them from the VM's
+                // generic host-state table before the host body runs.
                 return None;
             }
             let Pat::Ident(ident) = pat_type.pat.as_ref() else {
