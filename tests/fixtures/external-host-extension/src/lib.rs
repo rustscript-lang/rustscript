@@ -16,6 +16,15 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+extern crate vm as vm_sdk;
+
+/// Re-export the public `vm` crate so generated descriptors can use `crate::vm`.
+pub mod vm {
+    pub use super::vm_sdk::*;
+}
+
+pub use vm::host_api;
+
 #[cfg(test)]
 use vm::HostContextErrorKind;
 use pd_host_function::pd_host_function;
@@ -23,11 +32,10 @@ use pd_host_function::pd_host_function;
 #[cfg(test)]
 use vm::{BytecodeBuilder, HostImport};
 use vm::{
-    CallOutcome, HostApiCatalog, HostContextError, HostExtension, HostFunctionRegistry,
-    HostParamPassing, HostTypeSchema, ResourceTypeKey, ResourceTypeSchema, Value, Vm, VmError,
-    VmResult, arg, catalog_import_schemas, resource, return_one,
+    HostApiCatalog, HostContextError, HostExtension, HostFunctionRegistry, HostModuleDescriptor,
+    HostParamPassing, HostResourceType, HostResourceTypeMeta, HostTypeSchema, ResourceTypeKey,
+    Value, Vm, VmError, VmResult, arg, borrow_arg, catalog_import_schemas, resource,
 };
-use vm::host_api;
 
 /// Number of times the external `Counter` resource was closed.
 pub static CLOSED_COUNTERS: AtomicUsize = AtomicUsize::new(0);
@@ -65,6 +73,11 @@ impl resource::HostResource for Counter {
     }
 }
 
+impl HostResourceType for Counter {
+    const KEY: &'static str = "demo.counter";
+    const DESCRIPTION: &'static str = "An external counter resource";
+}
+
 /// A second typed external resource with its own key.
 #[derive(Debug)]
 pub struct Widget(pub i64);
@@ -81,6 +94,11 @@ impl resource::HostResource for Widget {
         CLOSED_WIDGETS.fetch_add(1, Ordering::SeqCst);
         Ok(resource::CloseProgress::Ready)
     }
+}
+
+impl HostResourceType for Widget {
+    const KEY: &'static str = "demo.widget";
+    const DESCRIPTION: &'static str = "An external widget resource";
 }
 
 /// Persistent per-VM module state: survives execution-scope reset and never
@@ -129,139 +147,16 @@ impl vm::operation::HostOperation for CounterOp {
 
 // ---- catalog ---------------------------------------------------------------
 
-/// The external extension's catalog: one resource key per concrete type and
-/// one declared function per registered host callable.
-pub fn demo_catalog() -> Arc<HostApiCatalog> {
-    let mut builder = HostApiCatalog::builder();
-    builder.resource(ResourceTypeSchema::new(
-        ResourceTypeKey::new("demo.counter").expect("key"),
-        "An external counter resource",
-    ));
-    builder.resource(ResourceTypeSchema::new(
-        ResourceTypeKey::new("demo.widget").expect("key"),
-        "An external widget resource",
-    ));
-    builder.function(vm::HostFunctionSchema::with_return(
-        "demo::make_counter",
-        vec![vm::HostParamSchema::value("seed", HostTypeSchema::Int)],
-        HostTypeSchema::Int,
-    ));
-    builder.function(vm::HostFunctionSchema::with_return(
-        "demo::make_widget",
-        vec![vm::HostParamSchema::value("seed", HostTypeSchema::Int)],
-        HostTypeSchema::Int,
-    ));
-    builder.function(vm::HostFunctionSchema::with_return(
-        "demo::read_counter",
-        vec![vm::HostParamSchema::with_passing(
-            "handle",
-            HostTypeSchema::Resource(ResourceTypeKey::new("demo.counter").expect("key")),
-            HostParamPassing::Borrow,
-        )],
-        HostTypeSchema::Int,
-    ));
-    builder.function(vm::HostFunctionSchema::with_return(
-        "demo::spawn_op",
-        vec![],
-        HostTypeSchema::Int,
-    ));
-    builder.function(vm::HostFunctionSchema::with_return(
-        "demo::overloaded",
-        vec![vm::HostParamSchema::value("value", HostTypeSchema::Int)],
-        HostTypeSchema::Int,
-    ));
-    builder.function(vm::HostFunctionSchema::with_return(
-        "demo::overloaded",
-        vec![vm::HostParamSchema::value("value", HostTypeSchema::String)],
-        HostTypeSchema::String,
-    ));
-    builder.function(vm::HostFunctionSchema::with_return(
-        "demo::macro_borrow_counter",
-        vec![vm::HostParamSchema::with_passing(
-            "counter",
-            HostTypeSchema::Resource(ResourceTypeKey::new("demo.counter").expect("key")),
-            HostParamPassing::Borrow,
-        )],
-        HostTypeSchema::Int,
-    ));
-    builder.function(vm::HostFunctionSchema::with_return(
-        "demo::macro_take_counter",
-        vec![vm::HostParamSchema::with_passing(
-            "counter",
-            HostTypeSchema::Resource(ResourceTypeKey::new("demo.counter").expect("key")),
-            HostParamPassing::TakeOwned,
-        )],
-        HostTypeSchema::Int,
-    ));
-    Arc::new(builder.build().expect("catalog must build"))
+fn counter_resource() -> HostResourceTypeMeta {
+    HostResourceTypeMeta::of::<Counter>()
 }
 
-fn decode_handle(raw: i64) -> Result<resource::ResourceHandle, VmError> {
-    resource::ResourceHandle::from_raw(raw as u64)
-        .map_err(|error| VmError::HostError(error.to_string()))
+fn widget_resource() -> HostResourceTypeMeta {
+    HostResourceTypeMeta::of::<Widget>()
 }
 
 fn host_error(error: HostContextError) -> VmError {
     VmError::HostError(error.to_string())
-}
-
-/// External host function: inserts a `Counter` into the VM's execution scope
-/// and returns its raw handle to the guest.
-fn make_counter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let seed = match args.first() {
-        Some(Value::Int(seed)) => *seed,
-        _ => return Err(VmError::TypeMismatch("int seed")),
-    };
-    let token = vm
-        .host_context()
-        .push_resource(Counter(seed as u64))
-        .map_err(host_error)?;
-    Ok(CallOutcome::Return(return_one(token.handle().raw() as i64)))
-}
-
-/// External host function: inserts a `Widget` into the scope.
-fn make_widget(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let seed = match args.first() {
-        Some(Value::Int(seed)) => *seed,
-        _ => return Err(VmError::TypeMismatch("int seed")),
-    };
-    let token = vm
-        .host_context()
-        .push_resource(Widget(seed))
-        .map_err(host_error)?;
-    Ok(CallOutcome::Return(return_one(token.handle().raw() as i64)))
-}
-
-/// External host function: borrows a `Counter` through the typed host
-/// boundary and reads its value.
-fn read_counter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    let raw = match args.first() {
-        Some(Value::Int(raw)) => *raw,
-        _ => return Err(VmError::TypeMismatch("int handle")),
-    };
-    let decoded = decode_handle(raw)?;
-    let value = vm
-        .host_context()
-        .borrow_resource::<Counter>(decoded)
-        .map_err(host_error)?
-        .0;
-    Ok(CallOutcome::Return(return_one(value as i64)))
-}
-
-/// External host function: starts a concrete [`HostOperation`] driver in the
-/// VM's execution scope and returns a non-zero id.
-fn spawn_op(vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
-    let cancelled = Arc::new(AtomicUsize::new(0));
-    let spec = vm::operation::OperationSpec::new(CounterOp {
-        remaining: 2,
-        cancelled: Arc::clone(&cancelled),
-        quiescent: false,
-    });
-    let id = vm
-        .host_context()
-        .start_operation(spec)
-        .map_err(host_error)?;
-    Ok(CallOutcome::Return(return_one(id.raw() as i64)))
 }
 
 mod macro_functions_parent {
@@ -269,6 +164,62 @@ mod macro_functions_parent {
 
     pub mod functions {
         use super::*;
+
+        /// Inserts a `Counter` into the VM's execution scope and returns its handle.
+        #[pd_host_function(name = "demo::make_counter")]
+        pub fn make_counter(vm: &mut Vm, seed: i64) -> VmResult<i64> {
+            let token = vm
+                .host_context()
+                .push_resource(Counter(seed as u64))
+                .map_err(host_error)?;
+            Ok(token.handle().raw() as i64)
+        }
+
+        /// Inserts a `Widget` into the VM's execution scope and returns its handle.
+        #[pd_host_function(name = "demo::make_widget")]
+        pub fn make_widget(vm: &mut Vm, seed: i64) -> VmResult<i64> {
+            let token = vm
+                .host_context()
+                .push_resource(Widget(seed))
+                .map_err(host_error)?;
+            Ok(token.handle().raw() as i64)
+        }
+
+        /// Borrows a `Counter` through the typed host boundary and reads its value.
+        #[pd_host_function(name = "demo::read_counter")]
+        pub fn read_counter(
+            #[pd_host_resource(passing = "borrow", key = "demo.counter")]
+            handle: resource::ResourceRef<'_, Counter>,
+        ) -> VmResult<i64> {
+            Ok(handle.0 as i64)
+        }
+
+        /// Starts a concrete [`vm::operation::HostOperation`] driver and returns its id.
+        #[pd_host_function(name = "demo::spawn_op")]
+        pub fn spawn_op(vm: &mut Vm) -> VmResult<i64> {
+            let cancelled = Arc::new(AtomicUsize::new(0));
+            let spec = vm::operation::OperationSpec::new(CounterOp {
+                remaining: 2,
+                cancelled: Arc::clone(&cancelled),
+                quiescent: false,
+            });
+            let id = vm.host_context().start_operation(spec).map_err(host_error)?;
+            Ok(id.raw() as i64)
+        }
+
+        /// Integer overload of `demo::overloaded`.
+        #[pd_host_function(name = "demo::overloaded")]
+        pub fn overloaded_int(value: i64) -> i64 {
+            let _ = value;
+            101
+        }
+
+        /// String overload of `demo::overloaded`.
+        #[pd_host_function(name = "demo::overloaded")]
+        pub fn overloaded_string(value: String) -> String {
+            let _ = value;
+            "string overload".to_string()
+        }
 
         /// External proc-macro function with a matching borrowed resource key.
         #[pd_host_function(name = "demo::macro_borrow_counter")]
@@ -312,74 +263,28 @@ mod macro_functions_parent {
     }
 }
 
-fn macro_borrow_counter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    Ok(CallOutcome::Return(return_one(
-        macro_functions_parent::functions::macro_borrow_counter(vm, args)?,
-    )))
-}
-
-fn macro_take_counter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    Ok(CallOutcome::Return(return_one(
-        macro_functions_parent::functions::macro_take_counter(vm, args)?,
-    )))
-}
-
-fn overloaded_int(_vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
-    Ok(CallOutcome::Return(return_one(101_i64)))
-}
-
-fn overloaded_string(_vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
-    Ok(CallOutcome::Return(return_one("string overload")))
-}
-fn register_from_catalog(
-    registry: &mut HostFunctionRegistry,
-    catalog: &HostApiCatalog,
-    name: &str,
-    function: vm::StaticHostFunction,
-) -> VmResult<()> {
-    // Preserve the complete selected schema and let the SDK validate it before
-    // mutating the registry. The helper intentionally does not select an
-    // overload by position.
-    let schemas = catalog_import_schemas(catalog, name);
-    let [schema] = schemas.as_slice() else {
-        return Err(VmError::HostError(format!(
-            "expected exactly one catalog schema for '{name}'"
-        )));
-    };
-    vm::register_catalog_static_function(registry, catalog, name, (*schema).clone(), function)
-        .map_err(|error| VmError::HostError(error.to_string()))
-}
-
-fn register_overloads_from_catalog(
-    registry: &mut HostFunctionRegistry,
-    catalog: &HostApiCatalog,
-) -> VmResult<()> {
-    let schemas = catalog_import_schemas(catalog, "demo::overloaded");
-    if schemas.len() != 2 {
-        return Err(VmError::HostError(
-            "expected two overload schemas for 'demo::overloaded'".to_string(),
-        ));
+/// Explicit ordered demo module. Function schemas and adapters come from
+/// `#[pd_host_function]`; extra resources keep widget/counter documentation.
+pub fn demo_module() -> HostModuleDescriptor {
+    HostModuleDescriptor {
+        name: "demo",
+        functions: &[
+            macro_functions_parent::functions::make_counter_descriptor,
+            macro_functions_parent::functions::make_widget_descriptor,
+            macro_functions_parent::functions::read_counter_descriptor,
+            macro_functions_parent::functions::spawn_op_descriptor,
+            macro_functions_parent::functions::overloaded_int_descriptor,
+            macro_functions_parent::functions::overloaded_string_descriptor,
+            macro_functions_parent::functions::macro_borrow_counter_descriptor,
+            macro_functions_parent::functions::macro_take_counter_descriptor,
+        ],
+        resources: &[counter_resource, widget_resource],
     }
-    for schema in schemas {
-        let function = match schema.params.first().map(|param| &param.schema) {
-            Some(HostTypeSchema::Int) => overloaded_int as vm::StaticHostFunction,
-            Some(HostTypeSchema::String) => overloaded_string as vm::StaticHostFunction,
-            _ => {
-                return Err(VmError::HostError(
-                    "unexpected overload parameter schema".to_string(),
-                ));
-            }
-        };
-        vm::register_catalog_static_function(
-            registry,
-            catalog,
-            "demo::overloaded",
-            schema,
-            function,
-        )
-        .map_err(|error| VmError::HostError(error.to_string()))?;
-    }
-    Ok(())
+}
+
+/// The external extension's catalog: derived from [`demo_module`].
+pub fn demo_catalog() -> Arc<HostApiCatalog> {
+    Arc::new(demo_module().catalog().expect("catalog must build"))
 }
 
 /// External host extension: registers host functions and installs persistent
@@ -388,25 +293,7 @@ pub struct DemoExtension;
 
 impl HostExtension for DemoExtension {
     fn register(&self, registry: &mut HostFunctionRegistry) -> VmResult<()> {
-        let catalog = demo_catalog();
-        register_from_catalog(registry, &catalog, "demo::make_counter", make_counter)?;
-        register_from_catalog(registry, &catalog, "demo::make_widget", make_widget)?;
-        register_from_catalog(registry, &catalog, "demo::read_counter", read_counter)?;
-        register_from_catalog(registry, &catalog, "demo::spawn_op", spawn_op)?;
-        register_overloads_from_catalog(registry, &catalog)?;
-        register_from_catalog(
-            registry,
-            &catalog,
-            "demo::macro_borrow_counter",
-            macro_borrow_counter,
-        )?;
-        register_from_catalog(
-            registry,
-            &catalog,
-            "demo::macro_take_counter",
-            macro_take_counter,
-        )?;
-        Ok(())
+        demo_module().install(registry).map(|_| ())
     }
 
     fn install(&self, vm: &mut Vm) {
