@@ -1,20 +1,9 @@
-extern crate vm as vm_sdk;
-
-pub mod vm {
-    pub use super::vm_sdk::*;
-}
-
 use pd_host_function::pd_host_function;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use vm::resource::{
     CloseProgress, HostResource, ResourceCloseReason, ResourceMut, ResourceOwned, ResourceRef,
 };
-
-use vm::{Program, Value, Vm, VmError, VmResult};
-
-use vm::resource;
-
-pub use vm::host_api;
+use vm::{HostResourceType, Program, Value, Vm, VmError, VmResult};
 
 static KEYED_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -28,6 +17,11 @@ impl HostResource for Counter {
     ) -> vm::resource::ResourceResult<CloseProgress> {
         Ok(CloseProgress::Ready)
     }
+}
+
+impl HostResourceType for Counter {
+    const KEY: &'static str = "test.counter";
+    const DESCRIPTION: &'static str = "A test counter";
 }
 
 #[derive(Debug, PartialEq)]
@@ -44,6 +38,11 @@ impl HostResource for KeyedCounter {
     ) -> vm::resource::ResourceResult<CloseProgress> {
         Ok(CloseProgress::Ready)
     }
+}
+
+impl HostResourceType for KeyedCounter {
+    const KEY: &'static str = "macro.counter";
+    const DESCRIPTION: &'static str = "A keyed test counter";
 }
 
 mod generated_parent {

@@ -65,7 +65,7 @@ fn expand_pd_host_function(
         }
     }
     validate_sync_vm_resource_borrow_conflict(&item, &resource_params)?;
-    validate_return_type(&item.sig.output)?;
+    validate_return_type(&item.sig.output, has_named_struct_attr(&item.attrs))?;
 
     if is_abi_declaration_only(&item) {
         return Ok(quote!(#item));
@@ -86,6 +86,13 @@ fn expand_pd_host_function(
     } else {
         generate_vm_wrapper(&item, &wrapper_name, &resource_params)?
     };
+    let descriptor = generate_host_function_descriptor(
+        &item,
+        &wrapper_name,
+        &guest_name,
+        &docs,
+        &resource_params,
+    )?;
     for input in &mut item.sig.inputs {
         if let FnArg::Typed(pat_type) = input {
             pat_type.attrs.retain(|attr| {
@@ -103,22 +110,14 @@ fn expand_pd_host_function(
                             | "pd_borrow_mut"
                             | "pd_take_owned"
                             | "pd_value"
+                            | "pd_host_named_struct"
                     )
                 )
             });
         }
     }
-    let descriptor = if is_async {
-        quote!()
-    } else {
-        generate_host_function_descriptor(
-            &item,
-            &wrapper_name,
-            &guest_name,
-            &docs,
-            &resource_params,
-        )?
-    };
+    item.attrs
+        .retain(|attr| !attr.path().is_ident("pd_host_named_struct"));
     Ok(quote! {
         #item
         #wrapper
@@ -295,6 +294,9 @@ fn validate_param(arg: &FnArg) -> Result<(), Error> {
     {
         return Ok(());
     }
+    if has_named_struct_attr(&pat_type.attrs) {
+        return Ok(());
+    }
     type_label(&pat_type.ty)?;
     Ok(())
 }
@@ -330,7 +332,7 @@ fn validate_sync_vm_resource_borrow_conflict(
     Ok(())
 }
 
-fn validate_return_type(output: &ReturnType) -> Result<(), Error> {
+fn validate_return_type(output: &ReturnType, named_struct: bool) -> Result<(), Error> {
     match output {
         ReturnType::Default => Ok(()),
         ReturnType::Type(_, ty) => {
@@ -362,6 +364,9 @@ fn validate_return_type(output: &ReturnType) -> Result<(), Error> {
                         "{resource_name} cannot appear in a host function return nested inside {wrappers}; resource borrows cannot cross the host boundary"
                     ),
                 ));
+            }
+            if named_struct {
+                return Ok(());
             }
             type_label(ty)?;
             Ok(())
@@ -496,6 +501,7 @@ fn resource_extract_tokens(
     spec: &ResourceSpec,
     arg_index: usize,
 ) -> Result<proc_macro2::TokenStream, Error> {
+    let sdk = sdk_path();
     let ident = syn::Ident::new(ident, proc_macro2::Span::call_site());
     let inner = &spec.inner;
     let index = syn::Index::from(arg_index);
@@ -507,12 +513,12 @@ fn resource_extract_tokens(
     let key_validation = spec.key.as_ref().map(|key| {
         let key = LitStr::new(key.as_str(), proc_macro2::Span::call_site());
         quote! {
-            let #key_ident = super::super::host_api::ResourceTypeKey::new(#key)
-                .map_err(|error| super::super::VmError::HostError(error.to_string()))?;
-            super::super::resource::ResourceTable::validate_concrete_resource_type_key::<#inner>(
+            let #key_ident = #sdk::host_api::ResourceTypeKey::new(#key)
+                .map_err(|error| #sdk::VmError::HostError(error.to_string()))?;
+            #sdk::resource::ResourceTable::validate_concrete_resource_type_key::<#inner>(
                 &#key_ident,
             )
-            .map_err(|error| super::super::VmError::HostError(error.to_string()))?;
+            .map_err(|error| #sdk::VmError::HostError(error.to_string()))?;
         }
     });
 
@@ -546,8 +552,8 @@ fn resource_extract_tokens(
 
     let decode_handle = quote! {
         let raw = super::arg::<i64>(args, #index, #handle_label)?;
-        let handle = super::super::resource::ResourceHandle::from_raw(raw as u64)
-            .map_err(|error| super::super::VmError::HostError(error.to_string()))?;
+        let handle = #sdk::resource::ResourceHandle::from_raw(raw as u64)
+            .map_err(|error| #sdk::VmError::HostError(error.to_string()))?;
     };
     let context_ident = syn::Ident::new(
         &format!("__pd_resource_context_{ident}"),
@@ -560,7 +566,7 @@ fn resource_extract_tokens(
             let #context_ident = vm.host_context();
             let #ident = #context_ident
                 #borrow_call
-                .map_err(|error| super::super::VmError::HostError(error.to_string()))?;
+                .map_err(|error| #sdk::VmError::HostError(error.to_string()))?;
         },
         ResourceMode::BorrowMut => quote! {
             #key_validation
@@ -568,20 +574,20 @@ fn resource_extract_tokens(
             let mut #context_ident = vm.host_context();
             let #ident = #context_ident
                 #borrow_mut_call
-                .map_err(|error| super::super::VmError::HostError(error.to_string()))?;
+                .map_err(|error| #sdk::VmError::HostError(error.to_string()))?;
         },
         ResourceMode::TakeOwned => {
             let owned_value = quote! {
                 vm
                     .host_context()
                     #take_call
-                    .map_err(|error| super::super::VmError::HostError(error.to_string()))?
+                    .map_err(|error| #sdk::VmError::HostError(error.to_string()))?
             };
             if spec.owned_wrapper {
                 quote! {
                     #key_validation
                     #decode_handle
-                    let #ident = super::super::resource::ResourceOwned::new(#owned_value);
+                    let #ident = #sdk::resource::ResourceOwned::new(#owned_value);
                 }
             } else {
                 quote! {
@@ -791,6 +797,13 @@ fn type_label(ty: &Type) -> Result<String, Error> {
     pd_host_schema::type_label(ty).map_err(|message| Error::new_spanned(ty, message))
 }
 
+fn sdk_path() -> proc_macro2::TokenStream {
+    match std::env::var("CARGO_CRATE_NAME").as_deref() {
+        Ok("vm") => quote!(crate),
+        _ => quote!(::vm),
+    }
+}
+
 fn generate_host_function_descriptor(
     item: &ItemFn,
     wrapper_name: &syn::Ident,
@@ -802,7 +815,8 @@ fn generate_host_function_descriptor(
         syn::Ident::new(&format!("{wrapper_name}_descriptor"), wrapper_name.span());
     let adapter_name =
         syn::Ident::new(&format!("{wrapper_name}_host_adapter"), wrapper_name.span());
-    let needs_vm = item.sig.inputs.iter().any(is_vm_context_param) || !resource_params.is_empty();
+    let sdk = sdk_path();
+    let binding = classify_generated_binding(item, resource_params);
 
     let mut param_tokens = Vec::new();
     let mut effect_tokens = Vec::new();
@@ -821,38 +835,38 @@ fn generate_host_function_descriptor(
         if let Some((_, spec)) = resource_params.iter().find(|(name, _)| name == &param_name) {
             let key_expr = resource_key_tokens(spec);
             let passing = match spec.mode {
-                ResourceMode::Borrow => quote!(crate::host_api::HostParamPassing::Borrow),
-                ResourceMode::BorrowMut => quote!(crate::host_api::HostParamPassing::BorrowMut),
-                ResourceMode::TakeOwned => quote!(crate::host_api::HostParamPassing::TakeOwned),
-                ResourceMode::Value => quote!(crate::host_api::HostParamPassing::Value),
+                ResourceMode::Borrow => quote!(#sdk::host_extension::HostParamPassing::Borrow),
+                ResourceMode::BorrowMut => {
+                    quote!(#sdk::host_extension::HostParamPassing::BorrowMut)
+                }
+                ResourceMode::TakeOwned => {
+                    quote!(#sdk::host_extension::HostParamPassing::TakeOwned)
+                }
+                ResourceMode::Value => quote!(#sdk::host_extension::HostParamPassing::Value),
             };
             param_tokens.push(quote! {
-                crate::host_api::HostParamSchema::with_passing(
+                #sdk::host_extension::HostParamSchema::with_passing(
                     #param_name,
-                    crate::host_api::HostTypeSchema::Resource(#key_expr),
+                    #sdk::host_extension::HostTypeSchema::Resource(#key_expr),
                     #passing,
                 )
             });
             if let Some(effect) = resource_effect_tokens(spec.mode, &key_expr) {
                 effect_tokens.push(effect);
             }
-            let inner = &spec.inner;
-            resource_meta_tokens.push(quote! {
-                crate::vm::host_extension::HostResourceTypeMeta {
-                    schema: crate::host_api::ResourceTypeSchema::new(#key_expr, ""),
-                    type_id: ::std::any::TypeId::of::<#inner>(),
-                    type_name: ::std::any::type_name::<#inner>(),
-                }
-            });
+            resource_meta_tokens.push(resource_meta_tokens_for(spec));
         } else {
-            let schema = host_type_schema_tokens(&pat_type.ty)?;
+            let schema =
+                host_type_schema_tokens(&pat_type.ty, has_named_struct_attr(&pat_type.attrs))?;
             param_tokens.push(quote! {
-                crate::host_api::HostParamSchema::value(#param_name, #schema)
+                #sdk::host_extension::HostParamSchema::value(#param_name, #schema)
             });
         }
     }
 
-    let (return_schema, return_effect, return_meta) = return_schema_tokens(&item.sig.output)?;
+    let named_return = has_named_struct_attr(&item.attrs);
+    let (return_schema, return_effect, return_meta) =
+        return_schema_tokens(&item.sig.output, named_return)?;
     if let Some(effect) = return_effect {
         effect_tokens.push(effect);
     }
@@ -860,50 +874,61 @@ fn generate_host_function_descriptor(
         resource_meta_tokens.push(meta);
     }
 
-    let (binding_kind, adapter, adapter_fn) = if needs_vm {
-        (
-            quote!(crate::vm::host_extension::HostBindingKind::StaticStack),
-            quote!(crate::vm::host_extension::HostAdapterDescriptor::StaticStack(#adapter_name)),
+    let (binding_kind, adapter, adapter_fn) = match binding {
+        GeneratedBinding::Stack => (
+            quote!(#sdk::host_extension::HostBindingKind::StaticStack),
+            quote!(#sdk::host_extension::HostAdapterDescriptor::StaticStack(#adapter_name)),
             quote! {
                 #[allow(dead_code)]
                 fn #adapter_name(
-                    vm: &mut crate::vm::Vm,
-                    args: &[crate::vm::Value],
-                ) -> crate::vm::VmResult<crate::vm::CallOutcome> {
-                    crate::vm::host_extension::host_descriptor_call_outcome(
+                    vm: &mut #sdk::Vm,
+                    args: &[#sdk::Value],
+                ) -> #sdk::VmResult<#sdk::CallOutcome> {
+                    #sdk::host_extension::host_descriptor_call_outcome(
                         #wrapper_name(vm, args),
                     )
                 }
             },
-        )
-    } else {
-        (
-            quote!(crate::vm::host_extension::HostBindingKind::StaticArgs),
-            quote!(crate::vm::host_extension::HostAdapterDescriptor::StaticArgs(#adapter_name)),
+        ),
+        GeneratedBinding::Args => (
+            quote!(#sdk::host_extension::HostBindingKind::StaticArgs),
+            quote!(#sdk::host_extension::HostAdapterDescriptor::StaticArgs(#adapter_name)),
             quote! {
                 #[allow(dead_code)]
                 fn #adapter_name(
-                    args: &[crate::vm::Value],
-                ) -> crate::vm::VmResult<crate::vm::CallOutcome> {
-                    crate::vm::host_extension::host_descriptor_call_outcome(#wrapper_name(args))
+                    args: &[#sdk::Value],
+                ) -> #sdk::VmResult<#sdk::CallOutcome> {
+                    #sdk::host_extension::host_descriptor_call_outcome(#wrapper_name(args))
                 }
             },
-        )
+        ),
+        GeneratedBinding::NonYieldingArgs => (
+            quote!(#sdk::host_extension::HostBindingKind::StaticNonYieldingArgs),
+            quote!(#sdk::host_extension::HostAdapterDescriptor::StaticNonYieldingArgs(#adapter_name)),
+            quote! {
+                #[allow(dead_code)]
+                fn #adapter_name(
+                    args: &[#sdk::Value],
+                ) -> #sdk::VmResult<#sdk::CallOutcome> {
+                    #sdk::host_extension::host_descriptor_call_outcome(#wrapper_name(args))
+                }
+            },
+        ),
     };
 
     Ok(quote! {
         #adapter_fn
 
         #[allow(dead_code)]
-        pub fn #descriptor_name() -> crate::vm::host_extension::HostFunctionDescriptor {
-            crate::vm::host_extension::HostFunctionDescriptor {
-                schema: crate::host_api::HostFunctionSchema::with_return(
+        pub fn #descriptor_name() -> #sdk::host_extension::HostFunctionDescriptor {
+            #sdk::host_extension::HostFunctionDescriptor {
+                schema: #sdk::host_extension::HostFunctionSchema::with_return(
                     #guest_name,
                     vec![#(#param_tokens),*],
                     #return_schema,
                 )
                 .with_description(#docs),
-                binding: crate::vm::host_extension::HostBindingDescriptor {
+                binding: #sdk::host_extension::HostBindingDescriptor {
                     kind: #binding_kind,
                 },
                 effects: vec![#(#effect_tokens),*],
@@ -914,16 +939,126 @@ fn generate_host_function_descriptor(
     })
 }
 
+enum GeneratedBinding {
+    Stack,
+    Args,
+    NonYieldingArgs,
+}
+
+fn classify_generated_binding(
+    item: &ItemFn,
+    resource_params: &[(String, ResourceSpec)],
+) -> GeneratedBinding {
+    let is_async = item.sig.asyncness.is_some();
+    let has_vm = item.sig.inputs.iter().any(is_vm_context_param);
+    if is_async || has_vm || !resource_params.is_empty() {
+        return GeneratedBinding::Stack;
+    }
+    match &item.sig.output {
+        ReturnType::Default => GeneratedBinding::NonYieldingArgs,
+        ReturnType::Type(_, ty) => {
+            if is_call_outcome_return(ty) {
+                GeneratedBinding::Args
+            } else if is_supported_ordinary_return_type(ty) {
+                GeneratedBinding::NonYieldingArgs
+            } else {
+                GeneratedBinding::Args
+            }
+        }
+    }
+}
+
+fn type_path_ends_with(ty: &Type, name: &str) -> bool {
+    match ty {
+        Type::Group(group) => type_path_ends_with(&group.elem, name),
+        Type::Paren(paren) => type_path_ends_with(&paren.elem, name),
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == name),
+        _ => false,
+    }
+}
+
+fn sole_type_argument(ty: &Type) -> Option<&Type> {
+    match ty {
+        Type::Group(group) => sole_type_argument(&group.elem),
+        Type::Paren(paren) => sole_type_argument(&paren.elem),
+        Type::Path(path) => path.path.segments.last().and_then(first_type_arg),
+        _ => None,
+    }
+}
+
+fn is_call_outcome_return(ty: &Type) -> bool {
+    if type_path_ends_with(ty, "CallOutcome") {
+        return true;
+    }
+    sole_type_argument(ty)
+        .filter(|_| type_path_ends_with(ty, "VmResult") || type_path_ends_with(ty, "HostResult"))
+        .is_some_and(is_call_outcome_return)
+}
+
+fn is_supported_ordinary_return_type(ty: &Type) -> bool {
+    match ty {
+        Type::Group(group) => is_supported_ordinary_return_type(&group.elem),
+        Type::Paren(paren) => is_supported_ordinary_return_type(&paren.elem),
+        Type::Tuple(tuple) if tuple.elems.is_empty() => true,
+        Type::Path(path) => {
+            let Some(segment) = path.path.segments.last() else {
+                return false;
+            };
+            match segment.ident.to_string().as_str() {
+                "i64" | "f64" | "bool" | "String" | "Value" | "HostString" | "HostValue"
+                | "VmString" | "VmValue" => true,
+                "Vec" => sole_type_argument(ty).is_some_and(|inner| {
+                    type_path_ends_with(inner, "u8") || type_path_ends_with(inner, "Value")
+                }),
+                "HostBytes" | "VmBytes" | "HostArray" | "VmArray" => true,
+                "Option" => sole_type_argument(ty).is_some_and(is_supported_ordinary_return_type),
+                "Result" | "VmResult" | "HostResult" => {
+                    sole_type_argument(ty).is_some_and(is_supported_ordinary_return_type)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn has_named_struct_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("pd_host_named_struct"))
+}
+
 fn resource_key_tokens(spec: &ResourceSpec) -> proc_macro2::TokenStream {
+    let sdk = sdk_path();
     if let Some(key) = &spec.key {
         quote! {
-            crate::host_api::ResourceTypeKey::new(#key).expect("validated resource type key")
+            #sdk::host_extension::ResourceTypeKey::new(#key).expect("validated resource type key")
         }
     } else {
         let inner = &spec.inner;
         quote! {
-            <#inner as crate::resource::HostResource>::resource_type_key()
-                .expect("resource type key required to build a host function descriptor")
+            #sdk::host_extension::ResourceTypeKey::new(
+                <#inner as #sdk::host_extension::HostResourceType>::KEY,
+            )
+            .expect("validated resource type key")
+        }
+    }
+}
+
+fn resource_meta_tokens_for(spec: &ResourceSpec) -> proc_macro2::TokenStream {
+    let sdk = sdk_path();
+    let inner = &spec.inner;
+    if let Some(key) = &spec.key {
+        quote! {
+            #sdk::host_extension::compatible_resource_type_meta::<#inner>(#key)
+        }
+    } else {
+        quote! {
+            #sdk::host_extension::HostResourceTypeMeta::of::<#inner>()
         }
     }
 }
@@ -938,13 +1073,15 @@ fn resource_effect_tokens(
         ResourceMode::TakeOwned => quote!(take_owned),
         ResourceMode::Value => return None,
     };
+    let sdk = sdk_path();
     Some(quote! {
-        crate::host_api::HostEffect::GuestResource(crate::host_api::ResourceEffect::#ctor(#key_expr))
+        #sdk::host_extension::HostEffect::GuestResource(#sdk::host_extension::ResourceEffect::#ctor(#key_expr))
     })
 }
 
 fn return_schema_tokens(
     output: &ReturnType,
+    named_return: bool,
 ) -> Result<
     (
         proc_macro2::TokenStream,
@@ -953,8 +1090,13 @@ fn return_schema_tokens(
     ),
     Error,
 > {
+    let sdk = sdk_path();
     let ReturnType::Type(_, ty) = output else {
-        return Ok((quote!(crate::host_api::HostTypeSchema::Null), None, None));
+        return Ok((
+            quote!(#sdk::host_extension::HostTypeSchema::Null),
+            None,
+            None,
+        ));
     };
     let surface = unwrap_transparent_return(ty);
     if resource_return_kind(surface) == Some(ResourceReturnKind::Owned) {
@@ -962,26 +1104,24 @@ fn return_schema_tokens(
             Error::new_spanned(surface, "Resource return must have a type argument")
         })?;
         let key_expr = quote! {
-            <#inner as crate::resource::HostResource>::resource_type_key()
-                .expect("resource type key required to build a host function descriptor")
+            #sdk::host_extension::ResourceTypeKey::new(
+                <#inner as #sdk::host_extension::HostResourceType>::KEY,
+            )
+            .expect("validated resource type key")
         };
         return Ok((
-            quote!(crate::host_api::HostTypeSchema::Resource(#key_expr)),
+            quote!(#sdk::host_extension::HostTypeSchema::Resource(#key_expr)),
             Some(quote! {
-                crate::host_api::HostEffect::GuestResource(
-                    crate::host_api::ResourceEffect::create(#key_expr)
+                #sdk::host_extension::HostEffect::GuestResource(
+                    #sdk::host_extension::ResourceEffect::create(#key_expr)
                 )
             }),
             Some(quote! {
-                crate::vm::host_extension::HostResourceTypeMeta {
-                    schema: crate::host_api::ResourceTypeSchema::new(#key_expr, ""),
-                    type_id: ::std::any::TypeId::of::<#inner>(),
-                    type_name: ::std::any::type_name::<#inner>(),
-                }
+                #sdk::host_extension::HostResourceTypeMeta::of::<#inner>()
             }),
         ));
     }
-    Ok((host_type_schema_tokens(ty)?, None, None))
+    Ok((host_type_schema_tokens(surface, named_return)?, None, None))
 }
 
 fn unwrap_transparent_return(ty: &Type) -> &Type {
@@ -1027,32 +1167,40 @@ fn last_generic_type(ty: &Type) -> Option<&Type> {
     })
 }
 
-fn host_type_schema_tokens(ty: &Type) -> Result<proc_macro2::TokenStream, Error> {
+fn host_type_schema_tokens(
+    ty: &Type,
+    named_struct: bool,
+) -> Result<proc_macro2::TokenStream, Error> {
+    let sdk = sdk_path();
+    if named_struct {
+        return Ok(quote!(<#ty as #sdk::host_extension::HostNamedStruct>::host_type_schema()));
+    }
     let label = type_label(ty)?;
     host_type_schema_from_label(&label, ty)
 }
 
 fn host_type_schema_from_label(label: &str, _ty: &Type) -> Result<proc_macro2::TokenStream, Error> {
+    let sdk = sdk_path();
     if let Some(inner) = label.strip_suffix(" | null") {
         let inner_tokens = host_type_schema_from_label(inner, _ty)?;
-        return Ok(quote!(crate::host_api::HostTypeSchema::Optional(Box::new(#inner_tokens))));
+        return Ok(quote!(#sdk::host_extension::HostTypeSchema::Optional(Box::new(#inner_tokens))));
     }
     Ok(match label {
-        "int" => quote!(crate::host_api::HostTypeSchema::Int),
-        "float" => quote!(crate::host_api::HostTypeSchema::Float),
-        "bool" => quote!(crate::host_api::HostTypeSchema::Bool),
-        "string" => quote!(crate::host_api::HostTypeSchema::String),
-        "bytes" => quote!(crate::host_api::HostTypeSchema::Bytes),
-        "number" => quote!(crate::host_api::HostTypeSchema::Number),
-        "null" => quote!(crate::host_api::HostTypeSchema::Null),
-        "any" | "unknown" => quote!(crate::host_api::HostTypeSchema::Unknown),
-        "array" => quote!(crate::host_api::HostTypeSchema::Array(Box::new(
-            crate::host_api::HostTypeSchema::Unknown
+        "int" => quote!(#sdk::host_extension::HostTypeSchema::Int),
+        "float" => quote!(#sdk::host_extension::HostTypeSchema::Float),
+        "bool" => quote!(#sdk::host_extension::HostTypeSchema::Bool),
+        "string" => quote!(#sdk::host_extension::HostTypeSchema::String),
+        "bytes" => quote!(#sdk::host_extension::HostTypeSchema::Bytes),
+        "number" => quote!(#sdk::host_extension::HostTypeSchema::Number),
+        "null" => quote!(#sdk::host_extension::HostTypeSchema::Null),
+        "any" | "unknown" => quote!(#sdk::host_extension::HostTypeSchema::Unknown),
+        "array" => quote!(#sdk::host_extension::HostTypeSchema::Array(Box::new(
+            #sdk::host_extension::HostTypeSchema::Unknown
         ))),
-        "map" => quote!(crate::host_api::HostTypeSchema::Map(Box::new(
-            crate::host_api::HostTypeSchema::Unknown
+        "map" => quote!(#sdk::host_extension::HostTypeSchema::Map(Box::new(
+            #sdk::host_extension::HostTypeSchema::Unknown
         ))),
-        _ => quote!(crate::host_api::HostTypeSchema::Unknown),
+        _ => quote!(#sdk::host_extension::HostTypeSchema::Unknown),
     })
 }
 
@@ -1362,5 +1510,164 @@ mod tests {
         let error =
             expand_pd_host_function(attr, item).expect_err("ResourceRef return must be rejected");
         assert!(error.to_string().contains("ResourceRef"));
+    }
+
+    #[test]
+    fn typed_resource_descriptor_uses_host_resource_type_not_empty_description() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::read_counter");
+        let item: ItemFn = parse_quote! {
+            /// Reads a typed counter.
+            fn read_counter(counter: ResourceRef<'_, Counter>) -> i64 {
+                counter.0
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("typed ResourceRef should generate a descriptor")
+            .to_string();
+        assert!(
+            expanded.contains("HostResourceTypeMeta :: of"),
+            "typed wrappers must use HostResourceTypeMeta::of: {expanded}"
+        );
+        assert!(
+            expanded.contains("HostResourceType"),
+            "typed wrappers must derive catalog key/description from HostResourceType: {expanded}"
+        );
+        assert!(
+            !expanded.contains("HostResource :: resource_type_key"),
+            "typed wrappers must not use HostResource::resource_type_key for catalog metadata: {expanded}"
+        );
+        assert!(
+            !expanded.contains("resource_type_key () . expect"),
+            "typed wrappers must not expect() a HostResource key: {expanded}"
+        );
+    }
+
+    #[test]
+    fn async_function_emits_descriptor_with_static_stack_adapter() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::delay");
+        let item: ItemFn = parse_quote! {
+            /// Yields then returns.
+            async fn delay(#[pd_host_context] context: HostContext, ticks: i64) -> i64 {
+                let _ = context;
+                ticks
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("async functions must emit descriptors")
+            .to_string();
+        assert!(
+            expanded.contains("fn delay_descriptor"),
+            "async expansion must include a descriptor factory: {expanded}"
+        );
+        assert!(
+            expanded.contains("HostBindingKind :: StaticStack"),
+            "async VM-aware functions must select StaticStack: {expanded}"
+        );
+        assert!(
+            expanded.contains("HostParamSchema :: value (\"ticks\""),
+            "async descriptor guest schema must include ticks: {expanded}"
+        );
+        assert!(
+            !expanded.contains("HostParamSchema :: value (\"context\""),
+            "async descriptor guest arity must exclude host context: {expanded}"
+        );
+    }
+
+    #[test]
+    fn args_only_ordinary_return_selects_static_non_yielding_args() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::add");
+        let item: ItemFn = parse_quote! {
+            /// Adds two integers.
+            fn add(lhs: i64, rhs: i64) -> i64 {
+                lhs + rhs
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("ordinary args-only functions must emit descriptors")
+            .to_string();
+        assert!(
+            expanded.contains("HostBindingKind :: StaticNonYieldingArgs"),
+            "proven one-value ordinary returns must select StaticNonYieldingArgs: {expanded}"
+        );
+        assert!(
+            !expanded.contains("HostBindingKind :: StaticArgs"),
+            "ordinary non-yielding returns must not be installed as StaticArgs: {expanded}"
+        );
+    }
+
+    #[test]
+    fn call_outcome_args_only_selects_static_args() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::maybe_yield");
+        let item: ItemFn = parse_quote! {
+            /// May suspend.
+            fn maybe_yield(flag: bool) -> crate::vm::CallOutcome {
+                let _ = flag;
+                crate::vm::CallOutcome::Return(crate::vm::CallReturn::None)
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("CallOutcome functions must emit descriptors")
+            .to_string();
+        assert!(
+            expanded.contains("HostBindingKind :: StaticArgs"),
+            "args-only CallOutcome must select StaticArgs: {expanded}"
+        );
+        assert!(
+            !expanded.contains("HostBindingKind :: StaticNonYieldingArgs"),
+            "suspension-capable returns must not select StaticNonYieldingArgs: {expanded}"
+        );
+    }
+
+    #[test]
+    fn generated_descriptor_uses_public_vm_sdk_paths() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::add");
+        let item: ItemFn = parse_quote! {
+            /// Adds two integers.
+            fn add(lhs: i64, rhs: i64) -> i64 {
+                lhs + rhs
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("value-only functions must emit descriptors")
+            .to_string();
+        assert!(
+            expanded.contains(":: vm ::"),
+            "generated descriptors must use the public vm crate path: {expanded}"
+        );
+        assert!(
+            !expanded.contains("crate :: host_api"),
+            "generated descriptors must not hardcode crate::host_api: {expanded}"
+        );
+        assert!(
+            !expanded.contains("crate :: vm ::"),
+            "generated descriptors must not hardcode crate::vm: {expanded}"
+        );
+        assert!(
+            !expanded.contains("crate :: resource"),
+            "generated descriptors must not hardcode crate::resource: {expanded}"
+        );
+    }
+
+    #[test]
+    fn named_struct_attr_uses_host_named_struct_schema() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "geo::origin");
+        let item: ItemFn = parse_quote! {
+            /// Returns a named point.
+            #[pd_host_named_struct]
+            fn origin() -> Point {
+                todo!()
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("named-struct returns must emit descriptors")
+            .to_string();
+        assert!(
+            expanded.contains("HostNamedStruct"),
+            "named-struct returns must use HostNamedStruct: {expanded}"
+        );
+        assert!(
+            !expanded.contains("pd_host_named_struct"),
+            "named-struct attribute must be stripped: {expanded}"
+        );
     }
 }

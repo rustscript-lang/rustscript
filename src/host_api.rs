@@ -446,6 +446,24 @@ pub enum HostEffect {
     HostState(HostStateEffect),
 }
 
+/// Opt-in named host-struct schema for generated function descriptors.
+///
+/// Rust signatures cannot encode field names. Types that implement this trait
+/// can be selected with `#[pd_host_named_struct]` instead of collapsing to
+/// [`HostTypeSchema::Unknown`].
+pub trait HostNamedStruct {
+    /// Catalog struct name.
+    const NAME: &'static str;
+
+    /// Declared fields in registration order.
+    fn host_struct_fields() -> Vec<HostStructField>;
+
+    /// Guest type schema for this named struct.
+    fn host_type_schema() -> HostTypeSchema {
+        HostTypeSchema::named_struct(Self::NAME, Self::host_struct_fields())
+    }
+}
+
 impl HostEffect {
     /// Guest resource effect, if this is one.
     pub fn guest_resource(&self) -> Option<&ResourceEffect> {
@@ -2745,6 +2763,15 @@ pub enum HostApiCatalogError {
         struct_name: String,
         key: ResourceTypeKey,
     },
+    /// Guest-resource effects do not exactly match the function schema.
+    GuestResourceEffectMismatch {
+        function: String,
+    },
+    /// A [`HostResourceType`] declaration used an invalid catalog key.
+    InvalidResourceTypeKey {
+        type_name: &'static str,
+        reason: String,
+    },
 }
 
 impl fmt::Display for HostApiCatalogError {
@@ -2819,6 +2846,14 @@ impl fmt::Display for HostApiCatalogError {
             Self::UnknownStructResourceReference { struct_name, key } => write!(
                 f,
                 "named host struct `{struct_name}` references undeclared resource type `{key}`"
+            ),
+            Self::GuestResourceEffectMismatch { function } => write!(
+                f,
+                "host function `{function}` has guest-resource effects that do not match its schema"
+            ),
+            Self::InvalidResourceTypeKey { type_name, reason } => write!(
+                f,
+                "host resource type `{type_name}` has an invalid resource type key: {reason}"
             ),
         }
     }

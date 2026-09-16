@@ -16,21 +16,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-extern crate vm as vm_sdk;
-
-/// Re-export the public `vm` crate so generated descriptors can use `crate::vm`.
-pub mod vm {
-    pub use super::vm_sdk::*;
-}
-
-pub use vm::host_api;
-
-#[cfg(test)]
-use vm::HostContextErrorKind;
 use pd_host_function::pd_host_function;
 
 #[cfg(test)]
-use vm::{BytecodeBuilder, HostImport};
+use vm::{BytecodeBuilder, HostContextErrorKind, HostImport};
 use vm::{
     HostApiCatalog, HostContextError, HostExtension, HostFunctionRegistry, HostModuleDescriptor,
     HostParamPassing, HostResourceType, HostResourceTypeMeta, HostTypeSchema, ResourceTypeKey,

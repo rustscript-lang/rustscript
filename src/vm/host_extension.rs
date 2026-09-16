@@ -30,16 +30,18 @@
 //! coupling to the builtin runtime modules or any concrete host library.
 
 use crate::host_api::{
-    HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint, HostEffect,
-    HostFunctionSchema, HostParamPassing, HostStructSchema, HostTypeSchema, ResourceTypeKey,
-    ResourceTypeSchema,
+    HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint, HostStructSchema,
 };
 use crate::vm::VmResult;
 
 pub use super::host_context::HostContext;
 pub use super::host_context::HostModule as HostModuleState;
 use super::resource::HostResource;
-pub use crate::host_api::{HostImportParam, HostImportSchema};
+pub use crate::host_api::{
+    HostEffect, HostFunctionSchema, HostImportParam, HostImportSchema, HostNamedStruct,
+    HostParamPassing, HostParamSchema, HostTypeSchema, ResourceEffect, ResourceTypeKey,
+    ResourceTypeSchema,
+};
 
 /// Canonical declaration for one concrete host resource type.
 ///
@@ -53,17 +55,21 @@ pub trait HostResourceType: HostResource {
     const DESCRIPTION: &'static str;
 
     /// Catalog resource schema derived from [`Self::KEY`] and [`Self::DESCRIPTION`].
+    fn try_resource_schema() -> Result<ResourceTypeSchema, HostApiCatalogError> {
+        let key = ResourceTypeKey::new(Self::KEY).map_err(|error| {
+            HostApiCatalogError::InvalidResourceTypeKey {
+                type_name: std::any::type_name::<Self>(),
+                reason: error.to_string(),
+            }
+        })?;
+        Ok(ResourceTypeSchema::new(key, Self::DESCRIPTION))
+    }
+
+    /// Catalog resource schema derived from [`Self::KEY`] and [`Self::DESCRIPTION`].
+    ///
+    /// Prefer [`Self::try_resource_schema`] when the key may be invalid.
     fn resource_schema() -> ResourceTypeSchema {
-        ResourceTypeSchema::new(
-            ResourceTypeKey::new(Self::KEY).unwrap_or_else(|error| {
-                panic!(
-                    "HostResourceType::KEY {:?} for {} is not a valid resource type key: {error}",
-                    Self::KEY,
-                    std::any::type_name::<Self>()
-                )
-            }),
-            Self::DESCRIPTION,
-        )
+        Self::try_resource_schema().unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -80,12 +86,19 @@ pub struct HostResourceTypeMeta {
 
 impl HostResourceTypeMeta {
     /// Builds metadata from a [`HostResourceType`] implementation.
-    pub fn of<T: HostResourceType>() -> Self {
-        Self {
-            schema: T::resource_schema(),
+    pub fn try_of<T: HostResourceType>() -> Result<Self, HostApiCatalogError> {
+        Ok(Self {
+            schema: T::try_resource_schema()?,
             type_id: std::any::TypeId::of::<T>(),
             type_name: std::any::type_name::<T>(),
-        }
+        })
+    }
+
+    /// Builds metadata from a [`HostResourceType`] implementation.
+    ///
+    /// Prefer [`Self::try_of`] when the key may be invalid.
+    pub fn of<T: HostResourceType>() -> Self {
+        Self::try_of::<T>().unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -100,8 +113,6 @@ pub enum HostBindingKind {
     StaticArgs,
     /// Non-yielding args-slice adapter.
     StaticNonYieldingArgs,
-    /// Owned-dispatch factory.
-    Owned,
 }
 
 /// Binding identity carried by a function descriptor.
@@ -124,6 +135,30 @@ pub enum HostAdapterDescriptor {
     StaticNonYieldingArgs(super::host::StaticHostArgsFunction),
 }
 
+/// Builds descriptor metadata for an explicit-key compatibility resource.
+///
+/// Typed wrappers without an explicit key use [`HostResourceTypeMeta::of`].
+/// This path keeps attribute `key = "..."` working for legacy `HostResource`
+/// implementations. If the type also reports [`HostResource::resource_type_key`],
+/// a disagreement fails closed.
+pub fn compatible_resource_type_meta<T: HostResource>(key: &'static str) -> HostResourceTypeMeta {
+    let declared = ResourceTypeKey::new(key)
+        .unwrap_or_else(|error| panic!("explicit resource type key {key:?} is invalid: {error}"));
+    if let Some(runtime_key) = T::resource_type_key()
+        && runtime_key != declared
+    {
+        panic!(
+            "resource type key disagreement for {}: HostResource::resource_type_key() is `{runtime_key}`, attribute key is `{declared}`",
+            std::any::type_name::<T>()
+        );
+    }
+    HostResourceTypeMeta {
+        schema: ResourceTypeSchema::new(declared, String::new()),
+        type_id: std::any::TypeId::of::<T>(),
+        type_name: std::any::type_name::<T>(),
+    }
+}
+
 /// One host function's schema, binding, runtime-only effects, and adapter.
 pub struct HostFunctionDescriptor {
     /// Guest ABI and catalog fingerprint input.
@@ -142,59 +177,43 @@ pub struct HostFunctionDescriptor {
 impl HostFunctionDescriptor {
     /// Builds a catalog from descriptors without mutating any registry.
     ///
-    /// Resource keys are collected from guest schemas and guest-resource
-    /// effects. Duplicate keys are ignored; catalog validation still rejects
-    /// undeclared or conflicting declarations.
+    /// Guest-resource effects must exactly match resource-bearing parameter
+    /// passing modes and resource-return create effects. Resource keys are
+    /// collected from guest schemas and typed resource declarations, not from
+    /// a second serialized effect source.
     pub fn collect_catalog(descriptors: &[Self]) -> Result<HostApiCatalog, HostApiCatalogError> {
+        Self::collect_catalog_with_resources(descriptors, &[])
+    }
+
+    fn collect_catalog_with_resources(
+        descriptors: &[Self],
+        module_resources: &[HostResourceTypeMeta],
+    ) -> Result<HostApiCatalog, HostApiCatalogError> {
         let mut builder = HostApiBuilder::new();
-        let mut seen_resources: Vec<(ResourceTypeKey, Option<std::any::TypeId>)> = Vec::new();
+        let mut seen_resources: Vec<SeenResource> = Vec::new();
         let mut seen_structs: Vec<HostStructSchema> = Vec::new();
+        for meta in module_resources {
+            merge_declared_resource(&mut seen_resources, meta)?;
+        }
         for descriptor in descriptors {
+            validate_guest_resource_effects(descriptor)?;
             for meta in &descriptor.resource_types {
-                if let Some(existing) = seen_resources
-                    .iter_mut()
-                    .find(|(key, _)| key == &meta.schema.key)
-                {
-                    if let Some(type_id) = existing.1
-                        && type_id != meta.type_id
-                    {
-                        return Err(HostApiCatalogError::DuplicateResourceKey(
-                            meta.schema.key.clone(),
-                        ));
-                    }
-                    existing.1 = Some(meta.type_id);
-                    continue;
-                }
-                seen_resources.push((meta.schema.key.clone(), Some(meta.type_id)));
-                builder.resource(meta.schema.clone());
+                merge_declared_resource(&mut seen_resources, meta)?;
             }
-            let mut keys = Vec::new();
             for param in &descriptor.schema.params {
-                param.ty.collect_resource_keys(&mut keys);
+                collect_schema_resource_keys(&param.ty, &mut seen_resources);
                 collect_named_structs_from_type(&param.ty, &mut seen_structs, &mut builder)?;
             }
-            descriptor
-                .schema
-                .return_type
-                .collect_resource_keys(&mut keys);
+            collect_schema_resource_keys(&descriptor.schema.return_type, &mut seen_resources);
             collect_named_structs_from_type(
                 &descriptor.schema.return_type,
                 &mut seen_structs,
                 &mut builder,
             )?;
-            for effect in &descriptor.effects {
-                if let Some(resource) = effect.guest_resource() {
-                    keys.push(resource.key());
-                }
-            }
-            for key in keys {
-                if seen_resources.iter().any(|(existing, _)| existing == key) {
-                    continue;
-                }
-                seen_resources.push((key.clone(), None));
-                builder.resource(ResourceTypeSchema::new(key.clone(), ""));
-            }
             builder.function(descriptor.schema.clone());
+        }
+        for resource in seen_resources {
+            builder.resource(ResourceTypeSchema::new(resource.key, resource.description));
         }
         builder.build()
     }
@@ -228,33 +247,13 @@ impl HostModuleDescriptor {
         self.functions.iter().map(|factory| factory()).collect()
     }
 
-    /// Builds the guest catalog from the explicit function list.
+    /// Builds the guest catalog from the explicit function list and module
+    /// resource metadata. Module resources are aggregated independently of
+    /// function descriptors.
     pub fn catalog(&self) -> Result<HostApiCatalog, HostApiCatalogError> {
-        let mut descriptors = self.descriptors();
         let extras: Vec<HostResourceTypeMeta> =
             self.resources.iter().map(|factory| factory()).collect();
-        if let Some(first) = descriptors.first_mut() {
-            first.resource_types.extend(extras);
-        } else if !extras.is_empty() {
-            let mut builder = HostApiBuilder::new();
-            let mut seen: Vec<(ResourceTypeKey, Option<std::any::TypeId>)> = Vec::new();
-            for meta in extras {
-                if let Some((_, existing_type)) =
-                    seen.iter().find(|(key, _)| key == &meta.schema.key)
-                {
-                    if existing_type.is_some_and(|id| id != meta.type_id) {
-                        return Err(HostApiCatalogError::DuplicateResourceKey(
-                            meta.schema.key.clone(),
-                        ));
-                    }
-                    continue;
-                }
-                seen.push((meta.schema.key.clone(), Some(meta.type_id)));
-                builder.resource(meta.schema);
-            }
-            return builder.build();
-        }
-        HostFunctionDescriptor::collect_catalog(&descriptors)
+        HostFunctionDescriptor::collect_catalog_with_resources(&self.descriptors(), &extras)
     }
 
     /// Validates the complete module, then registers adapters transactionally.
@@ -269,6 +268,12 @@ impl HostModuleDescriptor {
         let catalog = self
             .catalog()
             .map_err(|error| crate::vm::VmError::HostError(error.to_string()))?;
+        if self.functions.is_empty() {
+            return Err(crate::vm::VmError::HostError(format!(
+                "host module '{}' declares no functions",
+                self.name
+            )));
+        }
         let descriptors = self.descriptors();
         registry.transactionally(|registry| {
             let named_structs = catalog_named_struct_schemas(&catalog);
@@ -364,6 +369,109 @@ fn matching_import_schema(
             schema.name
         ))),
     }
+}
+
+struct SeenResource {
+    key: ResourceTypeKey,
+    type_id: Option<std::any::TypeId>,
+    description: String,
+    from_meta: bool,
+}
+
+fn merge_declared_resource(
+    seen: &mut Vec<SeenResource>,
+    meta: &HostResourceTypeMeta,
+) -> Result<(), HostApiCatalogError> {
+    if let Some(existing) = seen.iter_mut().find(|item| item.key == meta.schema.key) {
+        if let Some(type_id) = existing.type_id
+            && type_id != meta.type_id
+        {
+            return Err(HostApiCatalogError::DuplicateResourceKey(
+                meta.schema.key.clone(),
+            ));
+        }
+        if existing.from_meta
+            && !existing.description.is_empty()
+            && !meta.schema.description.is_empty()
+            && existing.description != meta.schema.description
+        {
+            return Err(HostApiCatalogError::DuplicateResourceKey(
+                meta.schema.key.clone(),
+            ));
+        }
+        existing.type_id = Some(meta.type_id);
+        if existing.description.is_empty() {
+            existing.description = meta.schema.description.clone();
+        }
+        existing.from_meta = true;
+        return Ok(());
+    }
+    seen.push(SeenResource {
+        key: meta.schema.key.clone(),
+        type_id: Some(meta.type_id),
+        description: meta.schema.description.clone(),
+        from_meta: true,
+    });
+    Ok(())
+}
+
+fn collect_schema_resource_keys(schema: &HostTypeSchema, seen: &mut Vec<SeenResource>) {
+    let mut keys = Vec::new();
+    schema.collect_resource_keys(&mut keys);
+    for key in keys {
+        if seen.iter().any(|item| &item.key == key) {
+            continue;
+        }
+        seen.push(SeenResource {
+            key: key.clone(),
+            type_id: None,
+            description: String::new(),
+            from_meta: false,
+        });
+    }
+}
+
+fn expected_guest_resource_effects(schema: &HostFunctionSchema) -> Vec<ResourceEffect> {
+    let mut expected = Vec::new();
+    for param in &schema.params {
+        if let HostTypeSchema::Resource(key) = &param.ty {
+            match param.passing {
+                HostParamPassing::Borrow => expected.push(ResourceEffect::borrow(key.clone())),
+                HostParamPassing::BorrowMut => {
+                    expected.push(ResourceEffect::borrow_mut(key.clone()))
+                }
+                HostParamPassing::TakeOwned => {
+                    expected.push(ResourceEffect::take_owned(key.clone()))
+                }
+                HostParamPassing::Value => {}
+            }
+        }
+    }
+    if let HostTypeSchema::Resource(key) = &schema.return_type {
+        expected.push(ResourceEffect::create(key.clone()));
+    }
+    expected
+}
+
+fn validate_guest_resource_effects(
+    descriptor: &HostFunctionDescriptor,
+) -> Result<(), HostApiCatalogError> {
+    let mut expected = expected_guest_resource_effects(&descriptor.schema);
+    let mut actual: Vec<ResourceEffect> = descriptor
+        .effects
+        .iter()
+        .filter_map(HostEffect::guest_resource)
+        .cloned()
+        .collect();
+    let sort_key = |effect: &ResourceEffect| format!("{effect:?}");
+    expected.sort_by_key(|left| sort_key(left));
+    actual.sort_by_key(|left| sort_key(left));
+    if expected != actual {
+        return Err(HostApiCatalogError::GuestResourceEffectMismatch {
+            function: descriptor.schema.name.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn collect_named_structs_from_type(

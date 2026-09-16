@@ -1,16 +1,9 @@
 #![allow(dead_code, unused_imports)]
 
-extern crate vm as vm_sdk;
-
-pub mod vm {
-    pub use super::vm_sdk::*;
-}
-
 use pd_host_function::pd_host_function;
 use vm::resource::{CloseProgress, HostResource, ResourceOwned, ResourceRef};
 use vm::resource;
-use vm::{Value, Vm, VmError, VmResult};
-pub use vm::host_api;
+use vm::{HostResourceType, Value, Vm, VmError, VmResult};
 
 #[derive(Debug)]
 struct Counter(i64);
@@ -22,6 +15,11 @@ impl HostResource for Counter {
     ) -> vm::resource::ResourceResult<CloseProgress> {
         Ok(CloseProgress::Ready)
     }
+}
+
+impl HostResourceType for Counter {
+    const KEY: &'static str = "test.counter";
+    const DESCRIPTION: &'static str = "A test counter";
 }
 
 mod generated_parent {
