@@ -1543,6 +1543,29 @@ impl HostFunctionRegistry {
             .map_err(|error| VmError::HostError(error.to_string()))
     }
 
+    /// Registers an owned-dispatch catalog entry whose dispatch drains the
+    /// call operands and transfers ownership of the arguments the function
+    /// takes.
+    ///
+    /// This is the descriptor path for the exact owned registration described
+    /// on [`HostFunctionRegistry::register_exact_owned`]: the import identity
+    /// comes from the supplied catalog schema instead of a separate
+    /// name/arity pair, and every ownership, alias, and resource-bearing
+    /// guarantee of the exact owned path is unchanged. `factory` runs once per
+    /// bind and receives the registry through [`OwnedHostContext`].
+    pub fn register_catalog_owned(
+        &mut self,
+        schema: HostImportSchema,
+        factory: &'static dyn super::host_extension::HostOwnedAdapterFactory,
+    ) -> Result<u16, RegistrySchemaError> {
+        self.register_catalog_entry(
+            schema,
+            RegistryEntryKind::OwnedFactory(Arc::new(move |context: OwnedHostContext<'_>| {
+                factory.create(context)
+            })),
+        )
+    }
+
     /// Grants a registered extension import its host capability without
     /// coupling the VM to the extension's concrete domain.
     pub fn authorize_registered_builtin_import(&mut self, name: &str) {

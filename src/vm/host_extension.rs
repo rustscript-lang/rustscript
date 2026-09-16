@@ -111,10 +111,17 @@ pub enum HostBindingKind {
     Static,
     /// Stack-mutating adapter with `&mut Vm`.
     StaticStack,
+    /// Stack-mutating adapter whose pending operation is owned by the generic
+    /// runtime operation/stream registries rather than by a registered
+    /// operation driver.
+    StaticStackRuntimeOwned,
     /// Args-slice adapter without `&mut Vm`.
     StaticArgs,
     /// Non-yielding args-slice adapter.
     StaticNonYieldingArgs,
+    /// Owned dispatch: the adapter drains the call operands and transfers the
+    /// arguments a `TakeOwned` parameter names.
+    Owned,
 }
 
 /// Binding identity carried by a function descriptor.
@@ -124,6 +131,22 @@ pub struct HostBindingDescriptor {
     pub kind: HostBindingKind,
 }
 
+/// Factory for one owned-dispatch host function instance.
+///
+/// An owned host function is created once per bind and receives the registry
+/// through [`super::host::OwnedHostContext`], so it can retain the immutable
+/// registry/binding configuration it needs to spawn an isolated owned-value
+/// execution VM. Descriptors reference a `'static` factory so the adapter
+/// descriptor stays `Copy` and the owned path keeps the same guarantees as
+/// [`super::host::HostFunctionRegistry::register_exact_owned`].
+pub trait HostOwnedAdapterFactory: Send + Sync {
+    /// Creates one owned-dispatch host function for the given registration context.
+    fn create(
+        &self,
+        context: super::host::OwnedHostContext<'_>,
+    ) -> Box<dyn crate::HostOwnedFunction>;
+}
+
 /// Runtime adapter attached to a function descriptor.
 #[derive(Clone, Copy)]
 pub enum HostAdapterDescriptor {
@@ -131,10 +154,14 @@ pub enum HostAdapterDescriptor {
     Static(super::host::StaticHostFunction),
     /// [`super::host::StaticHostStackFunction`].
     StaticStack(super::host::StaticHostStackFunction),
+    /// Pending-operation-owning [`super::host::StaticHostStackFunction`].
+    StaticStackRuntimeOwned(super::host::StaticHostStackFunction),
     /// [`super::host::StaticHostArgsFunction`].
     StaticArgs(super::host::StaticHostArgsFunction),
     /// Non-yielding [`super::host::StaticHostArgsFunction`].
     StaticNonYieldingArgs(super::host::StaticHostArgsFunction),
+    /// Owned-dispatch factory, created once per bind.
+    Owned(&'static dyn HostOwnedAdapterFactory),
 }
 
 /// Builds descriptor metadata for an explicit-key compatibility resource.
@@ -264,6 +291,36 @@ fn collect_state_requirements(
     Ok(requirements)
 }
 
+/// Validates a declared guest contract against its macro-declared name.
+///
+/// A `#[pd_host_function(contract = <path>)]` function names its guest schema
+/// explicitly. The schema must describe the same guest name as the function,
+/// so a renamed function cannot silently keep an unrelated contract.
+pub fn declared_host_contract(
+    schema: HostFunctionSchema,
+    guest_name: &'static str,
+) -> HostFunctionSchema {
+    assert_eq!(
+        schema.name, guest_name,
+        "declared host contract names `{}` but the function declares `{guest_name}`",
+        schema.name
+    );
+    schema
+}
+
+/// Guest resource effects implied by a host function schema.
+///
+/// Resource-bearing parameters map to borrow/borrow-mut/take-owned effects and
+/// a resource return maps to a create effect. A declared contract derives its
+/// effects from this single source, so a raw-handle Rust signature cannot
+/// disagree with the guest contract it advertises.
+pub fn guest_resource_effects(schema: &HostFunctionSchema) -> Vec<HostEffect> {
+    expected_guest_resource_effects(schema)
+        .into_iter()
+        .map(HostEffect::GuestResource)
+        .collect()
+}
+
 /// Converts a generated host-function wrapper result into a catalog adapter outcome.
 pub fn host_descriptor_call_outcome<T>(
     result: super::VmResult<T>,
@@ -336,6 +393,85 @@ impl HostModuleDescriptor {
         })
     }
 
+    /// Validates the complete module against a caller-supplied catalog
+    /// snapshot, then registers adapters transactionally against that
+    /// snapshot's import identity.
+    ///
+    /// This is the descriptor path for embedders that compose their own
+    /// catalog (or a subcatalog) instead of the module's own aggregate: every
+    /// descriptor's schema must match exactly one import in `catalog` with the
+    /// same name, parameter labels, schemas, passing modes, and return type,
+    /// and both catalogs must validate before any registry mutation. Each
+    /// installed import is granted the host-import capability it needs, so a
+    /// restricted registry keeps its deny-by-default policy for every import
+    /// the module does not declare.
+    ///
+    /// `catalog` is the snapshot the guest code was compiled against; the
+    /// adapters installed here are exactly the module's own descriptors.
+    pub fn install_from_catalog(
+        &self,
+        registry: &mut super::host::HostFunctionRegistry,
+        catalog: &HostApiCatalog,
+    ) -> VmResult<HostApiCatalog> {
+        let contract = self
+            .catalog()
+            .map_err(|error| crate::vm::VmError::HostError(error.to_string()))?;
+        if self.functions.is_empty() {
+            return Err(crate::vm::VmError::HostError(format!(
+                "host module '{}' declares no functions",
+                self.name
+            )));
+        }
+        let contract_fingerprint = contract.fingerprint();
+        let catalog_fingerprint = catalog.fingerprint();
+        let descriptors = self.descriptors();
+        collect_state_requirements(&descriptors)
+            .map_err(|error| crate::vm::VmError::HostError(error.to_string()))?;
+        let schemas = descriptors
+            .iter()
+            .map(|descriptor| {
+                validate_catalog_import_schemas_with_fingerprints(
+                    catalog,
+                    &contract,
+                    &descriptor.schema.name,
+                    catalog_fingerprint,
+                    contract_fingerprint,
+                )
+                .and_then(|schemas| {
+                    // A name may carry several overloads. Each descriptor owns
+                    // exactly its own shape: the schema the caller catalog
+                    // publishes for this descriptor and no other.
+                    let own = matching_import_schema(&contract, &descriptor.schema)?;
+                    let selected: Vec<HostImportSchema> = schemas
+                        .into_iter()
+                        .filter(|schema| same_import_shape(schema, &own))
+                        .collect();
+                    match selected.as_slice() {
+                        [schema] => Ok((descriptor, vec![schema.clone()])),
+                        [] => Err(crate::vm::VmError::HostError(format!(
+                            "host function '{}' is missing from the supplied catalog",
+                            descriptor.schema.name
+                        ))),
+                        _ => Err(crate::vm::VmError::HostError(format!(
+                            "host function '{}' is ambiguous in the supplied catalog",
+                            descriptor.schema.name
+                        ))),
+                    }
+                })
+            })
+            .collect::<VmResult<Vec<_>>>()?;
+        registry.transactionally(|registry| {
+            registry.install_named_struct_schemas(catalog_named_struct_schemas(catalog))?;
+            for (descriptor, schemas) in &schemas {
+                for schema in schemas.iter().cloned() {
+                    install_descriptor_adapter(registry, descriptor, schema)?;
+                }
+                registry.authorize_registered_builtin_import(&descriptor.schema.name);
+            }
+            Ok(catalog.clone())
+        })
+    }
+
     /// Deduplicated host-private state requirements of this module.
     ///
     /// Identical providers collapse (a state written anywhere is reported as a
@@ -392,17 +528,25 @@ pub fn install_host_state_requirements(
     vm.install_host_state_requirements(requirements)
 }
 
-fn install_function_descriptor(
+/// Registers one descriptor's adapter under an already-resolved import schema.
+fn install_descriptor_adapter(
     registry: &mut super::host::HostFunctionRegistry,
-    catalog: &HostApiCatalog,
     descriptor: &HostFunctionDescriptor,
+    schema: HostImportSchema,
 ) -> VmResult<()> {
-    let schema = matching_import_schema(catalog, &descriptor.schema)?;
+    let mut runtime_owned_pending: Option<String> = None;
     let result = match (&descriptor.binding.kind, &descriptor.adapter) {
         (HostBindingKind::Static, HostAdapterDescriptor::Static(function)) => {
             registry.register_catalog_static(schema, *function)
         }
         (HostBindingKind::StaticStack, HostAdapterDescriptor::StaticStack(function)) => {
+            registry.register_catalog_static_stack(schema, *function)
+        }
+        (
+            HostBindingKind::StaticStackRuntimeOwned,
+            HostAdapterDescriptor::StaticStackRuntimeOwned(function),
+        ) => {
+            runtime_owned_pending = Some(schema.name.clone());
             registry.register_catalog_static_stack(schema, *function)
         }
         (HostBindingKind::StaticArgs, HostAdapterDescriptor::StaticArgs(function)) => {
@@ -412,6 +556,9 @@ fn install_function_descriptor(
             HostBindingKind::StaticNonYieldingArgs,
             HostAdapterDescriptor::StaticNonYieldingArgs(function),
         ) => registry.register_catalog_static_non_yielding_args(schema, *function),
+        (HostBindingKind::Owned, HostAdapterDescriptor::Owned(factory)) => {
+            registry.register_catalog_owned(schema, *factory)
+        }
         _ => {
             return Err(crate::vm::VmError::HostError(format!(
                 "host function '{}' has a binding/adapter mismatch",
@@ -419,12 +566,29 @@ fn install_function_descriptor(
             )));
         }
     };
-    result.map(|_| ()).map_err(|error| {
+    let registered = result.map_err(|error| {
         crate::vm::VmError::HostError(format!(
             "failed to install host function '{}': {error}",
             descriptor.schema.name
         ))
-    })
+    })?;
+    if let Some(name) = runtime_owned_pending {
+        // The pending operation is resolved from the generic VM
+        // operation/stream registries, which requires the registered import to
+        // be marked runtime-owned.
+        registry.mark_exact_runtime_owned_pending(&name)?;
+    }
+    let _ = registered;
+    Ok(())
+}
+
+fn install_function_descriptor(
+    registry: &mut super::host::HostFunctionRegistry,
+    catalog: &HostApiCatalog,
+    descriptor: &HostFunctionDescriptor,
+) -> VmResult<()> {
+    let schema = matching_import_schema(catalog, &descriptor.schema)?;
+    install_descriptor_adapter(registry, descriptor, schema)
 }
 
 fn matching_import_schema(
@@ -433,19 +597,7 @@ fn matching_import_schema(
 ) -> VmResult<HostImportSchema> {
     let matched: Vec<HostImportSchema> = catalog_import_schemas(catalog, &schema.name)
         .into_iter()
-        .filter(|candidate| {
-            candidate.params.len() == schema.params.len()
-                && candidate
-                    .params
-                    .iter()
-                    .zip(&schema.params)
-                    .all(|(import, param)| {
-                        import.name == param.name
-                            && import.schema == param.ty
-                            && import.passing == param.passing
-                    })
-                && candidate.return_type == schema.return_type
-        })
+        .filter(|candidate| same_function_shape(candidate, schema))
         .collect();
     match matched.as_slice() {
         [schema] => Ok(schema.clone()),
@@ -458,6 +610,38 @@ fn matching_import_schema(
             schema.name
         ))),
     }
+}
+
+/// Whether an import schema is the same guest shape as a function schema.
+///
+/// The catalog fingerprint is deliberately excluded: a caller may supply a
+/// composite catalog whose fingerprint differs from the module's own snapshot
+/// while the import identity (name, labels, schemas, passing modes, return
+/// type) is identical.
+fn same_function_shape(import: &HostImportSchema, schema: &HostFunctionSchema) -> bool {
+    import.params.len() == schema.params.len()
+        && import
+            .params
+            .iter()
+            .zip(&schema.params)
+            .all(|(candidate, param)| {
+                candidate.name == param.name
+                    && candidate.schema == param.ty
+                    && candidate.passing == param.passing
+            })
+        && import.return_type == schema.return_type
+}
+
+/// Whether two import schemas describe the same guest shape.
+fn same_import_shape(left: &HostImportSchema, right: &HostImportSchema) -> bool {
+    left.name == right.name
+        && left.params.len() == right.params.len()
+        && left
+            .params
+            .iter()
+            .zip(&right.params)
+            .all(|(a, b)| a.name == b.name && a.schema == b.schema && a.passing == b.passing)
+        && left.return_type == right.return_type
 }
 
 struct SeenResource {
