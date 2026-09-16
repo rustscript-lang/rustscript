@@ -2,8 +2,8 @@ use std::{cell::Cell, sync::Arc};
 
 use vm::{
     BytecodeBuilder, CallOutcome, CallReturn, HostFunction, JitConfig, JitTraceTerminal, OpCode,
-    Program, Value, ValueType, Vm, VmStatus, VmYieldReason, builtin_call_index, compile_source,
-    disassemble_program,
+    Program, RegexCacheVmExt, Value, ValueType, Vm, VmStatus, VmYieldReason, builtin_call_index,
+    compile_source, disassemble_program,
 };
 
 fn native_jit_supported() -> bool {
@@ -8566,5 +8566,122 @@ fn call_script_division_failure_path_known_regression() {
     assert!(
         matches!(aot_err, vm::VmError::JitNative(_)),
         "pre-existing AOT division regression changed: {aot_err:?}"
+    );
+}
+
+/// Regex-cache parity: the interpreter hosts and the native (JIT)
+/// specializations must resolve the *same* per-VM cache instance.
+#[test]
+fn interpreter_and_native_regex_paths_share_one_cache_instance() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        use re;
+        let mut i = 0;
+        let mut matched = false;
+        while i < 8 {
+            matched = re::match("(?i)^rustscript$", "RustScript");
+            i = i + 1;
+        }
+        matched;
+    "#;
+    let compiled = compile_source(source).expect("regex match compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+
+    disable_trace_jit(&mut vm);
+    assert_eq!(
+        vm.run().expect("interpreter regex loop should run"),
+        VmStatus::Halted
+    );
+    let entries = vm.regex_cache_entry_count();
+    let compiles = vm.regex_cache_compile_count();
+    let hits = vm.regex_cache_hit_count();
+    assert_eq!(entries, 1, "the interpreter compiles the pattern once");
+    assert_eq!(compiles, 1);
+    assert_eq!(hits, 7, "seven interpreter hits");
+
+    // Re-run the same program through the native specialization path on the
+    // same VM: the shortcut must reuse the interpreter's cache instance
+    // instead of compiling into a second cache.
+    vm.reset_for_reuse().expect("reset_for_reuse must succeed");
+    vm.set_jit_config(JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    assert_eq!(
+        vm.run().expect("native regex loop should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.regex_cache_entry_count(), entries);
+    assert_eq!(
+        vm.regex_cache_compile_count(),
+        compiles,
+        "the native path must not compile into a second cache"
+    );
+    assert!(
+        vm.regex_cache_hit_count() >= hits + 7,
+        "native hits accumulate in the same cache: {} vs {}",
+        vm.regex_cache_hit_count(),
+        hits
+    );
+    assert!(
+        vm.host_state::<vm::RegexCache>().is_some(),
+        "the regex cache is one generic host-state instance"
+    );
+
+    let snapshot = vm.jit_snapshot();
+    assert_native_ssa_specialized_trace(&vm, &snapshot, "regex builtin loop", &["regex_match"]);
+}
+
+/// Regex-cache parity: the AOT path and the interpreter path must resolve the
+/// same per-VM cache instance.
+#[test]
+fn aot_and_interpreter_regex_paths_share_one_cache_instance() {
+    if !native_jit_supported() {
+        return;
+    }
+    let source = r#"
+        use re;
+        let mut i = 0;
+        let mut matched = false;
+        while i < 8 {
+            matched = re::match("(?i)^rustscript$", "RustScript");
+            i = i + 1;
+        }
+        matched;
+    "#;
+    let compiled = compile_source(source).expect("regex match compile should succeed");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+
+    install_aot(&mut vm);
+    assert_eq!(
+        vm.run().expect("aot regex loop should run"),
+        VmStatus::Halted
+    );
+    let entries = vm.regex_cache_entry_count();
+    let compiles = vm.regex_cache_compile_count();
+    assert_eq!(entries, 1, "the compiled path caches the pattern once");
+    assert_eq!(compiles, 1);
+
+    // Drop the AOT artifact, keep the VM state: the interpreter path must hit
+    // the very same cache instance.
+    vm.clear_aot();
+    vm.reset_for_reuse().expect("reset_for_reuse must succeed");
+    disable_trace_jit(&mut vm);
+    assert_eq!(
+        vm.run().expect("interpreter regex loop should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.regex_cache_entry_count(), entries);
+    assert_eq!(
+        vm.regex_cache_compile_count(),
+        compiles,
+        "the interpreter path must reuse the cache the AOT run populated"
+    );
+    assert!(
+        vm.regex_cache_hit_count() >= 7,
+        "interpreter hits accumulate in the same cache"
     );
 }

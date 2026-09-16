@@ -43,6 +43,7 @@ mod typed;
 pub use jit::{
     jit_host_catalog, register_jit_builtin_module, register_jit_builtin_module_from_catalog,
 };
+pub use regex::{DEFAULT_REGEX_CACHE_CAPACITY, RegexCache, RegexCacheVmExt};
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub use sqlite::{register_sqlite_builtin_module, register_sqlite_builtin_module_from_catalog};
 pub use timer::{

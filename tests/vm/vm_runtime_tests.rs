@@ -3,7 +3,7 @@ mod common;
 use common::*;
 use std::sync::Arc;
 use vm::OpCode;
-use vm::{HostImport, StandardSurfaceComposition};
+use vm::{HostImport, RegexCacheVmExt, StandardSurfaceComposition};
 
 fn non_yielding_returns_none(_: &[Value]) -> Result<CallOutcome, vm::VmError> {
     Ok(CallOutcome::Return(vm::CallReturn::none()))
@@ -82,16 +82,20 @@ fn builtin_call_index_with_arity(source: &str, argc: u8) -> u16 {
 }
 
 #[test]
-fn regex_cache_capacity_is_configurable_through_public_vm_api() {
+fn regex_cache_capacity_is_configurable_through_the_regex_module_api() {
     let program = Program::new(Vec::new(), vec![OpCode::Ret as u8]);
     let mut vm = Vm::new(program);
 
     assert_eq!(vm.regex_cache_capacity(), 512);
-    vm.set_regex_cache_capacity(64);
+    vm.set_regex_cache_capacity(64)
+        .expect("capacity change must resolve the regex cache");
     assert_eq!(vm.regex_cache_capacity(), 64);
-    vm.set_regex_cache_capacity(0);
+    vm.set_regex_cache_capacity(0)
+        .expect("capacity change must resolve the regex cache");
     assert_eq!(vm.regex_cache_capacity(), 0);
     assert_eq!(vm.regex_cache_entry_count(), 0);
+    assert_eq!(vm.regex_cache_compile_count(), 0);
+    assert_eq!(vm.regex_cache_hit_count(), 0);
 }
 
 #[test]
