@@ -4,11 +4,7 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::builtins::BuiltinFunction;
-use crate::host_api::{
-    HostApiBuilder, HostApiCatalog, HostApiFingerprint, HostFunctionSchema, HostParamPassing,
-    HostParamSchema, HostStructField, HostStructSchema, HostTypeSchema, ResourceTypeKey,
-    ResourceTypeSchema,
-};
+use crate::host_api::{HostApiCatalog, HostApiFingerprint};
 #[cfg(all(feature = "async", not(target_family = "wasm")))]
 use crate::vm::CaptureAsyncHostContext;
 #[allow(unused_imports)]
@@ -22,6 +18,7 @@ pub(crate) mod core;
 pub(crate) mod error;
 pub(crate) mod event;
 mod host;
+pub(crate) mod host_modules;
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
 pub(crate) mod http;
 #[cfg(not(target_arch = "wasm32"))]
@@ -36,10 +33,12 @@ pub(crate) mod print;
 pub(crate) mod regex;
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub(crate) mod sqlite;
+pub(crate) mod sqlite_schema;
 pub(crate) mod standard_composition;
 mod timer;
 mod typed;
 
+pub use host_modules::StandardHostModule;
 pub use jit::{
     jit_host_catalog, register_jit_builtin_module, register_jit_builtin_module_from_catalog,
 };
@@ -57,355 +56,56 @@ pub use timer::{
 /// Returns the editor/compiler catalog for the built-in host extensions.
 ///
 /// The runtime implementation and the semantic catalog intentionally share only
-/// these schemas. Keeping the catalog here lets non-executing tools resolve the
-/// same resource-bearing calls without constructing a VM.
+/// these schemas. The catalog is derived from the owning standard host
+/// module's descriptors, so a function is the single source of its schema,
+/// binding, resources, and effects.
 pub fn io_host_catalog() -> Arc<HostApiCatalog> {
     static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
     Arc::clone(CATALOG.get_or_init(|| {
-        let file_key = ResourceTypeKey::new("io.file").expect("built-in resource key is valid");
-        let mut builder = HostApiBuilder::new();
-        builder.resource(ResourceTypeSchema::new(
-            file_key.clone(),
-            "An open file handle",
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            "io::open",
-            vec![
-                HostParamSchema::value("path", HostTypeSchema::String),
-                HostParamSchema::value("mode", HostTypeSchema::String),
-            ],
-            HostTypeSchema::Resource(file_key.clone()),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            "io::read_all",
-            vec![HostParamSchema::with_passing(
-                "handle",
-                HostTypeSchema::Resource(file_key.clone()),
-                HostParamPassing::Borrow,
-            )],
-            HostTypeSchema::String,
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            "io::close",
-            vec![HostParamSchema::with_passing(
-                "handle",
-                HostTypeSchema::Resource(file_key),
-                HostParamPassing::TakeOwned,
-            )],
-            HostTypeSchema::Bool,
-        ));
-        Arc::new(builder.build().expect("built-in IO catalog is valid"))
+        io::io_host_module()
+            .catalog_module()
+            .expect("the IO module publishes a catalog surface")
+            .catalog()
+            .expect("built-in IO catalog is valid")
+            .into()
     }))
 }
 
-fn optional_type(inner: HostTypeSchema) -> HostTypeSchema {
-    HostTypeSchema::Optional(Box::new(inner))
-}
-
-fn array_type(inner: HostTypeSchema) -> HostTypeSchema {
-    HostTypeSchema::Array(Box::new(inner))
-}
-
-fn sqlite_limits_struct() -> HostStructSchema {
-    HostStructSchema::new(
-        "SqliteLimits",
-        [
-            "max_connections",
-            "max_statements",
-            "max_rows",
-            "max_columns",
-            "max_result_bytes",
-            "max_statement_bytes",
-            "max_parameters",
-            "max_parameter_bytes",
-            "max_pending_operations",
-            "max_transaction_ms",
-            "busy_timeout_ms",
-        ]
-        .into_iter()
-        .map(|name| HostStructField::new(name, optional_type(HostTypeSchema::Int)))
-        .collect(),
-    )
-    .with_description("Effective SQLite host limits. Omitted keys keep the embedding ceiling.")
-}
-
-fn sqlite_open_options_struct(limits: &HostStructSchema) -> HostStructSchema {
-    HostStructSchema::new(
-        "SqliteOpenOptions",
-        vec![
-            HostStructField::new("path", optional_type(HostTypeSchema::String)),
-            HostStructField::new("mode", optional_type(HostTypeSchema::String)),
-            HostStructField::new("root", optional_type(HostTypeSchema::String)),
-            HostStructField::new("limits", optional_type(limits.as_type())),
-        ],
-    )
-    .with_description("SQLite open options. Runtime still requires a non-empty path.")
-}
-
-fn sqlite_execute_result_struct() -> HostStructSchema {
-    HostStructSchema::new(
-        "SqliteExecuteResult",
-        vec![
-            HostStructField::new("rows_affected", HostTypeSchema::Int),
-            HostStructField::new("last_insert_rowid", HostTypeSchema::Int),
-        ],
-    )
-    .with_description("Result envelope for sqlite::execute. Runtime value remains a map.")
-}
-
-fn sqlite_value_struct() -> HostStructSchema {
-    HostStructSchema::new(
-        "SqliteValue",
-        vec![
-            HostStructField::new("kind", HostTypeSchema::String),
-            HostStructField::new("int_value", optional_type(HostTypeSchema::Int)),
-            HostStructField::new("float_value", optional_type(HostTypeSchema::Float)),
-            HostStructField::new("text_value", optional_type(HostTypeSchema::String)),
-            HostStructField::new("blob_value", optional_type(HostTypeSchema::Bytes)),
-        ],
-    )
-    .with_description(
-        "A tagged SQLite parameter or result cell. Exactly one payload matches kind, except null.",
-    )
-}
-
-fn sqlite_row_struct(value: &HostStructSchema) -> HostStructSchema {
-    HostStructSchema::new(
-        "SqliteRow",
-        vec![HostStructField::new("cells", array_type(value.as_type()))],
-    )
-    .with_description("One SQLite result row containing typed cells in column order.")
-}
-
-fn sqlite_query_result_struct(row: &HostStructSchema) -> HostStructSchema {
-    HostStructSchema::new(
-        "SqliteQueryResult",
-        vec![
-            HostStructField::new("columns", array_type(HostTypeSchema::String)),
-            HostStructField::new("rows", array_type(row.as_type())),
-            HostStructField::new("truncated", HostTypeSchema::Bool),
-            HostStructField::new("next_cursor", optional_type(HostTypeSchema::Int)),
-        ],
-    )
-    .with_description("Query result envelope with typed rows; next_cursor is omitted when absent.")
-}
-
-fn sqlite_statement_struct(
-    limits: &HostStructSchema,
-    value: &HostStructSchema,
-) -> HostStructSchema {
-    HostStructSchema::new(
-        "SqliteStatement",
-        vec![
-            HostStructField::new("sql", HostTypeSchema::String),
-            HostStructField::new("params", optional_type(array_type(value.as_type()))),
-            HostStructField::new("query", optional_type(HostTypeSchema::Bool)),
-            HostStructField::new("limits", optional_type(limits.as_type())),
-        ],
-    )
-    .with_description("One sqlite::transaction statement with optional typed parameters.")
-}
-
-fn sqlite_transaction_result_struct(
-    execute: &HostStructSchema,
-    query: &HostStructSchema,
-) -> HostStructSchema {
-    HostStructSchema::new(
-        "SqliteTransactionResult",
-        vec![
-            HostStructField::new("kind", HostTypeSchema::String),
-            HostStructField::new("execute", optional_type(execute.as_type())),
-            HostStructField::new("query", optional_type(query.as_type())),
-        ],
-    )
-    .with_description("A tagged ordered SQLite transaction result envelope.")
-}
-
-/// Returns the editor/compiler catalog for the SQLite host extension.
+/// Returns the editor/compiler catalog for the SQLite host extension, derived
+/// from the standard SQLite host module descriptors.
 pub fn sqlite_host_catalog() -> Arc<HostApiCatalog> {
     static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
-    Arc::clone(CATALOG.get_or_init(build_sqlite_host_catalog))
-}
-
-fn build_sqlite_host_catalog() -> Arc<HostApiCatalog> {
-    let connection_key =
-        ResourceTypeKey::new("sqlite.connection").expect("built-in resource key is valid");
-    let mut builder = HostApiBuilder::new();
-    builder.resource(ResourceTypeSchema::new(
-        connection_key.clone(),
-        "An open SQLite connection",
-    ));
-
-    let limits = sqlite_limits_struct();
-    let open_options = sqlite_open_options_struct(&limits);
-    let execute_result = sqlite_execute_result_struct();
-    let value = sqlite_value_struct();
-    let row = sqlite_row_struct(&value);
-    let query_result = sqlite_query_result_struct(&row);
-    let statement = sqlite_statement_struct(&limits, &value);
-    let transaction_result = sqlite_transaction_result_struct(&execute_result, &query_result);
-    builder.named_struct(limits.clone());
-    builder.named_struct(open_options.clone());
-    builder.named_struct(execute_result.clone());
-    builder.named_struct(value.clone());
-    builder.named_struct(row.clone());
-    builder.named_struct(query_result.clone());
-    builder.named_struct(statement.clone());
-    builder.named_struct(transaction_result.clone());
-
-    // Positional params, result cells, and mixed transaction outputs use named
-    // structs. Runtime values remain map/array carriers for these named types.
-    builder.function(HostFunctionSchema::with_return(
-        "sqlite::open",
-        vec![HostParamSchema::value("options", open_options.as_type())],
-        HostTypeSchema::Resource(connection_key.clone()),
-    ));
-    builder.function(HostFunctionSchema::with_return(
-        "sqlite::execute",
-        vec![
-            HostParamSchema::with_passing(
-                "connection",
-                HostTypeSchema::Resource(connection_key.clone()),
-                HostParamPassing::Borrow,
-            ),
-            HostParamSchema::value("sql", HostTypeSchema::String),
-            HostParamSchema::value("params", array_type(value.as_type())),
-        ],
-        execute_result.as_type(),
-    ));
-    builder.function(HostFunctionSchema::with_return(
-        "sqlite::query",
-        vec![
-            HostParamSchema::with_passing(
-                "connection",
-                HostTypeSchema::Resource(connection_key.clone()),
-                HostParamPassing::Borrow,
-            ),
-            HostParamSchema::value("sql", HostTypeSchema::String),
-            HostParamSchema::value("params", array_type(value.as_type())),
-            HostParamSchema::value("limits", limits.as_type()),
-        ],
-        query_result.as_type(),
-    ));
-    builder.function(HostFunctionSchema::with_return(
-        "sqlite::transaction",
-        vec![
-            HostParamSchema::with_passing(
-                "connection",
-                HostTypeSchema::Resource(connection_key.clone()),
-                HostParamPassing::Borrow,
-            ),
-            HostParamSchema::value("statements", array_type(statement.as_type())),
-        ],
-        array_type(transaction_result.as_type()),
-    ));
-    builder.function(HostFunctionSchema::with_return(
-        "sqlite::close",
-        vec![HostParamSchema::with_passing(
-            "connection",
-            HostTypeSchema::Resource(connection_key),
-            HostParamPassing::TakeOwned,
-        )],
-        HostTypeSchema::Null,
-    ));
-    Arc::new(builder.build().expect("built-in SQLite catalog is valid"))
+    Arc::clone(CATALOG.get_or_init(|| {
+        sqlite_schema::sqlite_catalog_module()
+            .catalog()
+            .expect("built-in SQLite catalog is valid")
+            .into()
+    }))
 }
 
 /// Returns the combined catalog used by default source analysis.
+///
+/// Resources, named structs, and function schemas are the derived catalogs of
+/// every standard host module that publishes a guest surface, merged in the
+/// deterministic aggregation order.
 pub fn standard_host_catalog() -> Arc<HostApiCatalog> {
     static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
-    Arc::clone(CATALOG.get_or_init(|| {
-        let file_key = ResourceTypeKey::new("io.file").expect("built-in resource key is valid");
-        let connection_key =
-            ResourceTypeKey::new("sqlite.connection").expect("built-in resource key is valid");
-        let mut builder = HostApiBuilder::new();
-        builder.resource(ResourceTypeSchema::new(
-            file_key.clone(),
-            "An open file handle",
-        ));
-        builder.resource(ResourceTypeSchema::new(
-            connection_key.clone(),
-            "An open SQLite connection",
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            "io::open",
-            vec![
-                HostParamSchema::value("path", HostTypeSchema::String),
-                HostParamSchema::value("mode", HostTypeSchema::String),
-            ],
-            HostTypeSchema::Resource(file_key.clone()),
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            "io::read_all",
-            vec![HostParamSchema::with_passing(
-                "handle",
-                HostTypeSchema::Resource(file_key.clone()),
-                HostParamPassing::Borrow,
-            )],
-            HostTypeSchema::String,
-        ));
-        builder.function(HostFunctionSchema::with_return(
-            "io::close",
-            vec![HostParamSchema::with_passing(
-                "handle",
-                HostTypeSchema::Resource(file_key),
-                HostParamPassing::TakeOwned,
-            )],
-            HostTypeSchema::Bool,
-        ));
-        {
-            let sqlite_catalog = sqlite_host_catalog();
-            for schema in sqlite_catalog.structs() {
-                builder.named_struct(schema.clone());
-            }
-            for function in sqlite_catalog.functions() {
-                builder.function(function.clone());
-            }
-        }
-        #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
-        {
-            let http_catalog = http::http_host_catalog();
-            for resource in http_catalog.resources() {
-                builder.resource(resource.clone());
-            }
-            for schema in http_catalog.structs() {
-                builder.named_struct(schema.clone());
-            }
-            for function in http_catalog.functions() {
-                builder.function(function.clone());
-            }
-        }
-        {
-            let jit_catalog = jit_host_catalog();
-            for schema in jit_catalog.structs() {
-                builder.named_struct(schema.clone());
-            }
-            for function in jit_catalog.functions() {
-                builder.function(function.clone());
-            }
-        }
-        {
-            // The standard timer surface: exact catalog entries whose owned
-            // callbacks are registered by `TimerExtension` /
-            // `register_timer_builtin_module`, exactly like the other exact
-            // adapter surfaces. A compiled program resolves the imports from
-            // this catalog; each call then fails at the runtime boundary until
-            // backend state is installed.
-            let timer_catalog = timer_host_catalog();
-            for schema in timer_catalog.structs() {
-                builder.named_struct(schema.clone());
-            }
-            for function in timer_catalog.functions() {
-                builder.function(function.clone());
-            }
-        }
-        Arc::new(builder.build().expect("standard host catalog is valid"))
-    }))
+    Arc::clone(CATALOG.get_or_init(|| Arc::new(host_modules::build_standard_host_catalog())))
 }
 
 /// Returns the cached fingerprint for [`standard_host_catalog`].
 pub fn standard_host_catalog_fingerprint() -> HostApiFingerprint {
     standard_host_catalog().fingerprint()
+}
+
+/// The standard host modules for this build (see [`host_modules`]).
+pub fn standard_host_modules() -> &'static [StandardHostModule] {
+    host_modules::standard_host_modules()
+}
+
+/// The standard modules that publish a guest catalog surface for this build.
+pub fn standard_catalog_modules() -> Vec<crate::host_extension::HostModuleDescriptor> {
+    host_modules::standard_catalog_modules()
 }
 
 #[cfg(target_arch = "wasm32")]

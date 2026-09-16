@@ -63,6 +63,16 @@ struct IoResource {
     owner_alive: Arc<AtomicBool>,
 }
 
+impl crate::host_extension::HostResourceType for IoResource {
+    const KEY: &'static str = "io.file";
+    const DESCRIPTION: &'static str = "An open file handle";
+}
+
+/// The canonical declaration for the `io.file` resource type.
+pub(crate) fn io_file_resource() -> crate::host_extension::HostResourceTypeMeta {
+    crate::host_extension::HostResourceTypeMeta::of::<IoResource>()
+}
+
 impl IoResource {
     fn new(handle: IoHandle) -> Self {
         let process_id = match &handle {
@@ -435,7 +445,7 @@ impl CaptureAsyncHostContext for IoHandleContext {
 }
 
 /// Opens a file handle for runtime I/O.
-#[pd_host_function(name = "io::open")]
+#[pd_host_function(name = "io::open", contract = super::io_open_contract)]
 pub(crate) async fn builtin_io_open(
     #[pd_host_context] context: IoPolicyContext,
     path: String,
@@ -519,7 +529,7 @@ pub(crate) async fn builtin_io_popen(
 }
 
 /// Reads all remaining text from an I/O handle.
-#[pd_host_function(name = "io::read_all")]
+#[pd_host_function(name = "io::read_all", contract = super::io_read_all_contract)]
 pub(crate) async fn builtin_io_read_all(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
@@ -674,7 +684,7 @@ pub(crate) async fn builtin_io_flush(
 }
 
 /// Closes an I/O handle.
-#[pd_host_function(name = "io::close")]
+#[pd_host_function(name = "io::close", contract = super::io_close_contract)]
 pub(crate) async fn builtin_io_close(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,

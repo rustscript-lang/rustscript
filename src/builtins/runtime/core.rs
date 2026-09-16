@@ -888,6 +888,57 @@ fn builtin_map_iter_close_metadata(map: VmMapRef<'_>, _slot: i64) -> VmMapHandle
     Arc::new(map.clone())
 }
 
+// ---- standard host module ownership ---------------------------------------
+
+/// The standard `core` host module: one descriptor owner per host
+/// function.
+pub(super) fn core_host_module() -> super::host_modules::StandardHostModule {
+    const OWNED: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+        builtin_bind_callable_metadata_descriptor,
+        builtin_detach_local_metadata_descriptor,
+        builtin_len_string_descriptor,
+        builtin_len_array_descriptor,
+        builtin_len_bytes_descriptor,
+        builtin_len_map_descriptor,
+        builtin_slice_string_descriptor,
+        builtin_slice_array_descriptor,
+        builtin_slice_bytes_descriptor,
+        builtin_concat_string_descriptor,
+        builtin_concat_array_descriptor,
+        builtin_concat_bytes_descriptor,
+        builtin_array_new_descriptor,
+        builtin_array_push_typed_descriptor,
+        builtin_map_new_descriptor,
+        builtin_get_string_descriptor,
+        builtin_get_array_descriptor,
+        builtin_get_bytes_descriptor,
+        builtin_get_map_descriptor,
+        builtin_has_array_descriptor,
+        builtin_has_bytes_descriptor,
+        builtin_has_map_descriptor,
+        builtin_type_of_descriptor,
+        builtin_to_string_descriptor,
+        builtin_format_template_descriptor,
+        builtin_set_array_descriptor,
+        builtin_set_map_descriptor,
+        builtin_keys_array_descriptor,
+        builtin_keys_map_descriptor,
+        builtin_count_array_descriptor,
+        builtin_count_map_descriptor,
+        builtin_assert_descriptor,
+        builtin_string_contains_descriptor,
+        builtin_string_replace_literal_descriptor,
+        builtin_string_lower_ascii_descriptor,
+        builtin_string_split_literal_descriptor,
+        builtin_map_iter_init_metadata_descriptor,
+        builtin_map_iter_next_metadata_descriptor,
+        builtin_map_iter_take_key_metadata_descriptor,
+        builtin_map_iter_take_value_metadata_descriptor,
+        builtin_map_iter_close_metadata_descriptor,
+    ];
+    super::host_modules::descriptor_only_module("core", OWNED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

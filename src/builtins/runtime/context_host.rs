@@ -10,3 +10,13 @@ use crate::vm::{CallOutcome, Vm, VmResult};
 fn stream_emit_impl(vm: &mut Vm, value: AnyValue) -> VmResult<CallOutcome> {
     vm.emit_stream_item(value)
 }
+
+// ---- standard host module ownership ---------------------------------------
+
+/// The standard `context` host module: one descriptor owner per host
+/// function.
+pub(super) fn context_host_module() -> super::host_modules::StandardHostModule {
+    const OWNED: &[fn() -> crate::host_extension::HostFunctionDescriptor] =
+        &[stream_emit_descriptor];
+    super::host_modules::descriptor_only_module("context", OWNED)
+}

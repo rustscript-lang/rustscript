@@ -46,6 +46,22 @@ pub(super) fn builtin_aot_dump(vm: &mut Vm) -> VmResult<String> {
     Ok(vm.dump_aot_info())
 }
 
+// ---- standard host module ownership ---------------------------------------
+
+/// The standard `aot` host module: one descriptor owner per host
+/// function.
+pub(super) fn aot_host_module() -> super::host_modules::StandardHostModule {
+    const OWNED: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+        builtin_aot_compile_descriptor,
+        builtin_aot_clear_descriptor,
+        builtin_aot_is_compiled_descriptor,
+        builtin_aot_exec_count_descriptor,
+        builtin_aot_resume_ips_descriptor,
+        builtin_aot_dump_descriptor,
+    ];
+    super::host_modules::descriptor_only_module("aot", OWNED)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

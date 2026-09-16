@@ -10,8 +10,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::host_api::{
-    HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema,
-    HostTypeSchema,
+    HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema,
 };
 use crate::{
     CallOutcome, CallReturn, HostFunctionRegistry, HostOwnedFunction, OwnedHostCall,
@@ -419,7 +418,9 @@ impl crate::vm::HostExtension for TimerExtension {
     fn catalog(&self) -> Option<&HostApiCatalog> {
         Some(
             TIMER_HOST_CATALOG
-                .get_or_init(build_timer_host_catalog)
+                .get_or_init(|| {
+                    super::host_modules::module_catalog("timer", TIMER_CATALOG_FUNCTIONS, &[], &[])
+                })
                 .as_ref(),
         )
     }
@@ -441,42 +442,131 @@ static TIMER_HOST_CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
 /// execute, and the value is dropped instead of accumulating. This is the one
 /// deliberate dynamic occurrence in the public timer surface; the typed-catalog
 /// guard records it as its narrow discarded-callable-result policy exception.
-fn build_timer_host_catalog() -> Arc<HostApiCatalog> {
-    let callback = HostTypeSchema::Callable {
+fn timer_callback_schema() -> HostTypeSchema {
+    HostTypeSchema::Callable {
         params: vec![HostTypeSchema::Bool],
         result: Box::new(HostTypeSchema::Unknown),
-    };
-    let mut builder = HostApiBuilder::new();
-    for (name, delay_name) in [("timer::at", "delay_ms"), ("timer::every", "interval_ms")] {
-        builder.function(
-            HostFunctionSchema::with_return(
-                name,
-                vec![
-                    HostParamSchema::value(delay_name, HostTypeSchema::Int),
-                    HostParamSchema::with_passing(
-                        "callback",
-                        callback.clone(),
-                        HostParamPassing::TakeOwned,
-                    ),
-                ],
-                HostTypeSchema::Bool,
-            )
-            .with_description("Registers an owned timer callback"),
-        );
     }
-    for name in ["timer::pending_count", "timer::running_count"] {
-        builder.function(HostFunctionSchema::with_return(
-            name,
-            Vec::new(),
-            HostTypeSchema::Int,
-        ));
-    }
-    Arc::new(builder.build().expect("timer host catalog must be valid"))
 }
 
-/// Exact catalog for `timer::{at,every,pending_count,running_count}`.
+/// Guest contract for `timer::at` / `timer::every`.
+///
+/// The timer functions are not `#[pd_host_function]` declarations: they need
+/// the exact owned dispatch (`register_exact_owned`) rather than a borrowed
+/// adapter, so the module declares explicit descriptors. The descriptor still
+/// carries the schema, binding class, adapter factory, and effects, so there is
+/// no parallel catalog or registry glue.
+fn timer_register_contract(name: &'static str, delay_name: &'static str) -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        name,
+        vec![
+            HostParamSchema::value(delay_name, HostTypeSchema::Int),
+            HostParamSchema::with_passing(
+                "callback",
+                timer_callback_schema(),
+                HostParamPassing::TakeOwned,
+            ),
+        ],
+        HostTypeSchema::Bool,
+    )
+    .with_description("Registers an owned timer callback")
+}
+
+/// The owned-dispatch factory for one timer registration function.
+struct RegisterTimerFactory {
+    repeating: bool,
+}
+
+impl crate::host_extension::HostOwnedAdapterFactory for RegisterTimerFactory {
+    fn create(&self, context: OwnedHostContext<'_>) -> Box<dyn HostOwnedFunction> {
+        Box::new(RegisterTimer {
+            registry: context.registry().clone(),
+            repeating: self.repeating,
+        })
+    }
+}
+
+static TIMER_AT_FACTORY: RegisterTimerFactory = RegisterTimerFactory { repeating: false };
+static TIMER_EVERY_FACTORY: RegisterTimerFactory = RegisterTimerFactory { repeating: true };
+
+fn timer_at_descriptor() -> crate::host_extension::HostFunctionDescriptor {
+    crate::host_extension::HostFunctionDescriptor {
+        schema: timer_register_contract("timer::at", "delay_ms"),
+        binding: crate::host_extension::HostBindingDescriptor {
+            kind: crate::host_extension::HostBindingKind::Owned,
+        },
+        effects: Vec::new(),
+        adapter: crate::host_extension::HostAdapterDescriptor::Owned(&TIMER_AT_FACTORY),
+        resource_types: Vec::new(),
+    }
+}
+
+fn timer_every_descriptor() -> crate::host_extension::HostFunctionDescriptor {
+    crate::host_extension::HostFunctionDescriptor {
+        schema: timer_register_contract("timer::every", "interval_ms"),
+        binding: crate::host_extension::HostBindingDescriptor {
+            kind: crate::host_extension::HostBindingKind::Owned,
+        },
+        effects: Vec::new(),
+        adapter: crate::host_extension::HostAdapterDescriptor::Owned(&TIMER_EVERY_FACTORY),
+        resource_types: Vec::new(),
+    }
+}
+
+fn timer_count_descriptor(
+    name: &'static str,
+    adapter: crate::vm::StaticHostStackFunction,
+) -> crate::host_extension::HostFunctionDescriptor {
+    crate::host_extension::HostFunctionDescriptor {
+        schema: HostFunctionSchema::with_return(name, Vec::new(), HostTypeSchema::Int),
+        binding: crate::host_extension::HostBindingDescriptor {
+            kind: crate::host_extension::HostBindingKind::StaticStack,
+        },
+        effects: Vec::new(),
+        adapter: crate::host_extension::HostAdapterDescriptor::StaticStack(adapter),
+        resource_types: Vec::new(),
+    }
+}
+
+fn timer_pending_count_descriptor() -> crate::host_extension::HostFunctionDescriptor {
+    timer_count_descriptor("timer::pending_count", pending_count)
+}
+
+fn timer_running_count_descriptor() -> crate::host_extension::HostFunctionDescriptor {
+    timer_count_descriptor("timer::running_count", running_count)
+}
+
+/// Exact catalog functions for `timer::{at,every,pending_count,running_count}`.
+const TIMER_CATALOG_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+    timer_at_descriptor,
+    timer_every_descriptor,
+    timer_pending_count_descriptor,
+    timer_running_count_descriptor,
+];
+
+fn timer_catalog_module() -> crate::host_extension::HostModuleDescriptor {
+    super::host_modules::catalog_module("timer", TIMER_CATALOG_FUNCTIONS, &[])
+}
+
+/// The standard `timer` host module: every timer function is owned here and the
+/// whole surface is published.
+pub(super) fn timer_host_module() -> super::host_modules::StandardHostModule {
+    use super::host_modules::StandardHostModule;
+
+    StandardHostModule {
+        name: "timer",
+        catalog: timer_catalog_module,
+        owned: TIMER_CATALOG_FUNCTIONS,
+        named_structs: &[],
+    }
+}
+
+/// Exact catalog for `timer::{at,every,pending_count,running_count}`, derived
+/// from the module descriptors.
 pub fn timer_host_catalog() -> Arc<HostApiCatalog> {
-    Arc::clone(TIMER_HOST_CATALOG.get_or_init(build_timer_host_catalog))
+    Arc::clone(TIMER_HOST_CATALOG.get_or_init(|| {
+        super::host_modules::module_catalog("timer", TIMER_CATALOG_FUNCTIONS, &[], &[])
+    }))
 }
 
 struct RegisterTimer {
@@ -685,54 +775,21 @@ pub fn register_timer_builtin_module(registry: &mut HostFunctionRegistry) -> VmR
 }
 
 /// Registers all timer functions against a caller-provided catalog snapshot.
+///
+/// `timer::at` / `timer::every` keep their exact owned dispatch: the installed
+/// adapter is the module's owned-descriptor factory, so the callback operand is
+/// drained, transferred, and driven by the same isolated owned-value execution
+/// VM as before, and the callback provenance guarantees are unchanged. The
+/// count functions keep their synchronous stack dispatch.
 pub fn register_timer_builtin_module_from_catalog(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
-    let names = [
-        "timer::at",
-        "timer::every",
-        "timer::pending_count",
-        "timer::running_count",
-    ];
-    let schemas = names
-        .iter()
-        .map(|name| {
-            crate::vm::validate_catalog_import_schemas(catalog, &timer_host_catalog(), name)
-                .map(|schemas| (*name, schemas))
-        })
-        .collect::<VmResult<Vec<_>>>()?;
-    registry.transactionally(|staged| {
-        for (name, schemas) in &schemas {
-            for schema in schemas.iter().cloned() {
-                match *name {
-                    "timer::at" | "timer::every" => {
-                        let repeating = *name == "timer::every";
-                        staged.register_exact_owned(
-                            name,
-                            2,
-                            schema,
-                            move |context: OwnedHostContext<'_>| -> Box<dyn HostOwnedFunction> {
-                                Box::new(RegisterTimer {
-                                    registry: context.registry().clone(),
-                                    repeating,
-                                })
-                            },
-                        )?;
-                    }
-                    "timer::pending_count" => {
-                        staged.register_exact_static(name, 0, schema, pending_count)?;
-                    }
-                    "timer::running_count" => {
-                        staged.register_exact_static(name, 0, schema, running_count)?;
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            staged.authorize_registered_builtin_import(name);
-        }
-        Ok(())
-    })
+    timer_host_module()
+        .catalog_module()
+        .expect("the timer module publishes a catalog surface")
+        .install_from_catalog(registry, catalog)
+        .map(|_| ())
 }
 
 #[cfg(test)]

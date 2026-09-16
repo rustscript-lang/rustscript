@@ -37,7 +37,7 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params_from_iter};
 
 use super::typed::{VmArrayRef, VmMapRef};
-use super::{HostCallResult, IntoHostCallOutcome, VmMap};
+use super::{HostCallResult, VmMap};
 use crate::host_api::{HostApiCatalog, ResourceTypeKey};
 use crate::vm::operation::driver::HostOperation;
 use crate::vm::operation::error::{OperationError, OperationErrorCode, OperationResult};
@@ -46,10 +46,7 @@ use crate::vm::operation::{OperationId, OperationOutcome, OperationSpec};
 use crate::vm::resource::close::{CloseProgress, HostResource};
 use crate::vm::resource::error::ResourceResult;
 use crate::vm::resource::{ResourceCloseReason, ResourceHandle};
-use crate::vm::{
-    CallOutcome, CallReturn, HostFunctionRegistry, HostOpId, Value, Vm, VmError, VmResult,
-    catalog_named_struct_schemas, host_extension,
-};
+use crate::vm::{CallReturn, HostFunctionRegistry, HostOpId, Value, Vm, VmError, VmResult};
 
 /// SQLite `progress_handler` step cadence used to surface cancellation while a
 /// statement runs.
@@ -228,7 +225,7 @@ impl SqliteResource {
 
 impl HostResource for SqliteResource {
     fn resource_type_key() -> Option<ResourceTypeKey> {
-        ResourceTypeKey::new("sqlite.connection").ok()
+        ResourceTypeKey::new(super::sqlite_schema::SQLITE_CONNECTION_KEY).ok()
     }
 
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
@@ -1536,7 +1533,7 @@ fn parse_open_options(vm: &Vm, options: &VmMap) -> VmResult<OpenOptions> {
 /// arena, slot, generation, open state, and type on every later use. The
 /// live-connection count is adapter-owned (shared with each resource) so
 /// `max_connections` is enforced without a generic by-type helper.
-#[pd_host_function(name = "sqlite::open")]
+#[pd_host_function(name = "sqlite::open", contract = super::sqlite_schema::sqlite_open_contract)]
 pub(super) fn builtin_sqlite_open_impl(vm: &mut Vm, options: VmMapRef<'_>) -> VmResult<i64> {
     let options = parse_open_options(vm, options)?;
     // The adapter-declared scope state owns the live-connection counter;
@@ -1571,7 +1568,7 @@ pub(super) fn builtin_sqlite_open_impl(vm: &mut Vm, options: VmMapRef<'_>) -> Vm
 }
 
 /// Executes one parameterized SQLite statement asynchronously.
-#[pd_host_function(name = "sqlite::execute")]
+#[pd_host_function(name = "sqlite::execute", contract = super::sqlite_schema::sqlite_execute_contract, runtime_owned_pending)]
 pub(super) fn builtin_sqlite_execute_impl(
     vm: &mut Vm,
     db_id: i64,
@@ -1592,7 +1589,7 @@ pub(super) fn builtin_sqlite_execute_impl(
 }
 
 /// Runs one parameterized SQLite query with row and result-byte bounds.
-#[pd_host_function(name = "sqlite::query")]
+#[pd_host_function(name = "sqlite::query", contract = super::sqlite_schema::sqlite_query_contract, runtime_owned_pending)]
 pub(super) fn builtin_sqlite_query_impl(
     vm: &mut Vm,
     db_id: i64,
@@ -1671,7 +1668,7 @@ fn parse_transaction_statements(
 }
 
 /// Runs ordered statements atomically and returns ordered result envelopes.
-#[pd_host_function(name = "sqlite::transaction")]
+#[pd_host_function(name = "sqlite::transaction", contract = super::sqlite_schema::sqlite_transaction_contract, runtime_owned_pending)]
 pub(super) fn builtin_sqlite_transaction_impl(
     vm: &mut Vm,
     db_id: i64,
@@ -1711,7 +1708,7 @@ pub(super) fn builtin_sqlite_transaction_impl(
 /// Closes a SQLite resource through the generic scope close. Pending drivers
 /// on the connection observe the closed slot and are retired through the
 /// scope's operation registry; no type-dispatched helper is needed.
-#[pd_host_function(name = "sqlite::close")]
+#[pd_host_function(name = "sqlite::close", contract = super::sqlite_schema::sqlite_close_contract)]
 pub(super) fn builtin_sqlite_close_impl(vm: &mut Vm, db_id: i64) -> VmResult<()> {
     let handle = sqlite_handle(db_id)?;
     vm.execution_scope()
@@ -1720,65 +1717,27 @@ pub(super) fn builtin_sqlite_close_impl(vm: &mut Vm, db_id: i64) -> VmResult<()>
     Ok(())
 }
 
-struct SqliteAdapterContract {
-    name: &'static str,
-    arity: u8,
-    adapter: fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>,
-    runtime_owned_pending: bool,
-}
-
-const SQLITE_ADAPTER_CONTRACTS: &[SqliteAdapterContract] = &[
-    SqliteAdapterContract {
-        name: "sqlite::open",
-        arity: 1,
-        adapter: open_adapter,
-        runtime_owned_pending: false,
-    },
-    SqliteAdapterContract {
-        name: "sqlite::execute",
-        arity: 3,
-        adapter: execute_adapter,
-        runtime_owned_pending: true,
-    },
-    SqliteAdapterContract {
-        name: "sqlite::query",
-        arity: 4,
-        adapter: query_adapter,
-        runtime_owned_pending: true,
-    },
-    SqliteAdapterContract {
-        name: "sqlite::transaction",
-        arity: 2,
-        adapter: transaction_adapter,
-        runtime_owned_pending: true,
-    },
-    SqliteAdapterContract {
-        name: "sqlite::close",
-        arity: 1,
-        adapter: close_adapter,
-        runtime_owned_pending: false,
-    },
+/// Every SQLite catalog function the feature-enabled build owns.
+pub(super) const SQLITE_CATALOG_FUNCTIONS:
+    &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+    builtin_sqlite_open_descriptor,
+    builtin_sqlite_execute_descriptor,
+    builtin_sqlite_query_descriptor,
+    builtin_sqlite_transaction_descriptor,
+    builtin_sqlite_close_descriptor,
 ];
 
-fn open_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    builtin_sqlite_open(vm, args).map(IntoHostCallOutcome::into_host_call_outcome)
+impl crate::host_extension::HostResourceType for SqliteResource {
+    const KEY: &'static str = super::sqlite_schema::SQLITE_CONNECTION_KEY;
+    const DESCRIPTION: &'static str = super::sqlite_schema::SQLITE_CONNECTION_DESCRIPTION;
 }
 
-fn execute_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    builtin_sqlite_execute(vm, args).map(IntoHostCallOutcome::into_host_call_outcome)
+/// The canonical declaration for the concrete `sqlite.connection` resource.
+pub(super) fn concrete_sqlite_connection_resource() -> crate::host_extension::HostResourceTypeMeta {
+    crate::host_extension::HostResourceTypeMeta::of::<SqliteResource>()
 }
 
-fn query_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    builtin_sqlite_query(vm, args).map(IntoHostCallOutcome::into_host_call_outcome)
-}
-
-fn transaction_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    builtin_sqlite_transaction(vm, args).map(IntoHostCallOutcome::into_host_call_outcome)
-}
-
-fn close_adapter(vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-    builtin_sqlite_close(vm, args).map(IntoHostCallOutcome::into_host_call_outcome)
-}
+/// The standard `sqlite` host module.
 
 /// Registers SQLite host functions from [`super::standard_host_catalog`].
 pub fn register_sqlite_builtin_module(registry: &mut HostFunctionRegistry) -> VmResult<()> {
@@ -1789,42 +1748,17 @@ pub fn register_sqlite_builtin_module(registry: &mut HostFunctionRegistry) -> Vm
 /// Registers SQLite host functions using schemas from `catalog`.
 ///
 /// `catalog` must declare the same SQLite named structs and function overloads
-/// as [`super::sqlite_host_catalog`]; registered fingerprints match the supplied
-/// catalog so exact compile/bind pairs.
+/// as [`super::sqlite_host_catalog`]; the registered adapters are the module
+/// descriptors, so a compile/bind pair always agrees on identity.
 pub fn register_sqlite_builtin_module_from_catalog(
     registry: &mut HostFunctionRegistry,
     catalog: &HostApiCatalog,
 ) -> VmResult<()> {
-    let contract = super::sqlite_host_catalog();
-    let catalog_fingerprint = catalog.fingerprint();
-    let contract_fingerprint = contract.fingerprint();
-    let schemas = SQLITE_ADAPTER_CONTRACTS
-        .iter()
-        .map(|entry| {
-            host_extension::validate_catalog_import_schemas_with_fingerprints(
-                catalog,
-                &contract,
-                entry.name,
-                catalog_fingerprint,
-                contract_fingerprint,
-            )
-            .map(|schemas| (entry, schemas))
-        })
-        .collect::<VmResult<Vec<_>>>()?;
-
-    registry.transactionally(|staged| {
-        staged.install_named_struct_schemas(catalog_named_struct_schemas(catalog))?;
-        for (entry, schemas) in &schemas {
-            for schema in schemas.iter().cloned() {
-                staged.register_exact_static(entry.name, entry.arity, schema, entry.adapter)?;
-            }
-            staged.authorize_registered_builtin_import(entry.name);
-            if entry.runtime_owned_pending {
-                staged.mark_exact_runtime_owned_pending(entry.name)?;
-            }
-        }
-        Ok(())
-    })
+    super::sqlite_schema::sqlite_standard_host_module()
+        .catalog_module()
+        .expect("the SQLite module publishes a catalog surface")
+        .install_from_catalog(registry, catalog)
+        .map(|_| ())
 }
 
 /// Adapter-owned SQLite embedding-control surface.
