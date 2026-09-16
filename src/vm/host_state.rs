@@ -56,6 +56,7 @@ struct HostStateEntry {
 }
 
 /// A registered (but not necessarily initialized) host-private state provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RegisteredProvider {
     key: &'static str,
     type_name: &'static str,
@@ -97,7 +98,9 @@ pub enum HostStateError {
     /// The requested state exists but holds a different concrete type.
     TypeMismatch {
         key: &'static str,
-        expected_type: &'static str,
+        /// Concrete type the state table holds.
+        held_type: &'static str,
+        /// Concrete type the caller requested.
         requested_type: &'static str,
     },
 }
@@ -173,11 +176,11 @@ impl fmt::Display for HostStateError {
             ),
             Self::TypeMismatch {
                 key,
-                expected_type,
+                held_type,
                 requested_type,
             } => write!(
                 formatter,
-                "host state `{key}` holds `{expected_type}` but `{requested_type}` was requested"
+                "host state `{key}` holds `{held_type}` but `{requested_type}` was requested"
             ),
         }
     }
@@ -331,63 +334,27 @@ impl ModuleStateStore {
         &mut self,
         provider: &HostStateProvider,
     ) -> Result<(), HostStateError> {
-        if let Some(existing_type) = self.provider_keys.get(provider.key()).copied()
-            && existing_type != provider.type_id()
-        {
-            return Err(HostStateError::Requirement(
-                HostStateRequirementError::ProviderKeyConflict {
-                    key: provider.key(),
-                    existing_type: self.registered_type_name(existing_type),
-                    conflicting_type: provider.type_name(),
-                },
-            ));
-        }
-        if let Some(existing) = self.providers.get(&provider.type_id()) {
-            if existing.key != provider.key() || existing.lifetime != provider.lifetime() {
-                return Err(HostStateError::Requirement(
-                    HostStateRequirementError::ProviderConflict {
-                        key: existing.key,
-                        type_name: existing.type_name,
-                    },
-                ));
-            }
-            return Ok(());
-        }
-        if let Some(entry) = self.host_states.get(&provider.type_id())
-            && entry.key != provider.key()
-        {
-            return Err(HostStateError::Requirement(
-                HostStateRequirementError::ProviderConflict {
-                    key: entry.key,
-                    type_name: entry.type_name,
-                },
-            ));
-        }
-        self.provider_keys
-            .insert(provider.key(), provider.type_id());
-        self.providers.insert(
-            provider.type_id(),
-            RegisteredProvider {
-                key: provider.key(),
-                type_name: provider.type_name(),
-                lifetime: provider.lifetime(),
-            },
-        );
+        self.validate_host_state_provider(provider)?;
+        self.apply_host_state_provider(provider);
         Ok(())
     }
 
     /// Installs a requirement list transactionally, returning the deduplicated
     /// requirements.
     ///
-    /// Identical providers deduplicate; a conflicting requirement leaves the
-    /// table unchanged.
+    /// Identical providers deduplicate; the complete deduplicated list is
+    /// validated against the current table before any provider is registered,
+    /// so a conflicting requirement leaves the table unchanged.
     pub(crate) fn install_host_state_requirements(
         &mut self,
         requirements: &[HostStateRequirement],
     ) -> Result<Vec<HostStateRequirement>, HostStateError> {
         let merged = dedupe_host_state_requirements(requirements)?;
         for requirement in &merged {
-            self.register_host_state_provider(&requirement.provider)?;
+            self.validate_host_state_provider(&requirement.provider)?;
+        }
+        for requirement in &merged {
+            self.apply_host_state_provider(&requirement.provider);
         }
         Ok(merged)
     }
@@ -503,6 +470,69 @@ impl ModuleStateStore {
         self.host_states.is_empty()
     }
 
+    /// Read-only conflict check for one provider descriptor against the
+    /// complete current table.
+    ///
+    /// A key owned by another concrete type, a concrete type already registered
+    /// under a different key or lifetime, or an existing state instance under a
+    /// different key all fail closed. Nothing is mutated, so a rejected batch
+    /// leaves every table map exactly as it was.
+    fn validate_host_state_provider(
+        &self,
+        provider: &HostStateProvider,
+    ) -> Result<(), HostStateError> {
+        if let Some(existing_type) = self.provider_keys.get(provider.key()).copied()
+            && existing_type != provider.type_id()
+        {
+            return Err(HostStateError::Requirement(
+                HostStateRequirementError::ProviderKeyConflict {
+                    key: provider.key(),
+                    existing_type: self.registered_type_name(existing_type),
+                    conflicting_type: provider.type_name(),
+                },
+            ));
+        }
+        if let Some(existing) = self.providers.get(&provider.type_id())
+            && (existing.key != provider.key() || existing.lifetime != provider.lifetime())
+        {
+            return Err(HostStateError::Requirement(
+                HostStateRequirementError::ProviderConflict {
+                    key: existing.key,
+                    type_name: existing.type_name,
+                },
+            ));
+        }
+        if let Some(entry) = self.host_states.get(&provider.type_id())
+            && entry.key != provider.key()
+        {
+            return Err(HostStateError::Requirement(
+                HostStateRequirementError::ProviderConflict {
+                    key: entry.key,
+                    type_name: entry.type_name,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Inserts one validated provider descriptor.
+    ///
+    /// Conflicts must be rejected by [`Self::validate_host_state_provider`]
+    /// first; this step cannot fail, which is what makes a validated batch
+    /// installable in one pass.
+    fn apply_host_state_provider(&mut self, provider: &HostStateProvider) {
+        self.provider_keys
+            .insert(provider.key(), provider.type_id());
+        self.providers.insert(
+            provider.type_id(),
+            RegisteredProvider {
+                key: provider.key(),
+                type_name: provider.type_name(),
+                lifetime: provider.lifetime(),
+            },
+        );
+    }
+
     /// Ensures `provider`'s state exists, running its initializer when needed.
     fn ensure_host_state_provider(
         &mut self,
@@ -573,11 +603,14 @@ impl ModuleStateStore {
     }
 
     /// Deterministic diagnostic for a concrete-type mismatch.
+    ///
+    /// `held_type` is the concrete type the provider's state actually holds and
+    /// `requested_type` is the type the caller asked for.
     fn type_mismatch<T: HostState>(&self, provider: &HostStateProvider) -> HostStateError {
         HostStateError::TypeMismatch {
             key: provider.key(),
-            expected_type: std::any::type_name::<T>(),
-            requested_type: provider.type_name(),
+            held_type: provider.type_name(),
+            requested_type: std::any::type_name::<T>(),
         }
     }
 
@@ -607,8 +640,13 @@ impl ModuleStateStore {
 
 #[cfg(test)]
 mod tests {
+    use std::any::TypeId;
+
     use super::ModuleStateStore;
-    use crate::host_api::HostState;
+    use crate::host_api::{
+        HostState, HostStateProvider, HostStateRequirement, HostStateRequirementError,
+        dedupe_host_state_requirements,
+    };
     use crate::vm::host_state::HostStateError;
 
     #[derive(Debug, PartialEq)]
@@ -781,5 +819,211 @@ mod tests {
         store
             .ensure_host_state::<LazyState>("test::lazy", "state read LazyState")
             .expect("provider can be registered again after removal");
+    }
+
+    #[derive(Debug, Default, PartialEq)]
+    struct BatchState {
+        value: u64,
+    }
+
+    impl HostState for BatchState {
+        const KEY: &'static str = "test.batch_state";
+
+        fn initialize() -> Result<Self, String> {
+            Ok(Self::default())
+        }
+    }
+
+    /// Sorted snapshot of the types that currently hold a state instance.
+    fn state_types(store: &ModuleStateStore) -> Vec<TypeId> {
+        let mut types: Vec<TypeId> = store.host_states.keys().copied().collect();
+        types.sort();
+        types
+    }
+
+    #[test]
+    fn a_conflicting_batch_registers_no_provider_from_its_valid_prefix() {
+        let mut store = ModuleStateStore::new();
+        store
+            .set_host_state(ImpostorState { value: 3 })
+            .expect("the seeded conflict installs");
+
+        let providers_before = store.providers.clone();
+        let provider_keys_before = store.provider_keys.clone();
+        let states_before = state_types(&store);
+
+        let error = store
+            .install_host_state_requirements(&[
+                HostStateRequirement {
+                    provider: BatchState::provider(),
+                    write: false,
+                },
+                HostStateRequirement {
+                    provider: LazyState::provider(),
+                    write: true,
+                },
+            ])
+            .expect_err("the later conflict must reject the whole batch");
+        assert_eq!(error.key(), Some("test.lazy_state"));
+
+        assert!(
+            !store.providers.contains_key(&TypeId::of::<BatchState>()),
+            "the valid prefix must not stay registered after a later conflict"
+        );
+        assert_eq!(
+            store.providers, providers_before,
+            "the provider map must be unchanged"
+        );
+        assert_eq!(
+            store.provider_keys, provider_keys_before,
+            "the provider key map must be unchanged"
+        );
+        assert_eq!(
+            state_types(&store),
+            states_before,
+            "the state map must be unchanged"
+        );
+
+        // The rejected batch leaves the table retryable: the canonical install
+        // of the valid prefix succeeds and resolves through its provider.
+        let merged = store
+            .install_host_state_requirements(&[HostStateRequirement {
+                provider: BatchState::provider(),
+                write: true,
+            }])
+            .expect("a canonical install must succeed after a rejected batch");
+        assert_eq!(merged.len(), 1);
+        assert!(
+            merged[0].write,
+            "read→write upgrades the retried requirement"
+        );
+        store
+            .ensure_host_state::<BatchState>("test::batch", "state read BatchState")
+            .expect("the canonical requirement resolves");
+        assert_eq!(store.host_state::<BatchState>().expect("present").value, 0);
+    }
+
+    #[test]
+    fn requirement_dedupe_identifies_states_by_concrete_type() {
+        let read = HostStateRequirement {
+            provider: HostStateProvider::with_diagnostic_name::<LazyState>(
+                "test.lazy_state",
+                "alias::ReadName",
+            ),
+            write: false,
+        };
+        let write = HostStateRequirement {
+            provider: HostStateProvider::with_diagnostic_name::<LazyState>(
+                "test.lazy_state",
+                "alias::WriteName",
+            ),
+            write: true,
+        };
+
+        let merged = dedupe_host_state_requirements(&[read, write])
+            .expect("one concrete type with one key must deduplicate");
+        assert_eq!(merged.len(), 1);
+        assert!(
+            merged[0].write,
+            "read→write upgrades the merged requirement"
+        );
+        assert_eq!(merged[0].provider.type_id(), TypeId::of::<LazyState>());
+        assert_eq!(merged[0].key(), "test.lazy_state");
+    }
+
+    #[test]
+    fn distinct_concrete_types_never_merge_on_equal_diagnostic_names() {
+        let first = HostStateRequirement {
+            provider: HostStateProvider::with_diagnostic_name::<LazyState>(
+                "test.shared_key",
+                "alias::SharedName",
+            ),
+            write: false,
+        };
+        let second = HostStateRequirement {
+            provider: HostStateProvider::with_diagnostic_name::<ImpostorState>(
+                "test.shared_key",
+                "alias::SharedName",
+            ),
+            write: false,
+        };
+
+        let error = dedupe_host_state_requirements(&[first, second])
+            .expect_err("distinct concrete types must not merge on an equal name");
+        assert_eq!(
+            error,
+            HostStateRequirementError::ProviderKeyConflict {
+                key: "test.shared_key",
+                existing_type: "alias::SharedName",
+                conflicting_type: "alias::SharedName",
+            }
+        );
+    }
+
+    #[test]
+    fn one_concrete_type_with_two_keys_is_a_provider_conflict() {
+        let first = HostStateRequirement {
+            provider: HostStateProvider::with_diagnostic_name::<LazyState>(
+                "test.first_key",
+                "alias::Lazy",
+            ),
+            write: false,
+        };
+        let second = HostStateRequirement {
+            provider: HostStateProvider::with_diagnostic_name::<LazyState>(
+                "test.second_key",
+                "alias::Lazy",
+            ),
+            write: false,
+        };
+
+        let error = dedupe_host_state_requirements(&[first, second])
+            .expect_err("one concrete type cannot declare two state keys");
+        assert_eq!(
+            error,
+            HostStateRequirementError::ProviderConflict {
+                key: "test.first_key",
+                type_name: "alias::Lazy",
+            }
+        );
+    }
+
+    #[test]
+    fn type_mismatch_reports_provider_type_before_requested_type() {
+        let store = ModuleStateStore::new();
+        let provider = ImpostorState::provider();
+
+        let error = store
+            .host_state_ref::<LazyState>(&provider, "test::lazy", "state read LazyState")
+            .expect_err("a provider for another concrete type must fail closed");
+        assert_eq!(error.key(), Some("test.lazy_state"));
+
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            format!(
+                "host state `test.lazy_state` holds `{}` but `{}` was requested",
+                std::any::type_name::<ImpostorState>(),
+                std::any::type_name::<LazyState>(),
+            ),
+            "the diagnostic must name the provider-held type first"
+        );
+        match &error {
+            HostStateError::TypeMismatch {
+                key,
+                held_type,
+                requested_type,
+            } => {
+                assert_eq!(*key, "test.lazy_state");
+                assert_eq!(*held_type, std::any::type_name::<ImpostorState>());
+                assert_eq!(*requested_type, std::any::type_name::<LazyState>());
+            }
+            other => panic!("expected a concrete-type mismatch, got {other}"),
+        }
+
+        let error = store
+            .host_state_mut::<LazyState>(&provider, "test::lazy", "state write LazyState")
+            .expect_err("the mutable path reports the same mismatch");
+        assert_eq!(error.to_string(), message);
     }
 }
