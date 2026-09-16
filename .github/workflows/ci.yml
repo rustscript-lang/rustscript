@@ -126,6 +126,8 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '22'
+      - name: Check the runtime for wasm32
+        run: cargo check -p pd-vm-wasm --target wasm32-unknown-unknown --features runtime
       - name: Build language service wasm
         run: cargo build -p pd-vm-wasm --target wasm32-unknown-unknown --release
       - name: Stage language service wasm
