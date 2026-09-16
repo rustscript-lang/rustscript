@@ -67,9 +67,10 @@ pub use builtins::runtime::{
 };
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
-    DEFAULT_REGEX_CACHE_CAPACITY, RegexCache, RegexCacheVmExt, io_host_catalog, jit_host_catalog,
-    register_jit_builtin_module, register_jit_builtin_module_from_catalog, sqlite_host_catalog,
-    standard_composition, standard_host_catalog, standard_host_catalog_fingerprint,
+    DEFAULT_REGEX_CACHE_CAPACITY, RegexCache, RegexCacheVmExt, StandardHostModule, io_host_catalog,
+    jit_host_catalog, register_jit_builtin_module, register_jit_builtin_module_from_catalog,
+    sqlite_host_catalog, standard_catalog_modules, standard_composition, standard_host_catalog,
+    standard_host_catalog_fingerprint, standard_host_modules,
 };
 #[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
 pub use builtins::runtime::{IoHostExt, IoPolicy};
@@ -150,7 +151,8 @@ pub use vm::diagnostics::render_vm_error;
 #[cfg(feature = "runtime")]
 pub use vm::host_extension::{
     HostAdapterDescriptor, HostBindingDescriptor, HostBindingKind, HostFunctionDescriptor,
-    HostModuleDescriptor, HostResourceType, HostResourceTypeMeta, install_host_state_requirements,
+    HostModuleDescriptor, HostOwnedAdapterFactory, HostResourceType, HostResourceTypeMeta,
+    install_host_state_requirements,
 };
 #[cfg(feature = "runtime")]
 pub use vm::resource::{Resource, ResourceHandle, ResourceMut, ResourceOwned, ResourceRef};
