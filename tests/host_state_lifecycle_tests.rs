@@ -93,6 +93,20 @@ impl HostState for ImpostorTuning {
     }
 }
 
+/// A second concrete type that (incorrectly) claims `ProvidedTuning`'s key.
+#[derive(Debug, PartialEq, Eq)]
+struct ImpostorProvidedTuning {
+    value: i64,
+}
+
+impl HostState for ImpostorProvidedTuning {
+    const KEY: &'static str = "test.provided_tuning";
+
+    fn initialize() -> Result<Self, String> {
+        Ok(Self { value: 0 })
+    }
+}
+
 fn empty_vm() -> Vm {
     Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]))
 }
@@ -462,4 +476,85 @@ fn requirement_lists_deduplicate_deterministically() {
 
     install_host_state_requirements(&mut vm, &[read])
         .expect("re-installing the same requirement stays idempotent");
+}
+
+#[test]
+fn a_late_conflict_installs_none_of_the_earlier_requirements() {
+    let mut vm = empty_vm();
+
+    // The table already owns `test.demo_tuning`.
+    install_host_state_requirements(
+        &mut vm,
+        &[HostStateRequirement {
+            provider: ImpostorTuning::provider(),
+            write: false,
+        }],
+    )
+    .expect("the seeded requirement installs");
+
+    let error = install_host_state_requirements(
+        &mut vm,
+        &[
+            HostStateRequirement {
+                provider: ProvidedTuning::provider(),
+                write: false,
+            },
+            HostStateRequirement {
+                provider: DemoTuning::provider(),
+                write: false,
+            },
+        ],
+    )
+    .expect_err("a requirement conflicting with the installed table must fail the batch");
+    assert!(
+        error.to_string().contains("test.demo_tuning"),
+        "diagnostic must name the conflicting key: {error}"
+    );
+
+    assert!(
+        vm.host_state::<ProvidedTuning>().is_none(),
+        "the failed batch must not create state for its valid prefix"
+    );
+
+    // No residue: a different concrete type can still claim the key the valid
+    // prefix declared, so the rejected batch registered nothing.
+    install_host_state_requirements(
+        &mut vm,
+        &[HostStateRequirement {
+            provider: ImpostorProvidedTuning::provider(),
+            write: false,
+        }],
+    )
+    .expect("the failed batch must leave no provider or key residue behind");
+
+    // The rejected batch stays retryable: the canonical requirement installs
+    // with read→write semantics and resolves through the VM.
+    let merged = install_host_state_requirements(
+        &mut vm,
+        &[HostStateRequirement {
+            provider: ImpostorProvidedTuning::provider(),
+            write: true,
+        }],
+    )
+    .expect("a canonical install must succeed after a rejected batch");
+    assert_eq!(merged.len(), 1);
+    assert!(
+        merged[0].write,
+        "read→write must upgrade the retried requirement"
+    );
+
+    let mut context = vm.host_context();
+    context
+        .ensure_host_state::<ImpostorProvidedTuning>(
+            "test::tuning",
+            "state read ImpostorProvidedTuning",
+        )
+        .expect("the canonical requirement resolves");
+    let state = context
+        .host_state_ref::<ImpostorProvidedTuning>(
+            "test::tuning",
+            "state read ImpostorProvidedTuning",
+        )
+        .expect("the canonical requirement reads");
+    assert_eq!(state.value, 0);
 }

@@ -525,6 +525,27 @@ impl HostStateProvider {
         }
     }
 
+    /// Test-only provider whose diagnostic name is decoupled from its concrete
+    /// [`TypeId`].
+    ///
+    /// Production providers are canonical, so a test that needs two distinct
+    /// concrete types reporting one type-name, or one concrete type reporting
+    /// two different names, constructs the descriptor here instead of relying
+    /// on those cases being reachable through [`HostState::provider`].
+    #[cfg(test)]
+    pub(crate) fn with_diagnostic_name<T: HostState>(
+        key: &'static str,
+        type_name: &'static str,
+    ) -> Self {
+        Self {
+            key,
+            type_id: TypeId::of::<T>(),
+            type_name,
+            lifetime: HostStateLifetime::Vm,
+            init: boxed_state_init::<T>,
+        }
+    }
+
     /// Declared state key ([`HostState::KEY`]).
     pub fn key(&self) -> &'static str {
         self.key
@@ -738,32 +759,41 @@ impl std::error::Error for HostStateRequirementError {}
 /// Deduplicates state requirements and rejects conflicting providers.
 ///
 /// Requirements for one state merge (a state written anywhere is reported as a
-/// write). Two concrete types claiming one key, or one type with two different
-/// providers, fail closed. Output order follows first appearance so
-/// diagnostics stay deterministic.
+/// write). Concrete identity is the provider [`TypeId`]: two distinct concrete
+/// types never merge, even when their diagnostic type names are equal, and one
+/// concrete type with two different providers (a different key or lifetime)
+/// fails closed. Output order follows first appearance so diagnostics stay
+/// deterministic.
 pub fn dedupe_host_state_requirements(
     requirements: &[HostStateRequirement],
 ) -> Result<Vec<HostStateRequirement>, HostStateRequirementError> {
     let mut merged: Vec<HostStateRequirement> = Vec::new();
     for requirement in requirements {
         let key = requirement.key();
-        let type_name = requirement.type_name();
-        match merged.iter_mut().find(|seen| seen.key() == key) {
-            Some(existing) => {
-                if existing.type_name() != type_name {
-                    return Err(HostStateRequirementError::ProviderKeyConflict {
-                        key,
-                        existing_type: existing.type_name(),
-                        conflicting_type: type_name,
-                    });
-                }
-                if existing.provider.lifetime() != requirement.provider.lifetime() {
-                    return Err(HostStateRequirementError::ProviderConflict { key, type_name });
-                }
-                existing.merge(requirement);
+        let type_id = requirement.provider.type_id();
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|seen| seen.provider.type_id() == type_id)
+        {
+            if existing.key() != key
+                || existing.provider.lifetime() != requirement.provider.lifetime()
+            {
+                return Err(HostStateRequirementError::ProviderConflict {
+                    key: existing.key(),
+                    type_name: existing.type_name(),
+                });
             }
-            None => merged.push(*requirement),
+            existing.merge(requirement);
+            continue;
         }
+        if let Some(existing) = merged.iter().find(|seen| seen.key() == key) {
+            return Err(HostStateRequirementError::ProviderKeyConflict {
+                key,
+                existing_type: existing.type_name(),
+                conflicting_type: requirement.type_name(),
+            });
+        }
+        merged.push(*requirement);
     }
     Ok(merged)
 }
