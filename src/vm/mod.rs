@@ -60,6 +60,7 @@ pub use self::host_extension::{
     validate_catalog_import_schemas_with_fingerprints,
 };
 use self::host_runtime::HostRuntime;
+pub use self::host_state::{HostStateError, HostStateMut, HostStateRef};
 use self::instance::{ExecutionFrame, FrameContinuation, Instance, QueuedCallable};
 pub use self::invocation::{Invocation, InvocationError, InvocationItem, InvocationPoll};
 pub use self::resource::ResourceCloseReason;
@@ -71,6 +72,10 @@ pub use crate::bytecode::{
     ValueType,
 };
 use crate::bytecode::{StableHasher, hash_value};
+pub use crate::host_api::{
+    HostState, HostStateLifetime, HostStateProvider, HostStateRequirement,
+    HostStateRequirementError,
+};
 pub use store::{
     IntoScriptValue, QueuedScriptInvocation, ScriptArgs, ScriptCallback, ScriptResult, Store,
 };
@@ -3540,6 +3545,32 @@ impl Vm {
     /// or naming a builtin domain module.
     pub fn host_context(&mut self) -> crate::vm::host_context::HostContext<'_> {
         crate::vm::host_context::HostContext::new(self)
+    }
+
+    /// Borrows already-initialized per-VM host state of `T`, if any.
+    ///
+    /// This is the host-agnostic read seam for diagnostics that only have a
+    /// shared VM borrow (host modules expose their own configuration /
+    /// statistics helpers on top of it). It never initializes the state:
+    /// resolution and lazy initialization go through
+    /// [`HostContext::ensure_host_state`](crate::vm::host_context::HostContext::ensure_host_state).
+    pub fn host_state<T: crate::host_api::HostState>(
+        &self,
+    ) -> Option<crate::vm::host_state::HostStateRef<'_, T>> {
+        self.host.host_state::<T>()
+    }
+
+    /// Installs a host-private state requirement list, returning the
+    /// deduplicated requirements.
+    ///
+    /// Identical providers deduplicate; a conflicting requirement (a second
+    /// concrete type claiming one state key) fails before any mutation.
+    pub fn install_host_state_requirements(
+        &mut self,
+        requirements: &[crate::host_api::HostStateRequirement],
+    ) -> Result<Vec<crate::host_api::HostStateRequirement>, crate::vm::host_state::HostStateError>
+    {
+        self.host.install_host_state_requirements(requirements)
     }
 
     /// Installs a [`HostExtension`](crate::vm::host_extension::HostExtension)

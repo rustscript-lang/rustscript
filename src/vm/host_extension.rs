@@ -36,11 +36,13 @@ use crate::vm::VmResult;
 
 pub use super::host_context::HostContext;
 pub use super::host_context::HostModule as HostModuleState;
+pub use super::host_state::{HostStateError, HostStateMut, HostStateRef};
 use super::resource::HostResource;
 pub use crate::host_api::{
     HostEffect, HostFunctionSchema, HostImportParam, HostImportSchema, HostNamedStruct,
-    HostParamPassing, HostParamSchema, HostTypeSchema, ResourceEffect, ResourceTypeKey,
-    ResourceTypeSchema,
+    HostParamPassing, HostParamSchema, HostState, HostStateEffect, HostStateLifetime,
+    HostStateProvider, HostStateRequirement, HostStateRequirementError, HostTypeSchema,
+    ResourceEffect, ResourceTypeKey, ResourceTypeSchema,
 };
 
 /// Canonical declaration for one concrete host resource type.
@@ -217,6 +219,49 @@ impl HostFunctionDescriptor {
         }
         builder.build()
     }
+
+    /// Host-private state requirements declared by this function.
+    ///
+    /// These never appear in [`HostFunctionSchema`], guest arity, or the
+    /// catalog fingerprint; they are resolved per VM through the generic
+    /// host-state table.
+    pub fn state_requirements(&self) -> Vec<HostStateRequirement> {
+        self.effects
+            .iter()
+            .filter_map(HostEffect::host_state)
+            .map(HostStateRequirement::of_effect)
+            .collect()
+    }
+}
+
+/// Aggregates the deduplicated host-private state requirements of a
+/// descriptor list.
+///
+/// Requirements merge in descriptor order (a state written anywhere is
+/// reported as a write). A conflicting provider fails the whole list, and the
+/// error names the descriptor that introduced the conflict.
+fn collect_state_requirements(
+    descriptors: &[HostFunctionDescriptor],
+) -> Result<Vec<HostStateRequirement>, HostApiCatalogError> {
+    let mut requirements: Vec<HostStateRequirement> = Vec::new();
+    for descriptor in descriptors {
+        let declared = descriptor.state_requirements();
+        if declared.is_empty() {
+            continue;
+        }
+        let mut next = requirements.clone();
+        next.extend(declared);
+        match crate::host_api::dedupe_host_state_requirements(&next) {
+            Ok(merged) => requirements = merged,
+            Err(error) => {
+                return Err(HostApiCatalogError::HostStateRequirement {
+                    function: descriptor.schema.name.clone(),
+                    error,
+                });
+            }
+        }
+    }
+    Ok(requirements)
 }
 
 /// Converts a generated host-function wrapper result into a catalog adapter outcome.
@@ -258,9 +303,10 @@ impl HostModuleDescriptor {
 
     /// Validates the complete module, then registers adapters transactionally.
     ///
-    /// Named structs, resources, function schemas, and binding identities are
-    /// checked before any registry mutation. A later failure rolls back every
-    /// adapter installed by this call.
+    /// Named structs, resources, function schemas, binding identities, and
+    /// host-private state requirements are checked before any registry
+    /// mutation. A later failure rolls back every adapter installed by this
+    /// call.
     pub fn install(
         &self,
         registry: &mut super::host::HostFunctionRegistry,
@@ -275,6 +321,11 @@ impl HostModuleDescriptor {
             )));
         }
         let descriptors = self.descriptors();
+        // Host-private state requirements validate before any registry
+        // mutation: identical providers deduplicate, conflicting ones fail the
+        // module.
+        collect_state_requirements(&descriptors)
+            .map_err(|error| crate::vm::VmError::HostError(error.to_string()))?;
         registry.transactionally(|registry| {
             let named_structs = catalog_named_struct_schemas(&catalog);
             registry.install_named_struct_schemas(named_structs)?;
@@ -285,12 +336,39 @@ impl HostModuleDescriptor {
         })
     }
 
+    /// Deduplicated host-private state requirements of this module.
+    ///
+    /// Identical providers collapse (a state written anywhere is reported as a
+    /// write); a conflicting provider fails the whole module before any
+    /// registry or VM mutation.
+    pub fn state_requirements(&self) -> Result<Vec<HostStateRequirement>, HostApiCatalogError> {
+        collect_state_requirements(&self.descriptors())
+    }
+
+    /// Installs this module's state requirements onto `vm`.
+    ///
+    /// Requirements are recorded (deduplicated) before first use; values stay
+    /// lazy until a call resolves them. A conflicting requirement fails before
+    /// the VM's state table is mutated.
+    pub fn install_state_requirements(
+        &self,
+        vm: &mut super::Vm,
+    ) -> VmResult<Vec<HostStateRequirement>> {
+        let requirements = self
+            .state_requirements()
+            .map_err(|error| crate::vm::VmError::HostError(error.to_string()))?;
+        vm.install_host_state_requirements(&requirements)
+            .map_err(|error| crate::vm::VmError::HostError(error.to_string()))
+    }
+
     /// Installs an explicit descriptor list transactionally.
     pub fn install_descriptors(
         registry: &mut super::host::HostFunctionRegistry,
         descriptors: &[HostFunctionDescriptor],
     ) -> VmResult<HostApiCatalog> {
         let catalog = HostFunctionDescriptor::collect_catalog(descriptors)
+            .map_err(|error| crate::vm::VmError::HostError(error.to_string()))?;
+        collect_state_requirements(descriptors)
             .map_err(|error| crate::vm::VmError::HostError(error.to_string()))?;
         let named_structs = catalog_named_struct_schemas(&catalog);
         registry.transactionally(|registry| {
@@ -301,6 +379,17 @@ impl HostModuleDescriptor {
             Ok(catalog.clone())
         })
     }
+}
+
+/// Installs a host-private state requirement list onto `vm`.
+///
+/// Identical providers deduplicate and are recorded before first use; a
+/// conflicting requirement fails before the VM's state table is mutated.
+pub fn install_host_state_requirements(
+    vm: &mut super::Vm,
+    requirements: &[HostStateRequirement],
+) -> Result<Vec<HostStateRequirement>, HostStateError> {
+    vm.install_host_state_requirements(requirements)
 }
 
 fn install_function_descriptor(

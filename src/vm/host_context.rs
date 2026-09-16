@@ -31,11 +31,12 @@ use std::any::Any;
 use std::fmt;
 use std::task::{Context, Poll};
 
-use crate::host_api::ResourceTypeKey;
+use crate::host_api::{HostState, HostStateProvider, HostStateRequirement, ResourceTypeKey};
 
 use super::Vm;
 use super::execution_scope::{ExecutionScope, ExecutionScopeError, ScopeState};
 use super::host_runtime::HostRuntime;
+use super::host_state::{HostStateError, HostStateMut, HostStateRef};
 use super::operation::{
     OperationCancelReason, OperationError, OperationId, OperationOutcome, OperationSpec,
     OperationStatus,
@@ -77,6 +78,9 @@ pub enum HostContextErrorKind {
     Resource(ResourceError),
     /// A structured failure from the operation layer (status query).
     Operation(OperationError),
+    /// A structured failure from the host-private state table (conflicting
+    /// provider, failing initializer, incompatible borrow, missing state).
+    HostState(HostStateError),
 }
 
 /// Error surfaced by the generic host boundary.
@@ -129,6 +133,16 @@ impl HostContextError {
             namespace: "host::operation",
             message,
             kind: HostContextErrorKind::Operation(error),
+        }
+    }
+
+    /// Builds a boundary error from a structured host-private state failure.
+    fn from_host_state(error: HostStateError) -> Self {
+        let message = error.to_string();
+        Self {
+            namespace: "host::state",
+            message,
+            kind: HostContextErrorKind::HostState(error),
         }
     }
 
@@ -201,6 +215,115 @@ impl<'a> HostContext<'a> {
     /// Returns `true` when no module state is currently registered.
     pub fn is_module_state_empty(&self) -> bool {
         self.vm.host.is_module_state_empty()
+    }
+
+    // ---- host-private state -------------------------------------------------
+
+    /// Resolves `T`-typed host-private state before its first use, running
+    /// `T`'s canonical provider exactly once and rejecting a conflicting
+    /// requirement.
+    ///
+    /// Host-private state is per-VM: it survives
+    /// [`Vm::reset_for_reuse`](super::Vm::reset_for_reuse) and scope close,
+    /// stays isolated between VMs, and drops with the VM. The provider never
+    /// overwrites a state preconfigured through [`Self::set_host_state`].
+    ///
+    /// Generated hidden-state parameters always resolve through this method
+    /// before borrowing, which keeps lazy initialization outside the borrow
+    /// guard and lets one host call hold several distinct state borrows.
+    /// Failures name `function`, `effect`, and the state type.
+    pub fn ensure_host_state<T: HostState>(
+        &mut self,
+        function: &str,
+        effect: &str,
+    ) -> HostContextResult<()> {
+        self.vm
+            .host
+            .ensure_host_state::<T>(function, effect)
+            .map_err(HostContextError::from_host_state)
+    }
+
+    /// Registers one explicit state requirement without creating the value.
+    ///
+    /// Identical providers deduplicate; a conflicting requirement fails before
+    /// any mutation.
+    pub fn ensure_host_state_requirement(
+        &mut self,
+        requirement: &HostStateRequirement,
+    ) -> HostContextResult<()> {
+        self.vm
+            .host
+            .register_host_state_provider(&requirement.provider)
+            .map_err(HostContextError::from_host_state)
+    }
+
+    /// Installs a requirement list transactionally, returning the
+    /// deduplicated requirements.
+    pub fn install_host_state_requirements(
+        &mut self,
+        requirements: &[HostStateRequirement],
+    ) -> HostContextResult<Vec<HostStateRequirement>> {
+        self.vm
+            .host
+            .install_host_state_requirements(requirements)
+            .map_err(HostContextError::from_host_state)
+    }
+
+    /// Shared (read-only) borrow of `T`-typed host-private state.
+    ///
+    /// Resolve the state with [`Self::ensure_host_state`] first; borrowing an
+    /// uninitialized state is a deterministic host error.
+    pub fn host_state_ref<T: HostState>(
+        &self,
+        function: &str,
+        effect: &str,
+    ) -> HostContextResult<HostStateRef<'_, T>> {
+        self.vm
+            .host
+            .host_state_ref::<T>(&T::provider(), function, effect)
+            .map_err(HostContextError::from_host_state)
+    }
+
+    /// Exclusive (mutable) borrow of `T`-typed host-private state.
+    ///
+    /// Resolve the state with [`Self::ensure_host_state`] first. An
+    /// incompatible borrow (a second mutable borrow, or a mutable borrow while
+    /// shared-borrowed) is a deterministic host error, never a panic.
+    pub fn host_state_mut<T: HostState>(
+        &self,
+        function: &str,
+        effect: &str,
+    ) -> HostContextResult<HostStateMut<'_, T>> {
+        self.vm
+            .host
+            .host_state_mut::<T>(&T::provider(), function, effect)
+            .map_err(HostContextError::from_host_state)
+    }
+
+    /// Preconfigures `T`-typed host-private state before its first use.
+    ///
+    /// Returns `true` when a previous value was replaced. The lazy provider
+    /// never overwrites a preconfigured value.
+    pub fn set_host_state<T: HostState>(&mut self, state: T) -> HostContextResult<bool> {
+        self.vm
+            .host
+            .set_host_state(state)
+            .map_err(HostContextError::from_host_state)
+    }
+
+    /// Borrows `T`-typed host-private state without initializing it.
+    pub fn host_state<T: HostState>(&self) -> Option<HostStateRef<'_, T>> {
+        self.vm.host.host_state::<T>()
+    }
+
+    /// Removes and returns `T`-typed host-private state, if any.
+    pub fn take_host_state<T: HostState>(&mut self) -> Option<T> {
+        self.vm.host.remove_host_state::<T>()
+    }
+
+    /// Returns `true` when no host-private state is currently registered.
+    pub fn is_host_state_empty(&self) -> bool {
+        self.vm.host.is_host_state_empty()
     }
 
     // ---- generic execution-scope SDK ---------------------------------------
@@ -613,5 +736,78 @@ impl HostRuntime {
     /// Returns `true` when no module state is currently registered.
     pub(crate) fn is_module_state_empty(&self) -> bool {
         self.module_state_store.is_empty()
+    }
+
+    /// Resolves and lazily initializes `T`-typed host-private state.
+    pub(crate) fn ensure_host_state<T: HostState>(
+        &mut self,
+        function: &str,
+        effect: &str,
+    ) -> Result<(), HostStateError> {
+        self.module_state_store
+            .ensure_host_state::<T>(function, effect)
+    }
+
+    /// Registers one explicit host-private state provider.
+    pub(crate) fn register_host_state_provider(
+        &mut self,
+        provider: &HostStateProvider,
+    ) -> Result<(), HostStateError> {
+        self.module_state_store
+            .register_host_state_provider(provider)
+    }
+
+    /// Installs a host-private state requirement list transactionally.
+    pub(crate) fn install_host_state_requirements(
+        &mut self,
+        requirements: &[HostStateRequirement],
+    ) -> Result<Vec<HostStateRequirement>, HostStateError> {
+        self.module_state_store
+            .install_host_state_requirements(requirements)
+    }
+
+    /// Shared borrow of `T`-typed host-private state.
+    pub(crate) fn host_state_ref<T: HostState>(
+        &self,
+        provider: &HostStateProvider,
+        function: &str,
+        effect: &str,
+    ) -> Result<HostStateRef<'_, T>, HostStateError> {
+        self.module_state_store
+            .host_state_ref::<T>(provider, function, effect)
+    }
+
+    /// Exclusive borrow of `T`-typed host-private state.
+    pub(crate) fn host_state_mut<T: HostState>(
+        &self,
+        provider: &HostStateProvider,
+        function: &str,
+        effect: &str,
+    ) -> Result<HostStateMut<'_, T>, HostStateError> {
+        self.module_state_store
+            .host_state_mut::<T>(provider, function, effect)
+    }
+
+    /// Preconfigures `T`-typed host-private state.
+    pub(crate) fn set_host_state<T: HostState>(
+        &mut self,
+        state: T,
+    ) -> Result<bool, HostStateError> {
+        self.module_state_store.set_host_state(state)
+    }
+
+    /// Borrows `T`-typed host-private state without initializing it.
+    pub(crate) fn host_state<T: HostState>(&self) -> Option<HostStateRef<'_, T>> {
+        self.module_state_store.host_state::<T>()
+    }
+
+    /// Removes `T`-typed host-private state.
+    pub(crate) fn remove_host_state<T: HostState>(&mut self) -> Option<T> {
+        self.module_state_store.remove_host_state::<T>()
+    }
+
+    /// Whether any host-private state is currently registered.
+    pub(crate) fn is_host_state_empty(&self) -> bool {
+        self.module_state_store.is_host_state_empty()
     }
 }

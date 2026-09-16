@@ -6,8 +6,8 @@ use syn::{
 };
 
 use pd_host_schema::{
-    ResourceMode, ResourceReturnKind, ResourceSpec, borrowed_resource_return, resource_return_kind,
-    resource_spec,
+    ResourceMode, ResourceReturnKind, ResourceSpec, StateSpec, borrowed_resource_return,
+    resource_return_kind, resource_spec, state_spec,
 };
 
 #[proc_macro_attribute]
@@ -27,12 +27,30 @@ fn expand_pd_host_function(
     let is_async = item.sig.asyncness.is_some();
     let docs = doc_string(&item.attrs);
     let mut resource_params = Vec::<(String, ResourceSpec)>::new();
+    let mut state_params = Vec::<(String, StateSpec)>::new();
     for input in &item.sig.inputs {
         let is_host_context = is_host_context_param(input);
         if !is_host_context && !is_vm_context_param(input) {
             let FnArg::Typed(pat_type) = input else {
                 return Err(Error::new_spanned(input, "methods are not supported"));
             };
+            if let Some(spec) = state_spec(&pat_type.ty) {
+                if is_async {
+                    return Err(Error::new_spanned(
+                        &pat_type.ty,
+                        "hidden host state parameters cannot cross async/yield; capture an owned \
+                         value or provider instead",
+                    ));
+                }
+                let Pat::Ident(PatIdent { ident, .. }) = pat_type.pat.as_ref() else {
+                    return Err(Error::new_spanned(
+                        &pat_type.pat,
+                        "hidden host state parameters must use identifier patterns",
+                    ));
+                };
+                state_params.push((ident.to_string(), spec));
+                continue;
+            }
             let spec = resource_spec(&pat_type.ty, &pat_type.attrs)
                 .map_err(|message| Error::new_spanned(&pat_type.ty, message))?;
             if let Some(spec) = spec {
@@ -65,6 +83,8 @@ fn expand_pd_host_function(
         }
     }
     validate_sync_vm_resource_borrow_conflict(&item, &resource_params)?;
+    validate_sync_vm_state_conflict(&item, &state_params)?;
+    validate_state_resource_combination(&state_params, &resource_params)?;
     validate_return_type(&item.sig.output, has_named_struct_attr(&item.attrs))?;
 
     if is_abi_declaration_only(&item) {
@@ -84,7 +104,13 @@ fn expand_pd_host_function(
     let wrapper = if is_async {
         generate_async_vm_wrapper(&item, &wrapper_name, &resource_params)?
     } else {
-        generate_vm_wrapper(&item, &wrapper_name, &resource_params)?
+        generate_vm_wrapper(
+            &item,
+            &wrapper_name,
+            &guest_name,
+            &resource_params,
+            &state_params,
+        )?
     };
     let descriptor = generate_host_function_descriptor(
         &item,
@@ -92,6 +118,7 @@ fn expand_pd_host_function(
         &guest_name,
         &docs,
         &resource_params,
+        &state_params,
     )?;
     for input in &mut item.sig.inputs {
         if let FnArg::Typed(pat_type) = input {
@@ -332,6 +359,54 @@ fn validate_sync_vm_resource_borrow_conflict(
     Ok(())
 }
 
+/// Rejects `&mut Vm` next to hidden host state parameters.
+///
+/// The generated wrapper resolves hidden state through
+/// `Vm::host_context()`, which holds the same mutable VM borrow for as long as
+/// the state guards live. A raw `&mut Vm` parameter cannot coexist with it, so
+/// the combination fails closed at compile time instead of producing an
+/// unborrowable wrapper.
+fn validate_sync_vm_state_conflict(
+    item: &ItemFn,
+    state_params: &[(String, StateSpec)],
+) -> Result<(), Error> {
+    if state_params.is_empty() {
+        return Ok(());
+    }
+    for input in &item.sig.inputs {
+        let FnArg::Typed(pat_type) = input else {
+            continue;
+        };
+        if is_vm_context_type(&pat_type.ty) {
+            return Err(Error::new_spanned(
+                &pat_type.ty,
+                "host functions cannot combine `&mut Vm` with hidden host state parameters; the generated HostContext holds the same mutable VM borrow",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects resource parameters next to hidden host state parameters.
+///
+/// Resource extraction resolves each resource through its own
+/// `Vm::host_context()` borrow, which cannot coexist with the state
+/// resolution's borrow. Keeping the two apart preserves the borrow-checked
+/// wrapper shape instead of silently reaching into VM internals.
+fn validate_state_resource_combination(
+    state_params: &[(String, StateSpec)],
+    resource_params: &[(String, ResourceSpec)],
+) -> Result<(), Error> {
+    if state_params.is_empty() || resource_params.is_empty() {
+        return Ok(());
+    }
+    Err(Error::new(
+        proc_macro2::Span::call_site(),
+        "host functions cannot combine resource parameters with hidden host state parameters; \
+         resolve the resource in a separate host call",
+    ))
+}
+
 fn validate_return_type(output: &ReturnType, named_struct: bool) -> Result<(), Error> {
     match output {
         ReturnType::Default => Ok(()),
@@ -390,7 +465,9 @@ fn is_abi_declaration_only(item: &ItemFn) -> bool {
 fn generate_vm_wrapper(
     item: &ItemFn,
     wrapper_name: &syn::Ident,
+    guest_name: &LitStr,
     resource_params: &[(String, ResourceSpec)],
+    state_params: &[(String, StateSpec)],
 ) -> Result<proc_macro2::TokenStream, Error> {
     let impl_name = &item.sig.ident;
     let mut wrapper_params = Vec::<proc_macro2::TokenStream>::new();
@@ -402,7 +479,7 @@ fn generate_vm_wrapper(
         FnArg::Typed(pat_type) => is_vm_context_type(&pat_type.ty),
         FnArg::Receiver(_) => false,
     });
-    let needs_vm = has_vm || !resource_params.is_empty();
+    let needs_vm = has_vm || !resource_params.is_empty() || !state_params.is_empty();
     if needs_vm {
         wrapper_params.push(quote!(vm: &mut super::super::Vm));
         if has_vm {
@@ -420,6 +497,31 @@ fn generate_vm_wrapper(
         params
     };
 
+    // Hidden host state is resolved before any guest argument is touched:
+    // every state is ensured first (lazy initialization / provider conflicts),
+    // then borrowed. Keeping resolution and borrowing apart lets one wrapper
+    // hold several distinct state borrows from the same generic context
+    // without an intermediate mutable borrow.
+    let context_ident = syn::Ident::new("__pd_host_state_context", proc_macro2::Span::call_site());
+    let sdk = sdk_path();
+    let state_ensure_stmts = state_params
+        .iter()
+        .map(|(_, spec)| {
+            let inner = &spec.inner;
+            let label = state_effect_label(spec);
+            quote! {
+                #context_ident
+                    .ensure_host_state::<#inner>(#guest_name, #label)
+                    .map_err(|error| #sdk::VmError::HostError(error.to_string()))?;
+            }
+        })
+        .collect::<Vec<_>>();
+    let state_context_stmt = (!state_params.is_empty()).then(|| {
+        quote! {
+            let mut #context_ident = vm.host_context();
+        }
+    });
+
     let mut arg_index = 0usize;
     for input in &item.sig.inputs {
         let FnArg::Typed(pat_type) = input else {
@@ -435,6 +537,27 @@ fn generate_vm_wrapper(
             ));
         };
         let ty = &pat_type.ty;
+        if let Some((_, spec)) = state_params
+            .iter()
+            .find(|(name, _)| name == &ident.to_string())
+        {
+            let inner = &spec.inner;
+            let label = state_effect_label(spec);
+            let accessor = if spec.is_write() {
+                quote!(host_state_mut)
+            } else {
+                quote!(host_state_ref)
+            };
+            let borrow = quote! {
+                let #ident = #context_ident
+                    .#accessor::<#inner>(#guest_name, #label)
+                    .map_err(|error| #sdk::VmError::HostError(error.to_string()))?;
+            };
+            imm_extract_stmts.push(borrow.clone());
+            mut_extract_stmts.push(borrow);
+            call_args.push(quote!(#ident));
+            continue;
+        }
         if let Some((_, spec)) = resource_params
             .iter()
             .find(|(name, _)| name == &ident.to_string())
@@ -476,16 +599,29 @@ fn generate_vm_wrapper(
     Ok(quote! {
         #[allow(dead_code)]
         pub(crate) fn #wrapper_name(#(#imm_wrapper_params),*) -> #wrapper_output {
+            #state_context_stmt
+            #(#state_ensure_stmts)*
             #(#imm_extract_stmts)*
             #call_expr
         }
 
         #[allow(dead_code)]
         pub(crate) fn #mutable_wrapper_name(#(#mut_wrapper_params),*) -> #wrapper_output {
+            #state_context_stmt
+            #(#state_ensure_stmts)*
             #(#mut_extract_stmts)*
             #call_expr
         }
     })
+}
+
+/// Deterministic effect label used for host-state diagnostics.
+fn state_effect_label(spec: &StateSpec) -> &'static str {
+    if spec.is_write() {
+        "state write"
+    } else {
+        "state read"
+    }
 }
 
 /// Generates the extraction statement for one resource parameter.
@@ -810,13 +946,14 @@ fn generate_host_function_descriptor(
     guest_name: &LitStr,
     docs: &str,
     resource_params: &[(String, ResourceSpec)],
+    state_params: &[(String, StateSpec)],
 ) -> Result<proc_macro2::TokenStream, Error> {
     let descriptor_name =
         syn::Ident::new(&format!("{wrapper_name}_descriptor"), wrapper_name.span());
     let adapter_name =
         syn::Ident::new(&format!("{wrapper_name}_host_adapter"), wrapper_name.span());
     let sdk = sdk_path();
-    let binding = classify_generated_binding(item, resource_params);
+    let binding = classify_generated_binding(item, resource_params, state_params);
 
     let mut param_tokens = Vec::new();
     let mut effect_tokens = Vec::new();
@@ -832,6 +969,23 @@ fn generate_host_function_descriptor(
             continue;
         };
         let param_name = ident.to_string();
+        if let Some((_, spec)) = state_params.iter().find(|(name, _)| name == &param_name) {
+            // Host-private state is hidden from guest arity, the function
+            // schema, and every fingerprint; only the runtime effect records
+            // it.
+            let inner = &spec.inner;
+            let ctor = if spec.is_write() {
+                quote!(write)
+            } else {
+                quote!(read)
+            };
+            effect_tokens.push(quote! {
+                #sdk::host_extension::HostEffect::HostState(
+                    #sdk::host_extension::HostStateEffect::#ctor::<#inner>(),
+                )
+            });
+            continue;
+        }
         if let Some((_, spec)) = resource_params.iter().find(|(name, _)| name == &param_name) {
             let key_expr = resource_key_tokens(spec);
             let passing = match spec.mode {
@@ -948,10 +1102,11 @@ enum GeneratedBinding {
 fn classify_generated_binding(
     item: &ItemFn,
     resource_params: &[(String, ResourceSpec)],
+    state_params: &[(String, StateSpec)],
 ) -> GeneratedBinding {
     let is_async = item.sig.asyncness.is_some();
     let has_vm = item.sig.inputs.iter().any(is_vm_context_param);
-    if is_async || has_vm || !resource_params.is_empty() {
+    if is_async || has_vm || !resource_params.is_empty() || !state_params.is_empty() {
         return GeneratedBinding::Stack;
     }
     match &item.sig.output {
@@ -1668,6 +1823,156 @@ mod tests {
         assert!(
             !expanded.contains("pd_host_named_struct"),
             "named-struct attribute must be stripped: {expanded}"
+        );
+    }
+
+    #[test]
+    fn hidden_state_parameter_is_omitted_from_guest_arity_and_declared_as_write() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::cached");
+        let item: ItemFn = parse_quote! {
+            /// Reads a cached value through per-VM host state.
+            fn cached(cache: HostStateMut<'_, Cache>, key: String) -> VmResult<i64> {
+                let _ = (cache, key);
+                todo!()
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("a hidden state parameter must expand")
+            .to_string();
+        assert!(
+            expanded.contains("HostParamSchema :: value (\"key\""),
+            "guest parameters must stay in the schema: {expanded}"
+        );
+        assert!(
+            !expanded.contains("\"cache\""),
+            "a hidden state parameter must never appear in the guest schema: {expanded}"
+        );
+        assert!(
+            expanded.contains("HostStateEffect :: write :: < Cache >"),
+            "a mutable hidden state parameter must declare a write effect: {expanded}"
+        );
+        assert!(
+            !expanded.contains("HostStateEffect :: read ::"),
+            "a write-only state parameter must not declare a read effect: {expanded}"
+        );
+        assert!(
+            expanded.contains("HostBindingKind :: StaticStack"),
+            "state-resolving hosts must use the vm-aware stack adapter: {expanded}"
+        );
+        assert!(
+            expanded.contains("ensure_host_state"),
+            "generated wrappers must resolve state through the generic table: {expanded}"
+        );
+        assert!(
+            expanded.contains("host_state_mut"),
+            "generated wrappers must borrow the resolved state: {expanded}"
+        );
+        assert!(
+            !expanded.contains("cached_impl (vm"),
+            "a state-only host impl must not take a raw Vm parameter: {expanded}"
+        );
+    }
+
+    #[test]
+    fn hidden_state_read_parameter_declares_a_read_effect() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::peek_cache");
+        let item: ItemFn = parse_quote! {
+            /// Peeks per-VM host state.
+            fn peek_cache(cache: HostStateRef<'_, Cache>) -> VmResult<i64> {
+                let _ = cache;
+                todo!()
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("a shared hidden state parameter must expand")
+            .to_string();
+        assert!(
+            expanded.contains("HostStateEffect :: read :: < Cache >"),
+            "a shared hidden state parameter must declare a read effect: {expanded}"
+        );
+        assert!(
+            !expanded.contains("HostStateEffect :: write ::"),
+            "a read-only state parameter must not declare a write effect: {expanded}"
+        );
+        assert!(
+            expanded.contains("host_state_ref"),
+            "generated wrappers must borrow shared state through the generic table: {expanded}"
+        );
+        assert!(
+            expanded.contains("HostFunctionSchema :: with_return"),
+            "the descriptor must still be generated: {expanded}"
+        );
+        assert!(
+            expanded.contains("vec ! []") || !expanded.contains("HostParamSchema"),
+            "a state-only host must expose an empty guest parameter list: {expanded}"
+        );
+    }
+
+    #[test]
+    fn async_hidden_state_parameter_is_rejected() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::async_cache");
+        let item: ItemFn = parse_quote! {
+            /// Attempts to borrow per-VM state across a yield.
+            async fn async_cache(cache: HostStateMut<'_, Cache>) -> VmResult<i64> {
+                let _ = cache;
+                todo!()
+            }
+        };
+        let error = expand_pd_host_function(attr, item)
+            .expect_err("a hidden state borrow must not cross async/yield");
+        assert!(
+            error.to_string().contains("async"),
+            "the diagnostic must explain the async restriction: {error}"
+        );
+    }
+
+    #[test]
+    fn hidden_state_parameter_with_mutable_vm_is_rejected() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::cached_with_vm");
+        let item: ItemFn = parse_quote! {
+            /// Attempts to combine a raw VM borrow with resolved host state.
+            fn cached_with_vm(vm: &mut Vm, cache: HostStateMut<'_, Cache>) -> VmResult<i64> {
+                let _ = (vm, cache);
+                todo!()
+            }
+        };
+        let error = expand_pd_host_function(attr, item)
+            .expect_err("a mutable VM and resolved host state cannot share a wrapper");
+        assert!(
+            error.to_string().contains("HostContext"),
+            "the diagnostic must explain the shared mutable borrow: {error}"
+        );
+    }
+
+    #[test]
+    fn multiple_hidden_state_parameters_expand_to_distinct_resolutions() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "demo::two_states");
+        let item: ItemFn = parse_quote! {
+            /// Uses two different per-VM states.
+            fn two_states(
+                first: HostStateMut<'_, FirstCache>,
+                second: HostStateRef<'_, SecondCache>,
+                key: String,
+            ) -> VmResult<i64> {
+                let _ = (first, second, key);
+                todo!()
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("multiple hidden state parameters must expand")
+            .to_string();
+        assert!(
+            expanded.contains("FirstCache") && expanded.contains("SecondCache"),
+            "both state types must be resolved: {expanded}"
+        );
+        assert!(
+            expanded.contains("HostStateEffect :: write :: < FirstCache >")
+                && expanded.contains("HostStateEffect :: read :: < SecondCache >"),
+            "each state parameter keeps its own access mode: {expanded}"
+        );
+        assert!(
+            !expanded.contains("\"first\"") && !expanded.contains("\"second\""),
+            "hidden state parameters must not leak into the guest arity: {expanded}"
         );
     }
 }

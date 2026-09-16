@@ -1,0 +1,5 @@
+error: hidden host state parameters cannot cross async/yield; capture an owned value or provider instead
+  --> tests/ui/fail/async_hidden_state.rs:27:44
+   |
+27 |         async fn async_bump_tuning(tuning: HostStateMut<'_, Tuning>) -> VmResult<i64> {
+   |                                            ^^^^^^^^^^^^^^^^^^^^^^^^
