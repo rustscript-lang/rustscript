@@ -1737,8 +1737,6 @@ pub(super) fn concrete_sqlite_connection_resource() -> crate::host_extension::Ho
     crate::host_extension::HostResourceTypeMeta::of::<SqliteResource>()
 }
 
-/// The standard `sqlite` host module.
-
 /// Registers SQLite host functions from [`super::standard_host_catalog`].
 pub fn register_sqlite_builtin_module(registry: &mut HostFunctionRegistry) -> VmResult<()> {
     let catalog = super::standard_host_catalog();

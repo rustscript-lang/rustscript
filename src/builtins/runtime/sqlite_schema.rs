@@ -329,11 +329,11 @@ pub(super) const SQLITE_NAMED_STRUCTS: &[(&str, &str)] = &[
     ),
 ];
 
-/// The SQLite host catalog surface: one descriptor per `sqlite::*` function.
-///
-/// The SQLite surface publishes every member it owns, so catalog and ownership
-/// coincide; parameter labels, result cells, and mixed transaction outputs use
-/// the typed named structs declared in `super`.
+// The SQLite host catalog surface: one descriptor per `sqlite::*` function.
+//
+// The SQLite surface publishes every member it owns, so catalog and ownership
+// coincide; parameter labels, result cells, and mixed transaction outputs use
+// the typed named structs declared in `super`.
 
 /// Fails closed when the SQLite host module is not compiled into the build.
 #[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]

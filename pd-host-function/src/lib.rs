@@ -987,6 +987,7 @@ fn sdk_path() -> proc_macro2::TokenStream {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn generate_host_function_descriptor(
     item: &ItemFn,
     wrapper_name: &syn::Ident,

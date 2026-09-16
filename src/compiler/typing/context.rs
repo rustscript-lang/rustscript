@@ -1336,23 +1336,21 @@ impl<'a> TypeContext<'a> {
                 }
                 if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                     self.infer_builtin_call_like_expr_type(builtin, type_args, args, state)
+                } else if let Some(decl) = self.function_decls.get(index)
+                    && let inferred =
+                        infer_host_passthrough_return_type(&decl.name, args, state, self)
+                    && inferred != BoundType::Unknown
+                {
+                    inferred
                 } else {
-                    if let Some(decl) = self.function_decls.get(index)
-                        && let inferred =
-                            infer_host_passthrough_return_type(&decl.name, args, state, self)
-                        && inferred != BoundType::Unknown
-                    {
+                    let inferred = self.infer_function_return(*index, type_args, args, state);
+                    if inferred != BoundType::Unknown {
                         inferred
                     } else {
-                        let inferred = self.infer_function_return(*index, type_args, args, state);
-                        if inferred != BoundType::Unknown {
-                            inferred
-                        } else {
-                            self.host_import_return_types
-                                .get(index)
-                                .copied()
-                                .unwrap_or(BoundType::Unknown)
-                        }
+                        self.host_import_return_types
+                            .get(index)
+                            .copied()
+                            .unwrap_or(BoundType::Unknown)
                     }
                 }
             }

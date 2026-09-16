@@ -623,66 +623,64 @@ impl Parser {
                         rparen_span,
                         name.clone(),
                     )
-                } else {
-                    if self.has_local_binding(&name) {
-                        if !type_args.is_empty() {
-                            return Err(ParseError {
-                                span: Some(self.current_span()),
-                                code: None,
-                                line: self.current_line(),
-                                message: format!(
-                                    "local callable '{name}' does not accept explicit type arguments"
-                                ),
-                            });
-                        }
-                        let index = self.get_local(&name)?;
-                        // Record local variable reference.
-                        self.record_local_ref(name_span, index, name.clone());
-                        Expr::Var(index)
-                    } else if let Some(decl) = self.functions.get(&name).cloned() {
-                        if !type_args.is_empty() {
-                            self.validate_named_call_type_args(&decl, &type_args)?;
-                        }
-                        // Record function value reference.
-                        self.record_func_ref(name_span, decl.index, name.clone());
-                        Expr::FunctionRef(decl.index, type_args)
-                    } else if let Some(index) = crate::builtin_call_index(&name) {
-                        if !type_args.is_empty() {
-                            return Err(ParseError {
-                                span: Some(self.current_span()),
-                                code: None,
-                                line: self.current_line(),
-                                message: format!(
-                                    "function '{name}' does not accept explicit type arguments"
-                                ),
-                            });
-                        }
-                        self.record_func_ref(name_span, index, name.clone());
-                        Expr::FunctionRef(index, Vec::new())
-                    } else if self.allow_implicit_externs {
-                        // Module mode: the name may be an imported function
-                        // binding the loader resolves to a module symbol
-                        // (`Expr::ModuleFunctionRef`) before unit merge. The
-                        // function-value reference is recorded with a
-                        // placeholder flat target; the loader upgrades the
-                        // matching site to `Module(symbol)` when it resolves
-                        // the reference, so the merged carrier never keeps a
-                        // stale unit-local index.
-                        let index = self
-                            .functions
-                            .get(&name)
-                            .map(|decl| decl.index)
-                            .unwrap_or(u16::MAX);
-                        self.record_func_ref(name_span, index, name.clone());
-                        Expr::UnresolvedFunctionRef { name, type_args }
-                    } else {
+                } else if self.has_local_binding(&name) {
+                    if !type_args.is_empty() {
                         return Err(ParseError {
-                            span: None,
+                            span: Some(self.current_span()),
                             code: None,
                             line: self.current_line(),
-                            message: format!("unknown local '{name}'"),
+                            message: format!(
+                                "local callable '{name}' does not accept explicit type arguments"
+                            ),
                         });
                     }
+                    let index = self.get_local(&name)?;
+                    // Record local variable reference.
+                    self.record_local_ref(name_span, index, name.clone());
+                    Expr::Var(index)
+                } else if let Some(decl) = self.functions.get(&name).cloned() {
+                    if !type_args.is_empty() {
+                        self.validate_named_call_type_args(&decl, &type_args)?;
+                    }
+                    // Record function value reference.
+                    self.record_func_ref(name_span, decl.index, name.clone());
+                    Expr::FunctionRef(decl.index, type_args)
+                } else if let Some(index) = crate::builtin_call_index(&name) {
+                    if !type_args.is_empty() {
+                        return Err(ParseError {
+                            span: Some(self.current_span()),
+                            code: None,
+                            line: self.current_line(),
+                            message: format!(
+                                "function '{name}' does not accept explicit type arguments"
+                            ),
+                        });
+                    }
+                    self.record_func_ref(name_span, index, name.clone());
+                    Expr::FunctionRef(index, Vec::new())
+                } else if self.allow_implicit_externs {
+                    // Module mode: the name may be an imported function
+                    // binding the loader resolves to a module symbol
+                    // (`Expr::ModuleFunctionRef`) before unit merge. The
+                    // function-value reference is recorded with a
+                    // placeholder flat target; the loader upgrades the
+                    // matching site to `Module(symbol)` when it resolves
+                    // the reference, so the merged carrier never keeps a
+                    // stale unit-local index.
+                    let index = self
+                        .functions
+                        .get(&name)
+                        .map(|decl| decl.index)
+                        .unwrap_or(u16::MAX);
+                    self.record_func_ref(name_span, index, name.clone());
+                    Expr::UnresolvedFunctionRef { name, type_args }
+                } else {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: self.current_line(),
+                        message: format!("unknown local '{name}'"),
+                    });
                 }
             };
             self.contextualize_function_call_args(&mut expr)?;
