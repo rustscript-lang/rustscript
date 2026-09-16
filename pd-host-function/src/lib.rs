@@ -23,7 +23,7 @@ fn expand_pd_host_function(
     attr: Punctuated<Meta, Token![,]>,
     mut item: ItemFn,
 ) -> Result<proc_macro2::TokenStream, Error> {
-    let guest_name = parse_name_arg(&attr)?;
+    let (guest_name, contract, runtime_owned_pending) = parse_function_args(&attr)?;
     let is_async = item.sig.asyncness.is_some();
     let docs = doc_string(&item.attrs);
     let mut resource_params = Vec::<(String, ResourceSpec)>::new();
@@ -86,6 +86,13 @@ fn expand_pd_host_function(
     validate_sync_vm_state_conflict(&item, &state_params)?;
     validate_state_resource_combination(&state_params, &resource_params)?;
     validate_return_type(&item.sig.output, has_named_struct_attr(&item.attrs))?;
+    if contract.is_some() && has_named_struct_attr(&item.attrs) {
+        return Err(Error::new_spanned(
+            &item.sig.ident,
+            "#[pd_host_named_struct] is redundant with a declared contract; the contract schema \
+             carries the named return",
+        ));
+    }
 
     if is_abi_declaration_only(&item) {
         return Ok(quote!(#item));
@@ -119,6 +126,8 @@ fn expand_pd_host_function(
         &docs,
         &resource_params,
         &state_params,
+        contract.as_ref(),
+        runtime_owned_pending,
     )?;
     for input in &mut item.sig.inputs {
         if let FnArg::Typed(pat_type) = input {
@@ -238,45 +247,83 @@ fn is_async_owned_type(ty: &Type) -> bool {
     }
 }
 
-fn parse_name_arg(args: &Punctuated<Meta, Token![,]>) -> Result<LitStr, Error> {
-    let Some(Meta::NameValue(name_value)) = args.first() else {
+/// Parses `#[pd_host_function(name = "...")]` plus the optional
+/// `contract = <path>` guest-schema override and the optional
+/// `runtime_owned_pending` dispatch flag.
+///
+/// `contract` names a zero-argument callable returning a
+/// [`HostFunctionSchema`](pd_host_schema) for functions whose guest contract
+/// cannot be inferred from the Rust signature alone (raw handle parameters,
+/// fixed-shape map returns). The contract is declared next to the function it
+/// describes, so the adapter, binding class, and effects still come from one
+/// macro expansion and there is no parallel catalog entry.
+///
+/// `runtime_owned_pending` selects the stack dispatch class whose pending
+/// operation is owned by the generic runtime operation/stream registries
+/// instead of a registered operation driver.
+fn parse_function_args(
+    args: &Punctuated<Meta, Token![,]>,
+) -> Result<(LitStr, Option<syn::Path>, bool), Error> {
+    let mut name: Option<LitStr> = None;
+    let mut contract: Option<syn::Path> = None;
+    let mut runtime_owned_pending = false;
+    for meta in args {
+        match meta {
+            Meta::Path(path) if path.is_ident("runtime_owned_pending") => {
+                runtime_owned_pending = true;
+            }
+            Meta::NameValue(name_value) if name_value.path.is_ident("name") => {
+                let syn::Expr::Lit(expr_lit) = &name_value.value else {
+                    return Err(Error::new_spanned(
+                        &name_value.value,
+                        "callable name must be a string literal",
+                    ));
+                };
+                let syn::Lit::Str(value) = &expr_lit.lit else {
+                    return Err(Error::new_spanned(
+                        &expr_lit.lit,
+                        "callable name must be a string literal",
+                    ));
+                };
+                if name.is_some() {
+                    return Err(Error::new_spanned(
+                        meta,
+                        "duplicate `name = \"...\"` argument",
+                    ));
+                }
+                name = Some(value.clone());
+            }
+            Meta::NameValue(name_value) if name_value.path.is_ident("contract") => {
+                let syn::Expr::Path(expr_path) = &name_value.value else {
+                    return Err(Error::new_spanned(
+                        &name_value.value,
+                        "`contract` must name a zero-argument guest-schema callable",
+                    ));
+                };
+                if contract.is_some() {
+                    return Err(Error::new_spanned(
+                        meta,
+                        "duplicate `contract = ...` argument",
+                    ));
+                }
+                contract = Some(expr_path.path.clone());
+            }
+            other => {
+                return Err(Error::new_spanned(
+                    other,
+                    "#[pd_host_function] only supports name = \"...\", an optional \
+                     contract = <path>, and the runtime_owned_pending dispatch flag",
+                ));
+            }
+        }
+    }
+    let Some(name) = name else {
         return Err(Error::new(
             proc_macro2::Span::call_site(),
             "expected #[pd_host_function(name = \"...\")]",
         ));
     };
-    if args.len() != 1 {
-        let extra = args
-            .iter()
-            .nth(1)
-            .expect("a non-empty attribute with more than one argument has an extra argument");
-        return Err(Error::new_spanned(
-            extra,
-            "#[pd_host_function] only supports name = \"...\"",
-        ));
-    }
-    if !name_value.path.is_ident("name") {
-        return Err(Error::new_spanned(
-            &name_value.path,
-            "expected #[pd_host_function(name = \"...\")]",
-        ));
-    }
-    match &name_value.value {
-        syn::Expr::Lit(expr_lit) => {
-            if let syn::Lit::Str(value) = &expr_lit.lit {
-                Ok(value.clone())
-            } else {
-                Err(Error::new_spanned(
-                    &expr_lit.lit,
-                    "callable name must be a string literal",
-                ))
-            }
-        }
-        other => Err(Error::new_spanned(
-            other,
-            "callable name must be a string literal",
-        )),
-    }
+    Ok((name, contract, runtime_owned_pending))
 }
 
 fn doc_string(attrs: &[syn::Attribute]) -> String {
@@ -947,6 +994,8 @@ fn generate_host_function_descriptor(
     docs: &str,
     resource_params: &[(String, ResourceSpec)],
     state_params: &[(String, StateSpec)],
+    contract: Option<&syn::Path>,
+    runtime_owned_pending: bool,
 ) -> Result<proc_macro2::TokenStream, Error> {
     let descriptor_name =
         syn::Ident::new(&format!("{wrapper_name}_descriptor"), wrapper_name.span());
@@ -954,6 +1003,21 @@ fn generate_host_function_descriptor(
         syn::Ident::new(&format!("{wrapper_name}_host_adapter"), wrapper_name.span());
     let sdk = sdk_path();
     let binding = classify_generated_binding(item, resource_params, state_params);
+
+    if let Some(contract) = contract {
+        return generate_contract_host_function_descriptor(
+            &sdk,
+            &descriptor_name,
+            &adapter_name,
+            wrapper_name,
+            guest_name,
+            contract,
+            state_params,
+            binding,
+            item,
+            runtime_owned_pending,
+        );
+    }
 
     let mut param_tokens = Vec::new();
     let mut effect_tokens = Vec::new();
@@ -1097,6 +1161,149 @@ enum GeneratedBinding {
     Stack,
     Args,
     NonYieldingArgs,
+}
+
+/// Adapter tokens for one generated binding class.
+///
+/// Returns `(binding kind, adapter value, adapter function)` so the inferred
+/// and contract-declared descriptor paths cannot diverge.
+fn generated_adapter_tokens(
+    sdk: &proc_macro2::TokenStream,
+    adapter_name: &syn::Ident,
+    wrapper_name: &syn::Ident,
+    binding: GeneratedBinding,
+) -> (
+    proc_macro2::TokenStream,
+    proc_macro2::TokenStream,
+    proc_macro2::TokenStream,
+) {
+    match binding {
+        GeneratedBinding::Stack => (
+            quote!(#sdk::host_extension::HostBindingKind::StaticStack),
+            quote!(#sdk::host_extension::HostAdapterDescriptor::StaticStack(#adapter_name)),
+            quote! {
+                #[allow(dead_code)]
+                fn #adapter_name(
+                    vm: &mut #sdk::Vm,
+                    args: &[#sdk::Value],
+                ) -> #sdk::VmResult<#sdk::CallOutcome> {
+                    #sdk::host_extension::host_descriptor_call_outcome(
+                        #wrapper_name(vm, args),
+                    )
+                }
+            },
+        ),
+        GeneratedBinding::Args => (
+            quote!(#sdk::host_extension::HostBindingKind::StaticArgs),
+            quote!(#sdk::host_extension::HostAdapterDescriptor::StaticArgs(#adapter_name)),
+            quote! {
+                #[allow(dead_code)]
+                fn #adapter_name(
+                    args: &[#sdk::Value],
+                ) -> #sdk::VmResult<#sdk::CallOutcome> {
+                    #sdk::host_extension::host_descriptor_call_outcome(#wrapper_name(args))
+                }
+            },
+        ),
+        GeneratedBinding::NonYieldingArgs => (
+            quote!(#sdk::host_extension::HostBindingKind::StaticNonYieldingArgs),
+            quote!(#sdk::host_extension::HostAdapterDescriptor::StaticNonYieldingArgs(#adapter_name)),
+            quote! {
+                #[allow(dead_code)]
+                fn #adapter_name(
+                    args: &[#sdk::Value],
+                ) -> #sdk::VmResult<#sdk::CallOutcome> {
+                    #sdk::host_extension::host_descriptor_call_outcome(#wrapper_name(args))
+                }
+            },
+        ),
+    }
+}
+
+/// Descriptor tokens for a function that declares its guest schema explicitly.
+///
+/// The contract supplies the guest-facing parameter and return schemas; the
+/// runtime adapter, binding class, and hidden host-state effects still come
+/// from this one macro expansion. Guest resource effects are derived from the
+/// contract schema, so a raw-handle signature cannot drift from the declared
+/// guest contract. Resource type *declarations* stay at the module level: a
+/// contract schema that names a resource key must be paired with a
+/// `HostResourceType` implementation contributed by the owning module, and
+/// catalog construction fails closed when a key has no declaration.
+#[allow(clippy::too_many_arguments)]
+fn generate_contract_host_function_descriptor(
+    sdk: &proc_macro2::TokenStream,
+    descriptor_name: &syn::Ident,
+    adapter_name: &syn::Ident,
+    wrapper_name: &syn::Ident,
+    guest_name: &LitStr,
+    contract: &syn::Path,
+    state_params: &[(String, StateSpec)],
+    binding: GeneratedBinding,
+    item: &ItemFn,
+    runtime_owned_pending: bool,
+) -> Result<proc_macro2::TokenStream, Error> {
+    if runtime_owned_pending && !matches!(binding, GeneratedBinding::Stack) {
+        return Err(Error::new_spanned(
+            &item.sig.ident,
+            "runtime_owned_pending requires a stack-dispatch signature (`&mut Vm` or a resource \
+             parameter)",
+        ));
+    }
+    let mut state_effect_tokens = Vec::new();
+    for input in &item.sig.inputs {
+        let FnArg::Typed(pat_type) = input else {
+            continue;
+        };
+        let Pat::Ident(PatIdent { ident, .. }) = pat_type.pat.as_ref() else {
+            continue;
+        };
+        let param_name = ident.to_string();
+        let Some((_, spec)) = state_params.iter().find(|(name, _)| name == &param_name) else {
+            continue;
+        };
+        let inner = &spec.inner;
+        let ctor = if spec.is_write() {
+            quote!(write)
+        } else {
+            quote!(read)
+        };
+        state_effect_tokens.push(quote! {
+            #sdk::host_extension::HostEffect::HostState(
+                #sdk::host_extension::HostStateEffect::#ctor::<#inner>(),
+            )
+        });
+    }
+
+    let (mut binding_kind, adapter, adapter_fn) =
+        generated_adapter_tokens(sdk, adapter_name, wrapper_name, binding);
+    let mut adapter = adapter;
+    if runtime_owned_pending {
+        binding_kind = quote!(#sdk::host_extension::HostBindingKind::StaticStackRuntimeOwned);
+        adapter = quote!(#sdk::host_extension::HostAdapterDescriptor::StaticStackRuntimeOwned(
+            #adapter_name
+        ));
+    }
+
+    Ok(quote! {
+        #adapter_fn
+
+        #[allow(dead_code)]
+        pub fn #descriptor_name() -> #sdk::host_extension::HostFunctionDescriptor {
+            let schema = #sdk::host_extension::declared_host_contract(#contract(), #guest_name);
+            let mut effects: Vec<#sdk::host_extension::HostEffect> = vec![#(#state_effect_tokens),*];
+            effects.extend(#sdk::host_extension::guest_resource_effects(&schema));
+            #sdk::host_extension::HostFunctionDescriptor {
+                schema,
+                binding: #sdk::host_extension::HostBindingDescriptor {
+                    kind: #binding_kind,
+                },
+                effects,
+                adapter: #adapter,
+                resource_types: Vec::new(),
+            }
+        }
+    })
 }
 
 fn classify_generated_binding(
@@ -1561,6 +1768,173 @@ mod tests {
         assert!(expanded.contains("vm : & mut super :: super :: Vm"));
         assert!(expanded.contains("borrow_resource"));
         assert!(expanded.contains("ResourceHandle :: from_raw"));
+    }
+
+    #[test]
+    fn runtime_owned_pending_flag_selects_the_pending_owning_stack_adapter() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(
+            name = "http::client::request",
+            contract = http_request_contract,
+            runtime_owned_pending
+        );
+        let item: ItemFn = parse_quote! {
+            /// Suspends until the generic runtime operation registry completes it.
+            fn request(vm: &mut Vm, request: VmMapHandle) -> VmResult<HostCallResult<VmMap>> {
+                todo!()
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item).unwrap().to_string();
+        assert!(
+            expanded.contains("StaticStackRuntimeOwned"),
+            "the dispatch flag must select the pending-owning stack adapter: {expanded}"
+        );
+        assert!(
+            expanded.contains("declared_host_contract"),
+            "the guest contract is still declared on the same function: {expanded}"
+        );
+    }
+
+    #[test]
+    fn runtime_owned_pending_flag_requires_a_stack_dispatch_signature() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(
+            name = "demo::count",
+            contract = demo_count_contract,
+            runtime_owned_pending
+        );
+        let item: ItemFn = parse_quote! {
+            /// A non-yielding signature cannot own a pending operation.
+            fn count() -> i64 {
+                todo!()
+            }
+        };
+        let error = expand_pd_host_function(attr, item)
+            .expect_err("the pending flag requires a stack-dispatch signature");
+        assert!(error.to_string().contains("runtime_owned_pending requires"));
+    }
+
+    #[test]
+    fn contract_argument_declares_schema_effects_and_adapter_in_one_expansion() {
+        let attr: Punctuated<Meta, Token![,]> =
+            parse_quote!(name = "io::open", contract = io_open_contract);
+        let item: ItemFn = parse_quote! {
+            /// Opens a raw handle whose guest contract is declared explicitly.
+            fn open(vm: &mut Vm, path: &str) -> VmResult<i64> {
+                todo!()
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item).unwrap().to_string();
+        assert!(
+            expanded.contains("declared_host_contract"),
+            "a declared contract must route through the validated contract boundary: {expanded}"
+        );
+        assert!(
+            expanded.contains("guest_resource_effects"),
+            "guest resource effects must derive from the declared contract schema: {expanded}"
+        );
+        assert!(
+            expanded.contains("resource_types : Vec :: new"),
+            "a raw-handle contract contributes no typed resource metadata of its own: {expanded}"
+        );
+        assert!(
+            expanded.contains("HostBindingKind :: StaticStack"),
+            "the adapter/binding class still comes from the Rust signature: {expanded}"
+        );
+        assert!(
+            expanded.contains("open_descriptor"),
+            "the descriptor factory name is unchanged: {expanded}"
+        );
+    }
+
+    #[test]
+    fn contract_argument_keeps_hidden_state_effects() {
+        let attr: Punctuated<Meta, Token![,]> =
+            parse_quote!(name = "re::match", contract = re_match_contract);
+        let item: ItemFn = parse_quote! {
+            /// Uses hidden module state while declaring its guest contract.
+            fn re_match(
+                cache: HostStateMut<RegexCache>,
+                pattern: &str,
+            ) -> VmResult<bool> {
+                todo!()
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item).unwrap().to_string();
+        assert!(
+            expanded.contains("HostStateEffect :: write :: < RegexCache >"),
+            "hidden host state effects must survive a declared contract: {expanded}"
+        );
+        assert!(
+            expanded.contains("declared_host_contract"),
+            "the declared contract must still be used: {expanded}"
+        );
+    }
+
+    #[test]
+    fn contract_argument_must_name_a_path() {
+        let attr: Punctuated<Meta, Token![,]> =
+            parse_quote!(name = "test::open", contract = "not-a-path");
+        let item: ItemFn = parse_quote! {
+            /// A literal is not a schema callable.
+            fn open() -> VmResult<i64> {
+                todo!()
+            }
+        };
+        let error = expand_pd_host_function(attr, item)
+            .expect_err("a contract must be a schema callable path");
+        assert!(
+            error
+                .to_string()
+                .contains("zero-argument guest-schema callable")
+        );
+    }
+
+    #[test]
+    fn contract_argument_conflicts_with_named_struct_attribute() {
+        let attr: Punctuated<Meta, Token![,]> =
+            parse_quote!(name = "test::open", contract = io_open_contract);
+        let item: ItemFn = parse_quote! {
+            /// The contract already carries the named return.
+            #[pd_host_named_struct]
+            fn open() -> VmResult<VmMap> {
+                todo!()
+            }
+        };
+        let error = expand_pd_host_function(attr, item)
+            .expect_err("contract and named-struct attribute are mutually exclusive");
+        assert!(
+            error
+                .to_string()
+                .contains("redundant with a declared contract")
+        );
+    }
+
+    #[test]
+    fn unknown_function_attribute_argument_is_rejected() {
+        let attr: Punctuated<Meta, Token![,]> =
+            parse_quote!(name = "test::open", schema_path = io_open_contract);
+        let item: ItemFn = parse_quote! {
+            /// Unknown arguments must fail closed.
+            fn open() -> VmResult<i64> {
+                todo!()
+            }
+        };
+        let error = expand_pd_host_function(attr, item)
+            .expect_err("unknown #[pd_host_function] arguments must be rejected");
+        assert!(error.to_string().contains("contract = <path>"));
+    }
+
+    #[test]
+    fn duplicate_name_argument_is_rejected() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::a", name = "test::b");
+        let item: ItemFn = parse_quote! {
+            /// Duplicate names must fail closed.
+            fn a() -> VmResult<i64> {
+                todo!()
+            }
+        };
+        let error = expand_pd_host_function(attr, item)
+            .expect_err("duplicate name arguments must be rejected");
+        assert!(error.to_string().contains("duplicate `name"));
     }
 
     #[test]
