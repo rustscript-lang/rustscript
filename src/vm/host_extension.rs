@@ -30,13 +30,380 @@
 //! coupling to the builtin runtime modules or any concrete host library.
 
 use crate::host_api::{
-    HostApiCatalog, HostApiFingerprint, HostFunctionSchema, HostParamPassing, HostTypeSchema,
+    HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint, HostEffect,
+    HostFunctionSchema, HostParamPassing, HostStructSchema, HostTypeSchema, ResourceTypeKey,
+    ResourceTypeSchema,
 };
 use crate::vm::VmResult;
 
 pub use super::host_context::HostContext;
 pub use super::host_context::HostModule as HostModuleState;
+use super::resource::HostResource;
 pub use crate::host_api::{HostImportParam, HostImportSchema};
+
+/// Canonical declaration for one concrete host resource type.
+///
+/// A function referring to `T` contributes `T`'s key and description to the
+/// module catalog. Conflicting declarations for the same key with a different
+/// Rust type fail before registry mutation.
+pub trait HostResourceType: HostResource {
+    /// Stable catalog resource type key. Must pass [`ResourceTypeKey::new`].
+    const KEY: &'static str;
+    /// Human-readable documentation excluded from catalog fingerprints.
+    const DESCRIPTION: &'static str;
+
+    /// Catalog resource schema derived from [`Self::KEY`] and [`Self::DESCRIPTION`].
+    fn resource_schema() -> ResourceTypeSchema {
+        ResourceTypeSchema::new(
+            ResourceTypeKey::new(Self::KEY).unwrap_or_else(|error| {
+                panic!(
+                    "HostResourceType::KEY {:?} for {} is not a valid resource type key: {error}",
+                    Self::KEY,
+                    std::any::type_name::<Self>()
+                )
+            }),
+            Self::DESCRIPTION,
+        )
+    }
+}
+
+/// Canonical resource type contributed by a function descriptor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostResourceTypeMeta {
+    /// Catalog resource schema (key + documentation).
+    pub schema: ResourceTypeSchema,
+    /// Concrete Rust type identity used for conflict checks.
+    pub type_id: std::any::TypeId,
+    /// Diagnostic type name.
+    pub type_name: &'static str,
+}
+
+impl HostResourceTypeMeta {
+    /// Builds metadata from a [`HostResourceType`] implementation.
+    pub fn of<T: HostResourceType>() -> Self {
+        Self {
+            schema: T::resource_schema(),
+            type_id: std::any::TypeId::of::<T>(),
+            type_name: std::any::type_name::<T>(),
+        }
+    }
+}
+
+/// Binding class selected for a host function adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostBindingKind {
+    /// Legacy `&mut Vm` plus borrowed args slice.
+    Static,
+    /// Stack-mutating adapter with `&mut Vm`.
+    StaticStack,
+    /// Args-slice adapter without `&mut Vm`.
+    StaticArgs,
+    /// Non-yielding args-slice adapter.
+    StaticNonYieldingArgs,
+    /// Owned-dispatch factory.
+    Owned,
+}
+
+/// Binding identity carried by a function descriptor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostBindingDescriptor {
+    /// Selected adapter class.
+    pub kind: HostBindingKind,
+}
+
+/// Runtime adapter attached to a function descriptor.
+#[derive(Clone, Copy)]
+pub enum HostAdapterDescriptor {
+    /// [`super::host::StaticHostFunction`].
+    Static(super::host::StaticHostFunction),
+    /// [`super::host::StaticHostStackFunction`].
+    StaticStack(super::host::StaticHostStackFunction),
+    /// [`super::host::StaticHostArgsFunction`].
+    StaticArgs(super::host::StaticHostArgsFunction),
+    /// Non-yielding [`super::host::StaticHostArgsFunction`].
+    StaticNonYieldingArgs(super::host::StaticHostArgsFunction),
+}
+
+/// One host function's schema, binding, runtime-only effects, and adapter.
+pub struct HostFunctionDescriptor {
+    /// Guest ABI and catalog fingerprint input.
+    pub schema: HostFunctionSchema,
+    /// Selected adapter/binding class.
+    pub binding: HostBindingDescriptor,
+    /// Runtime-only effects; guest resource effects stay tied to schema modes.
+    pub effects: Vec<HostEffect>,
+    /// Concrete adapter used at installation time.
+    pub adapter: HostAdapterDescriptor,
+    /// Resource types contributed by this function. Identical key+type pairs
+    /// dedupe; the same key with a different [`std::any::TypeId`] is a conflict.
+    pub resource_types: Vec<HostResourceTypeMeta>,
+}
+
+impl HostFunctionDescriptor {
+    /// Builds a catalog from descriptors without mutating any registry.
+    ///
+    /// Resource keys are collected from guest schemas and guest-resource
+    /// effects. Duplicate keys are ignored; catalog validation still rejects
+    /// undeclared or conflicting declarations.
+    pub fn collect_catalog(descriptors: &[Self]) -> Result<HostApiCatalog, HostApiCatalogError> {
+        let mut builder = HostApiBuilder::new();
+        let mut seen_resources: Vec<(ResourceTypeKey, Option<std::any::TypeId>)> = Vec::new();
+        let mut seen_structs: Vec<HostStructSchema> = Vec::new();
+        for descriptor in descriptors {
+            for meta in &descriptor.resource_types {
+                if let Some(existing) = seen_resources
+                    .iter_mut()
+                    .find(|(key, _)| key == &meta.schema.key)
+                {
+                    if let Some(type_id) = existing.1
+                        && type_id != meta.type_id
+                    {
+                        return Err(HostApiCatalogError::DuplicateResourceKey(
+                            meta.schema.key.clone(),
+                        ));
+                    }
+                    existing.1 = Some(meta.type_id);
+                    continue;
+                }
+                seen_resources.push((meta.schema.key.clone(), Some(meta.type_id)));
+                builder.resource(meta.schema.clone());
+            }
+            let mut keys = Vec::new();
+            for param in &descriptor.schema.params {
+                param.ty.collect_resource_keys(&mut keys);
+                collect_named_structs_from_type(&param.ty, &mut seen_structs, &mut builder)?;
+            }
+            descriptor
+                .schema
+                .return_type
+                .collect_resource_keys(&mut keys);
+            collect_named_structs_from_type(
+                &descriptor.schema.return_type,
+                &mut seen_structs,
+                &mut builder,
+            )?;
+            for effect in &descriptor.effects {
+                if let Some(resource) = effect.guest_resource() {
+                    keys.push(resource.key());
+                }
+            }
+            for key in keys {
+                if seen_resources.iter().any(|(existing, _)| existing == key) {
+                    continue;
+                }
+                seen_resources.push((key.clone(), None));
+                builder.resource(ResourceTypeSchema::new(key.clone(), ""));
+            }
+            builder.function(descriptor.schema.clone());
+        }
+        builder.build()
+    }
+}
+
+/// Converts a generated host-function wrapper result into a catalog adapter outcome.
+pub fn host_descriptor_call_outcome<T>(
+    result: super::VmResult<T>,
+) -> super::VmResult<super::CallOutcome>
+where
+    T: crate::IntoHostCallOutcome,
+{
+    result.map(crate::IntoHostCallOutcome::into_host_call_outcome)
+}
+
+/// Explicit ordered host module. Functions are listed by the author; there is
+/// no linker inventory or implicit global registration.
+pub struct HostModuleDescriptor {
+    /// Module identity used in diagnostics.
+    pub name: &'static str,
+    /// Deterministic function list. Order is the author's declaration order.
+    pub functions: &'static [fn() -> HostFunctionDescriptor],
+    /// Extra resource types that are part of the module catalog even when no
+    /// function schema mentions them yet.
+    pub resources: &'static [fn() -> HostResourceTypeMeta],
+}
+
+impl HostModuleDescriptor {
+    /// Materializes descriptors in declaration order.
+    pub fn descriptors(&self) -> Vec<HostFunctionDescriptor> {
+        self.functions.iter().map(|factory| factory()).collect()
+    }
+
+    /// Builds the guest catalog from the explicit function list.
+    pub fn catalog(&self) -> Result<HostApiCatalog, HostApiCatalogError> {
+        let mut descriptors = self.descriptors();
+        let extras: Vec<HostResourceTypeMeta> =
+            self.resources.iter().map(|factory| factory()).collect();
+        if let Some(first) = descriptors.first_mut() {
+            first.resource_types.extend(extras);
+        } else if !extras.is_empty() {
+            let mut builder = HostApiBuilder::new();
+            let mut seen: Vec<(ResourceTypeKey, Option<std::any::TypeId>)> = Vec::new();
+            for meta in extras {
+                if let Some((_, existing_type)) =
+                    seen.iter().find(|(key, _)| key == &meta.schema.key)
+                {
+                    if existing_type.is_some_and(|id| id != meta.type_id) {
+                        return Err(HostApiCatalogError::DuplicateResourceKey(
+                            meta.schema.key.clone(),
+                        ));
+                    }
+                    continue;
+                }
+                seen.push((meta.schema.key.clone(), Some(meta.type_id)));
+                builder.resource(meta.schema);
+            }
+            return builder.build();
+        }
+        HostFunctionDescriptor::collect_catalog(&descriptors)
+    }
+
+    /// Validates the complete module, then registers adapters transactionally.
+    ///
+    /// Named structs, resources, function schemas, and binding identities are
+    /// checked before any registry mutation. A later failure rolls back every
+    /// adapter installed by this call.
+    pub fn install(
+        &self,
+        registry: &mut super::host::HostFunctionRegistry,
+    ) -> VmResult<HostApiCatalog> {
+        let catalog = self
+            .catalog()
+            .map_err(|error| crate::vm::VmError::HostError(error.to_string()))?;
+        let descriptors = self.descriptors();
+        registry.transactionally(|registry| {
+            let named_structs = catalog_named_struct_schemas(&catalog);
+            registry.install_named_struct_schemas(named_structs)?;
+            for descriptor in &descriptors {
+                install_function_descriptor(registry, &catalog, descriptor)?;
+            }
+            Ok(catalog.clone())
+        })
+    }
+
+    /// Installs an explicit descriptor list transactionally.
+    pub fn install_descriptors(
+        registry: &mut super::host::HostFunctionRegistry,
+        descriptors: &[HostFunctionDescriptor],
+    ) -> VmResult<HostApiCatalog> {
+        let catalog = HostFunctionDescriptor::collect_catalog(descriptors)
+            .map_err(|error| crate::vm::VmError::HostError(error.to_string()))?;
+        let named_structs = catalog_named_struct_schemas(&catalog);
+        registry.transactionally(|registry| {
+            registry.install_named_struct_schemas(named_structs.clone())?;
+            for descriptor in descriptors {
+                install_function_descriptor(registry, &catalog, descriptor)?;
+            }
+            Ok(catalog.clone())
+        })
+    }
+}
+
+fn install_function_descriptor(
+    registry: &mut super::host::HostFunctionRegistry,
+    catalog: &HostApiCatalog,
+    descriptor: &HostFunctionDescriptor,
+) -> VmResult<()> {
+    let schema = matching_import_schema(catalog, &descriptor.schema)?;
+    let result = match (&descriptor.binding.kind, &descriptor.adapter) {
+        (HostBindingKind::Static, HostAdapterDescriptor::Static(function)) => {
+            registry.register_catalog_static(schema, *function)
+        }
+        (HostBindingKind::StaticStack, HostAdapterDescriptor::StaticStack(function)) => {
+            registry.register_catalog_static_stack(schema, *function)
+        }
+        (HostBindingKind::StaticArgs, HostAdapterDescriptor::StaticArgs(function)) => {
+            registry.register_catalog_static_args(schema, *function)
+        }
+        (
+            HostBindingKind::StaticNonYieldingArgs,
+            HostAdapterDescriptor::StaticNonYieldingArgs(function),
+        ) => registry.register_catalog_static_non_yielding_args(schema, *function),
+        _ => {
+            return Err(crate::vm::VmError::HostError(format!(
+                "host function '{}' has a binding/adapter mismatch",
+                descriptor.schema.name
+            )));
+        }
+    };
+    result.map(|_| ()).map_err(|error| {
+        crate::vm::VmError::HostError(format!(
+            "failed to install host function '{}': {error}",
+            descriptor.schema.name
+        ))
+    })
+}
+
+fn matching_import_schema(
+    catalog: &HostApiCatalog,
+    schema: &HostFunctionSchema,
+) -> VmResult<HostImportSchema> {
+    let matched: Vec<HostImportSchema> = catalog_import_schemas(catalog, &schema.name)
+        .into_iter()
+        .filter(|candidate| {
+            candidate.params.len() == schema.params.len()
+                && candidate
+                    .params
+                    .iter()
+                    .zip(&schema.params)
+                    .all(|(import, param)| {
+                        import.name == param.name
+                            && import.schema == param.ty
+                            && import.passing == param.passing
+                    })
+                && candidate.return_type == schema.return_type
+        })
+        .collect();
+    match matched.as_slice() {
+        [schema] => Ok(schema.clone()),
+        [] => Err(crate::vm::VmError::HostError(format!(
+            "host function '{}' is missing from the aggregated catalog",
+            schema.name
+        ))),
+        _ => Err(crate::vm::VmError::HostError(format!(
+            "host function '{}' is ambiguous in the aggregated catalog",
+            schema.name
+        ))),
+    }
+}
+
+fn collect_named_structs_from_type(
+    schema: &HostTypeSchema,
+    seen: &mut Vec<HostStructSchema>,
+    builder: &mut HostApiBuilder,
+) -> Result<(), HostApiCatalogError> {
+    match schema {
+        HostTypeSchema::Named { name, fields } => {
+            let declared = HostStructSchema::new(name.clone(), fields.clone());
+            if let Some(existing) = seen.iter().find(|item| item.name == declared.name) {
+                if existing.fields != declared.fields {
+                    return Err(HostApiCatalogError::StructFieldMismatch {
+                        function: String::new(),
+                        name: declared.name,
+                    });
+                }
+            } else {
+                seen.push(declared.clone());
+                builder.named_struct(declared);
+            }
+            for field in fields {
+                collect_named_structs_from_type(&field.ty, seen, builder)?;
+            }
+        }
+        HostTypeSchema::Array(inner)
+        | HostTypeSchema::Map(inner)
+        | HostTypeSchema::Optional(inner) => {
+            collect_named_structs_from_type(inner, seen, builder)?;
+        }
+        HostTypeSchema::Callable { params, result } => {
+            for param in params {
+                collect_named_structs_from_type(param, seen, builder)?;
+            }
+            collect_named_structs_from_type(result, seen, builder)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 /// Public name for the typed per-VM module-state marker used by the external
 /// extension surface.

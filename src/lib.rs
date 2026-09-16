@@ -87,12 +87,12 @@ pub use bytecode::{
 };
 pub use host_api::{
     FunctionNameError, HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint,
-    HostFunctionSchema, HostParamPassing, HostParamSchema, HostSchemaValidationError,
-    HostStructField, HostStructSchema, HostTypeSchema, MAX_HOST_CATALOG_FUNCTIONS,
+    HostEffect, HostFunctionSchema, HostParamPassing, HostParamSchema, HostSchemaValidationError,
+    HostStateEffect, HostStructField, HostStructSchema, HostTypeSchema, MAX_HOST_CATALOG_FUNCTIONS,
     MAX_HOST_CATALOG_PARAMETERS, MAX_HOST_CATALOG_RESOURCES, MAX_HOST_DESCRIPTION_LEN,
     MAX_HOST_FUNCTION_NAME_LEN, MAX_HOST_PARAMETER_NAME_LEN, MAX_HOST_RESOURCE_KEY_LEN,
-    MAX_HOST_SCHEMA_DEPTH, MAX_HOST_SCHEMA_NODES, MAX_HOST_SCHEMA_PROPERTIES, ResourceTypeKey,
-    ResourceTypeKeyError, ResourceTypeSchema, validate_host_import_schemas,
+    MAX_HOST_SCHEMA_DEPTH, MAX_HOST_SCHEMA_NODES, MAX_HOST_SCHEMA_PROPERTIES, ResourceEffect,
+    ResourceTypeKey, ResourceTypeKeyError, ResourceTypeSchema, validate_host_import_schemas,
 };
 #[cfg(feature = "runtime")]
 pub use vm::runtime::{
@@ -146,6 +146,11 @@ pub use jit::{
 };
 #[cfg(feature = "runtime")]
 pub use vm::diagnostics::render_vm_error;
+#[cfg(feature = "runtime")]
+pub use vm::host_extension::{
+    HostAdapterDescriptor, HostBindingDescriptor, HostBindingKind, HostFunctionDescriptor,
+    HostModuleDescriptor, HostResourceType, HostResourceTypeMeta,
+};
 #[cfg(feature = "runtime")]
 pub use vm::resource::{Resource, ResourceHandle, ResourceMut, ResourceOwned, ResourceRef};
 #[cfg(feature = "runtime")]

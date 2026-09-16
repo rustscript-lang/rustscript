@@ -361,6 +361,101 @@ impl HostParamPassing {
     }
 }
 
+/// Guest-visible resource access or creation inferred from a typed signature.
+///
+/// These effects materialize the same resource keys and passing modes already
+/// present in [`HostFunctionSchema`]. They are runtime metadata and must not
+/// be serialized into a catalog fingerprint.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ResourceEffect {
+    /// `ResourceRef<'_, T>` / borrow passing.
+    Borrow { key: ResourceTypeKey },
+    /// `ResourceMut<'_, T>` / borrow_mut passing.
+    BorrowMut { key: ResourceTypeKey },
+    /// `ResourceOwned<T>` / take_owned passing.
+    TakeOwned { key: ResourceTypeKey },
+    /// `Resource<T>` return / resource creation.
+    Create { key: ResourceTypeKey },
+}
+
+impl ResourceEffect {
+    /// Immutable borrow of resource `key`.
+    pub fn borrow(key: ResourceTypeKey) -> Self {
+        Self::Borrow { key }
+    }
+
+    /// Mutable borrow of resource `key`.
+    pub fn borrow_mut(key: ResourceTypeKey) -> Self {
+        Self::BorrowMut { key }
+    }
+
+    /// Ownership transfer of resource `key`.
+    pub fn take_owned(key: ResourceTypeKey) -> Self {
+        Self::TakeOwned { key }
+    }
+
+    /// Creation of a resource of type `key`.
+    pub fn create(key: ResourceTypeKey) -> Self {
+        Self::Create { key }
+    }
+
+    /// Resource type key this effect refers to.
+    pub fn key(&self) -> &ResourceTypeKey {
+        match self {
+            Self::Borrow { key }
+            | Self::BorrowMut { key }
+            | Self::TakeOwned { key }
+            | Self::Create { key } => key,
+        }
+    }
+
+    /// Parameter passing mode this effect corresponds to.
+    ///
+    /// Creation is a return-side effect and has no parameter passing mode.
+    pub fn passing(&self) -> Option<HostParamPassing> {
+        match self {
+            Self::Borrow { .. } => Some(HostParamPassing::Borrow),
+            Self::BorrowMut { .. } => Some(HostParamPassing::BorrowMut),
+            Self::TakeOwned { .. } => Some(HostParamPassing::TakeOwned),
+            Self::Create { .. } => None,
+        }
+    }
+}
+
+/// Host-private state requirement. Hidden from guest arity and fingerprints.
+///
+/// Core A records the type so descriptors can carry private effects later;
+/// generic host-state storage is installed by a later core.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum HostStateEffect {
+    /// Shared read of per-VM private state identified by `type_name`.
+    Read { type_name: &'static str },
+    /// Exclusive write of per-VM private state identified by `type_name`.
+    Write { type_name: &'static str },
+}
+
+/// Runtime-only host function effect.
+///
+/// Guest resource effects stay structurally tied to schema passing modes.
+/// Host-private state effects never appear in [`HostFunctionSchema`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum HostEffect {
+    /// Guest-visible resource borrow, take, or create.
+    GuestResource(ResourceEffect),
+    /// Host-private state that is invisible to guest arity and fingerprints.
+    HostState(HostStateEffect),
+}
+
+impl HostEffect {
+    /// Guest resource effect, if this is one.
+    pub fn guest_resource(&self) -> Option<&ResourceEffect> {
+        match self {
+            Self::GuestResource(effect) => Some(effect),
+            Self::HostState(_) => None,
+        }
+    }
+}
+
 /// One field of a named host struct.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct HostStructField {
