@@ -12,6 +12,9 @@ The legacy `HostApiBuilder::{resource,named_struct,function}` and
 the compatibility window (see [Compatibility window](#compatibility-window)).
 New modules should not need them.
 
+Organization freeze outcomes:
+[host-descriptor-migration-report.md](host-descriptor-migration-report.md).
+
 ## 1. The model
 
 One host function declaration produces, in a single macro expansion:
