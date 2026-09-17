@@ -7,19 +7,21 @@ mechanical pin audit, recovered gates, and compatibility decision. It does not
 retarget the frozen SHA or change core code.
 
 **Matrix result:** 19 organization repositories (18 public + private
-`ngx-rustscript`). No unclassified consumer. Every named candidate ref resolves
-to the expected SHA. No live Cargo/lock/CI stale pin on a migration candidate.
-Legacy builder and low-level registry APIs remain for the transition cycle;
-removal is a separate follow-up after this matrix, not part of this report.
+`ngx-rustscript`). No unclassified consumer. Every downstream candidate ref
+resolves to the expected SHA; the frozen core SHA resolves through merged PR #30
+because its source branch was deleted after merge. No live Cargo/lock/CI stale
+pin exists on a migration candidate. Legacy builder and low-level registry APIs
+remain for the transition cycle; removal is a separate follow-up after this
+matrix, not part of this report.
 
 ## 1. Frozen core
 
 | Item | Value |
 |---|---|
 | Frozen SHA | `b1d6cffede77f49410bf63525f30b9a46b02dc01` |
-| Containing remote branch | `subagent/host-descriptors-resource-effects` (PR #30 head) |
+| Remote provenance | PR #30 head; source branch deleted after merge |
 | PR | rustscript-lang/rustscript#30 `refactor(*): host descriptors resource effects`, merged 2026-09-17T08:30:48Z |
-| Default `master` | `fd405fbe3c91f5c7fe77762b69ceb81caea6962d` (merge commit of PR #30, not the frozen head) |
+| Default `master` | `fd405fbe3c91f5c7fe77762b69ceb81caea6962d` (squash/merge result with the same reviewed tree, not the frozen head commit) |
 
 Downstream candidates pin the frozen **head** SHA, not the merge commit.
 
@@ -30,13 +32,15 @@ At the frozen SHA:
 - Generic host state is `src/vm/host_state.rs`.
 - Authoring guide: [`docs/host-sdk-descriptors.md`](host-sdk-descriptors.md).
 
-Core `Cargo.lock` still records optional crates.io `pd-edge-abi 0.1.1` →
-`pd-host-function 0.22.2` because `pd-vm`'s optional `edge_abi` feature remains
-in the frozen tree. `pd-edge`  `5f4f889e349bdfbd5534deb42bd13b616a6114f5`
-explicitly does **not** enable `vm/edge-abi`; HTTP stays on in-tree ABI25.
-`scripts/test_publish_crates.py` still mentions registry `pd-host-function`
-`0.22.7` as a publish-rewrite fixture. Those are classified as core optional
-feature / publish templates, not consumer stale pins.
+Core `Cargo.lock` still records optional crates.io `pd-edge-abi 0.1.1` and
+`pd-host-function 0.22.2`: `pd-vm` retains the optional `edge_abi` feature and
+`pd-vm-wasm` retains an unconditional crates.io `pd-edge-abi` dependency in the
+frozen tree. `pd-edge` `5f4f889e349bdfbd5534deb42bd13b616a6114f5`
+explicitly does **not** enable `vm/edge-abi`; HTTP and every migrated downstream
+stay on the in-tree ABI25 family. `scripts/test_publish_crates.py` still mentions
+registry `pd-host-function` `0.22.7` as a publish-rewrite fixture. These are
+classified as frozen-core leftover graph / publish templates, not consumer stale
+pins, and retiring the unused core graph remains a follow-up.
 
 ## 2. Organization inventory
 
@@ -78,12 +82,15 @@ defaults is outside this report.
 
 ## 3. Candidate remote verification
 
-Every candidate was re-read with `GET /repos/rustscript-lang/{repo}/git/ref/heads/{branch}`
-(and HTTPS `git ls-remote` where used). All matched.
+Every downstream candidate was re-read with
+`GET /repos/rustscript-lang/{repo}/git/ref/heads/{branch}` (and HTTPS
+`git ls-remote` where used); all matched. The frozen core source branch was
+deleted after PR #30 merged, so its SHA was verified through the PR head and
+commit APIs instead of a live branch ref.
 
-| Repository | Candidate branch | Remote SHA | Match |
+| Repository | Candidate branch / provenance | Remote SHA | Match |
 |---|---|---|---|
-| rustscript | `subagent/host-descriptors-resource-effects` (PR #30 head) | `b1d6cffede77f49410bf63525f30b9a46b02dc01` | yes |
+| rustscript | PR #30 head (source branch deleted after merge) | `b1d6cffede77f49410bf63525f30b9a46b02dc01` | yes |
 | pd-edge | `subagent/pd-edge-remove-legacy-abi-feature-12e2b155` | `5f4f889e349bdfbd5534deb42bd13b616a6114f5` | yes |
 | ngx-rustscript | `subagent/ngx-host-descriptor-migration-e0996f6d` | `3735344a3e39a3be5f6cfb6f0af22367c3efe8a5` | yes |
 | rustscript-agent | `subagent/agent-host-descriptor-migration-37e396a7` | `141b7c3a0c7afcd6806d8e7769bff23146fd4947` | yes |
@@ -129,7 +136,7 @@ Hits that are **not** live pins:
 
 | Location | Why it is not a stale pin |
 |---|---|
-| Frozen core optional `edge_abi` → crates.io `pd-edge-abi 0.1.1` / `pd-host-function 0.22.2` | optional feature; pd-edge candidate does not enable `vm/edge-abi` |
+| Frozen core `pd-vm` optional `edge_abi` plus `pd-vm-wasm` crates.io `pd-edge-abi 0.1.1` / `pd-host-function 0.22.2` graph | frozen-core leftover; migrated downstream candidates do not enable or inherit it |
 | `scripts/test_publish_crates.py` `0.22.7` | publish-rewrite test fixture |
 | ngx `README.md` / scheduler design notes `f5f71ebc…` | historical docs; `Cargo.toml` `rustscript-rev` is `b1d6cff…`; `tests/core_pin.rs` treats `f5f71ebc…` as `STALE_REV` |
 | agent vendored comments `f9ca4143…` and `STALE_REV` | provenance / negative pin test |
@@ -172,7 +179,7 @@ for the candidate SHAs. This audit did not re-run Cargo.
 |---|---|---|---|---|---|
 | pd-controller | `b884a4e…` | migration | verified | pd-edge `5f4f889…`, pd-vm `b1d6cff…`; `mqtt = ["edge/mqtt"]` | Follow-up after ABI24 dual-universe / default-off MQTT-WebRTC blockers. Final review `passed=true`. Default-off MQTT/WebRTC compile accepts Ok only when matching imports are `None`. |
 | pd-edge-waf | `6977e0d…` | migration | verified | pd-edge `5f4f889…` with `mqtt`, core `b1d6cff…`; lock dropped crates.io `pd-edge-abi 0.1.1` / `pd-host-function 0.22.6` | Review `passed=true`. Exact RSS corpus **36** `rules/*.rss`. Repin from earlier `6320847` candidate. |
-| IronRust | `dfaf009…` | migration | verified | pd-edge family `5f4f889…`, core family `b1d6cff…`; no registry `pd-edge*` / `pd-host-*` / `pd-vm*` | Review `passed=true`. Native compiler + CLR. Intermediate CLR run: `dotnet` Release **71/71** (PdVm.Tests 67, PdEdge.Http.Tests 4), SDK 10.0.401 / runtime 10.0.12, seven-example matrix. Repin commit dropped ABI24 graph. |
+| IronRust | `dfaf009…` | migration | verified | pd-edge family `5f4f889…`, core family `b1d6cff…`; no registry `pd-edge*` / `pd-host-*` / `pd-vm*` | Review `passed=true`. Native compiler + CLR; final repinned Release run passed **82/82** (`PdVm.Tests` 78, `PdEdge.Http.Tests` 4), plus native 14 tests and the seven-example matrix. Rebuilt native artifact differed from the pre-repin binary, proving the final CLR matrix used the new dependency graph. |
 
 ### Documentation / no-change
 
@@ -230,7 +237,7 @@ and the public repo table. No pin or syntax change required.
 | Catalog fingerprint | ngx `0x10c407b2b827eaff`; Bevy `0x61e3eaf5de92afc7`; others lock-proven at frozen SHA |
 | Exact / restricted binding | ngx, agent, flint, GPUI, pd-edge install paths reviewed as single restricted/exact registries |
 | VM reset / reuse | Core regex reuse; GPUI reset clears stale callables; ngx worker/request tests in Task 10 evidence |
-| Interpreter / JIT / AOT / WASM / CLR | Core JIT/AOT in frozen review; playground WASM; micro VMBC/no_std; IronRust CLR 71/71 then ABI25 repin |
+| Interpreter / JIT / AOT / WASM / CLR | Core JIT/AOT in frozen review; playground WASM; micro VMBC/no_std; IronRust final repinned CLR **82/82** plus native tests and seven-example matrix |
 | Async / owned dispatch | ngx timer/semaphore; agent HTTP/tools; pd-edge network ABI |
 
 Plan RSS/example corpora accounted for:
@@ -240,7 +247,7 @@ Plan RSS/example corpora accounted for:
 | pd-edge 26 `.rss` + examples | Task 9 ABI25 compile path |
 | ngx host/integration tests | Task 10; 199-host catalog |
 | agent RSS including HTTP/storage | Task 11 reviewed candidate |
-| flint seven host modules | 207-host unified composition |
+| flint 13 host modules | 207-host unified composition |
 | Bevy six example assets / shooter-gomoku-xiangqi | Task 12 + address |
 | Pingora gateway tests | Task 12 `passed=true` |
 | GPUI two RSS files / 15 hosts | Task 13 |
@@ -273,8 +280,11 @@ is green and candidates are integrated. It is not part of this report commit.
 ## 9. Residual follow-ups (non-blockers)
 
 - Merge candidate branches onto default branches (defaults still pre-migration).
-- After merge: drop frozen core's unused optional crates.io `edge_abi` graph if
-  that feature is retired.
+- After merge: remove the frozen core leftover crates.io edge ABI graph if
+  `pd-vm`'s optional `edge_abi` feature and `pd-vm-wasm`'s direct dependency are
+  retired.
+- Pin CI sibling-core checkouts to the frozen/refined candidate where workflows
+  currently rely on the default branch; Cargo dependency pins are already exact.
 - Optional docs cleanup: ngx README/design notes that still *mention* `f5f71ebc…`.
 - Hardware flash and Windows UI execution when those platforms are available.
 - Legacy builder/registry removal (blocked on integration, not on this audit).
