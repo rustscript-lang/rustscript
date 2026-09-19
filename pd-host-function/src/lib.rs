@@ -224,6 +224,16 @@ fn is_async_owned_type(ty: &Type) -> bool {
         Type::Paren(paren) => is_async_owned_type(&paren.elem),
         Type::Reference(_) | Type::Slice(_) => false,
         Type::Tuple(tuple) => tuple.elems.iter().all(is_async_owned_type),
+        Type::BareFn(function) => {
+            function
+                .inputs
+                .iter()
+                .all(|input| is_async_owned_type(&input.ty))
+                && match &function.output {
+                    ReturnType::Default => true,
+                    ReturnType::Type(_, output) => is_async_owned_type(output),
+                }
+        }
         Type::Path(path) => {
             let Some(segment) = path.path.segments.last() else {
                 return false;
@@ -1713,6 +1723,25 @@ mod tests {
                 .to_string()
                 .contains("parameters must be owned and 'static")
         );
+    }
+
+    #[test]
+    fn async_callable_wrapper_accepts_owned_bare_function_schema() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::async_stream");
+        let item: ItemFn = parse_quote! {
+            /// Streams through an owned callback asynchronously.
+            async fn async_stream(
+                callback: VmCallable<fn(VmMap) -> VmMap>,
+            ) -> VmResult<HostFutureOutput<VmMap>> {
+                todo!()
+            }
+        };
+
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("an owned callable wrapper may cross the async boundary")
+            .to_string();
+        assert!(expanded.contains("VmCallable < fn (VmMap) -> VmMap >"));
+        assert!(expanded.contains("submit_host_future"));
     }
 
     #[test]

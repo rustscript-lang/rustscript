@@ -982,6 +982,11 @@ async fn sse_reset_releases_the_connection_permit_before_reuse() {
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
 
     assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        vm.await_waiting_host_op(),
+    )
+    .await;
     assert!(
         requests
             .recv_timeout(std::time::Duration::from_secs(1))

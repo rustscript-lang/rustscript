@@ -4,13 +4,12 @@ use std::time::{Duration, Instant};
 use pd_host_function::pd_host_function;
 
 use super::typed::{VmMap, VmMapHandle};
-use super::{borrow_arg, take_arg};
-use crate::HostCallResult;
+use super::{CallOutcome, CaptureAsyncHostContext, borrow_arg, return_one};
 use crate::host_api::{
     HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema, HostStructField,
     HostStructSchema, HostTypeSchema,
 };
-use crate::vm::{HostFunctionRegistry, Vm, VmError, VmResult};
+use crate::vm::{HostFunctionRegistry, HostFutureOutput, Value, Vm, VmError, VmResult};
 
 mod config;
 pub(super) mod policy;
@@ -19,20 +18,6 @@ pub(super) mod sse;
 
 pub use config::HttpConfig;
 use policy::{ConnectionAdmission, ConnectionPermit};
-pub use request::{HttpRequestResource, HttpResponseResource};
-
-impl crate::host_extension::HostResourceType for HttpRequestResource {
-    const KEY: &'static str = "http.request";
-    const DESCRIPTION: &'static str =
-        "An in-flight HTTP request under the configured network policy";
-}
-
-impl crate::host_extension::HostResourceType for HttpResponseResource {
-    const KEY: &'static str = "http.response";
-    const DESCRIPTION: &'static str = "An open HTTP response body stream";
-}
-
-pub(crate) use sse::SseStreamResource;
 
 const DEFAULT_MAX_HTTP_IN_FLIGHT: usize = 64;
 
@@ -47,13 +32,16 @@ const DEFAULT_MAX_HTTP_IN_FLIGHT: usize = 64;
 struct HttpHostState {
     config: Option<HttpConfig>,
     admission: ConnectionAdmission,
+    client: request::HttpClient,
 }
 
 impl Default for HttpHostState {
     fn default() -> Self {
+        let config = HttpConfig::default();
         Self {
             config: None,
             admission: ConnectionAdmission::new(DEFAULT_MAX_HTTP_IN_FLIGHT),
+            client: request::build_client(&config),
         }
     }
 }
@@ -82,9 +70,11 @@ impl HttpHostExt for Vm {
             .module_state::<HttpHostState>()
             .map(|state| state.admission.clone())
             .unwrap_or_else(|| ConnectionAdmission::new(DEFAULT_MAX_HTTP_IN_FLIGHT));
+        let client = request::build_client(&config);
         ctx.set_module_state(HttpHostState {
             config: Some(config),
             admission,
+            client,
         });
         Ok(())
     }
@@ -123,21 +113,21 @@ impl HttpHostExt for Vm {
     }
 }
 
-/// Captured HTTP configuration plus a connection permit, used to open a
-/// request/stream without re-entering the VM.
+/// Captured HTTP configuration, shared Hyper client, and one in-flight permit.
 pub(super) struct HttpRequestContext {
-    pub(super) config: HttpConfig,
+    config: HttpConfig,
+    client: request::HttpClient,
     permit: ConnectionPermit,
+    prepared_request: Option<(request::HttpRequest, Instant)>,
 }
 
 impl HttpRequestContext {
-    /// Captures the persistent HTTP policy plus a shared in-flight permit for
-    /// one connection-oriented adapter.
+    /// Captures persistent HTTP state without leaving a VM borrow in the
+    /// macro-owned future.
     ///
-    /// The deadline is validated *before* the permit is acquired, preserving
-    /// the historical ordering guarantee (a script timeout that cannot form a
-    /// deadline is rejected even when the in-flight capacity is exhausted).
-    fn capture(
+    /// Deadline validation precedes admission so an unrepresentable script
+    /// timeout remains the first reported error even when capacity is full.
+    pub(super) fn capture_for(
         vm: &mut Vm,
         script_timeout: Option<Duration>,
         protocol: &str,
@@ -163,13 +153,33 @@ impl HttpRequestContext {
             VmError::HostError("HTTP max_stream_duration cannot form a deadline".to_string())
         })?;
         let permit = state.admission.acquire()?;
-        Ok((Self { config, permit }, deadline))
+        Ok((
+            Self {
+                config,
+                client: state.client.clone(),
+                permit,
+                prepared_request: None,
+            },
+            deadline,
+        ))
+    }
+}
+
+impl CaptureAsyncHostContext for HttpRequestContext {
+    fn capture(vm: &mut Vm) -> VmResult<Self> {
+        Self::capture_for(vm, None, "HTTP").map(|(context, _)| context)
     }
 
-    /// Consumes the captured permit, transferring it to the caller (e.g. the
-    /// SSE driver that releases it when the stream finishes).
-    fn into_permit(self) -> ConnectionPermit {
-        self.permit
+    fn capture_with_args(vm: &mut Vm, args: &[Value]) -> VmResult<Self> {
+        let mut context = Self::capture(vm)?;
+        let request = match args.first() {
+            Some(Value::Map(request)) => request,
+            Some(_) => return Err(VmError::TypeMismatch("http request map")),
+            None => return Err(VmError::StackUnderflow),
+        };
+        context.prepared_request =
+            Some(request::prepare_buffered_request(&context.config, request)?);
+        Ok(context)
     }
 }
 
@@ -180,16 +190,7 @@ impl HttpRequestContext {
 /// registered by [`HttpExtension`] byte-for-byte.
 pub fn http_host_catalog() -> Arc<HostApiCatalog> {
     Arc::clone(HTTP_HOST_CATALOG.get_or_init(|| {
-        super::host_modules::module_catalog(
-            "http",
-            HTTP_CATALOG_FUNCTIONS,
-            &[
-                http_request_resource,
-                http_response_resource,
-                sse_stream_resource,
-            ],
-            HTTP_NAMED_STRUCTS,
-        )
+        super::host_modules::module_catalog("http", HTTP_CATALOG_FUNCTIONS, &[], HTTP_NAMED_STRUCTS)
     }))
 }
 
@@ -197,9 +198,8 @@ static HTTP_HOST_CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
 
 /// Guest contract for `http::client::request`.
 ///
-/// The runtime drives a pending operation under the configured network policy;
-/// the guest contract is the typed `http.request` resource it opens and the
-/// typed `HttpResponse` it resolves to.
+/// The request resolves directly to a typed `HttpResponse`; transport and pool
+/// state stay hidden in the host implementation.
 fn http_request_contract() -> HostFunctionSchema {
     HostFunctionSchema::with_return(
         "http::client::request",
@@ -260,15 +260,7 @@ const HTTP_CATALOG_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescr
 ];
 
 fn http_catalog_module() -> crate::host_extension::HostModuleDescriptor {
-    super::host_modules::catalog_module(
-        "http",
-        HTTP_CATALOG_FUNCTIONS,
-        &[
-            http_request_resource,
-            http_response_resource,
-            sse_stream_resource,
-        ],
-    )
+    super::host_modules::catalog_module("http", HTTP_CATALOG_FUNCTIONS, &[])
 }
 
 /// The standard `http` host module.
@@ -407,19 +399,6 @@ pub(super) fn sse_summary_struct(response_header: &HostStructSchema) -> HostStru
     )
 }
 
-/// The canonical declarations for the HTTP resource types.
-pub(super) fn http_request_resource() -> crate::host_extension::HostResourceTypeMeta {
-    crate::host_extension::HostResourceTypeMeta::of::<HttpRequestResource>()
-}
-
-pub(super) fn http_response_resource() -> crate::host_extension::HostResourceTypeMeta {
-    crate::host_extension::HostResourceTypeMeta::of::<HttpResponseResource>()
-}
-
-pub(super) fn sse_stream_resource() -> crate::host_extension::HostResourceTypeMeta {
-    crate::host_extension::HostResourceTypeMeta::of::<SseStreamResource>()
-}
-
 /// Registers every HTTP host function into `registry` using the exact
 /// catalog schema path and the authoritative [`standard_host_catalog`]
 /// snapshot.
@@ -474,24 +453,23 @@ impl crate::vm::HostExtension for HttpExtension {
 }
 
 /// Starts an HTTP request under the VM's configured network policy.
-///
-/// The request is a named `HttpRequest` record with `method`, `url`, optional
-/// `headers` as an array of typed `HttpRequestHeader` wrappers, and optional
-/// `body` as a typed `HttpRequestBody` wrapper. `HttpRequestBody` discriminates
-/// between `{ kind: "text", text: string }` and `{ kind: "bytes", bytes: bytes }`;
-/// the unused payload field is null. The response is a named `HttpResponse`
-/// record with `status`, typed `HttpResponseHeader` entries in `headers`, raw
-/// response `body` bytes, and the final validated `url`.
-#[pd_host_function(
-    name = "http::client::request",
-    contract = http_request_contract,
-    runtime_owned_pending
-)]
-pub(super) fn builtin_http_client_request(
-    vm: &mut Vm,
+#[pd_host_function(name = "http::client::request", contract = http_request_contract)]
+pub(super) async fn builtin_http_client_request(
+    #[pd_host_context] context: HttpRequestContext,
     request: VmMapHandle,
-) -> VmResult<HostCallResult<VmMap>> {
-    request::perform_buffered_request(vm, request)
+) -> VmResult<VmMap> {
+    let HttpRequestContext {
+        config,
+        client,
+        permit,
+        prepared_request,
+    } = context;
+    let _permit = permit;
+    let _ = request;
+    let (request, deadline) = prepared_request.ok_or_else(|| {
+        VmError::HostError("HTTP request capture did not prepare the request".to_string())
+    })?;
+    request::perform_buffered_request(&client, &config, &request, deadline).await
 }
 
 #[cfg(test)]
@@ -521,7 +499,7 @@ mod tests {
         vm.configure_http(HttpConfig::default())
             .expect("default config should be valid");
 
-        let error = super::HttpRequestContext::capture(&mut vm, Some(Duration::MAX), "SSE")
+        let error = super::HttpRequestContext::capture_for(&mut vm, Some(Duration::MAX), "SSE")
             .err()
             .expect("an unrepresentable script timeout should be rejected");
         assert!(error.to_string().contains("timeout_ms"), "{error}");
@@ -558,8 +536,8 @@ mod tests {
         assert!(validate_url(&config, SchemeFamily::Http, &default_port).is_err());
     }
 
-    #[test]
-    fn pinned_resolution_preserves_the_original_host_and_validated_address() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn pinned_resolution_preserves_the_original_host_and_validated_address() {
         let config = HttpConfig {
             allowed_schemes: vec!["http".to_string()],
             allowed_hosts: vec!["127.0.0.1".to_string()],
@@ -568,17 +546,9 @@ mod tests {
             ..HttpConfig::default()
         };
         let url = "http://127.0.0.1:8080/".parse().expect("valid pinned URL");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime should build");
 
-        let target = runtime
-            .block_on(super::policy::resolve_url(
-                &config,
-                SchemeFamily::Http,
-                &url,
-            ))
+        let target = super::policy::resolve_url(&config, SchemeFamily::Http, &url)
+            .await
             .expect("target should resolve under policy");
 
         assert_eq!(target.host, "127.0.0.1");

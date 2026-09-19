@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use vm::{
     CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HostOpId,
-    HttpConfig, HttpHostExt, IoHostExt, IoPolicy, ResourceTypeKey, Value, Vm, VmError, VmResult,
-    VmStatus, compile_source, register_http_builtin_module, standard_host_catalog,
+    HttpConfig, HttpHostExt, IoHostExt, IoPolicy, Value, Vm, VmError, VmResult, VmStatus,
+    compile_source, register_http_builtin_module, standard_host_catalog,
 };
 
 #[derive(Default)]
@@ -321,28 +321,15 @@ async fn worker_cleanup_reaches_quiescence_after_io_and_http() {
 }
 
 #[test]
-fn io_and_http_resource_type_keys_are_disjoint() {
+fn http_transport_does_not_publish_guest_resources() {
     let catalog = standard_host_catalog();
-    let io_keys = ["io.file", "io.socket", "io.process", "io.worker", "io.pipe"];
-    let http_keys = ["http.request", "http.response", "http.sse"];
-    for key in catalog
-        .resources()
-        .iter()
-        .map(|resource| resource.key.as_str())
-    {
-        if io_keys.contains(&key) {
-            assert!(!http_keys.contains(&key));
-        }
-        if http_keys.contains(&key) {
-            assert!(!io_keys.contains(&key));
-        }
-    }
-    for key in io_keys {
-        let _ = ResourceTypeKey::new(key).expect("IO resource key should be valid");
-    }
-    for key in http_keys {
-        let _ = ResourceTypeKey::new(key).expect("HTTP resource key should be valid");
-    }
+    assert!(
+        catalog
+            .resources()
+            .iter()
+            .all(|resource| !resource.key.as_str().starts_with("http.")),
+        "HTTP transport state must stay internal to macro-owned async calls"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

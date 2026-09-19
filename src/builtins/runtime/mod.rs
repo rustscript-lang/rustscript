@@ -5,10 +5,10 @@ use std::sync::{Arc, OnceLock};
 
 use crate::builtins::BuiltinFunction;
 use crate::host_api::{HostApiCatalog, HostApiFingerprint};
-#[cfg(all(feature = "async", not(target_family = "wasm")))]
-use crate::vm::CaptureAsyncHostContext;
 #[allow(unused_imports)]
 use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmError, VmResult};
+#[cfg(all(feature = "async", not(target_family = "wasm")))]
+use crate::vm::{CaptureAsyncHostContext, HostFutureOutput};
 
 mod aot;
 mod bytes;

@@ -25,12 +25,12 @@ const HTTP_SURFACE_ENABLED: bool = cfg!(all(feature = "http-client", not(target_
 /// Fingerprint of the published standard host catalog **with** the HTTP
 /// surface.
 ///
-/// Both fingerprints are exact goldens of the descriptor migration: the whole
-/// point of the change is that guest contracts did not move. The standard
-/// catalog is the merge of the composed module surfaces, so the golden depends
-/// on the composed set — the default build (no `http-client`) composes one
-/// module fewer and must reproduce [`STANDARD_CATALOG_FINGERPRINT_NO_HTTP`].
-const STANDARD_CATALOG_FINGERPRINT: &str = "6607e4fcb3187e73";
+/// The standard catalog is the merge of the current composed module surfaces,
+/// so the golden depends on the composed set. The HTTP surface intentionally
+/// omits transport-only resources; the default build (no `http-client`)
+/// composes one module fewer and must reproduce
+/// [`STANDARD_CATALOG_FINGERPRINT_NO_HTTP`].
+const STANDARD_CATALOG_FINGERPRINT: &str = "4e3b7572a59b3dae";
 /// Fingerprint of the published standard host catalog **without** the HTTP
 /// surface: the `--workspace` default build and every wasm build.
 const STANDARD_CATALOG_FINGERPRINT_NO_HTTP: &str = "a6b4b2dcadc5df14";
@@ -39,7 +39,7 @@ const SQLITE_CATALOG_FINGERPRINT: &str = "b6d4c278145edacf";
 const JIT_CATALOG_FINGERPRINT: &str = "d0a3efbca2d0923c";
 const TIMER_CATALOG_FINGERPRINT: &str = "4af2dfa2aee1f42e";
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
-const HTTP_CATALOG_FINGERPRINT: &str = "18a4033f5857c033";
+const HTTP_CATALOG_FINGERPRINT: &str = "66db92730480d50a";
 
 /// The standard catalog fingerprint this build must reproduce exactly.
 fn standard_catalog_fingerprint() -> &'static str {
@@ -53,8 +53,8 @@ fn standard_catalog_fingerprint() -> &'static str {
 /// Resource keys the standard catalog always publishes.
 const STANDARD_RESOURCE_KEYS: &[&str] = &["io.file", "sqlite.connection"];
 
-/// Resource keys the HTTP module publishes when it is composed.
-const HTTP_RESOURCE_KEYS: &[&str] = &["http.request", "http.response", "http.sse"];
+/// HTTP uses macro-owned futures and does not publish transient resources.
+const HTTP_RESOURCE_KEYS: &[&str] = &[];
 
 /// Named structs the standard catalog always declares.
 const STANDARD_NAMED_STRUCTS: &[&str] = &[
