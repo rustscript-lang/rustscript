@@ -58,7 +58,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
     });
 
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
     let decoded = decode_program(&encoded).expect("decode should succeed");
 
     assert_eq!(decoded.constants, program.constants);
@@ -1066,10 +1066,10 @@ fn validate_rejects_call_script_targeting_host_import_prototype() {
 }
 
 #[test]
-fn call_script_wire_version_is_v13_and_v11_accepts_schema_less_program() {
+fn call_script_wire_version_is_v14_and_v11_accepts_schema_less_program() {
     let program = Program::new(vec![], vec![vm::OpCode::Ret as u8]);
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
 
     let mut old = encoded;
     strip_empty_named_struct_section(&mut old);
@@ -1089,7 +1089,7 @@ fn call_script_no_script_program_code_bytes_unchanged_by_version_bump() {
     bc.ret();
     let program = Program::new(vec![Value::Int(1), Value::Int(2)], bc.finish());
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
     let decoded = decode_program(&encoded).expect("decode should succeed");
     assert_eq!(decoded.code, program.code);
     assert_eq!(decoded.constants, program.constants);
@@ -1112,7 +1112,7 @@ fn v12_trailing_zero_count_is_not_a_named_struct_table() {
 }
 
 #[test]
-fn v13_roundtrip_preserves_guest_named_struct_payload() {
+fn v14_roundtrip_preserves_guest_named_struct_payload() {
     let compiled = compile_source(
         r#"
         struct Point { x: int, y: int }
@@ -1126,10 +1126,23 @@ fn v13_roundtrip_preserves_guest_named_struct_payload() {
         "codegen should attach guest struct decls"
     );
     let encoded = encode_program(&compiled.program).expect("struct-bearing program should encode");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
-    let decoded = decode_program(&encoded).expect("v13 named-struct section should decode");
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
+    assert_eq!(vm::bytecode::BYTECODE_ABI_VERSION, 14);
+    let decoded = decode_program(&encoded).expect("v14 named-struct section should decode");
     assert!(
         decoded.named_struct_decls().contains_key("Point"),
-        "VMBC v13 should preserve guest struct decls"
+        "VMBC v14 should preserve guest struct decls"
     );
+}
+
+#[test]
+fn v13_artifact_requires_recompilation_after_catalog_revision() {
+    let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
+    let mut encoded = encode_program(&program).expect("current program should encode");
+    encoded[4..6].copy_from_slice(&13u16.to_le_bytes());
+
+    assert!(matches!(
+        decode_program(&encoded),
+        Err(WireError::UnsupportedVersion(13))
+    ));
 }
