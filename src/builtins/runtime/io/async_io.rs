@@ -5,10 +5,12 @@
 //! calls; transient reads, writes, flushes, and closes rely on the generic
 //! submitted-future lifecycle.
 
+use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::task::{Context, Poll};
 
 use pd_host_function::pd_host_function;
@@ -41,72 +43,89 @@ impl Drop for IoHandle {
     fn drop(&mut self) {
         match self {
             Self::PopenRead { child, .. } | Self::PopenWrite { child, .. } => {
-                terminate_process_id(child.id().unwrap_or(0));
-                let _ = child.start_kill();
+                let _ = start_terminate_child_tree(child);
             }
             Self::File(_) => {}
         }
     }
 }
 
-/// Shared handle state captured by async calls.
-struct IoResourceState {
-    handle: Mutex<Option<IoHandle>>,
-    closed: AtomicBool,
-    process_id: AtomicU32,
-}
-
-impl IoResourceState {
-    fn new(handle: IoHandle) -> Self {
-        let process_id = process_id(&handle);
-        Self {
-            handle: Mutex::new(Some(handle)),
-            closed: AtomicBool::new(false),
-            process_id: AtomicU32::new(process_id),
-        }
-    }
-
-    fn ensure_open(&self, operation: &str) -> VmResult<()> {
-        if self.closed.load(Ordering::Acquire) {
-            Err(VmError::HostError(format!("{operation} handle is closed")))
-        } else {
-            Ok(())
-        }
-    }
-}
-
 /// The typed resource stored in the execution scope for one async IO handle.
 struct IoResource {
-    state: Arc<IoResourceState>,
+    handle: Arc<Mutex<Option<IoHandle>>>,
 }
 
 impl IoResource {
     fn new(handle: IoHandle) -> Self {
         Self {
-            state: Arc::new(IoResourceState::new(handle)),
+            handle: Arc::new(Mutex::new(Some(handle))),
         }
     }
 
-    fn close_nonblocking(&mut self) -> ResourceResult<CloseProgress> {
-        self.state.closed.store(true, Ordering::Release);
-        terminate_process_id(self.state.process_id.load(Ordering::Acquire));
-        let Ok(mut slot) = self.state.handle.try_lock() else {
-            return Ok(CloseProgress::Pending);
-        };
-        if let Some(mut handle) = slot.take() {
-            start_close_io_handle(&mut handle)?;
+    fn exclusive_handle_slot(&mut self) -> ResourceResult<&mut Option<IoHandle>> {
+        Arc::get_mut(&mut self.handle)
+            .map(Mutex::get_mut)
+            .ok_or_else(|| {
+                ResourceError::new(
+                    ResourceErrorCode::ResourceCleanupFailed,
+                    "io::resource",
+                    "async IO handle remained borrowed after host operations quiesced",
+                )
+            })
+    }
+
+    fn begin_close_after_operations_quiesce(&mut self) -> ResourceResult<CloseProgress> {
+        let slot = self.exclusive_handle_slot()?;
+        match slot.as_mut() {
+            None => Ok(CloseProgress::Ready),
+            Some(IoHandle::File(_)) => {
+                slot.take();
+                Ok(CloseProgress::Ready)
+            }
+            Some(IoHandle::PopenRead { child, .. }) | Some(IoHandle::PopenWrite { child, .. }) => {
+                start_terminate_child_tree(child).map_err(process_resource_error)?;
+                Ok(CloseProgress::Pending)
+            }
         }
-        self.state.process_id.store(0, Ordering::Release);
-        Ok(CloseProgress::Ready)
+    }
+
+    fn poll_process_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        let slot = match self.exclusive_handle_slot() {
+            Ok(slot) => slot,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        let poll = match slot.as_mut() {
+            None | Some(IoHandle::File(_)) => Poll::Ready(Ok(())),
+            Some(IoHandle::PopenRead { child, .. }) | Some(IoHandle::PopenWrite { child, .. }) => {
+                match child.try_wait() {
+                    Ok(Some(_)) => Poll::Ready(Ok(())),
+                    Err(error) => Poll::Ready(Err(error)),
+                    Ok(None) if tokio::runtime::Handle::try_current().is_err() => Poll::Pending,
+                    Ok(None) => {
+                        let mut wait = Box::pin(child.wait());
+                        match wait.as_mut().poll(cx) {
+                            Poll::Pending => Poll::Pending,
+                            Poll::Ready(result) => Poll::Ready(result.map(|_| ())),
+                        }
+                    }
+                }
+            }
+        };
+        match poll {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(_)) => {
+                slot.take();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(process_resource_error(error))),
+        }
     }
 }
 
 impl Drop for IoResource {
     fn drop(&mut self) {
-        self.state.closed.store(true, Ordering::Release);
-        terminate_process_id(self.state.process_id.swap(0, Ordering::AcqRel));
-        if let Ok(mut slot) = self.state.handle.try_lock()
-            && let Some(mut handle) = slot.take()
+        if let Some(mutex) = Arc::get_mut(&mut self.handle)
+            && let Some(mut handle) = mutex.get_mut().take()
         {
             let _ = start_close_io_handle(&mut handle);
         }
@@ -125,41 +144,52 @@ pub(crate) fn io_file_resource() -> crate::host_extension::HostResourceTypeMeta 
 
 impl HostResource for IoResource {
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
-        self.close_nonblocking()
+        self.begin_close_after_operations_quiesce()
     }
 
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
-        match self.close_nonblocking() {
-            Ok(CloseProgress::Ready) => Poll::Ready(Ok(())),
-            Ok(CloseProgress::Pending) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Err(error) => Poll::Ready(Err(error)),
-        }
+        self.poll_process_close(cx)
     }
+}
+
+fn process_resource_error(error: io::Error) -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::ResourceCleanupFailed,
+        "io::resource",
+        format!("io_close popen terminate failed: {error}"),
+    )
 }
 
 fn start_close_io_handle(handle: &mut IoHandle) -> ResourceResult<()> {
     match handle {
         IoHandle::File(_) => Ok(()),
         IoHandle::PopenRead { child, .. } | IoHandle::PopenWrite { child, .. } => {
-            terminate_process_id(child.id().unwrap_or(0));
-            match child.start_kill() {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
-                Err(error) => Err(ResourceError::new(
-                    ResourceErrorCode::ResourceCleanupFailed,
-                    "io::resource",
-                    format!("io_close popen terminate failed: {error}"),
-                )),
-            }
+            start_terminate_child_tree(child).map_err(process_resource_error)
         }
     }
 }
 
-async fn close_io_handle(mut handle: IoHandle) -> VmResult<()> {
-    match &mut handle {
+type CloseIoFuture<'a> = Pin<Box<dyn Future<Output = VmResult<()>> + Send + 'a>>;
+
+fn close_io_handle_future(handle: &mut IoHandle) -> CloseIoFuture<'_> {
+    Box::pin(close_io_handle(handle))
+}
+
+async fn close_shared_io_handle_with(
+    shared: Arc<Mutex<Option<IoHandle>>>,
+    close: impl for<'a> FnOnce(&'a mut IoHandle) -> CloseIoFuture<'a>,
+) -> VmResult<()> {
+    let mut slot = shared.lock().await;
+    let handle = slot
+        .as_mut()
+        .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
+    close(handle).await?;
+    slot.take();
+    Ok(())
+}
+
+async fn close_io_handle(handle: &mut IoHandle) -> VmResult<()> {
+    match handle {
         IoHandle::File(file) => {
             file.get_mut()
                 .flush()
@@ -167,59 +197,138 @@ async fn close_io_handle(mut handle: IoHandle) -> VmResult<()> {
                 .map_err(|error| VmError::HostError(format!("io_close flush failed: {error}")))?;
         }
         IoHandle::PopenRead { child, .. } => {
-            terminate_process_id(child.id().unwrap_or(0));
-            kill_and_reap_child(child).await?;
+            terminate_child_tree(child).await?;
         }
         IoHandle::PopenWrite { child, stdin } => {
             let _ = stdin.shutdown().await;
-            terminate_process_id(child.id().unwrap_or(0));
-            kill_and_reap_child(child).await?;
+            terminate_child_tree(child).await?;
         }
     }
     Ok(())
 }
 
-async fn kill_and_reap_child(child: &mut Child) -> VmResult<()> {
+async fn terminate_child_tree(child: &mut Child) -> VmResult<()> {
+    let pid = child.id().unwrap_or(0);
+    terminate_process_tree_and_leader(|| terminate_process_id(pid), || kill_and_reap_child(child))
+        .await
+        .map_err(|error| VmError::HostError(format!("io_close popen terminate failed: {error}")))
+}
+
+async fn kill_and_reap_child(child: &mut Child) -> io::Result<()> {
     match child.kill().await {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-            child.wait().await.map(|_| ()).map_err(|wait_error| {
-                VmError::HostError(format!("io_close popen wait failed: {wait_error}"))
-            })
-        }
-        Err(error) => Err(VmError::HostError(format!(
-            "io_close popen wait failed: {error}"
-        ))),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => child.wait().await.map(|_| ()),
+        Err(error) => Err(error),
     }
 }
 
-fn process_id(handle: &IoHandle) -> u32 {
-    match handle {
-        IoHandle::PopenRead { child, .. } | IoHandle::PopenWrite { child, .. } => {
-            child.id().unwrap_or(0)
-        }
-        IoHandle::File(_) => 0,
+async fn terminate_process_tree_and_leader<Tree, Leader, LeaderFuture>(
+    terminate_tree: Tree,
+    terminate_leader: Leader,
+) -> io::Result<()>
+where
+    Tree: FnOnce() -> io::Result<()>,
+    Leader: FnOnce() -> LeaderFuture,
+    LeaderFuture: Future<Output = io::Result<()>>,
+{
+    let tree_result = terminate_tree();
+    let leader_result = terminate_leader().await;
+    combine_process_cleanup_results(tree_result, leader_result)
+}
+
+fn combine_process_cleanup_results(
+    tree_result: io::Result<()>,
+    leader_result: io::Result<()>,
+) -> io::Result<()> {
+    match (tree_result, leader_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(tree_error), Ok(())) => Err(tree_error),
+        (Ok(()), Err(leader_error)) => Err(leader_error),
+        (Err(tree_error), Err(leader_error)) => Err(io::Error::new(
+            tree_error.kind(),
+            format!(
+                "process-tree termination failed: {tree_error}; direct leader cleanup also failed: {leader_error}"
+            ),
+        )),
     }
 }
 
-fn terminate_process_id(pid: u32) {
+fn start_terminate_child_tree(child: &mut Child) -> io::Result<()> {
+    let pid = child.id().unwrap_or(0);
+    let tree_result = terminate_process_id(pid);
+    let leader_result = child.start_kill().or_else(ignore_already_exited);
+    combine_process_cleanup_results(tree_result, leader_result)
+}
+
+fn ignore_already_exited(error: io::Error) -> io::Result<()> {
+    if error.kind() == io::ErrorKind::InvalidInput {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn terminate_process_id(pid: u32) -> io::Result<()> {
     if pid == 0 {
-        return;
+        return Ok(());
     }
     #[cfg(unix)]
-    if let Ok(pid) = libc::pid_t::try_from(pid) {
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
+    {
+        terminate_unix_process_group_with(
+            pid,
+            |process_group, signal| unsafe { libc::kill(process_group, signal) },
+            io::Error::last_os_error,
+        )
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .status();
+        run_taskkill_with(pid, std::process::Command::status)
     }
     #[cfg(not(any(unix, windows)))]
-    let _ = pid;
+    {
+        let _ = pid;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn terminate_unix_process_group_with<Kill, LastError>(
+    pid: u32,
+    kill: Kill,
+    last_error: LastError,
+) -> io::Result<()>
+where
+    Kill: FnOnce(libc::pid_t, libc::c_int) -> libc::c_int,
+    LastError: FnOnce() -> io::Error,
+{
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process id exceeds pid_t"))?;
+    if kill(-pid, libc::SIGKILL) == 0 {
+        return Ok(());
+    }
+    let error = last_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn run_taskkill_with<Run>(pid: u32, run: Run) -> io::Result<()>
+where
+    Run: FnOnce(&mut std::process::Command) -> io::Result<std::process::ExitStatus>,
+{
+    let mut command = std::process::Command::new("taskkill");
+    command.args(["/T", "/F", "/PID", &pid.to_string()]);
+    let status = run(&mut command)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "taskkill exited with status {status}"
+        )))
+    }
 }
 
 /// The per-call captured policy context.
@@ -236,10 +345,10 @@ impl CaptureAsyncHostContext for IoPolicyContext {
     }
 }
 
-/// Shared handle state and byte limits captured before an async call starts.
+/// Shared handle ownership and byte limits captured before an async call starts.
 pub(crate) struct IoHandleContext {
-    handle: ResourceHandle,
-    state: Arc<IoResourceState>,
+    resource: ResourceHandle,
+    handle: Arc<Mutex<Option<IoHandle>>>,
     max_read_bytes: Option<usize>,
     max_write_bytes: Option<usize>,
 }
@@ -257,11 +366,11 @@ impl CaptureAsyncHostContext for IoHandleContext {
             Some(_) => return Err(VmError::TypeMismatch("int")),
             None => return Err(VmError::HostError("missing io handle argument".to_string())),
         };
-        let handle = io_parse_handle(handle_id)?;
-        let state = io_state_for_handle(vm, handle)?;
+        let resource = io_parse_handle(handle_id)?;
+        let handle = io_handle_for_resource(vm, resource)?;
         Ok(Self {
+            resource,
             handle,
-            state,
             max_read_bytes: io_policy(vm).map(|policy| policy.max_read_bytes),
             max_write_bytes: io_policy(vm).map(|policy| policy.max_write_bytes),
         })
@@ -358,9 +467,7 @@ pub(crate) async fn builtin_io_read_all(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
 ) -> VmResult<HostFutureOutput<String>> {
-    context.state.ensure_open("io_read_all")?;
-    let mut slot = context.state.handle.lock().await;
-    context.state.ensure_open("io_read_all")?;
+    let mut slot = context.handle.lock().await;
     let handle = slot
         .as_mut()
         .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
@@ -392,9 +499,7 @@ pub(crate) async fn builtin_io_read_line(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
 ) -> VmResult<HostFutureOutput<String>> {
-    context.state.ensure_open("io_read_line")?;
-    let mut slot = context.state.handle.lock().await;
-    context.state.ensure_open("io_read_line")?;
+    let mut slot = context.handle.lock().await;
     let handle = slot
         .as_mut()
         .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
@@ -435,9 +540,7 @@ pub(crate) async fn builtin_io_write(
             "io_write exceeded write limit".to_string(),
         ));
     }
-    context.state.ensure_open("io_write")?;
-    let mut slot = context.state.handle.lock().await;
-    context.state.ensure_open("io_write")?;
+    let mut slot = context.handle.lock().await;
     let handle = slot
         .as_mut()
         .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
@@ -460,9 +563,7 @@ pub(crate) async fn builtin_io_flush(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
 ) -> VmResult<HostFutureOutput<bool>> {
-    context.state.ensure_open("io_flush")?;
-    let mut slot = context.state.handle.lock().await;
-    context.state.ensure_open("io_flush")?;
+    let mut slot = context.handle.lock().await;
     let handle = slot
         .as_mut()
         .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
@@ -481,25 +582,12 @@ pub(crate) async fn builtin_io_close(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
 ) -> VmResult<HostFutureOutput<bool>> {
-    if context.state.closed.swap(true, Ordering::AcqRel) {
-        return Err(VmError::HostError("io_close handle is closed".to_string()));
-    }
-    let owned = context
-        .state
-        .handle
-        .lock()
-        .await
-        .take()
-        .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
-    let close_result = close_io_handle(owned).await;
-    if close_result.is_ok() {
-        context.state.process_id.store(0, Ordering::Release);
-    }
-    let handle = context.handle;
+    close_shared_io_handle_with(Arc::clone(&context.handle), close_io_handle_future).await?;
+    let resource = context.resource;
     Ok(HostFutureOutput::complete(move |vm| {
         let progress = vm
             .execution_scope()
-            .close_resource::<IoResource>(handle, ResourceCloseReason::Requested)
+            .close_resource::<IoResource>(resource, ResourceCloseReason::Requested)
             .map_err(|error| {
                 VmError::HostError(format!("io_close scope retirement failed: {error}"))
             })?;
@@ -508,7 +596,6 @@ pub(crate) async fn builtin_io_close(
                 "io_close scope retirement is still pending".to_string(),
             ));
         }
-        close_result?;
         Ok(true)
     }))
 }
@@ -585,7 +672,10 @@ async fn canonicalize_io_target(path: &Path) -> VmResult<PathBuf> {
     Ok(canonical_parent.join(name))
 }
 
-fn io_state_for_handle(vm: &mut Vm, handle: ResourceHandle) -> VmResult<Arc<IoResourceState>> {
+fn io_handle_for_resource(
+    vm: &mut Vm,
+    handle: ResourceHandle,
+) -> VmResult<Arc<Mutex<Option<IoHandle>>>> {
     let token = vm
         .execution_scope()
         .resources()
@@ -606,7 +696,7 @@ fn io_state_for_handle(vm: &mut Vm, handle: ResourceHandle) -> VmResult<Arc<IoRe
                 handle.raw()
             ))
         })?;
-    Ok(Arc::clone(&resource.state))
+    Ok(Arc::clone(&resource.handle))
 }
 
 fn io_parse_handle(handle_id: i64) -> VmResult<ResourceHandle> {
@@ -646,11 +736,13 @@ fn spawn_shell_command(shell_command: &str, mode: &str) -> VmResult<IoHandle> {
         .map_err(|error| VmError::HostError(format!("io_popen failed: {error}")))?;
     if mode == "r" {
         let Some(stdout) = child.stdout.take() else {
-            terminate_process_id(child.id().unwrap_or(0));
-            let _ = child.start_kill();
-            return Err(VmError::HostError(
-                "io_popen('r') did not provide stdout pipe".to_string(),
-            ));
+            let cleanup = start_terminate_child_tree(&mut child);
+            return Err(VmError::HostError(match cleanup {
+                Ok(()) => "io_popen('r') did not provide stdout pipe".to_string(),
+                Err(error) => format!(
+                    "io_popen('r') did not provide stdout pipe; process cleanup failed: {error}"
+                ),
+            }));
         };
         Ok(IoHandle::PopenRead {
             child,
@@ -658,12 +750,165 @@ fn spawn_shell_command(shell_command: &str, mode: &str) -> VmResult<IoHandle> {
         })
     } else {
         let Some(stdin) = child.stdin.take() else {
-            terminate_process_id(child.id().unwrap_or(0));
-            let _ = child.start_kill();
-            return Err(VmError::HostError(
-                "io_popen('w') did not provide stdin pipe".to_string(),
-            ));
+            let cleanup = start_terminate_child_tree(&mut child);
+            return Err(VmError::HostError(match cleanup {
+                Ok(()) => "io_popen('w') did not provide stdin pipe".to_string(),
+                Err(error) => format!(
+                    "io_popen('w') did not provide stdin pipe; process cleanup failed: {error}"
+                ),
+            }));
         };
         Ok(IoHandle::PopenWrite { child, stdin })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::{Future, pending};
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::task::{Context, Poll, Waker};
+
+    use super::*;
+
+    fn file_resource() -> IoResource {
+        let file = std::fs::File::open("Cargo.toml").expect("test fixture should exist");
+        IoResource::new(IoHandle::File(BufReader::new(File::from_std(file))))
+    }
+
+    fn pending_close<'a>(
+        _handle: &'a mut IoHandle,
+        started: Arc<StdMutex<bool>>,
+    ) -> Pin<Box<dyn Future<Output = VmResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            *started.lock().expect("started lock") = true;
+            pending().await
+        })
+    }
+
+    #[tokio::test]
+    async fn cancelling_explicit_close_retains_the_handle_in_the_resource() {
+        let resource = file_resource();
+        let shared = Arc::clone(&resource.handle);
+        let started = Arc::new(StdMutex::new(false));
+        let close_started = Arc::clone(&started);
+        let mut future = Box::pin(close_shared_io_handle_with(
+            Arc::clone(&shared),
+            move |handle| pending_close(handle, close_started),
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(*started.lock().expect("started lock"));
+        drop(future);
+
+        assert!(
+            shared.lock().await.is_some(),
+            "cancelling io::close must leave the real handle owned by the resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_resource_close_polls_until_the_leader_is_reaped() {
+        let mut resource =
+            IoResource::new(spawn_shell_command("sleep 30", "r").expect("process should spawn"));
+        let pid = {
+            let slot = resource.handle.lock().await;
+            match slot.as_ref().expect("resource handle") {
+                IoHandle::PopenRead { child, .. } => child.id().expect("child pid"),
+                other => panic!("expected popen read handle, got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            resource
+                .begin_close(ResourceCloseReason::VmReset)
+                .expect("close should start"),
+            CloseProgress::Pending
+        );
+        std::future::poll_fn(|cx| resource.poll_close(cx))
+            .await
+            .expect("leader cleanup should complete");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "resource close must reap the direct child"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_tree_failure_still_attempts_direct_async_leader_cleanup() {
+        let leader_attempted = Arc::new(StdMutex::new(false));
+        let attempted = Arc::clone(&leader_attempted);
+        let error = terminate_process_tree_and_leader(
+            || {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "tree denied",
+                ))
+            },
+            move || async move {
+                *attempted.lock().expect("attempt lock") = true;
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("tree failure must propagate");
+
+        assert!(*leader_attempted.lock().expect("attempt lock"));
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("tree denied"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_group_signal_treats_esrch_as_success() {
+        terminate_unix_process_group_with(
+            42,
+            |_, _| -1,
+            || io::Error::from_raw_os_error(libc::ESRCH),
+        )
+        .expect("an already absent process group is successfully terminated");
+
+        let error = terminate_unix_process_group_with(
+            42,
+            |_, _| -1,
+            || io::Error::from_raw_os_error(libc::EPERM),
+        )
+        .expect_err("other process group failures must propagate");
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn taskkill_launch_failure_is_an_error() {
+        let launch = run_taskkill_with(42, |_| {
+            Err(io::Error::new(io::ErrorKind::NotFound, "taskkill missing"))
+        })
+        .expect_err("taskkill launch failure must propagate");
+        assert_eq!(launch.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsuccessful_taskkill_status_is_an_error() {
+        let status = run_taskkill_with(42, |_| {
+            std::process::Command::new("sh")
+                .args(["-c", "exit 7"])
+                .status()
+        })
+        .expect_err("unsuccessful taskkill status must propagate");
+        assert!(status.to_string().contains("status"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unsuccessful_taskkill_status_is_an_error() {
+        let status = run_taskkill_with(42, |_| {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit", "7"])
+                .status()
+        })
+        .expect_err("unsuccessful taskkill status must propagate");
+        assert!(status.to_string().contains("status"));
     }
 }

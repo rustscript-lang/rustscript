@@ -1,5 +1,5 @@
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -413,16 +413,22 @@ fn spawn_shell_command(command: &str, mode: &str) -> VmResult<IoHandle> {
         "r" if child.stdout.is_some() => Ok(IoHandle::PopenRead { child }),
         "w" if child.stdin.is_some() => Ok(IoHandle::PopenWrite { child }),
         "r" => {
-            let _ = terminate_child_tree(&mut child);
-            Err(VmError::HostError(
-                "io_popen('r') did not provide stdout pipe".to_string(),
-            ))
+            let cleanup = terminate_child_tree(&mut child);
+            Err(VmError::HostError(match cleanup {
+                Ok(()) => "io_popen('r') did not provide stdout pipe".to_string(),
+                Err(error) => format!(
+                    "io_popen('r') did not provide stdout pipe; process cleanup failed: {error}"
+                ),
+            }))
         }
         "w" => {
-            let _ = terminate_child_tree(&mut child);
-            Err(VmError::HostError(
-                "io_popen('w') did not provide stdin pipe".to_string(),
-            ))
+            let cleanup = terminate_child_tree(&mut child);
+            Err(VmError::HostError(match cleanup {
+                Ok(()) => "io_popen('w') did not provide stdin pipe".to_string(),
+                Err(error) => format!(
+                    "io_popen('w') did not provide stdin pipe; process cleanup failed: {error}"
+                ),
+            }))
         }
         _ => unreachable!("mode validated above"),
     }
@@ -442,47 +448,117 @@ fn close_io_handle(mut handle: IoHandle) -> VmResult<()> {
 }
 
 fn terminate_child_tree(child: &mut Child) -> VmResult<()> {
-    terminate_process_tree(child.id());
-    match child.try_wait() {
-        Ok(Some(_)) => return Ok(()),
-        Ok(None) => {}
-        Err(error) => {
-            return Err(VmError::HostError(format!(
-                "io_close popen status failed: {error}"
-            )));
-        }
-    }
-    child
-        .kill()
-        .or_else(|error| {
-            if error.kind() == std::io::ErrorKind::InvalidInput {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })
-        .map_err(|error| VmError::HostError(format!("io_close popen terminate failed: {error}")))?;
-    child
-        .wait()
-        .map_err(|error| VmError::HostError(format!("io_close popen wait failed: {error}")))?;
-    Ok(())
+    let pid = child.id();
+    terminate_process_tree_and_leader(
+        || terminate_process_tree(pid),
+        || kill_and_reap_child(child),
+    )
+    .map_err(|error| VmError::HostError(format!("io_close popen terminate failed: {error}")))
 }
 
-fn terminate_process_tree(pid: u32) {
+fn kill_and_reap_child(child: &mut Child) -> io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    match child.kill() {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+        Err(error) => return Err(error),
+    }
+    child.wait().map(|_| ())
+}
+
+fn terminate_process_tree_and_leader<Tree, Leader>(
+    terminate_tree: Tree,
+    terminate_leader: Leader,
+) -> io::Result<()>
+where
+    Tree: FnOnce() -> io::Result<()>,
+    Leader: FnOnce() -> io::Result<()>,
+{
+    let tree_result = terminate_tree();
+    let leader_result = terminate_leader();
+    combine_process_cleanup_results(tree_result, leader_result)
+}
+
+fn combine_process_cleanup_results(
+    tree_result: io::Result<()>,
+    leader_result: io::Result<()>,
+) -> io::Result<()> {
+    match (tree_result, leader_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(tree_error), Ok(())) => Err(tree_error),
+        (Ok(()), Err(leader_error)) => Err(leader_error),
+        (Err(tree_error), Err(leader_error)) => Err(io::Error::new(
+            tree_error.kind(),
+            format!(
+                "process-tree termination failed: {tree_error}; direct leader cleanup also failed: {leader_error}"
+            ),
+        )),
+    }
+}
+
+fn terminate_process_tree(pid: u32) -> io::Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
     #[cfg(unix)]
-    if let Ok(pid) = libc::pid_t::try_from(pid) {
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
+    {
+        terminate_unix_process_group_with(
+            pid,
+            |process_group, signal| unsafe { libc::kill(process_group, signal) },
+            io::Error::last_os_error,
+        )
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .status();
+        run_taskkill_with(pid, Command::status)
     }
     #[cfg(not(any(unix, windows)))]
-    let _ = pid;
+    {
+        let _ = pid;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn terminate_unix_process_group_with<Kill, LastError>(
+    pid: u32,
+    kill: Kill,
+    last_error: LastError,
+) -> io::Result<()>
+where
+    Kill: FnOnce(libc::pid_t, libc::c_int) -> libc::c_int,
+    LastError: FnOnce() -> io::Error,
+{
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process id exceeds pid_t"))?;
+    if kill(-pid, libc::SIGKILL) == 0 {
+        return Ok(());
+    }
+    let error = last_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn run_taskkill_with<Run>(pid: u32, run: Run) -> io::Result<()>
+where
+    Run: FnOnce(&mut Command) -> io::Result<std::process::ExitStatus>,
+{
+    let mut command = Command::new("taskkill");
+    command.args(["/T", "/F", "/PID", &pid.to_string()]);
+    let status = run(&mut command)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "taskkill exited with status {status}"
+        )))
+    }
 }
 
 fn read_line_from_reader(reader: &mut impl Read) -> VmResult<String> {
@@ -501,4 +577,86 @@ fn read_line_from_reader(reader: &mut impl Read) -> VmResult<String> {
         }
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::io;
+
+    use super::*;
+
+    #[test]
+    fn process_tree_failure_still_attempts_direct_blocking_leader_cleanup() {
+        let leader_attempted = Cell::new(false);
+        let error = terminate_process_tree_and_leader(
+            || {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "tree denied",
+                ))
+            },
+            || {
+                leader_attempted.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("tree failure must propagate");
+
+        assert!(leader_attempted.get());
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("tree denied"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_group_signal_treats_esrch_as_success() {
+        terminate_unix_process_group_with(
+            42,
+            |_, _| -1,
+            || io::Error::from_raw_os_error(libc::ESRCH),
+        )
+        .expect("an already absent process group is successfully terminated");
+
+        let error = terminate_unix_process_group_with(
+            42,
+            |_, _| -1,
+            || io::Error::from_raw_os_error(libc::EPERM),
+        )
+        .expect_err("other process group failures must propagate");
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn taskkill_launch_failure_is_an_error() {
+        let launch = run_taskkill_with(42, |_| {
+            Err(io::Error::new(io::ErrorKind::NotFound, "taskkill missing"))
+        })
+        .expect_err("taskkill launch failure must propagate");
+        assert_eq!(launch.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsuccessful_taskkill_status_is_an_error() {
+        let status = run_taskkill_with(42, |_| {
+            std::process::Command::new("sh")
+                .args(["-c", "exit 7"])
+                .status()
+        })
+        .expect_err("unsuccessful taskkill status must propagate");
+        assert!(status.to_string().contains("status"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unsuccessful_taskkill_status_is_an_error() {
+        let status = run_taskkill_with(42, |_| {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit", "7"])
+                .status()
+        })
+        .expect_err("unsuccessful taskkill status must propagate");
+        assert!(status.to_string().contains("status"));
+    }
 }
