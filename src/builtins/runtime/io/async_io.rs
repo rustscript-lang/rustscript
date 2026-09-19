@@ -53,12 +53,28 @@ impl Drop for IoHandle {
 /// The typed resource stored in the execution scope for one async IO handle.
 struct IoResource {
     handle: Arc<Mutex<Option<IoHandle>>>,
+    process_tree_terminator: fn(u32) -> io::Result<()>,
+    deferred_process_cleanup_error: Option<io::Error>,
 }
 
 impl IoResource {
     fn new(handle: IoHandle) -> Self {
         Self {
             handle: Arc::new(Mutex::new(Some(handle))),
+            process_tree_terminator: terminate_process_id,
+            deferred_process_cleanup_error: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_process_tree_terminator(
+        handle: IoHandle,
+        process_tree_terminator: fn(u32) -> io::Result<()>,
+    ) -> Self {
+        Self {
+            handle: Arc::new(Mutex::new(Some(handle))),
+            process_tree_terminator,
+            deferred_process_cleanup_error: None,
         }
     }
 
@@ -75,24 +91,39 @@ impl IoResource {
     }
 
     fn begin_close_after_operations_quiesce(&mut self) -> ResourceResult<CloseProgress> {
+        let process_tree_terminator = self.process_tree_terminator;
         let slot = self.exclusive_handle_slot()?;
-        match slot.as_mut() {
-            None => Ok(CloseProgress::Ready),
+        let (progress, cleanup_error) = match slot.as_mut() {
+            None => (CloseProgress::Ready, None),
             Some(IoHandle::File(_)) => {
                 slot.take();
-                Ok(CloseProgress::Ready)
+                (CloseProgress::Ready, None)
             }
             Some(IoHandle::PopenRead { child, .. }) | Some(IoHandle::PopenWrite { child, .. }) => {
-                start_terminate_child_tree(child).map_err(process_resource_error)?;
-                Ok(CloseProgress::Pending)
+                let cleanup_error =
+                    start_terminate_child_tree_with(child, process_tree_terminator).err();
+                (CloseProgress::Pending, cleanup_error)
             }
-        }
+        };
+        self.deferred_process_cleanup_error = cleanup_error;
+        Ok(progress)
     }
 
     fn poll_process_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
-        let slot = match self.exclusive_handle_slot() {
-            Ok(slot) => slot,
-            Err(error) => return Poll::Ready(Err(error)),
+        let Self {
+            handle,
+            deferred_process_cleanup_error,
+            ..
+        } = self;
+        let slot = match Arc::get_mut(handle).map(Mutex::get_mut) {
+            Some(slot) => slot,
+            None => {
+                return Poll::Ready(Err(ResourceError::new(
+                    ResourceErrorCode::ResourceCleanupFailed,
+                    "io::resource",
+                    "async IO handle remained borrowed after host operations quiesced",
+                )));
+            }
         };
         let poll = match slot.as_mut() {
             None | Some(IoHandle::File(_)) => Poll::Ready(Ok(())),
@@ -113,11 +144,17 @@ impl IoResource {
         };
         match poll {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(_)) => {
+            Poll::Ready(leader_result) => {
                 slot.take();
-                Poll::Ready(Ok(()))
+                let prior_result = match deferred_process_cleanup_error.take() {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                };
+                Poll::Ready(
+                    combine_process_cleanup_results(prior_result, leader_result)
+                        .map_err(process_resource_error),
+                )
             }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(process_resource_error(error))),
         }
     }
 }
@@ -254,8 +291,15 @@ fn combine_process_cleanup_results(
 }
 
 fn start_terminate_child_tree(child: &mut Child) -> io::Result<()> {
+    start_terminate_child_tree_with(child, terminate_process_id)
+}
+
+fn start_terminate_child_tree_with(
+    child: &mut Child,
+    terminate_tree: impl FnOnce(u32) -> io::Result<()>,
+) -> io::Result<()> {
     let pid = child.id().unwrap_or(0);
-    let tree_result = terminate_process_id(pid);
+    let tree_result = terminate_tree(pid);
     let leader_result = child.start_kill().or_else(ignore_already_exited);
     combine_process_cleanup_results(tree_result, leader_result)
 }
@@ -834,6 +878,40 @@ mod tests {
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "resource close must reap the direct child"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resource_shutdown_reaps_leader_before_reporting_tree_failure() {
+        let handle = spawn_shell_command("sleep 30", "r").expect("process should spawn");
+        let pid = match &handle {
+            IoHandle::PopenRead { child, .. } => child.id().expect("child pid"),
+            other => panic!("expected popen read handle, got {other:?}"),
+        };
+        let resource = IoResource::new_with_process_tree_terminator(handle, |_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected tree failure",
+            ))
+        });
+        let mut resources = crate::vm::resource::ResourceTable::new().expect("resource table");
+        resources.push(resource).expect("resource insert");
+
+        let error =
+            std::future::poll_fn(|cx| resources.poll_close_all(ResourceCloseReason::VmReset, cx))
+                .await
+                .expect_err("tree failure must propagate after shutdown");
+
+        assert!(
+            resources.is_empty(),
+            "resource must be reclaimed after reap"
+        );
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "resource shutdown must reap the direct child before returning the tree error"
+        );
+        assert_eq!(error.code(), ResourceErrorCode::ResourceCleanupFailed);
+        assert!(error.to_string().contains("injected tree failure"));
     }
 
     #[tokio::test]
