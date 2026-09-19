@@ -1,6 +1,6 @@
 //! Milestone 7: `CallScript` parity in the no_std + alloc runtime.
 //!
-//! Programs are produced by the std VMBC encoder (V13) or hand-built with
+//! Programs are produced by the current std VMBC encoder or hand-built with
 //! `CallScript` bytecode (0x1A, prototype_id:u32 LE, argc:u8) so the wire
 //! contract and the typed validation/execution failures are pinned
 //! independently of the compiler.
