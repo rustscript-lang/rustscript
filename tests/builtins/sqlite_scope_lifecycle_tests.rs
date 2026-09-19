@@ -60,10 +60,6 @@ impl HostAsyncBridge for TokioHostDriver {
         poll
     }
 
-    fn cancel_op(&mut self, op_id: HostOpId) {
-        self.submitted.remove(&op_id);
-    }
-
     fn request_cancel_op(
         &mut self,
         op_id: HostOpId,
@@ -75,6 +71,11 @@ impl HostAsyncBridge for TokioHostDriver {
 
     fn poll_cancel_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<()>> {
         Poll::Ready(Ok(()))
+    }
+
+    fn cleanup_op(&mut self, op_id: HostOpId, _terminal: vm::HostAsyncOpTerminal) -> VmResult<()> {
+        self.submitted.remove(&op_id);
+        Ok(())
     }
 }
 
