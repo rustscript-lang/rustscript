@@ -191,7 +191,7 @@ pub(super) fn parse_rustscript_repl_source(
 }
 
 /// REPL parse with an optional catalog snapshot: when `Some`, the parsed IR
-/// carries `host_api_metadata` so standard host calls compile to exact V13
+/// carries `host_api_metadata` so standard host calls compile to exact
 /// `HostImport` schemas (never a name-only fallback).
 pub(super) fn parse_rustscript_repl_source_with_catalog(
     source: &str,
