@@ -97,18 +97,43 @@ fn async_io_popen_reads_through_tokio_process_pipe() {
 }
 
 #[test]
-fn io_implementations_do_not_create_private_threads_or_runtimes() {
+fn io_implementations_use_only_generic_async_and_inline_sync_lifecycles() {
     let async_source = include_str!("../../src/builtins/runtime/io/async_io.rs");
     let blocking_source = include_str!("../../src/builtins/runtime/io/blocking.rs");
 
-    // The async implementation must run on the bridge's executor: it must
-    // not spawn its own threads or build its own tokio runtime.
-    assert!(!async_source.contains("thread::Builder"));
-    assert!(!async_source.contains("runtime::Builder"));
-    assert!(!async_source.contains("spawn_blocking"));
-    // The blocking implementation must not create a private runtime either;
-    // per-op worker threads are driven by the blocking path itself.
-    assert!(!blocking_source.contains("runtime::Builder"));
+    for forbidden in [
+        "AtomicBool",
+        "AtomicU32",
+        "std::thread",
+        "thread::Builder",
+        "JoinHandle",
+        "runtime::Builder",
+        "spawn_blocking",
+        "submit_host_future",
+        "HostAsyncBridge",
+        "HostOperation",
+        "IoOperationLease",
+        "active_operations",
+        "close_waker",
+        "close_scheduled",
+        "close_future",
+        "owner_alive",
+        "process_id:",
+        "try_lock()",
+        "wake_by_ref()",
+        "OperationSpec",
+        "schedule_io_task",
+        "worker_done",
+    ] {
+        assert!(
+            !async_source.contains(forbidden),
+            "async IO must not contain `{forbidden}` lifecycle machinery"
+        );
+        assert!(
+            !blocking_source.contains(forbidden),
+            "blocking IO must be synchronous inline code without `{forbidden}`"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -156,7 +181,13 @@ fn pid_is_running(pid: u32) -> bool {
         return false;
     };
     let stat_path = std::path::PathBuf::from(format!("/proc/{pid}/stat"));
-    if std::fs::read_to_string(stat_path).is_err() {
+    let Ok(stat) = std::fs::read_to_string(stat_path) else {
+        return false;
+    };
+    if stat
+        .split_once(") ")
+        .is_some_and(|(_, state)| state.starts_with('Z'))
+    {
         return false;
     }
     let result = unsafe { libc::kill(pid, 0) };
@@ -256,6 +287,71 @@ fn async_io_reset_kills_and_reaps_the_entire_popen_process_group() {
     assert!(
         wait_for_pid_exit(descendant_pid),
         "the popen descendant must be gone"
+    );
+
+    let _ = std::fs::remove_file(parent_path);
+    let _ = std::fs::remove_file(descendant_path);
+    let _ = std::fs::remove_file(marker_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn async_io_vm_drop_terminates_live_popen_process_tree() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should follow Unix epoch")
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!(
+        "pd-vm-async-drop-tree-{}-{nonce}",
+        std::process::id()
+    ));
+    let parent_path = base.with_extension("parent");
+    let descendant_path = base.with_extension("descendant");
+    let marker_path = base.with_extension("marker");
+    let command = process_tree_command(&parent_path, &descendant_path, &marker_path);
+    let source = guest_popen_program(&command, "h;");
+
+    let compiled = compile_source(&format!("use io;\n{source}")).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    super::async_test_bridge::install(&mut vm);
+    assert!(matches!(
+        vm.run().expect("run should start"),
+        VmStatus::Waiting(_)
+    ));
+    vm.wait_for_host_op_blocking()
+        .expect("popen should complete");
+    assert!(matches!(
+        vm.resume().expect("program should complete"),
+        VmStatus::Halted
+    ));
+
+    let parent_pid = wait_for_file(&parent_path)
+        .trim()
+        .parse::<u32>()
+        .expect("parent pid");
+    let descendant_pid = wait_for_file(&descendant_path)
+        .trim()
+        .parse::<u32>()
+        .expect("descendant pid");
+    let _guard = ProcessGroupGuard {
+        parent: Some(parent_pid),
+        descendant: Some(descendant_pid),
+    };
+
+    drop(vm);
+
+    assert!(
+        wait_for_pid_exit(parent_pid),
+        "the popen parent must be gone"
+    );
+    assert!(
+        wait_for_pid_exit(descendant_pid),
+        "the popen descendant must be gone"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+    assert!(
+        !marker_path.exists(),
+        "VM drop must prevent descendants from continuing"
     );
 
     let _ = std::fs::remove_file(parent_path);
