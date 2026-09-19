@@ -709,7 +709,7 @@ fn sqlite_transaction_deadline_interrupts_and_rolls_back() {
     let error = run_sqlite_host_error(
         policy_for(&root),
         r#"
-        let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: { max_transaction_ms: 1 } });
+        let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: { max_transaction_ms: 500 } });
         sqlite::execute(&db, "CREATE TABLE items (value INTEGER)", []);
         sqlite::transaction(&db, {
             { sql: "INSERT INTO items (value) VALUES (1)" },
@@ -722,7 +722,7 @@ fn sqlite_transaction_deadline_interrupts_and_rolls_back() {
         "#,
     );
     assert!(
-        error.contains("transaction exceeded") && error.contains("1 ms deadline"),
+        error.contains("transaction exceeded") && error.contains("500 ms deadline"),
         "transaction deadline must surface explicitly, got: {error}"
     );
     run_sqlite_source(

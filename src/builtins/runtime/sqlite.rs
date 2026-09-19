@@ -132,23 +132,93 @@ impl Drop for SqliteOperationLease {
     }
 }
 
-type SqliteCloseFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>;
+enum SqliteCloseAttempt {
+    Closed,
+    Retryable {
+        connection: tokio_rusqlite::Connection,
+        message: String,
+    },
+    Failed(String),
+}
+
+type SqliteCloseFuture = Pin<Box<dyn Future<Output = SqliteCloseAttempt> + Send + 'static>>;
 
 enum SqliteCloseState {
     Open,
     Closing(SqliteCloseFuture),
+    // `tokio-rusqlite` returns a live handle with `Error::Close`; retain it so
+    // explicit close can fail without losing the resource and scope teardown
+    // can retry without releasing the connection permit.
+    Retryable {
+        connection: tokio_rusqlite::Connection,
+        message: String,
+    },
     Finished(Result<(), String>),
 }
 
 struct SqliteCloseLifecycle {
     state: Mutex<SqliteCloseState>,
+    #[cfg(test)]
+    injected_failures: AtomicUsize,
+    #[cfg(test)]
+    failures_seen: Arc<AtomicUsize>,
 }
 
 impl SqliteCloseLifecycle {
     fn new() -> Self {
         Self {
             state: Mutex::new(SqliteCloseState::Open),
+            #[cfg(test)]
+            injected_failures: AtomicUsize::new(0),
+            #[cfg(test)]
+            failures_seen: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_failures(failures: usize) -> Self {
+        Self {
+            state: Mutex::new(SqliteCloseState::Open),
+            injected_failures: AtomicUsize::new(failures),
+            failures_seen: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[cfg(test)]
+    fn failures_seen(&self) -> usize {
+        self.failures_seen.load(Ordering::Acquire)
+    }
+
+    fn close_future(&self, connection: tokio_rusqlite::Connection) -> SqliteCloseFuture {
+        #[cfg(test)]
+        let inject_failure = self
+            .injected_failures
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+        #[cfg(test)]
+        let failures_seen = Arc::clone(&self.failures_seen);
+        Box::pin(async move {
+            #[cfg(test)]
+            if inject_failure {
+                failures_seen.fetch_add(1, Ordering::AcqRel);
+                return SqliteCloseAttempt::Retryable {
+                    connection,
+                    message: "injected retryable SQLite close failure".to_string(),
+                };
+            }
+            match connection.close().await {
+                Ok(()) | Err(tokio_rusqlite::Error::ConnectionClosed) => SqliteCloseAttempt::Closed,
+                Err(tokio_rusqlite::Error::Close((connection, error))) => {
+                    SqliteCloseAttempt::Retryable {
+                        connection,
+                        message: sqlite_error_message(error),
+                    }
+                }
+                Err(error) => SqliteCloseAttempt::Failed(adapter_close_error_message(error)),
+            }
+        })
     }
 
     fn begin(
@@ -165,15 +235,11 @@ impl SqliteCloseLifecycle {
             SqliteCloseState::Open => {
                 closed.store(true, Ordering::Release);
                 interrupt.interrupt();
-                *state = SqliteCloseState::Closing(Box::pin(async move {
-                    connection
-                        .close()
-                        .await
-                        .map_err(adapter_close_error_message)
-                }));
+                *state = SqliteCloseState::Closing(self.close_future(connection));
                 Ok(false)
             }
             SqliteCloseState::Closing(_) => Ok(false),
+            SqliteCloseState::Retryable { message, .. } => Err(message.clone()),
             SqliteCloseState::Finished(result) => result.clone().map(|()| true),
         }
     }
@@ -187,12 +253,47 @@ impl SqliteCloseLifecycle {
             SqliteCloseState::Open => Poll::Pending,
             SqliteCloseState::Closing(future) => match future.as_mut().poll(cx) {
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(result) => {
-                    *state = SqliteCloseState::Finished(result.clone());
+                Poll::Ready(SqliteCloseAttempt::Closed) => {
+                    *state = SqliteCloseState::Finished(Ok(()));
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(SqliteCloseAttempt::Retryable {
+                    connection,
+                    message,
+                }) => {
+                    let result = Err(message.clone());
+                    *state = SqliteCloseState::Retryable {
+                        connection,
+                        message,
+                    };
+                    Poll::Ready(result)
+                }
+                Poll::Ready(SqliteCloseAttempt::Failed(message)) => {
+                    let result = Err(message.clone());
+                    *state = SqliteCloseState::Finished(Err(message));
                     Poll::Ready(result)
                 }
             },
+            SqliteCloseState::Retryable { message, .. } => Poll::Ready(Err(message.clone())),
             SqliteCloseState::Finished(result) => Poll::Ready(result.clone()),
+        }
+    }
+
+    fn retry_after_failure(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::mem::replace(&mut *state, SqliteCloseState::Open);
+        match previous {
+            SqliteCloseState::Retryable { connection, .. } => {
+                *state = SqliteCloseState::Closing(self.close_future(connection));
+                true
+            }
+            previous => {
+                *state = previous;
+                false
+            }
         }
     }
 
@@ -201,7 +302,10 @@ impl SqliteCloseLifecycle {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if matches!(&*state, SqliteCloseState::Finished(Err(_))) {
+        if matches!(
+            &*state,
+            SqliteCloseState::Retryable { .. } | SqliteCloseState::Finished(Err(_))
+        ) {
             *state = SqliteCloseState::Open;
             closed.store(false, Ordering::Release);
         }
@@ -245,6 +349,12 @@ impl HostResource for SqliteResource {
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
         match self.close_lifecycle.poll(cx) {
             Poll::Pending => Poll::Pending,
+            // A retryable adapter failure cannot become `Ready`: the resource
+            // table reclaims every ready resource, including cleanup errors.
+            Poll::Ready(Err(_)) if self.close_lifecycle.retry_after_failure() => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
             Poll::Ready(result) => Poll::Ready(result.map_err(sqlite_close_resource_error)),
         }
     }
@@ -1320,6 +1430,8 @@ struct TransactionStatement {
     params: Vec<SqlValue>,
     query: bool,
     limits: SqliteLimits,
+    #[cfg(test)]
+    after_execute: Option<Box<dyn Fn() + Send>>,
 }
 
 fn parse_transaction_statements(
@@ -1366,12 +1478,27 @@ fn parse_transaction_statements(
                 params,
                 query,
                 limits: statement_limits,
+                #[cfg(test)]
+                after_execute: None,
             })
         })
         .collect()
 }
 
 fn transaction_with_connection(
+    connection: &mut Connection,
+    statements: Vec<TransactionStatement>,
+    max_transaction_ms: u64,
+) -> VmResult<Vec<Value>> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(max_transaction_ms))
+        .ok_or_else(|| {
+            VmError::HostError("SQLite transaction deadline is out of range".to_string())
+        })?;
+    transaction_with_connection_until(connection, statements, deadline, max_transaction_ms)
+}
+
+fn transaction_with_connection_until(
     connection: &mut Connection,
     statements: Vec<TransactionStatement>,
     deadline: Instant,
@@ -1410,6 +1537,10 @@ fn transaction_with_connection(
                 transaction_result_value("execute", Some(value), None)
             };
             results.push(result);
+            #[cfg(test)]
+            if let Some(after_execute) = statement.after_execute.as_ref() {
+                after_execute();
+            }
         }
         if Instant::now() >= deadline {
             return Err(VmError::HostError(format!(
@@ -1444,11 +1575,6 @@ pub(super) async fn builtin_sqlite_transaction_impl(
         context.allow_unsafe_sql,
     )?;
     let max_transaction_ms = context.limits.max_transaction_ms;
-    let deadline = Instant::now()
-        .checked_add(Duration::from_millis(max_transaction_ms))
-        .ok_or_else(|| {
-            VmError::HostError("SQLite transaction deadline is out of range".to_string())
-        })?;
     let closed = Arc::clone(&context.closed);
     let value = context
         .connection
@@ -1459,7 +1585,7 @@ pub(super) async fn builtin_sqlite_transaction_impl(
                     "SQLite database is already closed".to_string(),
                 ));
             }
-            transaction_with_connection(connection, statements, deadline, max_transaction_ms)
+            transaction_with_connection(connection, statements, max_transaction_ms)
         })
         .await
         .map_err(adapter_call_error)?;
@@ -1609,10 +1735,147 @@ impl SqliteHostExt for Vm {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::sync::mpsc;
     use std::task::{Context, Poll, Waker};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::vm::resource::ResourceTable;
+
+    #[test]
+    fn transaction_deadline_rolls_back_an_observed_write() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rustscript-sqlite-observed-rollback-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("temporary SQLite root should be created");
+        let database_path = root.join("state.db");
+        Connection::open(&database_path)
+            .expect("setup connection should open")
+            .execute_batch("CREATE TABLE items (value INTEGER)")
+            .expect("setup table should be created");
+
+        let (write_observed_tx, write_observed_rx) = mpsc::sync_channel(0);
+        let worker_path = database_path.clone();
+        let transaction = std::thread::spawn(move || {
+            let mut connection =
+                Connection::open(worker_path).expect("transaction connection should open");
+            let limits = SqliteLimits::default();
+            let statements = vec![
+                TransactionStatement {
+                    sql: "INSERT INTO items (value) VALUES (1)".to_string(),
+                    params: Vec::new(),
+                    query: false,
+                    limits,
+                    after_execute: Some(Box::new(move || {
+                        write_observed_tx
+                            .send(())
+                            .expect("write observation receiver should remain open");
+                    })),
+                },
+                TransactionStatement {
+                    sql: "WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 10000000) SELECT sum(value) FROM numbers".to_string(),
+                    params: Vec::new(),
+                    query: true,
+                    limits,
+                    after_execute: None,
+                },
+            ];
+            transaction_with_connection_until(
+                &mut connection,
+                statements,
+                Instant::now() + Duration::from_millis(500),
+                500,
+            )
+        });
+
+        write_observed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the INSERT must execute before the expensive statement starts");
+        let error = transaction
+            .join()
+            .expect("transaction worker should not panic")
+            .expect_err("the expensive statement should cross the deadline");
+        assert!(
+            error.to_string().contains("500 ms deadline"),
+            "transaction deadline must surface explicitly, got: {error}"
+        );
+
+        let verifier = Connection::open(&database_path)
+            .expect("verification connection should reopen the database");
+        let count: i64 = verifier
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .expect("verification query should succeed");
+        assert_eq!(count, 0, "the observed write must be rolled back");
+        drop(verifier);
+        fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+    }
+
+    #[tokio::test]
+    async fn retryable_close_failure_retains_resource_and_connection_permit() {
+        let limits = SqliteLimits::default();
+        let options = OpenOptions {
+            path: ":memory:".to_string(),
+            mode: OpenMode::Memory,
+            root: None,
+            limits,
+            allow_unsafe_sql: false,
+        };
+        let (connection, interrupt) = open_connection(&options)
+            .await
+            .expect("adapter connection should open");
+        let open_connections = Arc::new(AtomicUsize::new(1));
+        let close_lifecycle = Arc::new(SqliteCloseLifecycle::new_with_failures(1));
+        let resource = SqliteResource {
+            connection,
+            interrupt,
+            limits,
+            allow_unsafe_sql: false,
+            closed: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            close_lifecycle: Arc::clone(&close_lifecycle),
+            _connection_permit: ConnectionCountPermit {
+                open_connections: Arc::clone(&open_connections),
+            },
+        };
+        let mut table = ResourceTable::new().expect("resource table should initialize");
+        let token = table.push(resource).expect("SQLite resource should insert");
+        assert_eq!(
+            table
+                .begin_close(token, ResourceCloseReason::VmReset)
+                .expect("close should begin"),
+            CloseProgress::Pending
+        );
+
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(table.poll_close(token, &mut cx), Poll::Pending));
+        assert_eq!(close_lifecycle.failures_seen(), 1);
+        assert_eq!(table.len(), 1, "retryable close must retain the resource");
+        assert_eq!(
+            open_connections.load(Ordering::Acquire),
+            1,
+            "retryable close must retain the connection permit"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut cx = Context::from_waker(Waker::noop());
+                match table.poll_close(token, &mut cx) {
+                    Poll::Ready(result) => break result,
+                    Poll::Pending => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await
+        .expect("retry should eventually confirm adapter closure")
+        .expect("retry should close the resource");
+        assert!(table.is_empty());
+        assert_eq!(open_connections.load(Ordering::Acquire), 0);
+    }
 
     #[tokio::test]
     async fn canceled_host_future_holds_operation_slot_until_adapter_closure_finishes() {
