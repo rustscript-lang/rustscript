@@ -1,33 +1,20 @@
 //! Scoped SQLite host functions (optional `sqlite` feature).
 //!
-//! SQLite connections are typed [`HostResource`]s owned by the VM's
-//! [`ExecutionScope`](crate::vm::execution_scope::ExecutionScope), exactly
-//! like IO handles. Pending `sqlite::execute` / `sqlite::query` /
-//! `sqlite::transaction` work is driven by concrete [`HostOperation`]
-//! drivers registered in the same scope and polled/cancelled directly by the
-//! operation registry. There is no poller table, no operation-owner enum, and
-//! no callback-payload resource: the driver holds the shared connection slot
-//! and the scope drives its lifecycle.
+//! Each public SQLite function is an ordinary macro-owned async host function.
+//! Calls capture owned SQL, parameters, and connection context before awaiting
+//! `tokio-rusqlite`, which owns the blocking SQLite execution thread. The host
+//! layer owns no worker, operation driver, mailbox, or manual wakeup state.
 //!
-//! Connection cleanup is adapter-owned: closing the resource (via
-//! `sqlite::close`, VM reset, or scope drop) interrupts the connection
-//! through the slot the resource owns and marks it closed. Pending drivers on
-//! that connection observe the closed state and are retired through the
-//! generic scope close, so no `close_resources_by_type` /
-//! `cancel_operations_by_owner` helper is needed.
-//!
-//! Bounds preserved from the PR16 source: statement byte length, parameter
-//! count and byte length, result rows/columns/bytes, connection count,
-//! transaction statement count, and transaction deadline, plus SQL-safety
-//! rejection and read-only enforcement.
+//! Connections remain typed [`HostResource`] values in the VM execution scope.
+//! A resource stores the adapter handle, immutable policy/limits, and only the
+//! open/closed and in-flight accounting needed for configured limits. Explicit
+//! close and scope teardown use SQLite's interrupt handle, while cancellation
+//! of an individual submitted future has the semantics provided by the adapter.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
-use std::thread;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use pd_host_function::pd_host_function;
@@ -36,23 +23,20 @@ use rusqlite::limits::Limit;
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params_from_iter};
 
-use super::typed::{VmArrayRef, VmMapRef};
-use super::{HostCallResult, VmMap};
+use super::VmMap;
+use super::typed::{VmArrayHandle, VmArrayRef};
 use crate::host_api::{HostApiCatalog, ResourceTypeKey};
-use crate::vm::operation::driver::HostOperation;
-use crate::vm::operation::error::{OperationError, OperationErrorCode, OperationResult};
-use crate::vm::operation::reason::OperationCancelReason;
-use crate::vm::operation::{OperationId, OperationOutcome, OperationSpec};
 use crate::vm::resource::close::{CloseProgress, HostResource};
 use crate::vm::resource::error::ResourceResult;
 use crate::vm::resource::{ResourceCloseReason, ResourceHandle};
-use crate::vm::{CallReturn, HostFunctionRegistry, HostOpId, Value, Vm, VmError, VmResult};
+use crate::vm::{
+    CaptureAsyncHostContext, HostFunctionRegistry, HostFutureOutput, Value, Vm, VmError, VmResult,
+};
 
-/// SQLite `progress_handler` step cadence used to surface cancellation while a
-/// statement runs.
+/// SQLite `progress_handler` step cadence used to enforce transaction deadlines.
 const SQLITE_PROGRESS_STEPS: i32 = 1_000;
 
-/// Bounded SQLite connection/query limits, mirroring the PR16 source surface.
+/// Bounded SQLite connection/query limits, mirroring the published surface.
 #[derive(Clone, Copy, Debug)]
 pub struct SqliteLimits {
     pub max_connections: usize,
@@ -110,117 +94,47 @@ struct OpenOptions {
     allow_unsafe_sql: bool,
 }
 
-/// Shared, adapter-owned per-connection state.
-///
-/// The connection itself is a [`Mutex<Connection>`] (SQLite connections are
-/// not thread-safe), serialized by the `execution` mutex so at most one
-/// worker uses the connection at a time. The slot records the currently
-/// executing operation and every in-flight operation on this connection so
-/// close can retire them without a type-dispatched helper.
-struct ConnectionSlot {
-    connection: Mutex<Connection>,
-    execution: Mutex<()>,
-    /// The operation currently executing on this connection, if any.
-    active_operation: Mutex<Option<OperationId>>,
-    /// Every in-flight operation scheduled against this connection.
-    pending: Mutex<Vec<OperationId>>,
-    /// Workers that have been scheduled but whose completion guard has not
-    /// retired yet. This closes the publish/unregister tail window.
-    live_workers: AtomicUsize,
-    /// Waker for a resource close waiting for `pending` to become empty.
-    close_waker: Mutex<Option<Waker>>,
+struct ConnectionCountPermit {
+    open_connections: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionCountPermit {
+    fn drop(&mut self) {
+        self.open_connections.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn reserve_connection(
+    open_connections: Arc<AtomicUsize>,
+    limit: usize,
+) -> VmResult<ConnectionCountPermit> {
+    open_connections
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < limit).then_some(count + 1)
+        })
+        .map_err(|_| VmError::HostError(format!("SQLite connection limit {limit} reached")))?;
+    Ok(ConnectionCountPermit { open_connections })
+}
+
+struct SqliteOperationLease {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for SqliteOperationLease {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The one script-visible SQLite connection resource.
+struct SqliteResource {
+    connection: tokio_rusqlite::Connection,
     interrupt: Arc<rusqlite::InterruptHandle>,
     limits: SqliteLimits,
     allow_unsafe_sql: bool,
-    closed: AtomicBool,
-}
-
-impl ConnectionSlot {
-    fn register(&self, id: OperationId) {
-        self.pending.lock().expect("sqlite pending lock").push(id);
-        self.live_workers.fetch_add(1, Ordering::Release);
-    }
-
-    fn unregister(&self, id: OperationId) {
-        let removed = {
-            let mut pending = self.pending.lock().expect("sqlite pending lock");
-            let before = pending.len();
-            pending.retain(|candidate| *candidate != id);
-            pending.len() != before
-        };
-        if !removed {
-            return;
-        }
-        let workers = self.live_workers.fetch_sub(1, Ordering::AcqRel) - 1;
-        if self.pending_count() == 0
-            && workers == 0
-            && let Some(waker) = self
-                .close_waker
-                .lock()
-                .expect("sqlite close waker lock")
-                .take()
-        {
-            waker.wake();
-        }
-    }
-
-    fn register_close_waker(&self, waker: &Waker) {
-        if self.pending_count() == 0 && self.live_workers.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        {
-            let mut close_waker = self.close_waker.lock().expect("sqlite close waker lock");
-            *close_waker = Some(waker.clone());
-        }
-        if self.pending_count() == 0
-            && self.live_workers.load(Ordering::Acquire) == 0
-            && let Some(waker) = self
-                .close_waker
-                .lock()
-                .expect("sqlite close waker lock")
-                .take()
-        {
-            waker.wake();
-        }
-    }
-
-    fn drained(&self) -> bool {
-        self.pending_count() == 0 && self.live_workers.load(Ordering::Acquire) == 0
-    }
-
-    fn pending_count(&self) -> usize {
-        self.pending.lock().expect("sqlite pending lock").len()
-    }
-}
-
-/// The typed connection resource stored in the execution scope.
-///
-/// The slot is `Arc`-shared with worker threads so a closing resource does not
-/// free the connection out from under an in-flight worker; the last Arc drops
-/// the `Connection`. `begin_close` is exact-once: it marks the slot closed and
-/// interrupts any currently executing statement so cancellation is prompt.
-struct SqliteResource {
-    slot: Arc<ConnectionSlot>,
-    /// Adapter-owned live-connection counter (decremented on close).
-    open_connections: Arc<AtomicUsize>,
-    counter_released: bool,
-}
-
-impl SqliteResource {
-    fn new(slot: Arc<ConnectionSlot>, open_connections: Arc<AtomicUsize>) -> Self {
-        Self {
-            slot,
-            open_connections,
-            counter_released: false,
-        }
-    }
-
-    fn release_connection(&mut self) {
-        if !self.counter_released {
-            self.open_connections.fetch_sub(1, Ordering::SeqCst);
-            self.counter_released = true;
-        }
-    }
+    closed: Arc<AtomicBool>,
+    in_flight: Arc<AtomicUsize>,
+    _connection_permit: ConnectionCountPermit,
 }
 
 impl HostResource for SqliteResource {
@@ -229,290 +143,104 @@ impl HostResource for SqliteResource {
     }
 
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
-        if !self.slot.closed.swap(true, Ordering::AcqRel) {
-            self.slot.interrupt.interrupt();
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.interrupt.interrupt();
         }
-        if self.slot.drained() {
-            self.release_connection();
-            Ok(CloseProgress::Ready)
-        } else {
-            Ok(CloseProgress::Pending)
-        }
-    }
-
-    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
-        if self.slot.drained() {
-            self.release_connection();
-            Poll::Ready(Ok(()))
-        } else {
-            self.slot.register_close_waker(cx.waker());
-            if self.slot.drained() {
-                self.release_connection();
-                Poll::Ready(Ok(()))
-            } else {
-                Poll::Pending
-            }
-        }
+        Ok(CloseProgress::Ready)
     }
 }
 
-impl Drop for SqliteResource {
-    fn drop(&mut self) {
-        self.release_connection();
-    }
-}
-
-/// Shared state between one SQLite worker, its [`SqliteOpDriver`] operation,
-/// and the adapter-owned completion hook on the VM thread.
-///
-/// The worker writes the terminal signal and guest-visible value; the driver
-/// reflects the signal into the operation registry and the VM wrapper reads
-/// the value after the registry drive returns terminal.
-struct SqliteOpShared {
-    cancelled: AtomicBool,
-    worker_done: AtomicBool,
-    signal: Mutex<Option<Result<(), String>>>,
-    value: Mutex<Option<VmResult<CallReturn>>>,
-    waker: Mutex<Option<Waker>>,
-    quiescence_waker: Mutex<Option<Waker>>,
-    worker: Mutex<Option<JoinHandle<()>>>,
-}
-
-impl SqliteOpShared {
-    fn new() -> Self {
-        Self {
-            cancelled: AtomicBool::new(false),
-            worker_done: AtomicBool::new(false),
-            signal: Mutex::new(None),
-            value: Mutex::new(None),
-            waker: Mutex::new(None),
-            quiescence_waker: Mutex::new(None),
-            worker: Mutex::new(None),
-        }
-    }
-
-    fn is_quiescent(&self) -> bool {
-        self.worker_done.load(Ordering::Acquire)
-    }
-
-    fn mark_worker_done(&self) {
-        self.worker_done.store(true, Ordering::Release);
-        if let Some(waker) = self
-            .quiescence_waker
-            .lock()
-            .expect("sqlite quiescence waker lock")
-            .take()
-        {
-            waker.wake();
-        }
-    }
-
-    fn register_quiescence_waker(&self, waker: &Waker) {
-        let mut guard = self
-            .quiescence_waker
-            .lock()
-            .expect("sqlite quiescence waker lock");
-        if self.is_quiescent() {
-            return;
-        }
-        *guard = Some(waker.clone());
-        if self.is_quiescent()
-            && let Some(waker) = guard.take()
-        {
-            waker.wake();
-        }
-    }
-
-    fn set_worker(&self, worker: JoinHandle<()>) {
-        *self.worker.lock().expect("sqlite worker lock") = Some(worker);
-    }
-
-    fn join_worker(&self) -> bool {
-        self.worker
-            .lock()
-            .expect("sqlite worker lock")
-            .take()
-            .is_some_and(|worker| worker.join().is_err())
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
-    }
-
-    fn publish(&self, signal: Result<(), String>) {
-        *self.signal.lock().expect("sqlite signal lock") = Some(signal);
-        if let Some(waker) = self.waker.lock().expect("sqlite waker lock").take() {
-            waker.wake();
-        }
-    }
-
-    fn take_signal(&self) -> Option<Result<(), String>> {
-        self.signal.lock().expect("sqlite signal lock").take()
-    }
-
-    fn register_waker(&self, waker: &Waker) {
-        *self.waker.lock().expect("sqlite waker lock") = Some(waker.clone());
-    }
-
-    fn fail(&self, error: VmError) {
-        let message = error.to_string();
-        *self.value.lock().expect("sqlite value lock") = Some(Err(error));
-        self.publish(Err(message));
-    }
-
-    fn succeed(&self, value: CallReturn) {
-        *self.value.lock().expect("sqlite value lock") = Some(Ok(value));
-        self.publish(Ok(()));
-    }
-}
-
-/// A concrete [`HostOperation`] driver for one pending SQLite operation.
-///
-/// The operation id is filled in by [`schedule_operation`] after
-/// [`ExecutionScope::start_operation`](crate::vm::execution_scope::ExecutionScope::start_operation)
-/// assigns it, because the registry allocates packed ids internally. The
-/// shared cell is written exactly once, before the driver can be polled or
-/// cancelled (the operation is registered with the driver already boxed, but
-/// the registry only drives it once the scheduler returns).
-struct SqliteOpDriver {
-    shared: Arc<SqliteOpShared>,
-    slot: Arc<ConnectionSlot>,
-    id: Arc<Mutex<Option<OperationId>>>,
-    name: String,
-}
-
-impl SqliteOpDriver {
-    fn new(
-        shared: Arc<SqliteOpShared>,
-        slot: Arc<ConnectionSlot>,
-        name: impl Into<String>,
-    ) -> Self {
-        Self {
-            shared,
-            slot,
-            id: Arc::new(Mutex::new(None)),
-            name: name.into(),
-        }
-    }
-
-    fn worker_failed(&self, message: String) -> Poll<OperationResult<()>> {
-        Poll::Ready(Err(OperationError::new(
-            OperationErrorCode::OperationDriverFailed,
-            "sqlite::operation",
-            message,
-        )))
-    }
-}
-
-impl HostOperation for SqliteOpDriver {
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
-        if !self.shared.is_quiescent() {
-            self.shared.register_waker(cx.waker());
-            self.shared.register_quiescence_waker(cx.waker());
-            if !self.shared.is_quiescent() {
-                return Poll::Pending;
-            }
-        }
-        if self.shared.is_cancelled() {
-            return self.worker_failed(format!("{} was cancelled", self.name));
-        }
-        match self.shared.take_signal() {
-            Some(Ok(())) => Poll::Ready(Ok(())),
-            Some(Err(message)) => self.worker_failed(message),
-            None => self.worker_failed(format!(
-                "{} worker terminated without a completion signal",
-                self.name
-            )),
-        }
-    }
-
-    fn cancel(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
-        self.shared.cancelled.store(true, Ordering::Release);
-        // If this operation is the one currently executing on the connection,
-        // interrupt the statement so the worker aborts promptly. Interrupting a
-        // connection with no active statement is a harmless no-op.
-        let is_active = self
-            .id
-            .lock()
-            .expect("sqlite driver id lock")
-            .is_some_and(|id| {
-                *self
-                    .slot
-                    .active_operation
-                    .lock()
-                    .expect("sqlite active lock")
-                    == Some(id)
-            });
-        if self.slot.closed.load(Ordering::Acquire) || is_active {
-            self.slot.interrupt.interrupt();
-        }
-        Ok(())
-    }
-
-    fn is_quiescent(&self) -> bool {
-        self.shared.is_quiescent()
-    }
-
-    fn register_quiescence_waker(&mut self, cx: &Context<'_>) {
-        self.shared.register_quiescence_waker(cx.waker());
-    }
-
-    fn cancel_and_wait(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
-        self.cancel(reason)?;
-        if self.shared.join_worker() {
-            return Err(OperationError::new(
-                OperationErrorCode::OperationDriverFailed,
-                "sqlite::operation",
-                format!("{} worker panicked while cancelling", self.name),
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for SqliteOpDriver {
-    fn drop(&mut self) {
-        if !self.shared.is_quiescent() {
-            let _ = self.cancel(OperationCancelReason::VmDrop);
-        }
-        let _ = self.shared.join_worker();
-    }
-}
-
-/// The per-VM SQLite adapter runtime state, mirroring the IO subsystem.
-///
-/// Lives in the execution scope's typed arena (accessed lazily through
-/// `ExecutionScope::scope_state_or_insert_with`), so it follows the scope
-/// lifecycle: it is destroyed on reset/drop and recreated fresh on next use.
-/// It owns the completion mailboxes for pending operations and an
-/// adapter-owned counter of live connections used to enforce
-/// `max_connections`. The embedding policy (`SqlitePolicy`) is *persistent*
-/// module state stored in the generic `ModuleStateStore`, so it survives
-/// `reset_for_reuse` while this runtime state does not.
+#[derive(Default)]
 pub(crate) struct SqliteState {
-    /// Adapter-owned live connection count, shared with each
-    /// [`SqliteResource`] so `begin_close` can decrement it. Avoids a generic
-    /// by-type close helper.
     pub(crate) open_connections: Arc<AtomicUsize>,
 }
 
-impl Default for SqliteState {
-    fn default() -> Self {
-        Self {
-            open_connections: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-}
-
-/// Returns the adapter-declared SQLite scope state (the per-op completion
-/// mailbox and the live-connection counter), creating the empty default on
-/// first access while the scope is Active. The state is owned by the
-/// execution-scope arena, so it is destroyed with the scope on reset and
-/// recreated lazily on next use.
 fn sqlite_state(vm: &mut Vm) -> VmResult<&mut SqliteState> {
     vm.execution_scope()
         .scope_state_or_insert_with(SqliteState::default)
         .map_err(|error| VmError::HostError(format!("sqlite scope state unavailable: {error}")))
+}
+
+#[derive(Clone)]
+pub(super) struct SqliteOpenContext {
+    policy: SqlitePolicy,
+    open_connections: Arc<AtomicUsize>,
+}
+
+impl CaptureAsyncHostContext for SqliteOpenContext {
+    fn capture(vm: &mut Vm) -> VmResult<Self> {
+        let policy = current_policy(vm).clone();
+        let open_connections = Arc::clone(&sqlite_state(vm)?.open_connections);
+        Ok(Self {
+            policy,
+            open_connections,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct SqliteConnectionContext {
+    handle: ResourceHandle,
+    connection: tokio_rusqlite::Connection,
+    interrupt: Arc<rusqlite::InterruptHandle>,
+    limits: SqliteLimits,
+    allow_unsafe_sql: bool,
+    closed: Arc<AtomicBool>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl SqliteConnectionContext {
+    fn ensure_open(&self) -> VmResult<()> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(VmError::HostError(
+                "SQLite database is already closed".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn begin_operation(&self) -> VmResult<SqliteOperationLease> {
+        self.ensure_open()?;
+        let limit = self.limits.max_pending_operations;
+        self.in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < limit).then_some(count + 1)
+            })
+            .map_err(|_| {
+                VmError::HostError(format!("SQLite pending operation limit {limit} reached"))
+            })?;
+        if self.closed.load(Ordering::Acquire) {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            return Err(VmError::HostError(
+                "SQLite database is already closed".to_string(),
+            ));
+        }
+        Ok(SqliteOperationLease {
+            in_flight: Arc::clone(&self.in_flight),
+        })
+    }
+}
+
+impl CaptureAsyncHostContext for SqliteConnectionContext {
+    fn capture(_vm: &mut Vm) -> VmResult<Self> {
+        Err(VmError::HostError(
+            "SQLite connection context requires call arguments".to_string(),
+        ))
+    }
+
+    fn capture_with_args(vm: &mut Vm, args: &[Value]) -> VmResult<Self> {
+        let db_id = match args.first() {
+            Some(Value::Int(value)) => *value,
+            Some(_) => return Err(VmError::TypeMismatch("int")),
+            None => {
+                return Err(VmError::HostError(
+                    "missing SQLite database argument".to_string(),
+                ));
+            }
+        };
+        lookup_connection(vm, db_id)
+    }
 }
 
 /// The default SQLite embedding policy used when no policy has been
@@ -558,35 +286,26 @@ fn sqlite_error(error: rusqlite::Error) -> VmError {
     VmError::HostError(format!("SQLite error {name} ({code}): {error}"))
 }
 
-fn cancellation_message(shared: &SqliteOpShared) -> String {
-    if shared.is_cancelled() {
-        "SQLite operation cancelled".to_string()
-    } else {
-        "SQLite connection was closed".to_string()
+fn adapter_call_error(error: tokio_rusqlite::Error<VmError>) -> VmError {
+    match error {
+        tokio_rusqlite::Error::ConnectionClosed => {
+            VmError::HostError("SQLite connection was closed".to_string())
+        }
+        tokio_rusqlite::Error::Close((_, error)) => sqlite_error(error),
+        tokio_rusqlite::Error::Error(error) => error,
+        _ => VmError::HostError(format!("SQLite adapter error: {error}")),
     }
 }
 
-/// Completes one operation after the generic scope registry reports a
-/// terminal outcome. The adapter owns the mailbox; the VM only invokes this
-/// opaque completion hook.
-fn finish_sqlite_operation(
-    _vm: &mut Vm,
-    op_id: OperationId,
-    outcome: OperationOutcome,
-    shared: Arc<SqliteOpShared>,
-) -> VmResult<CallReturn> {
-    // A cancelled/closed operation reports a guest-visible error even if the
-    // worker happened to complete concurrently.
-    if matches!(outcome, OperationOutcome::Cancelled(_)) || shared.is_cancelled() {
-        return Err(VmError::HostError(cancellation_message(&shared)));
-    }
-    let value = shared.value.lock().expect("sqlite value lock").take();
-    match value {
-        Some(value) => value,
-        None => Err(VmError::HostError(format!(
-            "scoped operation {} completed without a result",
-            op_id.raw()
-        ))),
+fn adapter_close_error(error: tokio_rusqlite::Error) -> VmError {
+    match error {
+        tokio_rusqlite::Error::ConnectionClosed => {
+            VmError::HostError("SQLite connection was closed".to_string())
+        }
+        tokio_rusqlite::Error::Close((_, error)) | tokio_rusqlite::Error::Error(error) => {
+            sqlite_error(error)
+        }
+        _ => VmError::HostError(format!("SQLite adapter error: {error}")),
     }
 }
 
@@ -605,12 +324,8 @@ fn sqlite_handle(handle_id: i64) -> VmResult<ResourceHandle> {
     })
 }
 
-/// Lifts a guest-visible integer handle into a typed, live scope token.
-///
-/// This validates arena, slot, generation, open state, and `TypeId` through
-/// the generic typed table — a foreign, stale, closed, or wrong-typed handle
-/// is rejected here before any SQLite state is touched.
-fn lookup_connection(vm: &mut Vm, handle_id: i64) -> VmResult<Arc<ConnectionSlot>> {
+/// Lifts a guest-visible integer handle into owned adapter call context.
+fn lookup_connection(vm: &mut Vm, handle_id: i64) -> VmResult<SqliteConnectionContext> {
     let handle = sqlite_handle(handle_id)?;
     let token = vm
         .execution_scope()
@@ -622,12 +337,20 @@ fn lookup_connection(vm: &mut Vm, handle_id: i64) -> VmResult<Arc<ConnectionSlot
         .resources()
         .get::<SqliteResource>(&token)
         .map_err(|error| VmError::HostError(format!("SQLite database borrow failed: {error}")))?;
-    if resource.slot.closed.load(Ordering::SeqCst) {
+    if resource.closed.load(Ordering::Acquire) {
         return Err(VmError::HostError(
             "SQLite database is already closed".to_string(),
         ));
     }
-    Ok(Arc::clone(&resource.slot))
+    Ok(SqliteConnectionContext {
+        handle,
+        connection: resource.connection.clone(),
+        interrupt: Arc::clone(&resource.interrupt),
+        limits: resource.limits,
+        allow_unsafe_sql: resource.allow_unsafe_sql,
+        closed: Arc::clone(&resource.closed),
+        in_flight: Arc::clone(&resource.in_flight),
+    })
 }
 
 fn map_value<'a>(map: &'a VmMap, key: &str) -> Option<&'a Value> {
@@ -835,48 +558,60 @@ fn sqlite_limit(value: usize, label: &str) -> VmResult<i32> {
 
 fn install_connection_limits(connection: &Connection, limits: SqliteLimits) -> VmResult<()> {
     let max_value_bytes = limits.max_result_bytes.max(limits.max_parameter_bytes);
-    connection.set_limit(
-        Limit::SQLITE_LIMIT_LENGTH,
-        sqlite_limit(max_value_bytes, "value byte limit")?,
-    );
-    connection.set_limit(
-        Limit::SQLITE_LIMIT_SQL_LENGTH,
-        sqlite_limit(limits.max_statement_bytes, "statement byte limit")?,
-    );
-    connection.set_limit(
-        Limit::SQLITE_LIMIT_COLUMN,
-        sqlite_limit(limits.max_columns, "column limit")?,
-    );
-    connection.set_limit(
-        Limit::SQLITE_LIMIT_VARIABLE_NUMBER,
-        sqlite_limit(limits.max_parameters, "parameter count limit")?,
-    );
+    connection
+        .set_limit(
+            Limit::SQLITE_LIMIT_LENGTH,
+            sqlite_limit(max_value_bytes, "value byte limit")?,
+        )
+        .map_err(sqlite_error)?;
+    connection
+        .set_limit(
+            Limit::SQLITE_LIMIT_SQL_LENGTH,
+            sqlite_limit(limits.max_statement_bytes, "statement byte limit")?,
+        )
+        .map_err(sqlite_error)?;
+    connection
+        .set_limit(
+            Limit::SQLITE_LIMIT_COLUMN,
+            sqlite_limit(limits.max_columns, "column limit")?,
+        )
+        .map_err(sqlite_error)?;
+    connection
+        .set_limit(
+            Limit::SQLITE_LIMIT_VARIABLE_NUMBER,
+            sqlite_limit(limits.max_parameters, "parameter count limit")?,
+        )
+        .map_err(sqlite_error)?;
     Ok(())
 }
 
-fn install_authorizer(connection: &Connection, allow_unsafe_sql: bool) {
-    connection.authorizer(Some(move |context: AuthContext<'_>| {
-        if allow_unsafe_sql {
-            return Authorization::Allow;
-        }
-        match context.action {
-            AuthAction::Attach { .. }
-            | AuthAction::Detach { .. }
-            | AuthAction::Pragma { .. }
-            | AuthAction::CreateVtable { .. }
-            | AuthAction::DropVtable { .. }
-            | AuthAction::Unknown { .. } => Authorization::Deny,
-            AuthAction::Function { function_name }
-                if function_name.eq_ignore_ascii_case("load_extension") =>
-            {
-                Authorization::Deny
+fn install_authorizer(connection: &Connection, allow_unsafe_sql: bool) -> VmResult<()> {
+    connection
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if allow_unsafe_sql {
+                return Authorization::Allow;
             }
-            _ => Authorization::Allow,
-        }
-    }));
+            match context.action {
+                AuthAction::Attach { .. }
+                | AuthAction::Detach { .. }
+                | AuthAction::Pragma { .. }
+                | AuthAction::CreateVtable { .. }
+                | AuthAction::DropVtable { .. }
+                | AuthAction::Unknown { .. } => Authorization::Deny,
+                AuthAction::Function { function_name }
+                    if function_name.eq_ignore_ascii_case("load_extension") =>
+                {
+                    Authorization::Deny
+                }
+                _ => Authorization::Allow,
+            }
+        }))
+        .map_err(sqlite_error)
 }
 
-fn open_connection(options: &OpenOptions) -> VmResult<Connection> {
+async fn open_connection(
+    options: &OpenOptions,
+) -> VmResult<(tokio_rusqlite::Connection, Arc<rusqlite::InterruptHandle>)> {
     let path = resolve_database_path(options)?;
     let flags = match options.mode {
         OpenMode::Memory => OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
@@ -887,16 +622,24 @@ fn open_connection(options: &OpenOptions) -> VmResult<Connection> {
         }
     } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let connection = match path {
-        Some(path) => Connection::open_with_flags(path, flags),
-        None => Connection::open_in_memory_with_flags(flags),
+        Some(path) => tokio_rusqlite::Connection::open_with_flags(path, flags).await,
+        None => tokio_rusqlite::Connection::open_in_memory_with_flags(flags).await,
     }
     .map_err(sqlite_error)?;
-    connection
-        .busy_timeout(Duration::from_millis(options.limits.busy_timeout_ms))
-        .map_err(sqlite_error)?;
-    install_connection_limits(&connection, options.limits)?;
-    install_authorizer(&connection, options.allow_unsafe_sql);
-    Ok(connection)
+    let limits = options.limits;
+    let allow_unsafe_sql = options.allow_unsafe_sql;
+    let interrupt = connection
+        .call(move |connection| {
+            connection
+                .busy_timeout(Duration::from_millis(limits.busy_timeout_ms))
+                .map_err(sqlite_error)?;
+            install_connection_limits(connection, limits)?;
+            install_authorizer(connection, allow_unsafe_sql)?;
+            Ok(connection.get_interrupt_handle())
+        })
+        .await
+        .map_err(adapter_call_error)?;
+    Ok((connection, Arc::new(interrupt)))
 }
 
 fn normalized_sql(sql: &str) -> VmResult<String> {
@@ -1139,36 +882,6 @@ fn sqlite_params(values: VmArrayRef<'_>, limits: SqliteLimits) -> VmResult<Vec<S
     Ok(params)
 }
 
-/// Runs one synchronous closure against the connection, with cancellation
-/// surfaced through the shared cancelled flag.
-fn with_connection<T>(
-    slot: &ConnectionSlot,
-    shared: &Arc<SqliteOpShared>,
-    operation: impl FnOnce(&mut Connection) -> Result<T, rusqlite::Error>,
-) -> VmResult<T> {
-    if slot.closed.load(Ordering::Acquire) || shared.is_cancelled() {
-        return Err(VmError::HostError(cancellation_message(shared)));
-    }
-    let mut connection = slot
-        .connection
-        .lock()
-        .map_err(|_| VmError::HostError("SQLite connection lock is poisoned".to_string()))?;
-    if slot.closed.load(Ordering::Acquire) || shared.is_cancelled() {
-        return Err(VmError::HostError(cancellation_message(shared)));
-    }
-    let handler_shared = Arc::clone(shared);
-    connection.progress_handler(
-        SQLITE_PROGRESS_STEPS,
-        Some(move || handler_shared.is_cancelled()),
-    );
-    let result = operation(&mut connection);
-    connection.progress_handler(0, None::<fn() -> bool>);
-    if slot.closed.load(Ordering::Acquire) || shared.is_cancelled() {
-        return Err(VmError::HostError(cancellation_message(shared)));
-    }
-    result.map_err(sqlite_error)
-}
-
 fn estimate_value_bytes(value: &Value) -> usize {
     match value {
         Value::Null => 1,
@@ -1360,136 +1073,7 @@ fn transaction_result_value(kind: &str, execute: Option<VmMap>, query: Option<Vm
     ])))
 }
 
-struct SqliteWorkerCompletion {
-    slot: Arc<ConnectionSlot>,
-    shared: Arc<SqliteOpShared>,
-    id: OperationId,
-}
-
-impl Drop for SqliteWorkerCompletion {
-    fn drop(&mut self) {
-        if let Ok(mut active) = self.slot.active_operation.lock()
-            && *active == Some(self.id)
-        {
-            *active = None;
-        }
-        self.shared.mark_worker_done();
-        self.slot.unregister(self.id);
-    }
-}
-
-/// Schedules a worker thread to run one SQLite operation on a connection and
-/// registers its [`SqliteOpDriver`] in the VM's execution scope.
-///
-/// The driver is constructed with a shared id cell that
-/// [`ExecutionScope::start_operation`](crate::vm::execution_scope::ExecutionScope::start_operation)
-/// fills in after allocating the packed operation id, so the driver's `cancel`
-/// can compare against the connection's active operation without a registry
-/// fixup. The worker holds the connection's execution mutex for the whole
-/// operation (serializing access, since SQLite connections are not
-/// thread-safe), records itself as the active operation, and publishes the
-/// terminal signal plus the guest-visible value through the shared mailbox.
-fn schedule_operation(
-    vm: &mut Vm,
-    slot: Arc<ConnectionSlot>,
-    operation: impl FnOnce(Arc<ConnectionSlot>, Arc<SqliteOpShared>) -> VmResult<CallReturn>
-    + Send
-    + 'static,
-) -> VmResult<HostOpId> {
-    if slot.closed.load(Ordering::SeqCst) {
-        return Err(VmError::HostError(
-            "SQLite database is already closed".to_string(),
-        ));
-    }
-    if slot.pending_count() >= slot.limits.max_pending_operations {
-        return Err(VmError::HostError(format!(
-            "SQLite pending operation limit {} reached",
-            slot.limits.max_pending_operations
-        )));
-    }
-
-    let shared = Arc::new(SqliteOpShared::new());
-    let worker_shared = Arc::clone(&shared);
-    let worker_slot = Arc::clone(&slot);
-    let worker_name = "sqlite::operation".to_string();
-    let driver = SqliteOpDriver::new(Arc::clone(&shared), Arc::clone(&slot), worker_name.clone());
-    let driver_id = Arc::clone(&driver.id);
-
-    let deadline =
-        Instant::now().checked_add(Duration::from_millis(slot.limits.max_transaction_ms));
-    let spec = OperationSpec::new(driver)
-        .with_deadline(deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)));
-
-    let op_id = vm
-        .execution_scope()
-        .start_operation(spec)
-        .map_err(|error| {
-            VmError::HostError(format!("failed to start sqlite operation: {error}"))
-        })?;
-    *driver_id
-        .lock()
-        .expect("sqlite driver id lock should not be poisoned") = Some(op_id);
-    slot.register(op_id);
-    if let Err(error) = vm.register_scoped_operation_completion(op_id, {
-        let completion_shared = Arc::clone(&shared);
-        move |vm, outcome| finish_sqlite_operation(vm, op_id, outcome, completion_shared)
-    }) {
-        let _ = vm
-            .execution_scope()
-            .abort_operation(op_id, OperationCancelReason::Requested);
-        slot.unregister(op_id);
-        return Err(error);
-    }
-    let raw = op_id.raw();
-
-    let worker = thread::Builder::new()
-        .name(format!("rustscript-sqlite-{raw}"))
-        .spawn(move || {
-            let _completion = SqliteWorkerCompletion {
-                slot: Arc::clone(&worker_slot),
-                shared: Arc::clone(&worker_shared),
-                id: op_id,
-            };
-            let _execution = worker_slot
-                .execution
-                .lock()
-                .expect("SQLite execution lock should not be poisoned");
-            if worker_slot.closed.load(Ordering::Acquire) || worker_shared.is_cancelled() {
-                worker_shared.fail(VmError::HostError(cancellation_message(&worker_shared)));
-                return;
-            }
-            *worker_slot
-                .active_operation
-                .lock()
-                .expect("SQLite active operation lock should not be poisoned") = Some(op_id);
-            if worker_slot.closed.load(Ordering::Acquire) || worker_shared.is_cancelled() {
-                worker_shared.fail(VmError::HostError(cancellation_message(&worker_shared)));
-                return;
-            }
-            let result = operation(Arc::clone(&worker_slot), Arc::clone(&worker_shared));
-            match result {
-                Ok(value) => worker_shared.succeed(value),
-                Err(error) => worker_shared.fail(error),
-            }
-        })
-        .map_err(|error| {
-            shared.mark_worker_done();
-            vm.discard_scoped_operation_completion(op_id);
-            let _ = vm
-                .execution_scope()
-                .abort_operation(op_id, OperationCancelReason::Requested);
-            slot.unregister(op_id);
-            VmError::HostError(format!("failed to spawn sqlite worker: {error}"))
-        })?;
-    shared.set_worker(worker);
-
-    Ok(raw)
-}
-
-/// Parses the `sqlite::open` options map against the adapter-owned embedding
-/// policy.
-fn parse_open_options(vm: &Vm, options: &VmMap) -> VmResult<OpenOptions> {
-    let policy = current_policy(vm);
+fn parse_open_options(policy: &SqlitePolicy, options: &VmMap) -> VmResult<OpenOptions> {
     let path = required_string(options, "path")?;
     let mode = match optional_string(options, "mode")?.as_deref() {
         Some("memory") => OpenMode::Memory,
@@ -1527,88 +1111,93 @@ fn parse_open_options(vm: &Vm, options: &VmMap) -> VmResult<OpenOptions> {
 }
 
 /// Opens a SQLite database under the embedding-owned path and limit policy.
-///
-/// The connection is stored as a typed [`SqliteResource`] in the execution
-/// scope; the guest-visible handle is the raw scope handle, validated for
-/// arena, slot, generation, open state, and type on every later use. The
-/// live-connection count is adapter-owned (shared with each resource) so
-/// `max_connections` is enforced without a generic by-type helper.
 #[pd_host_function(name = "sqlite::open", contract = super::sqlite_schema::sqlite_open_contract)]
-pub(super) fn builtin_sqlite_open_impl(vm: &mut Vm, options: VmMapRef<'_>) -> VmResult<i64> {
-    let options = parse_open_options(vm, options)?;
-    // The adapter-declared scope state owns the live-connection counter;
-    // clone the `Arc` so the scope borrow ends before `push_resource` below.
-    let open_connections: Arc<AtomicUsize> = Arc::clone(&sqlite_state(vm)?.open_connections);
-    if open_connections.load(Ordering::SeqCst) >= options.limits.max_connections {
-        return Err(VmError::HostError(format!(
-            "SQLite connection limit {} reached",
-            options.limits.max_connections
-        )));
-    }
-    let connection = open_connection(&options)?;
-    let interrupt = connection.get_interrupt_handle();
-    let slot = Arc::new(ConnectionSlot {
-        connection: Mutex::new(connection),
-        execution: Mutex::new(()),
-        active_operation: Mutex::new(None),
-        pending: Mutex::new(Vec::new()),
-        live_workers: AtomicUsize::new(0),
-        close_waker: Mutex::new(None),
-        interrupt: Arc::new(interrupt),
+pub(super) async fn builtin_sqlite_open_impl(
+    #[pd_host_context] context: SqliteOpenContext,
+    options: VmMap,
+) -> VmResult<HostFutureOutput<i64>> {
+    let options = parse_open_options(&context.policy, &options)?;
+    let connection_permit = reserve_connection(
+        Arc::clone(&context.open_connections),
+        options.limits.max_connections,
+    )?;
+    let (connection, interrupt) = open_connection(&options).await?;
+    let resource = SqliteResource {
+        connection,
+        interrupt,
         limits: options.limits,
         allow_unsafe_sql: options.allow_unsafe_sql,
-        closed: AtomicBool::new(false),
-    });
-    let resource = vm
-        .execution_scope()
-        .push_resource(SqliteResource::new(slot, Arc::clone(&open_connections)))
-        .map_err(|error| VmError::HostError(format!("failed to open SQLite database: {error}")))?;
-    open_connections.fetch_add(1, Ordering::SeqCst);
-    Ok(handle_value(resource.handle()))
+        closed: Arc::new(AtomicBool::new(false)),
+        in_flight: Arc::new(AtomicUsize::new(0)),
+        _connection_permit: connection_permit,
+    };
+    Ok(HostFutureOutput::complete(move |vm| {
+        let token = vm
+            .execution_scope()
+            .push_resource(resource)
+            .map_err(|error| {
+                VmError::HostError(format!("failed to open SQLite database: {error}"))
+            })?;
+        Ok(handle_value(token.handle()))
+    }))
 }
 
 /// Executes one parameterized SQLite statement asynchronously.
-#[pd_host_function(name = "sqlite::execute", contract = super::sqlite_schema::sqlite_execute_contract, runtime_owned_pending)]
-pub(super) fn builtin_sqlite_execute_impl(
-    vm: &mut Vm,
-    db_id: i64,
-    sql: &str,
-    params: VmArrayRef<'_>,
-) -> VmResult<HostCallResult<VmMap>> {
-    let slot = lookup_connection(vm, db_id)?;
-    validate_sql(sql, slot.limits, slot.allow_unsafe_sql)?;
-    let sql = sql.to_string();
-    let params = sqlite_params(params, slot.limits)?;
-    let op_id = schedule_operation(vm, slot, move |slot, shared| {
-        with_connection(&slot, &shared, |connection| {
-            execute_with_connection(connection, &sql, &params)
+#[pd_host_function(name = "sqlite::execute", contract = super::sqlite_schema::sqlite_execute_contract)]
+pub(super) async fn builtin_sqlite_execute_impl(
+    #[pd_host_context] context: SqliteConnectionContext,
+    _db_id: i64,
+    sql: String,
+    params: VmArrayHandle,
+) -> VmResult<VmMap> {
+    let _lease = context.begin_operation()?;
+    validate_sql(&sql, context.limits, context.allow_unsafe_sql)?;
+    let params = sqlite_params(params.as_ref(), context.limits)?;
+    let closed = Arc::clone(&context.closed);
+    let value = context
+        .connection
+        .call(move |connection| {
+            if closed.load(Ordering::Acquire) {
+                return Err(VmError::HostError(
+                    "SQLite database is already closed".to_string(),
+                ));
+            }
+            execute_with_connection(connection, &sql, &params).map_err(sqlite_error)
         })
-        .map(|value| CallReturn::one(Value::Map(Arc::new(value))))
-    })?;
-    Ok(HostCallResult::Pending(op_id))
+        .await
+        .map_err(adapter_call_error)?;
+    context.ensure_open()?;
+    Ok(value)
 }
 
 /// Runs one parameterized SQLite query with row and result-byte bounds.
-#[pd_host_function(name = "sqlite::query", contract = super::sqlite_schema::sqlite_query_contract, runtime_owned_pending)]
-pub(super) fn builtin_sqlite_query_impl(
-    vm: &mut Vm,
-    db_id: i64,
-    sql: &str,
-    params: VmArrayRef<'_>,
-    limits: VmMapRef<'_>,
-) -> VmResult<HostCallResult<VmMap>> {
-    let slot = lookup_connection(vm, db_id)?;
-    let query_limits = parse_query_limits(limits, slot.limits)?;
-    validate_sql(sql, query_limits, slot.allow_unsafe_sql)?;
-    let sql = sql.to_string();
-    let params = sqlite_params(params, slot.limits)?;
-    let op_id = schedule_operation(vm, slot, move |slot, shared| {
-        with_connection(&slot, &shared, |connection| {
-            query_with_connection(connection, &sql, &params, query_limits)
+#[pd_host_function(name = "sqlite::query", contract = super::sqlite_schema::sqlite_query_contract)]
+pub(super) async fn builtin_sqlite_query_impl(
+    #[pd_host_context] context: SqliteConnectionContext,
+    _db_id: i64,
+    sql: String,
+    params: VmArrayHandle,
+    limits: VmMap,
+) -> VmResult<VmMap> {
+    let _lease = context.begin_operation()?;
+    let query_limits = parse_query_limits(&limits, context.limits)?;
+    validate_sql(&sql, query_limits, context.allow_unsafe_sql)?;
+    let params = sqlite_params(params.as_ref(), context.limits)?;
+    let closed = Arc::clone(&context.closed);
+    let value = context
+        .connection
+        .call(move |connection| {
+            if closed.load(Ordering::Acquire) {
+                return Err(VmError::HostError(
+                    "SQLite database is already closed".to_string(),
+                ));
+            }
+            query_with_connection(connection, &sql, &params, query_limits).map_err(sqlite_error)
         })
-        .map(|value| CallReturn::one(Value::Map(Arc::new(value))))
-    })?;
-    Ok(HostCallResult::Pending(op_id))
+        .await
+        .map_err(adapter_call_error)?;
+    context.ensure_open()?;
+    Ok(value)
 }
 
 struct TransactionStatement {
@@ -1667,54 +1256,131 @@ fn parse_transaction_statements(
         .collect()
 }
 
-/// Runs ordered statements atomically and returns ordered result envelopes.
-#[pd_host_function(name = "sqlite::transaction", contract = super::sqlite_schema::sqlite_transaction_contract, runtime_owned_pending)]
-pub(super) fn builtin_sqlite_transaction_impl(
-    vm: &mut Vm,
-    db_id: i64,
-    statements: VmArrayRef<'_>,
-) -> VmResult<HostCallResult<Vec<Value>>> {
-    let slot = lookup_connection(vm, db_id)?;
-    let statements = parse_transaction_statements(statements, slot.limits, slot.allow_unsafe_sql)?;
-    let op_id = schedule_operation(vm, slot, move |slot, shared| {
-        with_connection(&slot, &shared, |connection| {
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let mut results = Vec::with_capacity(statements.len());
-            for statement in statements {
-                let result = if statement.query {
-                    let value = query_with_connection(
-                        &transaction,
-                        &statement.sql,
-                        &statement.params,
-                        statement.limits,
-                    )?;
-                    transaction_result_value("query", None, Some(value))
-                } else {
-                    let value =
-                        execute_with_connection(&transaction, &statement.sql, &statement.params)?;
-                    transaction_result_value("execute", Some(value), None)
-                };
-                results.push(result);
+fn transaction_with_connection(
+    connection: &mut Connection,
+    statements: Vec<TransactionStatement>,
+    deadline: Instant,
+    max_transaction_ms: u64,
+) -> VmResult<Vec<Value>> {
+    connection
+        .progress_handler(
+            SQLITE_PROGRESS_STEPS,
+            Some(move || Instant::now() >= deadline),
+        )
+        .map_err(sqlite_error)?;
+    let result = (|| {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error)?;
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in statements {
+            if Instant::now() >= deadline {
+                return Err(VmError::HostError(format!(
+                    "SQLite transaction exceeded the configured {max_transaction_ms} ms deadline"
+                )));
             }
-            transaction.commit()?;
-            Ok(results)
-        })
-        .map(|values| CallReturn::one(Value::array(values)))
-    })?;
-    Ok(HostCallResult::Pending(op_id))
+            let result = if statement.query {
+                let value = query_with_connection(
+                    &transaction,
+                    &statement.sql,
+                    &statement.params,
+                    statement.limits,
+                )
+                .map_err(sqlite_error)?;
+                transaction_result_value("query", None, Some(value))
+            } else {
+                let value =
+                    execute_with_connection(&transaction, &statement.sql, &statement.params)
+                        .map_err(sqlite_error)?;
+                transaction_result_value("execute", Some(value), None)
+            };
+            results.push(result);
+        }
+        if Instant::now() >= deadline {
+            return Err(VmError::HostError(format!(
+                "SQLite transaction exceeded the configured {max_transaction_ms} ms deadline"
+            )));
+        }
+        transaction.commit().map_err(sqlite_error)?;
+        Ok(results)
+    })();
+    connection
+        .progress_handler(0, None::<fn() -> bool>)
+        .map_err(sqlite_error)?;
+    if Instant::now() >= deadline && result.is_err() {
+        return Err(VmError::HostError(format!(
+            "SQLite transaction exceeded the configured {max_transaction_ms} ms deadline"
+        )));
+    }
+    result
 }
 
-/// Closes a SQLite resource through the generic scope close. Pending drivers
-/// on the connection observe the closed slot and are retired through the
-/// scope's operation registry; no type-dispatched helper is needed.
+/// Runs ordered statements atomically and returns ordered result envelopes.
+#[pd_host_function(name = "sqlite::transaction", contract = super::sqlite_schema::sqlite_transaction_contract)]
+pub(super) async fn builtin_sqlite_transaction_impl(
+    #[pd_host_context] context: SqliteConnectionContext,
+    _db_id: i64,
+    statements: VmArrayHandle,
+) -> VmResult<Vec<Value>> {
+    let _lease = context.begin_operation()?;
+    let statements = parse_transaction_statements(
+        statements.as_ref(),
+        context.limits,
+        context.allow_unsafe_sql,
+    )?;
+    let max_transaction_ms = context.limits.max_transaction_ms;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(max_transaction_ms))
+        .ok_or_else(|| {
+            VmError::HostError("SQLite transaction deadline is out of range".to_string())
+        })?;
+    let closed = Arc::clone(&context.closed);
+    let value = context
+        .connection
+        .call(move |connection| {
+            if closed.load(Ordering::Acquire) {
+                return Err(VmError::HostError(
+                    "SQLite database is already closed".to_string(),
+                ));
+            }
+            transaction_with_connection(connection, statements, deadline, max_transaction_ms)
+        })
+        .await
+        .map_err(adapter_call_error)?;
+    context.ensure_open()?;
+    Ok(value)
+}
+
+/// Closes the adapter connection, then removes its VM resource.
 #[pd_host_function(name = "sqlite::close", contract = super::sqlite_schema::sqlite_close_contract)]
-pub(super) fn builtin_sqlite_close_impl(vm: &mut Vm, db_id: i64) -> VmResult<()> {
-    let handle = sqlite_handle(db_id)?;
-    vm.execution_scope()
-        .close_resource::<SqliteResource>(handle, ResourceCloseReason::Requested)
-        .map_err(|error| VmError::HostError(format!("unknown SQLite database: {error}")))?;
-    Ok(())
+pub(super) async fn builtin_sqlite_close_impl(
+    #[pd_host_context] context: SqliteConnectionContext,
+    _db_id: i64,
+) -> VmResult<HostFutureOutput<()>> {
+    let _lease = context.begin_operation()?;
+    if context.closed.swap(true, Ordering::AcqRel) {
+        return Err(VmError::HostError(
+            "SQLite database is already closed".to_string(),
+        ));
+    }
+    context.interrupt.interrupt();
+    if let Err(error) = context.connection.close().await {
+        context.closed.store(false, Ordering::Release);
+        return Err(adapter_close_error(error));
+    }
+    let handle = context.handle;
+    Ok(HostFutureOutput::complete(move |vm| {
+        let progress = vm
+            .execution_scope()
+            .close_resource::<SqliteResource>(handle, ResourceCloseReason::Requested)
+            .map_err(|error| VmError::HostError(format!("unknown SQLite database: {error}")))?;
+        if progress != CloseProgress::Ready {
+            return Err(VmError::HostError(
+                "SQLite resource removal remained pending".to_string(),
+            ));
+        }
+        Ok(())
+    }))
 }
 
 /// Every SQLite catalog function the feature-enabled build owns.
@@ -1802,90 +1468,5 @@ impl SqliteHostExt for Vm {
 
     fn sqlite_policy(&self) -> &SqlitePolicy {
         current_policy(self)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_operation_id(slot: u64) -> OperationId {
-        OperationId::from_raw((1 << 43) | (slot << 22) | 1).expect("valid test operation id")
-    }
-
-    #[test]
-    fn close_waits_for_active_and_queued_workers() {
-        let connection = Connection::open_in_memory().expect("in-memory SQLite connection");
-        let interrupt = connection.get_interrupt_handle();
-        let slot = Arc::new(ConnectionSlot {
-            connection: Mutex::new(connection),
-            execution: Mutex::new(()),
-            active_operation: Mutex::new(None),
-            pending: Mutex::new(Vec::new()),
-            live_workers: AtomicUsize::new(0),
-            close_waker: Mutex::new(None),
-            interrupt: Arc::new(interrupt),
-            limits: SqliteLimits::default(),
-            allow_unsafe_sql: false,
-            closed: AtomicBool::new(false),
-        });
-        let open_connections = Arc::new(AtomicUsize::new(1));
-        let mut resource = SqliteResource::new(Arc::clone(&slot), Arc::clone(&open_connections));
-        let active_id = test_operation_id(1);
-        let queued_id = test_operation_id(2);
-        slot.register(active_id);
-        slot.register(queued_id);
-
-        let release_active = Arc::new(AtomicBool::new(false));
-        let active_started = Arc::new(AtomicBool::new(false));
-        let active_slot = Arc::clone(&slot);
-        let active_release = Arc::clone(&release_active);
-        let active_started_flag = Arc::clone(&active_started);
-        let active = thread::spawn(move || {
-            let _execution = active_slot.execution.lock().expect("execution lock");
-            active_started_flag.store(true, Ordering::Release);
-            while !active_release.load(Ordering::Acquire) {
-                thread::yield_now();
-            }
-            active_slot.unregister(active_id);
-        });
-        while !active_started.load(Ordering::Acquire) {
-            thread::yield_now();
-        }
-
-        let queued_started = Arc::new(AtomicBool::new(false));
-        let queued_executed = Arc::new(AtomicBool::new(false));
-        let queued_slot = Arc::clone(&slot);
-        let queued_started_flag = Arc::clone(&queued_started);
-        let queued_executed_flag = Arc::clone(&queued_executed);
-        let queued = thread::spawn(move || {
-            queued_started_flag.store(true, Ordering::Release);
-            let _execution = queued_slot.execution.lock().expect("execution lock");
-            if !queued_slot.closed.load(Ordering::Acquire) {
-                queued_executed_flag.store(true, Ordering::Release);
-            }
-            queued_slot.unregister(queued_id);
-        });
-        while !queued_started.load(Ordering::Acquire) {
-            thread::yield_now();
-        }
-
-        assert_eq!(
-            resource
-                .begin_close(ResourceCloseReason::Requested)
-                .expect("close should begin"),
-            CloseProgress::Pending
-        );
-        let mut cx = Context::from_waker(Waker::noop());
-        assert!(matches!(resource.poll_close(&mut cx), Poll::Pending));
-        assert!(!queued_executed.load(Ordering::Acquire));
-
-        release_active.store(true, Ordering::Release);
-        active.join().expect("active worker should finish");
-        queued.join().expect("queued worker should finish");
-        assert!(!queued_executed.load(Ordering::Acquire));
-        assert!(slot.drained());
-        assert!(matches!(resource.poll_close(&mut cx), Poll::Ready(Ok(()))));
-        assert_eq!(open_connections.load(Ordering::Acquire), 0);
     }
 }

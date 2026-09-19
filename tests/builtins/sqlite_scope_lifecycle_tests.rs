@@ -1,25 +1,132 @@
 //! Focused tests for the scoped SQLite host functions (PR16 commit 4).
 //!
-//! Connections are typed [`HostResource`]s owned by the VM's execution
-//! scope; `sqlite::execute` / `sqlite::query` / `sqlite::transaction` are
-//! driven by concrete [`HostOperation`] drivers in the same scope and polled
-//! through the shared operation registry. These tests exercise the
+//! Connections are typed [`HostResource`]s owned by the VM's execution scope;
+//! `sqlite::open` / `execute` / `query` / `transaction` / `close` are ordinary
+//! macro-owned async functions backed by `tokio-rusqlite`. These tests exercise the
 //! scope-backed behaviour through the public VM + SQLite API: typed-value
 //! round trips and ordered transactions, read-only and SQL-safety policy,
 //! row/result-byte truncation bounds, stale/foreign/typed handle rejection,
 //! and adapter-owned `configure`/`clear`/`close` cleanup.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::task::{Context, Poll, Waker};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use vm::operation::OperationCancelReason;
 use vm::{
-    CompileSourceFileOptions, HostFunctionRegistry, SqliteHostExt, Vm, VmError, VmStatus,
-    compile_source, compile_source_with_flavor_and_options,
-    register_sqlite_builtin_module_from_catalog, sqlite_host_catalog,
+    CallReturn, CompileSourceFileOptions, HostAsyncBridge, HostFunctionRegistry, HostFuture,
+    HostFutureOutput, HostOpId, SqliteHostExt, Vm, VmError, VmResult, VmStatus, compile_source,
+    compile_source_with_flavor_and_options, register_sqlite_builtin_module_from_catalog,
+    sqlite_host_catalog,
 };
 
 use super::vm_reset::reset_for_reuse_to_ready;
+
+#[derive(Default)]
+struct TokioHostDriver {
+    submitted: HashMap<HostOpId, HostFuture>,
+}
+
+impl HostAsyncBridge for TokioHostDriver {
+    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+        self.submitted.insert(op_id, future);
+        Ok(())
+    }
+
+    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Ready(Err(VmError::HostError(format!(
+            "unknown external host operation {op_id}"
+        ))))
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut Context<'_>,
+    ) -> Poll<VmResult<HostFutureOutput>> {
+        let poll = self.submitted.get_mut(&op_id).map_or_else(
+            || {
+                Poll::Ready(Err(VmError::HostError(format!(
+                    "unknown submitted host operation {op_id}"
+                ))))
+            },
+            |future| future.as_mut().poll(cx),
+        );
+        if poll.is_ready() {
+            self.submitted.remove(&op_id);
+        }
+        poll
+    }
+
+    fn cancel_op(&mut self, op_id: HostOpId) {
+        self.submitted.remove(&op_id);
+    }
+
+    fn request_cancel_op(
+        &mut self,
+        op_id: HostOpId,
+        _reason: OperationCancelReason,
+    ) -> VmResult<()> {
+        self.submitted.remove(&op_id);
+        Ok(())
+    }
+
+    fn poll_cancel_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn install_host_driver(vm: &mut Vm) {
+    vm.set_async_bridge(Box::<TokioHostDriver>::default())
+        .expect("test async bridge should install");
+}
+
+fn drive_vm_to_host_error(vm: &mut Vm) -> String {
+    let mut status = match vm.run() {
+        Ok(status) => status,
+        Err(VmError::HostError(message)) => return message,
+        Err(other) => return format!("{other:?}"),
+    };
+    loop {
+        status = match status {
+            VmStatus::Halted => panic!("expected host error, got success"),
+            VmStatus::Yielded => match vm.resume() {
+                Ok(status) => status,
+                Err(VmError::HostError(message)) => return message,
+                Err(other) => return format!("{other:?}"),
+            },
+            VmStatus::Waiting(_) => {
+                if let Err(error) = vm.wait_for_host_op_blocking() {
+                    return match error {
+                        VmError::HostError(message) => message,
+                        other => format!("{other:?}"),
+                    };
+                }
+                match vm.resume() {
+                    Ok(status) => status,
+                    Err(VmError::HostError(message)) => return message,
+                    Err(other) => return format!("{other:?}"),
+                }
+            }
+        };
+    }
+}
+
+fn start_long_sqlite_query(vm: &mut Vm) {
+    let open_status = vm.run().expect("SQLite open should start");
+    assert!(matches!(open_status, VmStatus::Waiting(_)));
+    vm.wait_for_host_op_blocking()
+        .expect("SQLite open should complete");
+    let query_status = vm.resume().expect("SQLite query should start");
+    assert!(matches!(query_status, VmStatus::Waiting(_)));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        matches!(vm.poll_waiting_host_op(&mut cx), Poll::Pending),
+        "long SQLite query should remain pending after its first poll"
+    );
+}
 
 /// Helper: run a SQLite source to completion. Scripts use `assert(...)` for
 /// value checks; a failed assert surfaces as a host error.
@@ -33,6 +140,7 @@ fn run_sqlite_source(policy: vm::SqlitePolicy, source: &str) -> Result<(), VmErr
     )
     .expect("source should compile");
     let mut vm = Vm::try_new(compiled.program)?;
+    install_host_driver(&mut vm);
     let mut registry = HostFunctionRegistry::empty();
     register_sqlite_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
     registry.bind_vm_cached(&mut vm)?;
@@ -60,13 +168,9 @@ fn run_sqlite_builtin_host_error(policy: vm::SqlitePolicy, source: &str) -> Stri
     let wrapped = format!("use sqlite;\n{source}");
     let compiled = compile_source(&wrapped).expect("source should compile");
     let mut vm = Vm::new(compiled.program);
+    install_host_driver(&mut vm);
     vm.configure_sqlite(policy);
-    match vm.run() {
-        Ok(VmStatus::Halted) => panic!("expected host error, got success"),
-        Ok(other) => panic!("expected host error, got status: {other:?}"),
-        Err(VmError::HostError(message)) => message,
-        Err(other) => format!("{other:?}"),
-    }
+    drive_vm_to_host_error(&mut vm)
 }
 
 /// Helper: run a SQLite source expecting a host error, returning its message.
@@ -96,6 +200,24 @@ fn policy_for(root: &Path) -> vm::SqlitePolicy {
         database_root: Some(root.to_string_lossy().into_owned()),
         ..vm::SqlitePolicy::default()
     }
+}
+
+#[test]
+fn sqlite_async_hosts_require_an_async_bridge() {
+    let compiled = compile_source(
+        "use sqlite;\nlet db = sqlite::open({ path: \":memory:\", mode: \"memory\", limits: {} });",
+    )
+    .expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    let error = vm
+        .run()
+        .expect_err("async SQLite open must require a host bridge");
+    assert!(
+        error
+            .to_string()
+            .contains("async host function requires a host async bridge"),
+        "unexpected missing-bridge error: {error}"
+    );
 }
 
 #[test]
@@ -431,14 +553,10 @@ fn sqlite_configure_and_clear_own_the_policy() {
     let compiled = compile_source("use sqlite;\nlet db = sqlite::open({ path: \"state.db\", mode: \"read_write_create\", limits: {} });")
         .expect("source should compile");
     let mut vm = Vm::new(compiled.program);
+    install_host_driver(&mut vm);
     vm.configure_sqlite(policy);
     vm.clear_sqlite();
-    let err = match vm.run() {
-        Ok(VmStatus::Halted) => panic!("open without a root must fail"),
-        Ok(_) => panic!("open without a root must fail"),
-        Err(VmError::HostError(message)) => message,
-        Err(other) => panic!("expected host error, got: {other:?}"),
-    };
+    let err = drive_vm_to_host_error(&mut vm);
     assert!(
         err.contains("root"),
         "cleared policy must reject file opens, got: {err}"
@@ -448,14 +566,12 @@ fn sqlite_configure_and_clear_own_the_policy() {
 }
 
 #[test]
-fn sqlite_close_cancels_siblings_and_reset_retires_all() {
+fn sqlite_close_and_reset_retire_resources() {
     let root = temporary_root("cancel-reset");
     let policy = policy_for(&root);
 
-    // Schedule a long-running query, then close the connection while it is
-    // still pending. The pending driver observes the closed slot and is
-    // retired through the generic scope close; a fresh connection on the same
-    // root then works normally.
+    // Explicit close retires the adapter connection; a fresh connection on the
+    // same root then works normally.
     run_sqlite_source(
         policy.clone(),
         r#"
@@ -475,7 +591,7 @@ fn sqlite_close_cancels_siblings_and_reset_retires_all() {
         sqlite::close(db2);
         "#,
     )
-    .expect("close should cancel pending siblings and leave a reusable connection");
+    .expect("close should retire the connection and allow a fresh connection");
 
     // VM reset retires all pending sqlite operations and closes every open
     // connection through the generic scope lifecycle.
@@ -484,14 +600,11 @@ fn sqlite_close_cancels_siblings_and_reset_retires_all() {
     )
     .expect("reset source should compile");
     let mut vm = Vm::new(compiled.program);
+    install_host_driver(&mut vm);
     vm.configure_sqlite(policy);
-    // Run until the long query is pending (the VM is waiting on it), then
-    // reset: the scope close must cancel the driver without hanging.
-    let status = vm.run().expect("run should start");
-    assert!(
-        matches!(status, VmStatus::Waiting(_)),
-        "long query should leave the VM waiting, got: {status:?}"
-    );
+    // Poll the long query once so it reaches the adapter, then reset. Scope
+    // close interrupts the active SQLite statement and retires the resource.
+    start_long_sqlite_query(&mut vm);
     reset_for_reuse_to_ready(&mut vm).expect("reset should reach quiescence");
     assert!(
         vm.execution_scope().operations().is_empty(),
@@ -538,7 +651,28 @@ fn sqlite_pending_operation_slots_are_reclaimed_after_completion() {
 }
 
 #[test]
-fn sqlite_pending_reset_repeatedly_drains_workers_and_keeps_vm_reusable() {
+fn sqlite_transaction_deadline_interrupts_and_rolls_back() {
+    let root = temporary_root("transaction-deadline");
+    let error = run_sqlite_host_error(
+        policy_for(&root),
+        r#"
+        let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: { max_transaction_ms: 1 } });
+        sqlite::transaction(&db, [{
+            sql: "WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 10000000) SELECT sum(value) FROM numbers",
+            query: true,
+            limits: { max_rows: 1 }
+        }]);
+        "#,
+    );
+    assert!(
+        error.contains("transaction exceeded") && error.contains("1 ms deadline"),
+        "transaction deadline must surface explicitly, got: {error}"
+    );
+    fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+}
+
+#[test]
+fn sqlite_pending_reset_repeatedly_keeps_vm_reusable() {
     let root = temporary_root("reset-stress");
     let policy = policy_for(&root);
     let compiled = compile_source(
@@ -546,16 +680,11 @@ fn sqlite_pending_reset_repeatedly_drains_workers_and_keeps_vm_reusable() {
     )
     .expect("stress source should compile");
     let mut vm = Vm::new(compiled.program);
+    install_host_driver(&mut vm);
     vm.configure_sqlite(policy);
 
     for iteration in 0..32 {
-        assert!(
-            matches!(
-                vm.run().expect("stress run should start"),
-                VmStatus::Waiting(_)
-            ),
-            "iteration {iteration} should leave the SQLite query pending"
-        );
+        start_long_sqlite_query(&mut vm);
         reset_for_reuse_to_ready(&mut vm).expect("stress reset should reach quiescence");
         assert!(
             vm.execution_scope().operations().is_empty(),

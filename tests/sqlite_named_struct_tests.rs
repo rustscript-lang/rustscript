@@ -3,6 +3,7 @@
 //! boundary. Runtime values remain maps; positional params, row cells, and
 //! transaction results use named wrappers.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
@@ -11,9 +12,51 @@ use vm::compiler::{
 };
 use vm::host_api::{HostStructField, HostTypeSchema};
 use vm::{
-    CompiledProgram, HostFunctionRegistry, SourcePathError, SqliteHostExt, SqlitePolicy,
+    CallReturn, CompiledProgram, HostAsyncBridge, HostFunctionRegistry, HostFuture,
+    HostFutureOutput, HostOpId, SourcePathError, SqliteHostExt, SqlitePolicy, VmError, VmResult,
     register_sqlite_builtin_module, sqlite_host_catalog, standard_host_catalog,
 };
+
+#[derive(Default)]
+struct TokioHostDriver {
+    submitted: HashMap<HostOpId, HostFuture>,
+}
+
+impl HostAsyncBridge for TokioHostDriver {
+    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+        self.submitted.insert(op_id, future);
+        Ok(())
+    }
+
+    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Ready(Err(VmError::HostError(format!(
+            "unknown external host operation {op_id}"
+        ))))
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        cx: &mut Context<'_>,
+    ) -> Poll<VmResult<HostFutureOutput>> {
+        let poll = self.submitted.get_mut(&op_id).map_or_else(
+            || {
+                Poll::Ready(Err(VmError::HostError(format!(
+                    "unknown submitted host operation {op_id}"
+                ))))
+            },
+            |future| future.as_mut().poll(cx),
+        );
+        if poll.is_ready() {
+            self.submitted.remove(&op_id);
+        }
+        poll
+    }
+
+    fn cancel_op(&mut self, op_id: HostOpId) {
+        self.submitted.remove(&op_id);
+    }
+}
 
 fn opt(inner: HostTypeSchema) -> HostTypeSchema {
     HostTypeSchema::Optional(Box::new(inner))
@@ -465,6 +508,8 @@ fn drive_to_halt(vm: &mut vm::vm::Vm) {
 
 fn run_compiled_sqlite(compiled: CompiledProgram) {
     let mut vm = vm::vm::Vm::try_new(compiled.program).expect("vm");
+    vm.set_async_bridge(Box::<TokioHostDriver>::default())
+        .expect("test async bridge should install");
     let mut registry = HostFunctionRegistry::empty();
     register_sqlite_builtin_module(&mut registry)
         .expect("sqlite exact registration should succeed");
