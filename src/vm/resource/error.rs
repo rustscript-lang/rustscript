@@ -62,6 +62,10 @@ pub enum ResourceErrorCode {
     /// quiescence (at least one remains pending) and so must not claim
     /// success.
     ResourceClosePending,
+    /// Cleanup requires a live Tokio runtime in the caller's current context.
+    /// The resource remains owned and the close may be polled again after the
+    /// embedding re-enters and drives that runtime.
+    RuntimeRequired,
 }
 
 impl ResourceErrorCode {
@@ -83,8 +87,21 @@ impl ResourceErrorCode {
             Self::ResourceNotClosing => "resource_not_closing",
             Self::ResourceCloseInProgress => "resource_close_in_progress",
             Self::ResourceClosePending => "resource_close_pending",
+            Self::RuntimeRequired => "runtime_required",
         }
     }
+}
+
+/// Whether a resource-close failure consumes the resource or permits a later
+/// poll to retry the same cleanup state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ResourceErrorDisposition {
+    /// The cleanup attempt is terminal; normal close sweeps reclaim the slot.
+    #[default]
+    Terminal,
+    /// The cleanup attempt could not run in the current context. The table
+    /// retains the resource in `Closing` so a later poll can retry it.
+    Retryable,
 }
 
 /// A structured, human- and machine-readable resource error.
@@ -99,6 +116,7 @@ pub struct ResourceError {
     message: String,
     limit: Option<usize>,
     value: Option<u64>,
+    disposition: ResourceErrorDisposition,
 }
 
 impl ResourceError {
@@ -114,6 +132,7 @@ impl ResourceError {
             message: message.into(),
             limit: None,
             value: None,
+            disposition: ResourceErrorDisposition::Terminal,
         }
     }
 
@@ -142,6 +161,16 @@ impl ResourceError {
         self.value
     }
 
+    /// How a resource table must treat this error during close.
+    pub fn disposition(&self) -> ResourceErrorDisposition {
+        self.disposition
+    }
+
+    /// Whether cleanup can be retried without discarding the resource.
+    pub fn is_retryable(&self) -> bool {
+        self.disposition == ResourceErrorDisposition::Retryable
+    }
+
     /// Attaches an optional capacity/limit payload.
     pub fn with_limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
@@ -151,6 +180,13 @@ impl ResourceError {
     /// Attaches an optional numeric value payload.
     pub fn with_value(mut self, value: u64) -> Self {
         self.value = Some(value);
+        self
+    }
+
+    /// Marks this cleanup failure as retryable. Close machinery must retain
+    /// the concrete resource and all of its owned state when returning it.
+    pub fn with_retryable_disposition(mut self) -> Self {
+        self.disposition = ResourceErrorDisposition::Retryable;
         self
     }
 }

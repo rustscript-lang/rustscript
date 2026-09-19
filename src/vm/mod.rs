@@ -1267,6 +1267,11 @@ impl Vm {
     /// A successful return only starts the reset; callers must poll
     /// `poll_reset_for_reuse` to obtain the deterministic completion result
     /// before observing an empty scope or reusing the VM.
+    ///
+    /// Process-backed async IO cleanup must be polled while a live Tokio
+    /// runtime is current. An off-runtime poll returns a retryable
+    /// `RuntimeRequired` resource error while retaining the old scope,
+    /// process/pipes, and pending reset for a later poll under that runtime.
     pub fn reset_for_reuse(&mut self) -> VmResult<()> {
         if let Err(error) = validate_frame_allocation_limits(&self.program) {
             self.host.mark_reset_failed(&error);
@@ -1287,7 +1292,19 @@ impl Vm {
             return Err(error);
         }
         if let Err(error) = self.host.reset_execution_scope() {
-            self.instance.invalidate_callback_registries();
+            if matches!(
+                &error,
+                VmError::ExecutionScope(scope_error) if scope_error.is_retryable_cleanup()
+            ) {
+                // Reset has been accepted and the old scope remains sealed.
+                // Clear guest-visible execution state now; a later successful
+                // cleanup poll only publishes the retained replacement scope.
+                self.run_ctx.reset_for_reuse();
+                self.instance.reset(&self.program);
+                self.engine.reset_runtime_state(&self.program);
+            } else {
+                self.instance.invalidate_callback_registries();
+            }
             return Err(error);
         }
         self.run_ctx.reset_for_reuse();
@@ -1679,21 +1696,14 @@ impl Vm {
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        let _ = self.cancel_waiting_host_op_with_reason(
-            crate::vm::operation::OperationCancelReason::VmDrop,
-        );
-        let _ = self.cancel_callable_stream_with_reason(
-            crate::vm::operation::OperationCancelReason::VmDrop,
-        );
-        let _ = self.terminate_all_callable_streams_with_reason(
-            crate::vm::operation::OperationCancelReason::VmDrop,
-        );
+        // Abrupt teardown is cancel-only. HostRuntime/ExecutionScope drop issue
+        // immediate cancellation and process kill requests without polling any
+        // future, entering a runtime, or waiting for worker/process quiescence.
+        // Embedders that require deterministic cleanup and child reaping must
+        // complete explicit close/reset before dropping the VM.
         self.host
             .cancel_submitted_host_ops(crate::vm::operation::OperationCancelReason::VmDrop);
         self.instance.drop_cleanup();
-        // Live IO handles and in-flight IO operations are retired by the
-        // `ExecutionScope`'s own `Drop`, which runs as part of `HostRuntime`.
-        // (No custom close-all side channel is needed.)
     }
 }
 

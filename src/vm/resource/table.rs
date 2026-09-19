@@ -356,8 +356,9 @@ impl ResourceTable {
     /// Polls one in-progress close to completion.
     ///
     /// Returns `Ready(Ok(()))` on a clean finish, `Ready(Err(_))` on a cleanup
-    /// failure (the slot is still reclaimed), or `Pending` while the resource
-    /// needs more time.
+    /// failure, or `Pending` while the resource needs more time. Terminal
+    /// failures reclaim the slot; a retryable failure retains the concrete
+    /// resource in `Closing` for a later poll.
     pub fn poll_close<T: HostResource>(
         &mut self,
         resource: Resource<T>,
@@ -370,6 +371,10 @@ impl ResourceTable {
         let state = self.replace_slot_state(slot_index, SlotState::Vacant);
         match state {
             SlotState::Closing(mut resource) => match resource.poll_close(cx) {
+                Poll::Ready(Err(error)) if error.is_retryable() => {
+                    self.put_slot_state(slot_index, SlotState::Closing(resource));
+                    Poll::Ready(Err(error))
+                }
                 Poll::Ready(result) => {
                     self.reclaim(slot_index);
                     Poll::Ready(result)
@@ -393,18 +398,20 @@ impl ResourceTable {
     ///
     /// This is the event-driven close-all: unlike a synchronous sweep it can
     /// wait on genuinely `Pending` resources using the caller's waker. A
-    /// cleanup failure does not stop the remaining best-effort closes: every
-    /// resource close is attempted and the first failure is retained until the
-    /// whole sweep finishes.
+    /// terminal cleanup failure does not stop the remaining best-effort closes:
+    /// every resource close is attempted and the first failure is retained
+    /// until the whole sweep finishes. A retryable cleanup error returns
+    /// immediately and retains that resource plus the in-flight sweep state.
     ///
     /// Contract:
-    /// - Returns [`Poll::Ready`] **only** once the table is quiescent
-    ///   ([`len`](ResourceTable::len) `== 0`). `Ready(Ok(n))` reports the
-    ///   cumulative number of resources closed across all polls; `Ready(Err)`
-    ///   reports the first cleanup failure once every resource has finished.
-    /// - Returns [`Poll::Pending`] whenever any Open or Closing resource
-    ///   remains. The cumulative closed count, the first cleanup error, and the
-    ///   initial `reason` are persisted across Pending polls.
+    /// - Returns [`Poll::Ready`] once the table is quiescent, or immediately
+    ///   for a retryable context error while retaining the affected resource.
+    ///   `Ready(Ok(n))` reports the cumulative number of resources closed across
+    ///   all polls; a terminal `Ready(Err)` reports the first cleanup failure
+    ///   once every resource has finished.
+    /// - Returns [`Poll::Pending`] when resources remain and no retryable error
+    ///   needs to be reported to the caller. The cumulative closed count, first
+    ///   terminal cleanup error, and initial `reason` persist across polls.
     /// - The `reason` is bound on the first poll of a sweep. Supplying a
     ///   conflicting reason is rejected deterministically with
     ///   [`ResourceErrorCode::ResourceCloseInProgress`] and leaves the in-flight
@@ -474,18 +481,35 @@ impl ResourceTable {
             progressed = false;
             let open_indices = self.open_indices()?;
             for slot_index in open_indices {
-                progressed |= self.try_begin_close(
+                match self.try_begin_close(
                     slot_index,
                     reason,
                     &mut closed,
                     &mut failed,
                     &mut first_error,
-                );
+                ) {
+                    Ok(made_progress) => progressed |= made_progress,
+                    Err(error) => {
+                        self.persist_close_all_progress(closed, failed, first_error);
+                        return Poll::Ready(Err(error));
+                    }
+                }
             }
             let closing_indices = self.closing_indices()?;
             for slot_index in closing_indices {
-                progressed |=
-                    self.try_poll_close(slot_index, cx, &mut closed, &mut failed, &mut first_error);
+                match self.try_poll_close(
+                    slot_index,
+                    cx,
+                    &mut closed,
+                    &mut failed,
+                    &mut first_error,
+                ) {
+                    Ok(made_progress) => progressed |= made_progress,
+                    Err(error) => {
+                        self.persist_close_all_progress(closed, failed, first_error);
+                        return Poll::Ready(Err(error));
+                    }
+                }
             }
         }
 
@@ -721,29 +745,33 @@ impl ResourceTable {
         closed: &mut usize,
         failed: &mut usize,
         first_error: &mut Option<ResourceError>,
-    ) -> bool {
+    ) -> ResourceResult<bool> {
         let state = self.replace_slot_state(slot_index, SlotState::Vacant);
         let SlotState::Open(mut resource) = state else {
             // Not open (e.g. already closing); restore and report no progress.
             self.put_slot_state(slot_index, state);
-            return false;
+            return Ok(false);
         };
         match resource.begin_close(reason) {
             Ok(CloseProgress::Ready) => {
                 self.reclaim(slot_index);
                 *closed += 1;
-                true
+                Ok(true)
             }
             Ok(CloseProgress::Pending) => {
                 self.put_slot_state(slot_index, SlotState::Closing(resource));
-                true
+                Ok(true)
+            }
+            Err(error) if error.is_retryable() => {
+                self.put_slot_state(slot_index, SlotState::Open(resource));
+                Err(error)
             }
             Err(error) => {
                 self.reclaim(slot_index);
                 *closed += 1;
                 *failed += 1;
                 first_error.get_or_insert(error);
-                true
+                Ok(true)
             }
         }
     }
@@ -755,13 +783,17 @@ impl ResourceTable {
         closed: &mut usize,
         failed: &mut usize,
         first_error: &mut Option<ResourceError>,
-    ) -> bool {
+    ) -> ResourceResult<bool> {
         let state = self.replace_slot_state(slot_index, SlotState::Vacant);
         let SlotState::Closing(mut resource) = state else {
             self.put_slot_state(slot_index, state);
-            return false;
+            return Ok(false);
         };
         match resource.poll_close(cx) {
+            Poll::Ready(Err(error)) if error.is_retryable() => {
+                self.put_slot_state(slot_index, SlotState::Closing(resource));
+                Err(error)
+            }
             Poll::Ready(result) => {
                 self.reclaim(slot_index);
                 *closed += 1;
@@ -769,13 +801,28 @@ impl ResourceTable {
                     *failed += 1;
                     first_error.get_or_insert(error);
                 }
-                true
+                Ok(true)
             }
             Poll::Pending => {
                 self.put_slot_state(slot_index, SlotState::Closing(resource));
-                false
+                Ok(false)
             }
         }
+    }
+
+    fn persist_close_all_progress(
+        &mut self,
+        closed: usize,
+        failed: usize,
+        first_error: Option<ResourceError>,
+    ) {
+        let state = self
+            .close_all
+            .as_mut()
+            .expect("close-all progress exists during a sweep");
+        state.closed = closed;
+        state.failed = failed;
+        state.first_error = first_error;
     }
 
     fn reclaim(&mut self, slot_index: usize) {
@@ -971,14 +1018,10 @@ impl ResourceTable {
 
 impl Drop for ResourceTable {
     fn drop(&mut self) {
-        // Best-effort last-resort cleanup with a no-op waker. This performs at
-        // most one synchronous sweep; it explicitly does NOT claim quiescence.
-        // In the intended flow the owning scope drives poll-based close to
-        // quiescence via `poll_close_all` before dropping the table, so this
-        // path only catches resources whose close was never driven. Genuinely
-        // event-driven Pending resources may remain live here and are released
-        // by their own `Drop` guards.
-        let _ = self.close_all(ResourceCloseReason::VmReset);
+        // Abrupt table teardown only begins immediate resource cancellation.
+        // Pending cleanup futures are never polled from Drop, and no eventual
+        // quiescence or process reap is promised on this path.
+        let _ = self.begin_close_remaining_for_drop(ResourceCloseReason::VmDrop);
     }
 }
 

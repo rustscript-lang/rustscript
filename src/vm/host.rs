@@ -2723,7 +2723,22 @@ impl Vm {
         Ok(())
     }
 
+    /// Removes the embedding async bridge after all bridge work and the
+    /// execution scope are quiescent.
+    ///
+    /// Live resources/operations and a pending reset retain the bridge because
+    /// process-backed async IO may still need the embedding Tokio runtime to
+    /// complete cleanup and reap its direct child.
     pub fn clear_async_bridge(&mut self) -> VmResult<()> {
+        if self.host.scope_reset_pending
+            || !self.host.execution_scope.resources().is_empty()
+            || !self.host.execution_scope.operations().is_empty()
+        {
+            return Err(VmError::HostError(
+                "cannot clear async bridge while the execution scope has live resources, operations, or a pending reset"
+                    .to_string(),
+            ));
+        }
         if self.host.has_active_bridge_operations()
             || self
                 .instance

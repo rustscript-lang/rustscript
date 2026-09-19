@@ -577,6 +577,9 @@ impl HostRuntime {
         match result {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(error)) => {
+                if error.is_retryable_cleanup() {
+                    return Poll::Ready(Err(VmError::ExecutionScope(error)));
+                }
                 self.scope_reset_error = Some(error.clone());
                 Poll::Ready(Err(VmError::ExecutionScope(error)))
             }

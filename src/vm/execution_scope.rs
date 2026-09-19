@@ -14,8 +14,7 @@
 //! resources own their close (see
 //! [`HostResource`](crate::vm::resource::HostResource)).
 
-use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll};
 
 use super::operation::driver::{OperationOutcome, OperationSpec};
 use super::operation::error::OperationError;
@@ -112,6 +111,12 @@ impl std::fmt::Display for ExecutionScopeError {
 }
 
 impl ExecutionScopeError {
+    /// Whether this error reports a retained resource cleanup that may be
+    /// polled again after the caller restores the required runtime context.
+    pub fn is_retryable_cleanup(&self) -> bool {
+        matches!(self, Self::Resource(error) if error.is_retryable())
+    }
+
     /// Recovers the underlying `OperationError` when the failure is an
     /// operation-domain error; returns `None` for scope-state violations.
     pub fn into_operation_error(self) -> Option<OperationError> {
@@ -612,6 +617,9 @@ impl ExecutionScope {
                     .expect("finish_close set terminal")))
             }
             Poll::Ready(Err(error)) => {
+                if error.is_retryable() {
+                    return Poll::Ready(Err(ExecutionScopeError::Resource(error)));
+                }
                 self.record_failure(ScopeCloseError::Resource(error));
                 self.finish_close();
                 Poll::Ready(Ok(self
@@ -666,12 +674,6 @@ impl ExecutionScope {
     }
 }
 
-struct ScopeDropWake;
-
-impl Wake for ScopeDropWake {
-    fn wake(self: Arc<Self>) {}
-}
-
 impl Drop for ExecutionScope {
     fn drop(&mut self) {
         if self.state == ScopeState::Active {
@@ -682,15 +684,15 @@ impl Drop for ExecutionScope {
         if self.state != ScopeState::Closing {
             return;
         }
-        let waker = Waker::from(Arc::new(ScopeDropWake));
-        let mut cx = Context::from_waker(&waker);
-        let _ = self.poll_close(&mut cx);
-        if self.state == ScopeState::Closing {
-            // A standalone scope drop cannot keep polling a Pending resource,
-            // but it must still launch every remaining ancestor close with the
-            // VmDrop reason before ResourceTable itself is dropped.
-            let _ = self.begin_drop_resource_close_nonblocking();
+        if !self.operations_drained {
+            let reason = self.close_reason.unwrap_or(ResourceCloseReason::VmDrop);
+            let _ = self.operations.cancel_all(operation_reason(reason));
+            self.operations_drained = true;
         }
+        // Abrupt drop only issues immediate cancellation/kill requests. It
+        // never polls an operation or resource future and cannot promise that
+        // process leaders will eventually be reaped.
+        let _ = self.begin_drop_resource_close_nonblocking();
     }
 }
 
