@@ -417,6 +417,20 @@ fn empty_host_future() -> HostFuture {
 }
 
 #[test]
+fn host_future_output_vm_continuation_survives_value_mapping() {
+    let output = HostFutureOutput::<i64>::continue_with(|_vm| Ok(CallOutcome::Pending(41)))
+        .map(|value| CallReturn::one(Value::Int(value)));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+
+    match output.finish(&mut vm).expect("continuation should run") {
+        async_host::HostFutureResolution::Continue(CallOutcome::Pending(op_id)) => {
+            assert_eq!(op_id, 41)
+        }
+        _ => panic!("mapped host future output must retain its VM continuation"),
+    }
+}
+
+#[test]
 fn submitted_bridge_operation_reserves_before_submit_and_rolls_back_on_failure() {
     let submissions = Arc::new(Mutex::new(Vec::new()));
     let fail_submission = Arc::new(AtomicBool::new(false));
