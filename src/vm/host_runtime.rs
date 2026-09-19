@@ -241,6 +241,26 @@ impl HostRuntime {
         !self.bridge_operations.is_empty()
     }
 
+    /// Whether no host-owned state can still depend on the installed async
+    /// bridge or its runtime.
+    ///
+    /// Keep bridge replacement and removal on this one lifecycle predicate so
+    /// newly introduced operation/resource owners cannot drift between the two
+    /// public mutation paths.
+    pub(crate) fn async_work_is_quiescent(&self) -> bool {
+        !self.scope_reset_pending
+            && self.scope_reset_error.is_none()
+            && self.reset_error.is_none()
+            && self.replacement_execution_scope.is_none()
+            && self.execution_scope.resources().is_clean()
+            && self.execution_scope.operations().is_empty()
+            && self.submitted_host_ops.is_empty()
+            && self.bridge_operations.is_empty()
+            && self.scoped_operation_completions.is_empty()
+            && self.stream_drivers.is_empty()
+            && self.pending_stream_terminations.is_empty()
+    }
+
     pub(crate) fn has_pending_bridge_cancellations(&self) -> bool {
         self.bridge_operations
             .values()

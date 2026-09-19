@@ -1108,9 +1108,20 @@ async fn sse_reset_while_callback_waits_retires_stream_to_quiescence() {
     assert!(matches!(vm.resume().unwrap(), VmStatus::Waiting(_)));
     assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
 
+    vm.set_async_bridge(Box::<TokioHostDriver>::default())
+        .expect_err("an active SSE callable stream must retain its async bridge");
+    vm.clear_async_bridge()
+        .expect_err("an active SSE callable stream must retain its async bridge");
+
     reset_and_wait(&mut vm)
         .await
         .expect("reset must cancel callback and retire the stream");
+    vm.set_async_bridge(Box::<TokioHostDriver>::default())
+        .expect("a quiescent SSE VM may replace its async bridge");
+    vm.clear_async_bridge()
+        .expect("a quiescent SSE VM may clear its async bridge");
+    vm.set_async_bridge(Box::<TokioHostDriver>::default())
+        .expect("the reused SSE VM needs an async bridge");
     drive(&mut vm)
         .await
         .expect("the reused VM must reacquire the permit");
