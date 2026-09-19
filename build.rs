@@ -2351,7 +2351,12 @@ mod tests {
                 .iter()
                 .find(|callable| callable.name == "io::open")
                 .expect("selected IO source must contain io::open");
-            assert_eq!(open.host_execution, HostExecutionKind::MaySuspend);
+            let expected_execution = if async_enabled || target_arch == "wasm32" {
+                HostExecutionKind::MaySuspend
+            } else {
+                HostExecutionKind::Sync
+            };
+            assert_eq!(open.host_execution, expected_execution);
         }
     }
 }
