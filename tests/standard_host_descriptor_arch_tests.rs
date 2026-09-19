@@ -30,16 +30,16 @@ const HTTP_SURFACE_ENABLED: bool = cfg!(all(feature = "http-client", not(target_
 /// omits transport-only resources; the default build (no `http-client`)
 /// composes one module fewer and must reproduce
 /// [`STANDARD_CATALOG_FINGERPRINT_NO_HTTP`].
-const STANDARD_CATALOG_FINGERPRINT: &str = "4e3b7572a59b3dae";
+const STANDARD_CATALOG_FINGERPRINT: &str = "8aad996e0b2f010b";
 /// Fingerprint of the published standard host catalog **without** the HTTP
 /// surface: the `--workspace` default build and every wasm build.
-const STANDARD_CATALOG_FINGERPRINT_NO_HTTP: &str = "a6b4b2dcadc5df14";
-const IO_CATALOG_FINGERPRINT: &str = "234a7fdc3aaa3f95";
-const SQLITE_CATALOG_FINGERPRINT: &str = "b6d4c278145edacf";
-const JIT_CATALOG_FINGERPRINT: &str = "d0a3efbca2d0923c";
-const TIMER_CATALOG_FINGERPRINT: &str = "4af2dfa2aee1f42e";
+const STANDARD_CATALOG_FINGERPRINT_NO_HTTP: &str = "8afd8a69c58f02bd";
+const IO_CATALOG_FINGERPRINT: &str = "a16730bd11bf5e10";
+const SQLITE_CATALOG_FINGERPRINT: &str = "dce61460a46c421a";
+const JIT_CATALOG_FINGERPRINT: &str = "ae81318e8a018681";
+const TIMER_CATALOG_FINGERPRINT: &str = "7ecc0517cea3570b";
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
-const HTTP_CATALOG_FINGERPRINT: &str = "66db92730480d50a";
+const HTTP_CATALOG_FINGERPRINT: &str = "329e09ffbdd82a6f";
 
 /// The standard catalog fingerprint this build must reproduce exactly.
 fn standard_catalog_fingerprint() -> &'static str {
