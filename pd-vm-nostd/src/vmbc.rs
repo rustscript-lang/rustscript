@@ -11,6 +11,7 @@ const MAGIC: [u8; 4] = *b"VMBC";
 const VERSION_V11: u16 = 11;
 const VERSION_V12: u16 = 12;
 const VERSION_V13: u16 = 13;
+const VERSION_V14: u16 = 14;
 const FLAGS: u16 = 0;
 const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;
@@ -75,7 +76,8 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     let version = cursor.read_u16()?;
     let has_host_import_schemas = match version {
         VERSION_V11 => false,
-        VERSION_V12 | VERSION_V13 => true,
+        VERSION_V12 | VERSION_V14 => true,
+        VERSION_V13 => return Err(WireError::UnsupportedVersion(VERSION_V13)),
         _ => return Err(WireError::UnsupportedVersion(version)),
     };
     let flags = cursor.read_u16()?;

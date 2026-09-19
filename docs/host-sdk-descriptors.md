@@ -314,9 +314,9 @@ Each module declares two things:
 standard `#[pd_host_function]` has exactly one descriptor owner, every ownership
 list is declared by a file that belongs to a module `standard_host_modules()`
 composes (a module this build's gates turn off is the only exemption, and it is
-stated in the guard), no gated module leaks into the derived catalog, and the
-published catalog fingerprints are byte-for-byte unchanged for the composed
-module set.
+stated in the guard), no gated module leaks into the derived catalog, and any
+intentional catalog revision updates the fingerprint format plus artifact ABI
+with explicit prior-artifact rejection coverage.
 
 ## 7. Compatibility window
 
