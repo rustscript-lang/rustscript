@@ -541,9 +541,9 @@ impl ResourceTable {
     ///
     /// Unlike the reusable close/reset sweep, this phase does not wait for a
     /// pending resource to become quiescent before continuing. It invokes
-    /// `begin_close` once for each still-open slot, retains closing slots in
-    /// `Closing`, and never reports table quiescence. Already-closing slots are
-    /// left untouched, preserving exactly-once begin semantics.
+    /// `begin_close_for_drop` once for each still-open slot, retains closing
+    /// slots in `Closing`, and never reports table quiescence. Already-closing
+    /// slots are left untouched, preserving exactly-once begin semantics.
     pub(crate) fn begin_close_remaining_for_drop(
         &mut self,
         reason: ResourceCloseReason,
@@ -557,7 +557,7 @@ impl ResourceTable {
                 self.put_slot_state(slot_index, state);
                 continue;
             };
-            match resource.begin_close(reason) {
+            match resource.begin_close_for_drop(reason) {
                 Ok(CloseProgress::Ready) => self.reclaim(slot_index),
                 Ok(CloseProgress::Pending) => {
                     self.put_slot_state(slot_index, SlotState::Closing(resource));

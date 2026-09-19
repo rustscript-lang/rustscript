@@ -20,21 +20,69 @@ pub(super) enum IoHandle {
 /// The typed resource stored in the execution scope for one IO handle.
 struct IoResource {
     handle: Option<IoHandle>,
+    explicit_cleanup: fn(&mut IoHandle) -> VmResult<()>,
+    drop_cleanup: fn(&mut IoHandle) -> VmResult<()>,
+    drop_cleanup_started: bool,
 }
 
 impl IoResource {
     fn new(handle: IoHandle) -> Self {
         Self {
             handle: Some(handle),
+            explicit_cleanup: close_io_handle,
+            drop_cleanup: start_close_io_handle_for_drop,
+            drop_cleanup_started: false,
         }
+    }
+
+    #[cfg(test)]
+    fn new_with_process_cleanup(
+        handle: IoHandle,
+        explicit_cleanup: fn(&mut IoHandle) -> VmResult<()>,
+        drop_cleanup: fn(&mut IoHandle) -> VmResult<()>,
+    ) -> Self {
+        Self {
+            handle: Some(handle),
+            explicit_cleanup,
+            drop_cleanup,
+            drop_cleanup_started: false,
+        }
+    }
+
+    fn close_explicit(&mut self) -> VmResult<()> {
+        let Some(handle) = self.handle.as_mut() else {
+            return Ok(());
+        };
+        (self.explicit_cleanup)(handle)?;
+        self.handle.take();
+        Ok(())
+    }
+
+    fn begin_close_for_drop_nonblocking(&mut self) -> ResourceResult<CloseProgress> {
+        let Some(handle) = self.handle.as_mut() else {
+            return Ok(CloseProgress::Ready);
+        };
+        if matches!(handle, IoHandle::File(_)) {
+            self.handle.take();
+            return Ok(CloseProgress::Ready);
+        }
+        if !self.drop_cleanup_started {
+            (self.drop_cleanup)(handle).map_err(|error| {
+                ResourceError::new(
+                    ResourceErrorCode::ResourceCleanupFailed,
+                    "io::resource",
+                    error.to_string(),
+                )
+            })?;
+            self.drop_cleanup_started = true;
+        }
+        Ok(CloseProgress::Pending)
     }
 }
 
 impl Drop for IoResource {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            let _ = close_io_handle(handle);
-        }
+        let _ = self.begin_close_for_drop_nonblocking();
     }
 }
 
@@ -50,16 +98,21 @@ pub(crate) fn io_file_resource() -> crate::host_extension::HostResourceTypeMeta 
 
 impl HostResource for IoResource {
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
-        if let Some(handle) = self.handle.take() {
-            close_io_handle(handle).map_err(|error| {
-                ResourceError::new(
-                    ResourceErrorCode::ResourceCleanupFailed,
-                    "io::resource",
-                    error.to_string(),
-                )
-            })?;
-        }
+        self.close_explicit().map_err(|error| {
+            ResourceError::new(
+                ResourceErrorCode::ResourceCleanupFailed,
+                "io::resource",
+                error.to_string(),
+            )
+        })?;
         Ok(CloseProgress::Ready)
+    }
+
+    fn begin_close_for_drop(
+        &mut self,
+        _reason: ResourceCloseReason,
+    ) -> ResourceResult<CloseProgress> {
+        self.begin_close_for_drop_nonblocking()
     }
 }
 
@@ -275,18 +328,17 @@ pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<bool> {
 pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<bool> {
     let token = io_resource_for_handle(vm, handle_id)?;
     let handle = token.handle();
-    let owned = {
+    {
         let mut resource = vm
             .execution_scope()
             .resources_mut()
             .get_mut(&token)
             .map_err(|error| io_borrow_error(handle_id, error))?;
-        resource
-            .handle
-            .take()
-            .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?
-    };
-    let close_result = close_io_handle(owned);
+        if resource.handle.is_none() {
+            return Err(VmError::HostError("io handle is closed".to_string()));
+        }
+        resource.close_explicit()?;
+    }
     let progress = vm
         .execution_scope()
         .close_resource::<IoResource>(handle, ResourceCloseReason::Requested)
@@ -298,7 +350,6 @@ pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<bool> {
             "io_close scope retirement is still pending".to_string(),
         ));
     }
-    close_result?;
     Ok(true)
 }
 
@@ -434,8 +485,8 @@ fn spawn_shell_command(command: &str, mode: &str) -> VmResult<IoHandle> {
     }
 }
 
-fn close_io_handle(mut handle: IoHandle) -> VmResult<()> {
-    match &mut handle {
+fn close_io_handle(handle: &mut IoHandle) -> VmResult<()> {
+    match handle {
         IoHandle::File(file) => file
             .flush()
             .map_err(|error| VmError::HostError(format!("io_close flush failed: {error}"))),
@@ -445,6 +496,18 @@ fn close_io_handle(mut handle: IoHandle) -> VmResult<()> {
             terminate_child_tree(child)
         }
     }
+}
+
+fn start_close_io_handle_for_drop(handle: &mut IoHandle) -> VmResult<()> {
+    match handle {
+        IoHandle::File(_) => Ok(()),
+        IoHandle::PopenRead { child } => start_terminate_child_tree_for_drop(child),
+        IoHandle::PopenWrite { child } => {
+            let _ = child.stdin.take();
+            start_terminate_child_tree_for_drop(child)
+        }
+    }
+    .map_err(|error| VmError::HostError(format!("io drop popen terminate failed: {error}")))
 }
 
 fn terminate_child_tree(child: &mut Child) -> VmResult<()> {
@@ -466,6 +529,21 @@ fn kill_and_reap_child(child: &mut Child) -> io::Result<()> {
         Err(error) => return Err(error),
     }
     child.wait().map(|_| ())
+}
+
+fn start_terminate_child_tree_for_drop(child: &mut Child) -> io::Result<()> {
+    let pid = child.id();
+    let tree_result = signal_process_tree_for_drop(pid);
+    let leader_result = child.kill().or_else(ignore_already_exited);
+    combine_process_cleanup_results(tree_result, leader_result)
+}
+
+fn ignore_already_exited(error: io::Error) -> io::Result<()> {
+    if error.kind() == io::ErrorKind::InvalidInput {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 fn terminate_process_tree_and_leader<Tree, Leader>(
@@ -515,6 +593,25 @@ fn terminate_process_tree(pid: u32) -> io::Result<()> {
         run_taskkill_with(pid, Command::status)
     }
     #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        Ok(())
+    }
+}
+
+fn signal_process_tree_for_drop(pid: u32) -> io::Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        terminate_unix_process_group_with(
+            pid,
+            |process_group, signal| unsafe { libc::kill(process_group, signal) },
+            io::Error::last_os_error,
+        )
+    }
+    #[cfg(not(unix))]
     {
         let _ = pid;
         Ok(())
@@ -583,8 +680,215 @@ fn read_line_from_reader(reader: &mut impl Read) -> VmResult<String> {
 mod tests {
     use std::cell::Cell;
     use std::io;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    static DROP_CLEANUP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXPLICIT_CLEANUP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PROCESS_CLEANUP_TEST_LOCK: Mutex<()> = Mutex::new(());
+    #[cfg(windows)]
+    static WINDOWS_TASKKILL_CALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(windows)]
+    static WINDOWS_WAIT_CALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_drop_cleanup(_handle: &mut IoHandle) -> VmResult<()> {
+        DROP_CLEANUP_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn record_explicit_cleanup(handle: &mut IoHandle) -> VmResult<()> {
+        EXPLICIT_CLEANUP_CALLS.fetch_add(1, Ordering::SeqCst);
+        match handle {
+            IoHandle::PopenRead { child } | IoHandle::PopenWrite { child } => child
+                .wait()
+                .map(|_| ())
+                .map_err(|error| VmError::HostError(format!("test child wait failed: {error}"))),
+            IoHandle::File(_) => panic!("expected process handle"),
+        }
+    }
+
+    fn fail_explicit_cleanup(_handle: &mut IoHandle) -> VmResult<()> {
+        Err(VmError::HostError(
+            "injected explicit cleanup failure".to_string(),
+        ))
+    }
+
+    #[cfg(windows)]
+    fn record_windows_drop_cleanup(handle: &mut IoHandle) -> VmResult<()> {
+        DROP_CLEANUP_CALLS.fetch_add(1, Ordering::SeqCst);
+        start_close_io_handle_for_drop(handle)
+    }
+
+    #[cfg(windows)]
+    fn record_windows_explicit_cleanup(handle: &mut IoHandle) -> VmResult<()> {
+        use std::os::windows::process::ExitStatusExt as _;
+
+        let child = match handle {
+            IoHandle::PopenRead { child } | IoHandle::PopenWrite { child } => child,
+            IoHandle::File(_) => panic!("expected process handle"),
+        };
+        run_taskkill_with(child.id(), |_| {
+            WINDOWS_TASKKILL_CALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(std::process::ExitStatus::from_raw(0))
+        })
+        .map_err(|error| VmError::HostError(format!("test taskkill failed: {error}")))?;
+        WINDOWS_WAIT_CALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
+        child
+            .wait()
+            .map(|_| ())
+            .map_err(|error| VmError::HostError(format!("test child wait failed: {error}")))
+    }
+
+    fn exited_process_handle() -> IoHandle {
+        let command = if cfg!(windows) { "exit /B 0" } else { "exit 0" };
+        spawn_shell_command(command, "r").expect("test process should spawn")
+    }
+
+    #[test]
+    fn process_resource_drop_uses_only_nonblocking_cleanup_path() {
+        let _guard = PROCESS_CLEANUP_TEST_LOCK.lock().expect("test lock");
+        DROP_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        EXPLICIT_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        let resource = IoResource::new_with_process_cleanup(
+            exited_process_handle(),
+            record_explicit_cleanup,
+            record_drop_cleanup,
+        );
+
+        drop(resource);
+
+        assert_eq!(DROP_CLEANUP_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(EXPLICIT_CLEANUP_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn successful_explicit_process_cleanup_retires_ready() {
+        let _guard = PROCESS_CLEANUP_TEST_LOCK.lock().expect("test lock");
+        DROP_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        EXPLICIT_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        let mut resource = IoResource::new_with_process_cleanup(
+            exited_process_handle(),
+            record_explicit_cleanup,
+            record_drop_cleanup,
+        );
+
+        resource
+            .close_explicit()
+            .expect("explicit cleanup should complete");
+        assert_eq!(
+            resource
+                .begin_close(ResourceCloseReason::Requested)
+                .expect("retirement should complete"),
+            CloseProgress::Ready
+        );
+        drop(resource);
+
+        assert_eq!(EXPLICIT_CLEANUP_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(DROP_CLEANUP_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn failed_builtin_close_preserves_process_resource_for_retry() {
+        let _guard = PROCESS_CLEANUP_TEST_LOCK.lock().expect("test lock");
+        DROP_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        EXPLICIT_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        let mut vm = Vm::new(crate::vm::Program::new(
+            Vec::new(),
+            vec![crate::vm::OpCode::Ret as u8],
+        ));
+        let token = vm
+            .execution_scope()
+            .push_resource(IoResource::new_with_process_cleanup(
+                exited_process_handle(),
+                fail_explicit_cleanup,
+                record_drop_cleanup,
+            ))
+            .expect("resource insert");
+        let handle = token.handle();
+        let raw = handle.raw() as i64;
+
+        let args = [crate::vm::Value::Int(raw)];
+        let error = builtin_io_close(&mut vm, &args).expect_err("cleanup failure must propagate");
+        assert!(
+            error
+                .to_string()
+                .contains("injected explicit cleanup failure")
+        );
+        let recovered = vm
+            .execution_scope()
+            .resources()
+            .typed::<IoResource>(handle)
+            .expect("failed close must leave the resource live");
+        assert!(
+            vm.execution_scope()
+                .resources()
+                .get(&recovered)
+                .expect("resource borrow")
+                .handle
+                .is_some()
+        );
+        vm.execution_scope()
+            .resources_mut()
+            .get_mut(&recovered)
+            .expect("resource borrow")
+            .explicit_cleanup = record_explicit_cleanup;
+
+        assert!(builtin_io_close(&mut vm, &args).expect("retry should close the resource"));
+        assert!(
+            vm.execution_scope()
+                .resources()
+                .typed::<IoResource>(handle)
+                .is_err(),
+            "successful retry must retire the resource"
+        );
+        assert_eq!(EXPLICIT_CLEANUP_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(DROP_CLEANUP_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drop_path_skips_taskkill_and_wait_cleanup() {
+        let _guard = PROCESS_CLEANUP_TEST_LOCK.lock().expect("test lock");
+        DROP_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        WINDOWS_TASKKILL_CALLBACK_CALLS.store(0, Ordering::SeqCst);
+        WINDOWS_WAIT_CALLBACK_CALLS.store(0, Ordering::SeqCst);
+        let resource = IoResource::new_with_process_cleanup(
+            exited_process_handle(),
+            record_windows_explicit_cleanup,
+            record_windows_drop_cleanup,
+        );
+
+        drop(resource);
+
+        assert_eq!(DROP_CLEANUP_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(WINDOWS_TASKKILL_CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(WINDOWS_WAIT_CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_explicit_close_can_run_taskkill_and_wait_callbacks() {
+        let _guard = PROCESS_CLEANUP_TEST_LOCK.lock().expect("test lock");
+        DROP_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        WINDOWS_TASKKILL_CALLBACK_CALLS.store(0, Ordering::SeqCst);
+        WINDOWS_WAIT_CALLBACK_CALLS.store(0, Ordering::SeqCst);
+        let mut resource = IoResource::new_with_process_cleanup(
+            exited_process_handle(),
+            record_windows_explicit_cleanup,
+            record_windows_drop_cleanup,
+        );
+
+        resource
+            .close_explicit()
+            .expect("explicit cleanup should complete");
+        drop(resource);
+
+        assert_eq!(WINDOWS_TASKKILL_CALLBACK_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(WINDOWS_WAIT_CALLBACK_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(DROP_CLEANUP_CALLS.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn process_tree_failure_still_attempts_direct_blocking_leader_cleanup() {
