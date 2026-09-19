@@ -1,10 +1,10 @@
-use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use hyper::body::Bytes;
 use pd_host_function::pd_host_function;
 
 use super::request::{
@@ -128,31 +128,31 @@ impl SseParser {
         Ok((consumed, None))
     }
 
-    fn finish(&mut self) -> VmResult<Vec<SseEvent>> {
+    fn finish(&mut self) -> VmResult<Option<SseEvent>> {
         if self.finished {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         self.finished = true;
-        let mut events = Vec::new();
+        let mut event = None;
         if !self.prefix.is_empty() {
             let prefix = std::mem::take(&mut self.prefix);
             for byte in prefix {
-                if let Some(event) = self.process_byte(byte)? {
-                    events.push(event);
+                if let Some(next) = self.process_byte(byte)? {
+                    event = Some(next);
                 }
             }
         }
         if !self.line.is_empty()
-            && let Some(event) = self.process_line()?
+            && let Some(next) = self.process_line()?
         {
-            events.push(event);
+            event = Some(next);
         }
         // EventSource dispatches only on a blank line. EOF discards a partial
         // event, including a final unterminated data line.
         self.data.clear();
         self.has_data = false;
         self.event = None;
-        Ok(events)
+        Ok(event)
     }
 
     fn process_byte(&mut self, byte: u8) -> VmResult<Option<SseEvent>> {
@@ -397,12 +397,35 @@ impl CaptureAsyncHostContext for SseRequestContext {
     }
 }
 
+struct RetainedSseFrame {
+    data: Bytes,
+    offset: usize,
+}
+
+impl RetainedSseFrame {
+    fn new(data: Bytes) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    fn next_event(&mut self, parser: &mut SseParser) -> VmResult<Option<SseEvent>> {
+        let (consumed, event) = parser.push_until_event(&self.data[self.offset..])?;
+        self.offset += consumed;
+        Ok(event)
+    }
+
+    fn is_consumed(&self) -> bool {
+        self.offset == self.data.len()
+    }
+}
+
 /// Generic callable-stream continuation that owns only the Hyper response,
-/// parser, callback-facing queue, deadlines, and the in-flight permit.
+/// parser, one retained body frame, deadlines, and the in-flight permit.
 struct SseStreamDriver {
     response: OwnedResponse,
     parser: SseParser,
-    pending: VecDeque<Value>,
+    open_item: Option<Value>,
+    retained_frame: Option<RetainedSseFrame>,
+    eof_event: Option<Value>,
     status: u16,
     headers: Arc<Vec<Value>>,
     url: String,
@@ -414,6 +437,7 @@ struct SseStreamDriver {
     idle_sleep: Pin<Box<tokio::time::Sleep>>,
     body_started: bool,
     eof: bool,
+    end_emitted: bool,
     _permit: super::policy::ConnectionPermit,
 }
 
@@ -446,12 +470,7 @@ impl SseStreamDriver {
                 )
             })?;
         let headers = Arc::new(response_header_entries(response.response().headers()));
-        let mut pending = VecDeque::new();
-        pending.push_back(sse_open_event(
-            status.as_u16(),
-            Arc::clone(&headers),
-            url.as_str(),
-        ));
+        let open_item = sse_open_event(status.as_u16(), Arc::clone(&headers), url.as_str());
         let total_at = tokio::time::Instant::from_std(deadline);
         Ok(Self {
             response,
@@ -460,7 +479,9 @@ impl SseStreamDriver {
                 config.max_stream_item_bytes,
                 config.max_stream_total_bytes,
             ),
-            pending,
+            open_item: Some(open_item),
+            retained_frame: None,
+            eof_event: None,
             status: status.as_u16(),
             headers,
             url: url.to_string(),
@@ -473,6 +494,7 @@ impl SseStreamDriver {
             idle_sleep: Box::pin(tokio::time::sleep_until(total_at)),
             body_started: false,
             eof: false,
+            end_emitted: false,
             _permit: permit,
         })
     }
@@ -496,25 +518,31 @@ impl SseStreamDriver {
             .reset(tokio::time::Instant::from_std(idle_at));
     }
 
-    fn pop_item(&mut self) -> Option<HostStreamPoll> {
-        self.pending.pop_front().map(|item| {
-            self.items = self.items.saturating_add(1);
-            HostStreamPoll::Item(item)
-        })
+    fn item(&mut self, item: Value) -> HostStreamPoll {
+        self.items = self.items.saturating_add(1);
+        HostStreamPoll::Item(item)
     }
 
-    fn queue_data(&mut self, data: &[u8]) -> VmResult<()> {
-        self.parser.admit_chunk(data.len())?;
-        self.bytes_received = self.bytes_received.saturating_add(data.len());
-        let mut offset = 0;
-        while offset < data.len() {
-            let (consumed, event) = self.parser.push_until_event(&data[offset..])?;
-            offset += consumed;
-            if let Some(event) = event {
-                self.pending.push_back(sse_data_event(event));
-            }
+    fn poll_retained_frame(&mut self) -> VmResult<Option<HostStreamPoll>> {
+        let Some(frame) = self.retained_frame.as_mut() else {
+            return Ok(None);
+        };
+        let event = frame.next_event(&mut self.parser)?;
+        if frame.is_consumed() {
+            self.retained_frame = None;
         }
-        Ok(())
+        Ok(event.map(|event| self.item(sse_data_event(event))))
+    }
+
+    fn poll_eof_item(&mut self) -> Option<HostStreamPoll> {
+        if let Some(event) = self.eof_event.take() {
+            return Some(self.item(event));
+        }
+        if !self.end_emitted {
+            self.end_emitted = true;
+            return Some(self.item(sse_end_event()));
+        }
+        None
     }
 }
 
@@ -532,10 +560,18 @@ impl HostStreamDriver for SseStreamDriver {
                 SSE_TOTAL_DEADLINE_ERROR.to_string(),
             )));
         }
-        if let Some(item) = self.pop_item() {
-            return Poll::Ready(Ok(item));
+        if let Some(item) = self.open_item.take() {
+            return Poll::Ready(Ok(self.item(item)));
+        }
+        match self.poll_retained_frame() {
+            Ok(Some(item)) => return Poll::Ready(Ok(item)),
+            Err(error) => return Poll::Ready(Err(error)),
+            Ok(None) => {}
         }
         if self.eof {
+            if let Some(item) = self.poll_eof_item() {
+                return Poll::Ready(Ok(item));
+            }
             return Poll::Ready(Ok(HostStreamPoll::Complete(self.summary("eof"))));
         }
         if self.body_started && self.idle_sleep.as_mut().poll(cx).is_ready() {
@@ -553,23 +589,30 @@ impl HostStreamDriver for SseStreamDriver {
                     return Poll::Pending;
                 };
                 self.reset_idle_deadline();
-                if let Err(error) = self.queue_data(&data) {
+                if let Err(error) = self.parser.admit_chunk(data.len()) {
                     return Poll::Ready(Err(error));
                 }
-                if let Some(item) = self.pop_item() {
-                    Poll::Ready(Ok(item))
-                } else {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
+                self.bytes_received = self.bytes_received.saturating_add(data.len());
+                self.retained_frame = Some(RetainedSseFrame::new(data));
+                match self.poll_retained_frame() {
+                    Ok(Some(item)) => Poll::Ready(Ok(item)),
+                    Ok(None) => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    Err(error) => Poll::Ready(Err(error)),
                 }
             }
             Poll::Ready(Ok(None)) => {
-                if let Err(error) = self.parser.finish() {
-                    return Poll::Ready(Err(error));
-                }
+                let event = match self.parser.finish() {
+                    Ok(event) => event,
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
                 self.eof = true;
-                self.pending.push_back(sse_end_event());
-                Poll::Ready(Ok(self.pop_item().expect("end item was queued")))
+                self.eof_event = event.map(sse_data_event);
+                Poll::Ready(Ok(self
+                    .poll_eof_item()
+                    .expect("EOF always produces a pending event or end item")))
             }
         }
     }
