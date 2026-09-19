@@ -214,8 +214,10 @@ handler interrupts a transaction after its configured deadline so the transactio
 ## Resource lifecycle
 
 `sqlite::close(db)` consumes the connection, awaits adapter close, and removes the VM resource.
-VM reset interrupts an active SQLite statement through the connection's interrupt handle, drops
-the adapter handle, and retires submitted futures through the generic async bridge. Cancelling an
-individual submitted future only drops that waiter; `tokio-rusqlite` may finish work already
-queued or running. The host layer adds no worker or stronger cancellation mechanism. Handles are
-VM-local and generation-checked, so a closed or foreign handle cannot be reused.
+VM reset interrupts active SQLite work and remains pending while the resource polls
+`tokio-rusqlite`'s `Connection::close`; the connection permit is released only after the adapter
+confirms that queued and running work has drained and the connection has closed. Cancelling an
+individual submitted future only drops that waiter. Its pending-operation lease remains owned by
+the queued adapter closure until the closure runs or is discarded, so canceled work still counts
+toward `max_pending_operations`. The host layer adds no worker or stronger cancellation mechanism.
+Handles are VM-local and generation-checked, so a closed or foreign handle cannot be reused.

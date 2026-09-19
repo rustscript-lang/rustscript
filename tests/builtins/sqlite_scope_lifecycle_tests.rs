@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::task::{Context, Poll, Waker};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use vm::operation::OperationCancelReason;
 use vm::{
@@ -619,6 +619,59 @@ fn sqlite_close_and_reset_retire_resources() {
 }
 
 #[test]
+fn sqlite_reset_waits_for_adapter_close_before_reuse_and_prevents_late_writes() {
+    let root = temporary_root("reset-adapter-close");
+    let database_path = root.join("state.db");
+    let blocker =
+        rusqlite::Connection::open(&database_path).expect("blocking SQLite connection should open");
+    blocker
+        .execute_batch("CREATE TABLE items (value INTEGER); BEGIN IMMEDIATE")
+        .expect("blocking transaction should hold the writer lock");
+
+    let compiled = compile_source(
+        "use sqlite;\nlet db = sqlite::open({ path: \"state.db\", mode: \"read_write_create\", limits: { busy_timeout_ms: 5000 } });\nsqlite::execute(&db, \"INSERT INTO items (value) VALUES (1)\", []);",
+    )
+    .expect("reset source should compile");
+    let mut vm = Vm::new(compiled.program);
+    install_host_driver(&mut vm);
+    vm.configure_sqlite(policy_for(&root));
+
+    let open_status = vm.run().expect("SQLite open should start");
+    assert!(matches!(open_status, VmStatus::Waiting(_)));
+    vm.wait_for_host_op_blocking()
+        .expect("SQLite open should complete");
+    let write_status = vm.resume().expect("blocked SQLite write should start");
+    assert!(matches!(write_status, VmStatus::Waiting(_)));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(vm.poll_waiting_host_op(&mut cx), Poll::Pending));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(matches!(vm.poll_waiting_host_op(&mut cx), Poll::Pending));
+
+    vm.reset_for_reuse().expect("reset should start");
+    assert!(
+        vm.scope_reset_pending(),
+        "reset must retain the scope until tokio-rusqlite confirms close"
+    );
+    assert!(matches!(vm.poll_reset_for_reuse(&mut cx), Poll::Pending));
+
+    blocker
+        .execute_batch("ROLLBACK")
+        .expect("blocking transaction should release the writer lock");
+    reset_for_reuse_to_ready(&mut vm).expect("reset should finish after adapter close");
+
+    let verifier = rusqlite::Connection::open(&database_path)
+        .expect("verification SQLite connection should open");
+    let count: i64 = verifier
+        .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+        .expect("verification query should succeed");
+    assert_eq!(count, 0, "canceled work must not mutate after reset");
+
+    drop(verifier);
+    drop(blocker);
+    fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+}
+
+#[test]
 fn sqlite_pending_operation_slots_are_reclaimed_after_completion() {
     let root = temporary_root("pending-reclaim");
     let policy = policy_for(&root);
@@ -657,17 +710,31 @@ fn sqlite_transaction_deadline_interrupts_and_rolls_back() {
         policy_for(&root),
         r#"
         let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: { max_transaction_ms: 1 } });
-        sqlite::transaction(&db, [{
-            sql: "WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 10000000) SELECT sum(value) FROM numbers",
-            query: true,
-            limits: { max_rows: 1 }
-        }]);
+        sqlite::execute(&db, "CREATE TABLE items (value INTEGER)", []);
+        sqlite::transaction(&db, {
+            { sql: "INSERT INTO items (value) VALUES (1)" },
+            {
+                sql: "WITH RECURSIVE numbers(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbers LIMIT 10000000) SELECT sum(value) FROM numbers",
+                query: true,
+                limits: { max_rows: 1 }
+            }
+        });
         "#,
     );
     assert!(
         error.contains("transaction exceeded") && error.contains("1 ms deadline"),
         "transaction deadline must surface explicitly, got: {error}"
     );
+    run_sqlite_source(
+        policy_for(&root),
+        r#"
+        let db = sqlite::open({ path: "state.db", mode: "read_write_create", limits: {} });
+        let result = sqlite::query(&db, "SELECT count(*) FROM items", [], {});
+        assert(result.rows[0].cells[0].int_value == 0);
+        sqlite::close(db);
+        "#,
+    )
+    .expect("the timed-out transaction write should be rolled back");
     fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
 }
 
