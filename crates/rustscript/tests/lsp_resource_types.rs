@@ -55,7 +55,11 @@ fn read_framed_message(reader: &mut impl BufRead) -> Option<serde_json::Value> {
 
 impl RpcClient {
     fn spawn() -> Self {
-        Self::spawn_with_args(&[])
+        let catalog = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sqlite-host-catalog.fixture"
+        );
+        Self::spawn_with_args(&["--catalog", catalog])
     }
 
     fn spawn_with_args(args: &[&str]) -> Self {

@@ -1,4 +1,4 @@
-#![cfg(feature = "sqlite")]
+#![cfg(all(feature = "sqlite", not(target_family = "wasm")))]
 //! SQLite fixed-shape host maps are named structs at the catalog/compiler
 //! boundary. Runtime values remain maps; positional params, row cells, and
 //! transaction results use named wrappers.

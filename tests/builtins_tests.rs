@@ -11,7 +11,7 @@ mod async_test_bridge;
 #[path = "builtins/io_builtin_edge_tests.rs"]
 mod io_builtin_edge_tests;
 
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
+#[cfg(all(not(feature = "async"), not(target_family = "wasm")))]
 #[path = "builtins/io_scope_lifecycle_tests.rs"]
 mod io_scope_lifecycle_tests;
 
@@ -19,7 +19,7 @@ mod io_scope_lifecycle_tests;
 #[path = "builtins/io_async_tests.rs"]
 mod io_async_tests;
 
-#[cfg(feature = "sqlite")]
+#[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
 #[path = "builtins/sqlite_scope_lifecycle_tests.rs"]
 mod sqlite_scope_lifecycle_tests;
 

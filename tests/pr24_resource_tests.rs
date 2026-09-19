@@ -97,18 +97,23 @@ fn standard_catalog_contains_exact_resource_close_schemas() {
     );
     assert_eq!(io_close.return_type, HostTypeSchema::Bool);
 
-    let sqlite_close = catalog
-        .function("sqlite::close")
-        .expect("standard catalog must contain sqlite::close");
-    assert_eq!(
-        sqlite_close.params,
-        vec![HostParamSchema::with_passing(
-            "connection",
-            HostTypeSchema::Resource(key("sqlite.connection")),
-            HostParamPassing::TakeOwned,
-        )]
-    );
-    assert_eq!(sqlite_close.return_type, HostTypeSchema::Null);
+    #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
+    {
+        let sqlite_close = catalog
+            .function("sqlite::close")
+            .expect("standard catalog must contain sqlite::close");
+        assert_eq!(
+            sqlite_close.params,
+            vec![HostParamSchema::with_passing(
+                "connection",
+                HostTypeSchema::Resource(key("sqlite.connection")),
+                HostParamPassing::TakeOwned,
+            )]
+        );
+        assert_eq!(sqlite_close.return_type, HostTypeSchema::Null);
+    }
+    #[cfg(not(all(feature = "sqlite", not(target_family = "wasm"))))]
+    assert!(catalog.function("sqlite::close").is_none());
 }
 
 #[test]
@@ -130,28 +135,38 @@ fn standard_catalog_resolves_open_then_close_with_nominal_ownership() {
     assert_eq!(io_close.passing, vec![HostParamPassing::TakeOwned]);
     assert_eq!(io_close.return_type, TypeSchema::Bool);
 
-    let connection = resolver
-        .resolve("sqlite::open", &[TypeSchema::Unknown])
-        .expect("standard sqlite::open resolves");
-    assert_eq!(
-        connection.return_type,
-        TypeSchema::Resource(key("sqlite.connection")),
-        "sqlite::open must produce the SQLite resource key"
+    #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
+    {
+        let connection = resolver
+            .resolve("sqlite::open", &[TypeSchema::Unknown])
+            .expect("standard sqlite::open resolves");
+        assert_eq!(
+            connection.return_type,
+            TypeSchema::Resource(key("sqlite.connection")),
+            "sqlite::open must produce the SQLite resource key"
+        );
+        let sqlite_close = resolver
+            .resolve(
+                "sqlite::close",
+                &[TypeSchema::Resource(key("sqlite.connection"))],
+            )
+            .expect("standard sqlite::close resolves");
+        assert_eq!(sqlite_close.passing, vec![HostParamPassing::TakeOwned]);
+        assert_eq!(sqlite_close.return_type, TypeSchema::Null);
+    }
+    #[cfg(not(all(feature = "sqlite", not(target_family = "wasm"))))]
+    assert!(
+        resolver
+            .resolve("sqlite::open", &[TypeSchema::Unknown])
+            .is_err()
     );
-    let sqlite_close = resolver
-        .resolve(
-            "sqlite::close",
-            &[TypeSchema::Resource(key("sqlite.connection"))],
-        )
-        .expect("standard sqlite::close resolves");
-    assert_eq!(sqlite_close.passing, vec![HostParamPassing::TakeOwned]);
-    assert_eq!(sqlite_close.return_type, TypeSchema::Null);
 }
 
 #[test]
 fn default_source_compilation_accepts_open_use_close_ownership_flow() {
     let options =
         CompileSourceFileOptions::new().with_host_api_catalog(vm::standard_host_catalog());
+    #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
     let source = r#"
         use io;
         use sqlite;
@@ -159,6 +174,12 @@ fn default_source_compilation_accepts_open_use_close_ownership_flow() {
         io::close(file);
         let connection = sqlite::open({});
         sqlite::close(connection);
+    "#;
+    #[cfg(not(all(feature = "sqlite", not(target_family = "wasm"))))]
+    let source = r#"
+        use io;
+        let file = io::open("Cargo.toml", "r");
+        io::close(file);
     "#;
     compile_source_with_flavor_and_options(source, vm::SourceFlavor::RustScript, options)
         .expect("standard catalog must compile normal open/use/close ownership flow");
