@@ -12,8 +12,9 @@ use std::time::Instant;
 use serde::Deserialize;
 use vm::{
     CallOutcome, CallReturn, FunctionDecl, HostAsyncBridge, HostAsyncOpTerminal, HostFunction,
-    HostOpId, LocalInfo, SourceFlavor, SourcePathError, Value, Vm, VmError, VmResult, VmStatus,
-    VmYieldReason, compile_source_with_flavor_and_options, format_value, render_vm_error,
+    HostFutureOutput, HostOpId, LocalInfo, SourceFlavor, SourcePathError, Value, Vm, VmError,
+    VmResult, VmStatus, VmYieldReason, compile_source_with_flavor_and_options, format_value,
+    render_vm_error,
 };
 
 use crate::analyzer::{LintDiagnostic, lint_source_with_flavor, lint_success_diagnostics};
@@ -293,6 +294,16 @@ impl HostAsyncBridge for BrowserAsyncBridge {
         } else {
             Poll::Pending
         }
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        _cx: &mut Context<'_>,
+    ) -> Poll<VmResult<HostFutureOutput>> {
+        Poll::Ready(Err(VmError::HostError(format!(
+            "unknown submitted host operation {op_id}"
+        ))))
     }
 
     fn request_cancel_op(

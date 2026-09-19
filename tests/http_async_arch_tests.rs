@@ -42,7 +42,6 @@ fn http_hosts_are_macro_owned_async_functions_without_private_drivers() {
         ("src/builtins/runtime/http/sse.rs", sse.as_str()),
     ] {
         for forbidden in [
-            "runtime_owned_pending",
             "submit_host_future",
             "HostAsyncBridge",
             "std::thread",

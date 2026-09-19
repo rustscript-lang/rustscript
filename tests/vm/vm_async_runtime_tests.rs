@@ -89,12 +89,14 @@ impl HostAsyncBridge for TestAsyncBridge {
             .poll_op(op_id, cx)
     }
 
-    fn cancel_op(&mut self, op_id: HostOpId) {
-        self.ops
-            .lock()
-            .expect("test async ops lock poisoned")
-            .pending
-            .remove(&op_id);
+    fn poll_submitted_op(
+        &mut self,
+        op_id: HostOpId,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<vm::HostFutureOutput, VmError>> {
+        Poll::Ready(Err(VmError::HostError(format!(
+            "unknown submitted host operation {op_id}"
+        ))))
     }
 
     fn request_cancel_op(
@@ -102,7 +104,11 @@ impl HostAsyncBridge for TestAsyncBridge {
         op_id: HostOpId,
         _reason: vm::operation::OperationCancelReason,
     ) -> Result<(), VmError> {
-        self.cancel_op(op_id);
+        self.ops
+            .lock()
+            .expect("test async ops lock poisoned")
+            .pending
+            .remove(&op_id);
         Ok(())
     }
 
@@ -112,6 +118,19 @@ impl HostAsyncBridge for TestAsyncBridge {
         _cx: &mut Context<'_>,
     ) -> Poll<Result<(), VmError>> {
         Poll::Ready(Ok(()))
+    }
+
+    fn cleanup_op(
+        &mut self,
+        op_id: HostOpId,
+        _terminal: vm::HostAsyncOpTerminal,
+    ) -> Result<(), VmError> {
+        self.ops
+            .lock()
+            .expect("test async ops lock poisoned")
+            .pending
+            .remove(&op_id);
+        Ok(())
     }
 }
 
@@ -130,6 +149,14 @@ impl HostAsyncBridge for RejectingCancelBridge {
         Poll::Pending
     }
 
+    fn poll_submitted_op(
+        &mut self,
+        _op_id: HostOpId,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<vm::HostFutureOutput, VmError>> {
+        Poll::Pending
+    }
+
     fn request_cancel_op(
         &mut self,
         _op_id: HostOpId,
@@ -138,6 +165,14 @@ impl HostAsyncBridge for RejectingCancelBridge {
         Err(VmError::HostError(
             "cancellation request rejected".to_string(),
         ))
+    }
+
+    fn cleanup_op(
+        &mut self,
+        _op_id: HostOpId,
+        _terminal: vm::HostAsyncOpTerminal,
+    ) -> Result<(), VmError> {
+        Ok(())
     }
 }
 

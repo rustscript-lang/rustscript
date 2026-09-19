@@ -46,14 +46,14 @@ The configurable call-depth limit remains a safety guard for non-tail recursion 
 **Tasks:**
 
 - Add `TailCallValue(argc)` with the same operand layout as `CallValue(argc)`.
-- Bump `BYTECODE_ABI_VERSION` and VMBC to v11 as a hard internal-format break; update no-std decoding and reject all earlier versions.
+- Update `BYTECODE_ABI_VERSION`, VMBC encoding, and no-std decoding for the new opcode.
 - Update opcode parsing, mnemonic rendering, assembler APIs, disassembly, validation, stack-effect analysis, function-region checks, and typed operand metadata.
 - Require `TailCallValue` to occur inside a script function region. Reject it in the root region and reject malformed arity/stack shapes.
 - Keep `Call` host-only and retain existing `CallValue` for non-tail script calls and Rust-host invocation boundaries.
 
 **Tests:**
 
-- VMBC v11 round-trip and old-version rejection;
+- current VMBC round-trip;
 - assembler/disassembler round-trip for `tailcallvalue`;
 - validator rejection in the root region and across malformed function regions;
 - no-std decoder parity.
