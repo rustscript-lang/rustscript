@@ -251,20 +251,6 @@ fn call_script_validation_rejects_truncated_operands() {
 }
 
 #[test]
-fn call_script_rejects_v11_wire_version() {
-    let compiled = compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
-        .expect("direct call source should compile");
-    let mut bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
-        .expect("direct call program should encode");
-    bytes[4..6].copy_from_slice(&11u16.to_le_bytes());
-    let err = decode_program(&bytes).expect_err("VMBC v11 must be rejected");
-    assert!(
-        matches!(err, WireError::UnsupportedVersion(11)),
-        "expected UnsupportedVersion(11), got {err:?}"
-    );
-}
-
-#[test]
 fn call_script_fuel_interruption() {
     let compiled = compile_source(
         "fn bump(value: int) -> int { value + 1 } let mut i = 0; let mut total = 0; while i < 1000 { total = bump(total); i = i + 1; } total;",

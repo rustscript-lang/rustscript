@@ -1086,6 +1086,22 @@ mod tests {
         ) -> Poll<VmResult<CallReturn>> {
             Poll::Pending
         }
+
+        fn poll_submitted_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut Context<'_>,
+        ) -> Poll<VmResult<crate::HostFutureOutput>> {
+            Poll::Pending
+        }
+
+        fn cleanup_op(
+            &mut self,
+            _op_id: HostOpId,
+            _terminal: crate::HostAsyncOpTerminal,
+        ) -> VmResult<()> {
+            Ok(())
+        }
     }
 
     /// Bridge stub driven by a test-owned state: it completes, fails, or
@@ -1123,8 +1139,45 @@ mod tests {
             }
         }
 
-        fn cancel_op(&mut self, _op_id: HostOpId) {
+        fn poll_submitted_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut Context<'_>,
+        ) -> Poll<VmResult<crate::HostFutureOutput>> {
+            let state = self.state.lock().expect("bridge state");
+            assert!(!state.panic_poll, "registered bridge poll panic");
+            if state.poll_error {
+                Poll::Ready(Err(VmError::HostError("bridge poll failed".to_string())))
+            } else if state.complete {
+                Poll::Ready(Ok(crate::HostFutureOutput::returning(CallReturn::none())))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn request_cancel_op(
+            &mut self,
+            _op_id: HostOpId,
+            _reason: crate::operation::OperationCancelReason,
+        ) -> VmResult<()> {
             self.state.lock().expect("bridge state").cancellations += 1;
+            Ok(())
+        }
+
+        fn poll_cancel_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut Context<'_>,
+        ) -> Poll<VmResult<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn cleanup_op(
+            &mut self,
+            _op_id: HostOpId,
+            _terminal: crate::HostAsyncOpTerminal,
+        ) -> VmResult<()> {
+            Ok(())
         }
     }
 
