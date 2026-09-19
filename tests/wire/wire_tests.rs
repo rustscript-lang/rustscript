@@ -81,7 +81,7 @@ fn wire_v11_legacy_imports_decode_without_schema_metadata() {
         vec![import.clone()],
         None,
     );
-    let encoded = encode_program(&program).expect("v13 encoding should succeed");
+    let encoded = encode_program(&program).expect("current encoding should succeed");
     let marker_offset = 8 + 4 + 4 + program.code.len() + 4 + 4 + import.name.len() + 2;
     assert_eq!(encoded[marker_offset], 0);
     let mut legacy = encoded;
@@ -97,7 +97,7 @@ fn wire_v11_legacy_imports_decode_without_schema_metadata() {
 #[test]
 fn wire_v11_zero_import_program_decodes_by_version() {
     let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
-    let mut encoded = encode_program(&program).expect("v13 encoding should succeed");
+    let mut encoded = encode_program(&program).expect("current encoding should succeed");
     strip_empty_named_struct_section(&mut encoded);
     encoded[4..6].copy_from_slice(&11u16.to_le_bytes());
 
@@ -1098,7 +1098,7 @@ fn call_script_no_script_program_code_bytes_unchanged_by_version_bump() {
 #[test]
 fn v12_trailing_zero_count_is_not_a_named_struct_table() {
     let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
-    let mut encoded = encode_program(&program).expect("v13 encoding should succeed");
+    let mut encoded = encode_program(&program).expect("current encoding should succeed");
     strip_empty_named_struct_section(&mut encoded);
     encoded[4..6].copy_from_slice(&12u16.to_le_bytes());
     decode_program(&encoded).expect("clean v12 without a named-struct section should decode");
