@@ -163,14 +163,14 @@ fn drop_retires_io_resources_through_scope() {
     drop(vm);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 struct ProcessTreeCleanup {
     leader: i32,
     descendant: i32,
     marker: std::path::PathBuf,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl Drop for ProcessTreeCleanup {
     fn drop(&mut self) {
         unsafe {
@@ -181,7 +181,7 @@ impl Drop for ProcessTreeCleanup {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn process_is_running(pid: i32) -> bool {
     let path = format!("/proc/{pid}/stat");
     let Ok(stat) = std::fs::read_to_string(path) else {
@@ -193,7 +193,7 @@ fn process_is_running(pid: i32) -> bool {
     !state.starts_with('Z')
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn wait_for_process_exit(pid: i32) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while process_is_running(pid) {
@@ -205,7 +205,7 @@ fn wait_for_process_exit(pid: i32) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn read_process_marker(path: &std::path::Path) -> (i32, i32) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
@@ -227,7 +227,7 @@ fn read_process_marker(path: &std::path::Path) -> (i32, i32) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn reset_for_reuse_terminates_live_popen_process_tree() {
     let marker = std::env::temp_dir().join(format!(
@@ -253,10 +253,37 @@ fn reset_for_reuse_terminates_live_popen_process_tree() {
     let _ = std::fs::remove_file(marker);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+#[test]
+fn vm_drop_signals_live_popen_process_tree_without_driving_close() {
+    let marker = std::env::temp_dir().join(format!(
+        "pd-vm-blocking-io-drop-{}-{}.marker",
+        std::process::id(),
+        SystemTimeNonce::new()
+    ));
+    let command = format!(
+        "parent=$$; sleep 30 & child=$!; printf '%s %s' $parent $child > {}; wait $child",
+        marker.display()
+    );
+    let vm = vm_for(&format!("let h = io::popen(\"{command}\", \"r\"); h;"));
+    let (leader, descendant) = read_process_marker(&marker);
+    let _cleanup = ProcessTreeCleanup {
+        leader,
+        descendant,
+        marker: marker.clone(),
+    };
+
+    drop(vm);
+
+    wait_for_process_exit(leader);
+    wait_for_process_exit(descendant);
+    let _ = std::fs::remove_file(marker);
+}
+
+#[cfg(target_os = "linux")]
 struct SystemTimeNonce(u128);
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl SystemTimeNonce {
     fn new() -> Self {
         Self(
@@ -268,7 +295,7 @@ impl SystemTimeNonce {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl std::fmt::Display for SystemTimeNonce {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)

@@ -208,7 +208,7 @@ fn wait_for_file(path: &std::path::Path) -> String {
     panic!("timed out waiting for {}", path.display());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn pid_is_running(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
@@ -227,7 +227,7 @@ fn pid_is_running(pid: u32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn wait_for_pid_exit(pid: u32) -> bool {
     for _ in 0..200 {
         if !pid_is_running(pid) {
@@ -258,7 +258,7 @@ fn guest_popen_program(command: &str, expression: &str) -> String {
     format!(r#"let h = io::popen("{command}", "r"); {expression}"#)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn async_io_reset_kills_and_reaps_the_entire_popen_process_group() {
     let nonce = SystemTime::now()
@@ -358,7 +358,7 @@ fn async_io_reset_kills_and_reaps_the_entire_popen_process_group() {
     let _ = std::fs::remove_file(marker_path);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn async_io_vm_drop_terminates_live_popen_process_tree() {
     let nonce = SystemTime::now()

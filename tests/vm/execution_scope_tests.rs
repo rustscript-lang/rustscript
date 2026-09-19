@@ -116,12 +116,21 @@ impl HostOperation for CancelAwareWorker {
 
 struct DropPendingResource {
     begins: Arc<AtomicUsize>,
+    drop_begins: Arc<AtomicUsize>,
     polls: Arc<AtomicUsize>,
 }
 
 impl HostResource for DropPendingResource {
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.begins.fetch_add(1, Ordering::SeqCst);
+        Ok(CloseProgress::Pending)
+    }
+
+    fn begin_close_for_drop(
+        &mut self,
+        _reason: ResourceCloseReason,
+    ) -> ResourceResult<CloseProgress> {
+        self.drop_begins.fetch_add(1, Ordering::SeqCst);
         Ok(CloseProgress::Pending)
     }
 
@@ -238,18 +247,21 @@ fn empty_scope_quiesces_cleanly() {
 #[test]
 fn vm_drop_begins_resource_cleanup_without_polling_it() {
     let begins = Arc::new(AtomicUsize::new(0));
+    let drop_begins = Arc::new(AtomicUsize::new(0));
     let polls = Arc::new(AtomicUsize::new(0));
     let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
     vm.execution_scope()
         .push_resource(DropPendingResource {
             begins: Arc::clone(&begins),
+            drop_begins: Arc::clone(&drop_begins),
             polls: Arc::clone(&polls),
         })
         .expect("resource");
 
     drop(vm);
 
-    assert_eq!(begins.load(Ordering::SeqCst), 1);
+    assert_eq!(begins.load(Ordering::SeqCst), 0);
+    assert_eq!(drop_begins.load(Ordering::SeqCst), 1);
     assert_eq!(
         polls.load(Ordering::SeqCst),
         0,
