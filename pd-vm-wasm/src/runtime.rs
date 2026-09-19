@@ -1,12 +1,12 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
-#[cfg(all(not(target_arch = "wasm32"), test))]
+#[cfg(all(not(target_family = "wasm"), test))]
 use std::time::Duration;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
 
 use serde::Deserialize;
@@ -370,7 +370,7 @@ fn noop_waker() -> Waker {
     Waker::from(Arc::new(NoopWake))
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 #[link(wasm_import_module = "env")]
 unsafe extern "C" {
     #[link_name = "pd_playground_now_ms"]
@@ -378,11 +378,11 @@ unsafe extern "C" {
 }
 
 fn current_time_ms() -> f64 {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     unsafe {
         imported_now_ms()
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     {
         static START: OnceLock<Instant> = OnceLock::new();
         START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1_000.0
@@ -1078,12 +1078,12 @@ pub(crate) fn run_source_with_flavor(source: &str, flavor: SourceFlavor) -> RunR
                     );
                 }
                 Poll::Pending => {
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(not(target_family = "wasm"))]
                     {
                         std::thread::sleep(Duration::from_millis(1));
                         continue;
                     }
-                    #[cfg(target_arch = "wasm32")]
+                    #[cfg(target_family = "wasm")]
                     {
                         let output = drain_output(&output_lines);
                         let stack = vm.stack().iter().map(format_value).collect::<Vec<_>>();

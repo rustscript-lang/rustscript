@@ -33,8 +33,9 @@ mod map_iter;
 mod math;
 pub(crate) mod print;
 pub(crate) mod regex;
-#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
 pub(crate) mod sqlite;
+#[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
 pub(crate) mod sqlite_schema;
 pub(crate) mod standard_composition;
 mod timer;
@@ -45,7 +46,7 @@ pub use jit::{
     jit_host_catalog, register_jit_builtin_module, register_jit_builtin_module_from_catalog,
 };
 pub use regex::{DEFAULT_REGEX_CACHE_CAPACITY, RegexCache, RegexCacheVmExt};
-#[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
 pub use sqlite::{register_sqlite_builtin_module, register_sqlite_builtin_module_from_catalog};
 pub use timer::{
     DEFAULT_MAX_PENDING_TIMERS, DEFAULT_MAX_RUNNING_TIMERS, OwnedTimerCallback, TIMER_CALLBACK_ARG,
@@ -75,6 +76,7 @@ pub fn io_host_catalog() -> Arc<HostApiCatalog> {
 
 /// Returns the editor/compiler catalog for the SQLite host extension, derived
 /// from the standard SQLite host module descriptors.
+#[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
 pub fn sqlite_host_catalog() -> Arc<HostApiCatalog> {
     static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
     Arc::clone(CATALOG.get_or_init(|| {
@@ -116,7 +118,7 @@ pub(crate) use context::{RuntimeContext, RuntimeContextConfig, STREAM_EMIT_NAME}
 pub use error::{RuntimeError, RuntimeErrorCode, RuntimeResult};
 #[allow(unused_imports)]
 pub(crate) use event::{EventLimits, EventPayload};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub use io::{IoHostExt, IoPolicy};
 pub use standard_composition::standard_composition;
 pub use typed::HostCallResult;

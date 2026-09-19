@@ -557,6 +557,29 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
     )
     .is_err());
 
+    let compiled = compile_source(
+        r#"
+        use http;
+        http::client::sse(
+            {method: "GET", url: "http://127.0.0.1:1/events"},
+            |item| {action: "continue"}
+        );
+        "#,
+    )
+    .expect("the structural callback reaches runtime schema validation");
+    let mut vm = Vm::new(compiled.program);
+    vm.configure_http(config(1)).unwrap();
+    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    let error = vm
+        .run()
+        .expect_err("an object callback result must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("fn(SseEvent) -> SseCallbackAction"),
+        "{error}"
+    );
+
     for (timeout, expected) in [("0", "positive"), ("-1", "positive")] {
         let source = format!(
             r#"
@@ -1001,9 +1024,10 @@ async fn sse_reset_releases_the_connection_permit_before_reuse() {
     ]);
     let source = format!(
         r#"use http;
+        fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
         http::client::sse(
             {{"method":"GET","url":"http://127.0.0.1:{port}/events"}},
-            |item| {{action: "continue"}}
+            callback
         );"#
     );
     let compiled = compile_source(&source).unwrap();
@@ -1053,11 +1077,12 @@ async fn sse_reset_while_callback_waits_retires_stream_to_quiescence() {
     let source = format!(
         r#"use http;
         fn async_wait() -> bool;
+        fn callback(item: SseEvent) -> SseCallbackAction {{
+            {{action: if async_wait() => {{ "continue" }} else => {{ "continue" }} }}
+        }}
         http::client::sse(
             {{"method":"GET","url":"http://127.0.0.1:{port}/events"}},
-            |item| {{
-                action: if async_wait() => {{ "continue" }} else => {{ "continue" }}
-            }}
+            callback
         );"#
     );
     let compiled = compile_source(&source).unwrap();
@@ -1290,7 +1315,9 @@ async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
         first.join().unwrap();
     });
     let source = format!(
-        r#"use http; http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, |item| {{action:"continue"}});"#
+        r#"use http;
+        fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
+        http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, callback);"#
     );
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
@@ -1348,11 +1375,12 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
         r#"
         use http;
         fn async_wait() -> bool;
+        fn callback(item: SseEvent) -> SseCallbackAction {{
+            {{action: if async_wait() => {{ "stop" }} else => {{ "stop" }} }}
+        }}
         http::client::sse(
             {{"method":"GET","url":"http://127.0.0.1:{port}/events"}},
-            |item| {{
-                action: if async_wait() => {{ "stop" }} else => {{ "stop" }}
-            }}
+            callback
         );
         "#
     );
@@ -1421,11 +1449,12 @@ async fn sse_callback_continue_after_deadline_fails_before_another_network_poll(
         r#"
         use http;
         fn async_wait() -> bool;
+        fn callback(item: SseEvent) -> SseCallbackAction {{
+            {{action: if async_wait() => {{ "continue" }} else => {{ "continue" }} }}
+        }}
         http::client::sse(
             {{"method":"GET","url":"http://127.0.0.1:{port}/events"}},
-            |item| {{
-                action: if async_wait() => {{ "continue" }} else => {{ "continue" }}
-            }}
+            callback
         );
         "#
     );

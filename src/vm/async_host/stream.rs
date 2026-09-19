@@ -67,8 +67,7 @@ pub(crate) struct HostStreamAdmissionError {
 /// The VM always validates the callback's callable provenance and arity before
 /// installing a driver. When its metadata is [`TypeSchema::Callable`], it also
 /// validates a map or Named argument and a map, Named, or Object result. HTTP SSE
-/// additionally requires the exact `SseCallbackAction` named type or a matching
-/// `{ action: string }` object rather than an arbitrary map. Scripts receive
+/// additionally requires the exact `SseCallbackAction` named type. Scripts receive
 /// ordinary callback items and a final value; they never receive a stream
 /// handle or a producer poll API.
 ///
@@ -162,8 +161,7 @@ pub(crate) struct HostStreamContinuation {
     pub(crate) parent_ip: usize,
 }
 
-/// HTTP SSE callback results retain the existing named action/object runtime
-/// compatibility, while callback inputs use the exact `SseEvent` named schema.
+/// HTTP SSE callbacks use exact named input and result schemas.
 #[cfg(feature = "http-client")]
 fn sse_callback_input_schema(params: &[TypeSchema]) -> bool {
     matches!(
@@ -174,16 +172,10 @@ fn sse_callback_input_schema(params: &[TypeSchema]) -> bool {
 
 #[cfg(feature = "http-client")]
 fn sse_callback_action_result_schema(result: &TypeSchema) -> bool {
-    match result {
-        TypeSchema::Named(name, args) => name == "SseCallbackAction" && args.is_empty(),
-        TypeSchema::Object(fields) => {
-            fields.len() == 1
-                && fields
-                    .get("action")
-                    .is_some_and(|ty| matches!(ty, TypeSchema::String))
-        }
-        _ => false,
-    }
+    matches!(
+        result,
+        TypeSchema::Named(name, args) if name == "SseCallbackAction" && args.is_empty()
+    )
 }
 
 impl Vm {
@@ -193,8 +185,8 @@ impl Vm {
     /// always validates that `callback` is a callable owned by this VM and has
     /// arity one. When its metadata is [`TypeSchema::Callable`], the VM also
     /// validates a map or Named argument and a map, Named, or Object result. HTTP SSE
-    /// uses [`Self::validate_sse_callback_value`] for the exact
-    /// `SseCallbackAction` named/object contract rather than an arbitrary map.
+    /// uses [`Self::validate_sse_callback_value`] for the exact named
+    /// `SseCallbackAction` contract.
     /// The VM then owns the callback and driver until completion, cancellation,
     /// reset, or error; removing the driver drops it to release producer
     /// resources.
@@ -311,12 +303,15 @@ impl Vm {
         else {
             return Ok(());
         };
-        if let Some(TypeSchema::Callable { params, result, .. }) = &prototype.schema
-            && (!sse_callback_input_schema(params) || !sse_callback_action_result_schema(result))
-        {
-            return Err(VmError::TypeMismatch("fn(SseEvent) -> SseCallbackAction"));
+        match &prototype.schema {
+            Some(TypeSchema::Callable { params, result, .. })
+                if sse_callback_input_schema(params)
+                    && sse_callback_action_result_schema(result) =>
+            {
+                Ok(())
+            }
+            _ => Err(VmError::TypeMismatch("fn(SseEvent) -> SseCallbackAction")),
         }
-        Ok(())
     }
 
     pub(crate) fn cancel_callable_stream_with_reason(

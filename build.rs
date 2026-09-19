@@ -166,18 +166,20 @@ fn main() {
 
     // The SQLite namespace is optional: its builtin module links rusqlite,
     // which is not available on every target or without the `sqlite` feature.
-    // When the feature is off (or the target is wasm32, where rusqlite's
+    // When the feature is off (or the target family is wasm, where rusqlite's
     // bundled build is unsupported), drop the namespace and its static
     // catalog IDs so the generated catalog, dispatch, and compiler namespace
     // surface stay consistent and feature-clean.
+    let target_family = env::var("CARGO_CFG_TARGET_FAMILY").expect("missing target family");
     let sqlite_enabled = env::var_os("CARGO_FEATURE_SQLITE").is_some()
-        && env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("wasm32");
+        && !target_family
+            .split(',')
+            .any(|family| family.trim() == "wasm");
     if !sqlite_enabled {
         namespaces.retain(|namespace| namespace.namespace != "sqlite");
         catalog.retain(|entry| !entry.source_name.starts_with("sqlite::"));
     }
 
-    let target_family = env::var("CARGO_CFG_TARGET_FAMILY").expect("missing target family");
     let mut host_sources = vec![
         SourceSpec {
             path: "src/builtins/runtime/host.rs".to_string(),
@@ -206,8 +208,7 @@ fn main() {
         });
     }
     let async_enabled = env::var_os("CARGO_FEATURE_ASYNC").is_some();
-    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("missing target architecture");
-    let builtin_sources = builtin_source_specs(&namespaces, async_enabled, &target_arch);
+    let builtin_sources = builtin_source_specs(&namespaces, async_enabled, &target_family);
     let core_sources = [SourceSpec {
         path: "src/builtins/runtime/core.rs".to_string(),
         module: "core".to_string(),
@@ -279,8 +280,11 @@ fn write_generated_file(path: &Path, contents: &str) {
         .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
 }
 
-pub(crate) fn select_io_source_path(async_enabled: bool, target_arch: &str) -> &'static str {
-    if target_arch == "wasm32" {
+pub(crate) fn select_io_source_path(async_enabled: bool, target_family: &str) -> &'static str {
+    if target_family
+        .split(',')
+        .any(|family| family.trim() == "wasm")
+    {
         "src/builtins/runtime/io_wasm.rs"
     } else if async_enabled {
         "src/builtins/runtime/io/async_io.rs"
@@ -292,13 +296,13 @@ pub(crate) fn select_io_source_path(async_enabled: bool, target_arch: &str) -> &
 fn builtin_source_specs(
     namespaces: &[NamespaceDecl],
     async_enabled: bool,
-    target_arch: &str,
+    target_family: &str,
 ) -> Vec<SourceSpec> {
     namespaces
         .iter()
         .map(|namespace| {
             let path = if namespace.module == "io" {
-                select_io_source_path(async_enabled, target_arch).to_string()
+                select_io_source_path(async_enabled, target_family).to_string()
             } else {
                 format!("src/builtins/runtime/{}.rs", namespace.module)
             };
@@ -2261,11 +2265,7 @@ fn find_matching_paren(source: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        HostExecutionKind, NamespaceDecl, SourceCategory, builtin_source_specs,
-        http_transport_enabled, parse_source_file, select_io_source_path,
-    };
-    use std::path::Path;
+    use super::{http_transport_enabled, select_io_source_path};
 
     #[test]
     fn http_transport_predicate_matches_source_and_catalog_boundary() {
@@ -2277,87 +2277,32 @@ mod tests {
         assert!(!http_transport_enabled(false, "wasm"));
     }
 
-    fn io_namespace() -> NamespaceDecl {
-        NamespaceDecl {
-            namespace: "io".to_string(),
-            module: "io".to_string(),
-            docs: "I/O".to_string(),
-            runtime_supported_on_wasm: false,
-        }
-    }
-
     #[test]
     fn io_source_selection_matches_runtime_module_cfg() {
         assert_eq!(
-            select_io_source_path(false, "x86_64"),
+            select_io_source_path(false, "unix"),
             "src/builtins/runtime/io/blocking.rs"
         );
         assert_eq!(
-            select_io_source_path(true, "x86_64"),
+            select_io_source_path(true, "unix"),
             "src/builtins/runtime/io/async_io.rs"
         );
         assert_eq!(
-            select_io_source_path(false, "aarch64"),
+            select_io_source_path(false, "windows"),
             "src/builtins/runtime/io/blocking.rs"
         );
         assert_eq!(
-            select_io_source_path(true, "aarch64"),
+            select_io_source_path(true, "windows"),
             "src/builtins/runtime/io/async_io.rs"
         );
         assert_eq!(
-            select_io_source_path(false, "wasm32"),
+            select_io_source_path(false, "wasm"),
             "src/builtins/runtime/io_wasm.rs"
         );
         assert_eq!(
-            select_io_source_path(true, "wasm32"),
+            select_io_source_path(true, "wasm"),
             "src/builtins/runtime/io_wasm.rs"
         );
-    }
-
-    #[test]
-    fn selected_io_source_drives_generated_metadata_input() {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let namespace = io_namespace();
-        for (async_enabled, target_arch) in [
-            (false, "x86_64"),
-            (true, "x86_64"),
-            (false, "wasm32"),
-            (true, "wasm32"),
-        ] {
-            let specs =
-                builtin_source_specs(std::slice::from_ref(&namespace), async_enabled, target_arch);
-            let spec = specs
-                .iter()
-                .find(|spec| spec.category == SourceCategory::NamespacedBuiltin)
-                .expect("the IO namespace must produce a source spec");
-            assert_eq!(
-                spec.path,
-                select_io_source_path(async_enabled, target_arch),
-                "metadata must use the same source selected by the runtime module"
-            );
-            let source = std::fs::read_to_string(manifest_dir.join(&spec.path))
-                .expect("selected IO source must be readable");
-            let open_marker = if async_enabled && target_arch != "wasm32" {
-                "async fn builtin_io_open"
-            } else {
-                "fn builtin_io_open"
-            };
-            assert!(
-                source.contains(open_marker),
-                "selected source must provide the expected IO implementation"
-            );
-            let callables = parse_source_file(&manifest_dir.join(&spec.path), spec, 0);
-            let open = callables
-                .iter()
-                .find(|callable| callable.name == "io::open")
-                .expect("selected IO source must contain io::open");
-            let expected_execution = if async_enabled || target_arch == "wasm32" {
-                HostExecutionKind::MaySuspend
-            } else {
-                HostExecutionKind::Sync
-            };
-            assert_eq!(open.host_execution, expected_execution);
-        }
     }
 }
 

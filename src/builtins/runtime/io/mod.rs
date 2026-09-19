@@ -18,13 +18,13 @@
 //! contract and the target it compiles for cannot drift.
 
 use super::borrow_arg;
-#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "async", not(target_family = "wasm")))]
 use super::{CallOutcome, CaptureAsyncHostContext, return_one};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use crate::vm::Vm;
 
 /// The synchronous pending-call channel used only by the wasm32 stub backend.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub(super) use super::HostCallResult;
 
 /// The canonical catalog key of the `io.file` resource type.
@@ -45,7 +45,7 @@ pub(crate) const IO_FILE_DESCRIPTION: &str = "An open file handle";
 // rejects every IO call regardless of policy, so the type and its accessors
 // exist only where they are consulted.
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IoPolicy {
     pub allowed_roots: Vec<String>,
@@ -55,7 +55,7 @@ pub struct IoPolicy {
     pub max_write_bytes: usize,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 impl Default for IoPolicy {
     fn default() -> Self {
         Self {
@@ -69,13 +69,13 @@ impl Default for IoPolicy {
 }
 
 /// I/O host configuration owned by the I/O host implementation.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub trait IoHostExt {
     fn configure_io(&mut self, policy: IoPolicy);
     fn clear_io_configuration(&mut self);
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 impl IoHostExt for Vm {
     fn configure_io(&mut self, mut policy: IoPolicy) {
         policy.allowed_roots.sort();
@@ -92,7 +92,7 @@ impl IoHostExt for Vm {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn io_policy(vm: &Vm) -> Option<IoPolicy> {
     vm.host
         .get_module_state::<IoPolicy>()
@@ -102,22 +102,22 @@ pub(super) fn io_policy(vm: &Vm) -> Option<IoPolicy> {
 
 // ---- cfg-selected implementations -----------------------------------------
 
-#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "async", not(target_family = "wasm")))]
 mod async_io;
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
+#[cfg(all(not(feature = "async"), not(target_family = "wasm")))]
 mod blocking;
 /// The wasm32 backend lives beside the native ones in the runtime module and is
 /// pulled in here so it inherits this module's contracts, catalog, ownership
 /// list, and resource metadata.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 #[path = "../io_wasm.rs"]
 mod wasm;
 
-#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "async", not(target_family = "wasm")))]
 pub(crate) use async_io::*;
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
+#[cfg(all(not(feature = "async"), not(target_family = "wasm")))]
 pub(crate) use blocking::*;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub(crate) use wasm::*;
 
 // ---- guest contracts -------------------------------------------------------
