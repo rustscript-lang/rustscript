@@ -43,6 +43,22 @@ fn builtin_pending_completion_uses_declared_return_type() {
         ) -> Poll<VmResult<CallReturn>> {
             Poll::Pending
         }
+
+        fn poll_submitted_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut Context<'_>,
+        ) -> Poll<VmResult<vm::HostFutureOutput>> {
+            Poll::Pending
+        }
+
+        fn cleanup_op(
+            &mut self,
+            _op_id: HostOpId,
+            _terminal: vm::HostAsyncOpTerminal,
+        ) -> VmResult<()> {
+            Ok(())
+        }
     }
 
     let builtin = BuiltinFunction::from_namespaced_name("io::exists")
