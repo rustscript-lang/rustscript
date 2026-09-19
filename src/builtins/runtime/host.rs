@@ -49,9 +49,9 @@ fn sleep_duration(millis: i64) -> VmResult<Duration> {
 #[pd_host_function(name = "runtime::sleep")]
 fn runtime_sleep_impl(ms: i64) -> VmResult<bool> {
     let duration = sleep_duration(ms)?;
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     std::thread::sleep(duration);
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     let _ = duration;
     Ok(true)
 }

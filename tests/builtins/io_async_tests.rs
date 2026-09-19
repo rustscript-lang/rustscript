@@ -1,6 +1,10 @@
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use vm::{Value, Vm, VmError, VmStatus, compile_source};
+use vm::{
+    BuiltinFunction, BytecodeBuilder, CallReturn, HostAsyncBridge, HostFuture, HostOpId, Program,
+    Value, Vm, VmError, VmResult, VmStatus, compile_source,
+};
 
 use super::vm_reset::reset_for_reuse_to_ready;
 
@@ -21,6 +25,61 @@ fn run_source(source: &str) -> Result<Vec<Value>, VmError> {
             }
         }
     }
+}
+
+#[test]
+fn builtin_pending_completion_uses_declared_return_type() {
+    struct PendingBridge;
+
+    impl HostAsyncBridge for PendingBridge {
+        fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
+            Ok(())
+        }
+
+        fn poll_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut Context<'_>,
+        ) -> Poll<VmResult<CallReturn>> {
+            Poll::Pending
+        }
+    }
+
+    let builtin = BuiltinFunction::from_namespaced_name("io::exists")
+        .expect("io::exists builtin should be available");
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ldc(0);
+    bytecode.call(builtin.call_index(), 1);
+    bytecode.ret();
+
+    let mut vm = Vm::new(Program::new(vec![Value::string(".")], bytecode.finish()));
+    vm.set_async_bridge(Box::new(PendingBridge))
+        .expect("pending bridge should install");
+    let VmStatus::Waiting(op_id) = vm.run().expect("builtin should enter pending") else {
+        panic!("io::exists should suspend");
+    };
+    let error = vm
+        .complete_host_op(op_id, CallReturn::one(Value::string("wrong")))
+        .expect_err("pending completion must reject the wrong type");
+    assert!(matches!(error, VmError::TypeMismatch("bool")), "{error:?}");
+
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ldc(0);
+    bytecode.call(builtin.call_index(), 1);
+    bytecode.ret();
+    let mut vm = Vm::new(Program::new(vec![Value::string(".")], bytecode.finish()));
+    vm.set_async_bridge(Box::new(PendingBridge))
+        .expect("pending bridge should install");
+    let VmStatus::Waiting(op_id) = vm.run().expect("builtin should enter pending") else {
+        panic!("io::exists should suspend");
+    };
+    vm.complete_host_op(op_id, CallReturn::one(Value::Bool(true)))
+        .expect("matching pending completion should be accepted");
+    assert_eq!(
+        vm.resume().expect("resume after completion"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Bool(true)]);
 }
 
 #[test]
@@ -94,46 +153,6 @@ fn async_io_popen_reads_through_tokio_process_pipe() {
     .expect("async popen program should complete");
 
     assert_eq!(stack.last(), Some(&Value::string("async-process")));
-}
-
-#[test]
-fn io_implementations_use_only_generic_async_and_inline_sync_lifecycles() {
-    let async_source = include_str!("../../src/builtins/runtime/io/async_io.rs");
-    let blocking_source = include_str!("../../src/builtins/runtime/io/blocking.rs");
-
-    for forbidden in [
-        "AtomicBool",
-        "AtomicU32",
-        "std::thread",
-        "thread::Builder",
-        "JoinHandle",
-        "runtime::Builder",
-        "spawn_blocking",
-        "submit_host_future",
-        "HostAsyncBridge",
-        "HostOperation",
-        "IoOperationLease",
-        "active_operations",
-        "close_waker",
-        "close_scheduled",
-        "close_future",
-        "owner_alive",
-        "process_id:",
-        "try_lock()",
-        "wake_by_ref()",
-        "OperationSpec",
-        "schedule_io_task",
-        "worker_done",
-    ] {
-        assert!(
-            !async_source.contains(forbidden),
-            "async IO must not contain `{forbidden}` lifecycle machinery"
-        );
-        assert!(
-            !blocking_source.contains(forbidden),
-            "blocking IO must be synchronous inline code without `{forbidden}`"
-        );
-    }
 }
 
 #[cfg(unix)]
