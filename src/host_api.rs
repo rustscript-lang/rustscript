@@ -5858,7 +5858,10 @@ mod tests {
             &bytes[..FINGERPRINT_DOMAIN_MAGIC.len()],
             FINGERPRINT_DOMAIN_MAGIC
         );
-        assert_eq!(bytes[FINGERPRINT_DOMAIN_MAGIC.len()], 2);
+        assert_eq!(
+            bytes[FINGERPRINT_DOMAIN_MAGIC.len()],
+            FINGERPRINT_FORMAT_VERSION
+        );
         assert_eq!(catalog.canonical_bytes(), bytes);
     }
 
