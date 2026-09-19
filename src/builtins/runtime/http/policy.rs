@@ -1,7 +1,13 @@
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Instant;
+
+use hyper_util::client::legacy::connect::dns::Name;
+use tower_service::Service;
 
 use super::config::HttpConfig;
 use crate::vm::{VmError, VmResult};
@@ -83,6 +89,54 @@ pub(super) struct ConnectionPermit {
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// DNS resolver used by Hyper's connector.
+///
+/// The request path validates scheme, host, port, and every current DNS answer
+/// before dispatch. Hyper invokes this resolver whenever its pool needs a new
+/// connection, so the address used by the actual socket is checked again and
+/// cannot bypass the private-address policy through DNS rebinding.
+#[derive(Clone, Debug)]
+pub(super) struct PolicyResolver {
+    allow_private_ips: bool,
+}
+
+impl PolicyResolver {
+    pub(super) fn new(config: &HttpConfig) -> Self {
+        Self {
+            allow_private_ips: config.allow_private_ips,
+        }
+    }
+}
+
+impl Service<Name> for PolicyResolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = std::io::Error;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        let host = name.as_str().to_string();
+        let allow_private_ips = self.allow_private_ips;
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .collect::<Vec<_>>();
+            let config = HttpConfig {
+                allow_private_ips,
+                ..HttpConfig::default()
+            };
+            validate_resolved_addresses(&config, &addresses).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+            })?;
+            Ok(addresses.into_iter())
+        })
     }
 }
 
