@@ -38,7 +38,7 @@ http-client = [
     "dep:tower-service",
     "dep:url",
 ]
-sqlite = ["runtime", "dep:rusqlite"]
+sqlite = ["async", "dep:rusqlite", "dep:tokio-rusqlite"]
 edge-abi = [
     "dep:edge_abi",
     "edge_abi/console",
@@ -87,7 +87,8 @@ cranelift-jit = { version = "0.129.1", optional = true }
 cranelift-module = { version = "0.129.1", optional = true }
 cranelift-native = { version = "0.129.1", optional = true }
 pd-host-function = { path = "./pd-host-function", version = "0.1.0" }
-rusqlite = { version = "0.32", default-features = false, features = ["bundled", "hooks", "limits"], optional = true }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "hooks", "limits"], optional = true }
+tokio-rusqlite = { version = "0.8", optional = true }
 edge_abi = { package = "pd-edge-abi", version = "0.1.1", default-features = false, optional = true }
 futures-channel = "0.3"
 paste = "1"
