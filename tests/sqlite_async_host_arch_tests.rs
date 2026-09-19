@@ -34,6 +34,9 @@ fn sqlite_host_functions_are_macro_owned_async_functions() {
 
 #[test]
 fn sqlite_host_owns_no_threads_or_custom_operation_driver() {
+    let implementation = SQLITE_SOURCE
+        .split_once("\n#[cfg(test)]\nmod tests")
+        .map_or(SQLITE_SOURCE, |(implementation, _tests)| implementation);
     for forbidden in [
         "std::thread",
         "thread::",
@@ -56,7 +59,7 @@ fn sqlite_host_owns_no_threads_or_custom_operation_driver() {
         "quiescence_waker",
     ] {
         assert!(
-            !SQLITE_SOURCE.contains(forbidden),
+            !implementation.contains(forbidden),
             "SQLite host source must not contain custom scheduling token `{forbidden}`"
         );
     }

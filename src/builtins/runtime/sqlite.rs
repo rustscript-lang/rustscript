@@ -42,6 +42,9 @@ use crate::vm::{
 /// SQLite `progress_handler` step cadence used to enforce transaction deadlines.
 const SQLITE_PROGRESS_STEPS: i32 = 1_000;
 
+/// Maximum adapter close attempts, including the initial request.
+const SQLITE_CLOSE_MAX_ATTEMPTS: usize = 3;
+
 /// Bounded SQLite connection/query limits, mirroring the published surface.
 #[derive(Clone, Copy, Debug)]
 pub struct SqliteLimits {
@@ -145,15 +148,19 @@ type SqliteCloseFuture = Pin<Box<dyn Future<Output = SqliteCloseAttempt> + Send 
 
 enum SqliteCloseState {
     Open,
-    Closing(SqliteCloseFuture),
-    // `tokio-rusqlite` returns a live handle with `Error::Close`; retain it so
-    // explicit close can fail without losing the resource and scope teardown
-    // can retry without releasing the connection permit.
-    Retryable {
-        connection: tokio_rusqlite::Connection,
+    Closing {
+        future: SqliteCloseFuture,
+        attempts: usize,
+    },
+    // A terminal error cannot be reported as resource-close completion:
+    // `ResourceTable` reclaims every Ready resource, including cleanup errors.
+    // Retain a returned adapter handle when available and park the resource so
+    // its connection permit and the VM reuse guard remain held.
+    Terminal {
+        _connection: Option<tokio_rusqlite::Connection>,
         message: String,
     },
-    Finished(Result<(), String>),
+    Closed,
 }
 
 struct SqliteCloseLifecycle {
@@ -235,12 +242,15 @@ impl SqliteCloseLifecycle {
             SqliteCloseState::Open => {
                 closed.store(true, Ordering::Release);
                 interrupt.interrupt();
-                *state = SqliteCloseState::Closing(self.close_future(connection));
+                *state = SqliteCloseState::Closing {
+                    future: self.close_future(connection),
+                    attempts: 1,
+                };
                 Ok(false)
             }
-            SqliteCloseState::Closing(_) => Ok(false),
-            SqliteCloseState::Retryable { message, .. } => Err(message.clone()),
-            SqliteCloseState::Finished(result) => result.clone().map(|()| true),
+            SqliteCloseState::Closing { .. } => Ok(false),
+            SqliteCloseState::Terminal { message, .. } => Err(message.clone()),
+            SqliteCloseState::Closed => Ok(true),
         }
     }
 
@@ -249,66 +259,64 @@ impl SqliteCloseLifecycle {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match &mut *state {
-            SqliteCloseState::Open => Poll::Pending,
-            SqliteCloseState::Closing(future) => match future.as_mut().poll(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(SqliteCloseAttempt::Closed) => {
-                    *state = SqliteCloseState::Finished(Ok(()));
-                    Poll::Ready(Ok(()))
+        loop {
+            match &mut *state {
+                SqliteCloseState::Open => return Poll::Pending,
+                SqliteCloseState::Closing { future, attempts } => {
+                    match future.as_mut().poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(SqliteCloseAttempt::Closed) => {
+                            *state = SqliteCloseState::Closed;
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Ready(SqliteCloseAttempt::Retryable {
+                            connection,
+                            message: _,
+                        }) if *attempts < SQLITE_CLOSE_MAX_ATTEMPTS => {
+                            let attempts = *attempts + 1;
+                            *state = SqliteCloseState::Closing {
+                                future: self.close_future(connection),
+                                attempts,
+                            };
+                            // Poll the replacement now so it either registers
+                            // the caller's waker or consumes another bounded,
+                            // immediately-ready retry. Never self-wake here.
+                        }
+                        Poll::Ready(SqliteCloseAttempt::Retryable {
+                            connection,
+                            message,
+                        }) => {
+                            let result = Err(message.clone());
+                            *state = SqliteCloseState::Terminal {
+                                _connection: Some(connection),
+                                message,
+                            };
+                            return Poll::Ready(result);
+                        }
+                        Poll::Ready(SqliteCloseAttempt::Failed(message)) => {
+                            let result = Err(message.clone());
+                            *state = SqliteCloseState::Terminal {
+                                _connection: None,
+                                message,
+                            };
+                            return Poll::Ready(result);
+                        }
+                    }
                 }
-                Poll::Ready(SqliteCloseAttempt::Retryable {
-                    connection,
-                    message,
-                }) => {
-                    let result = Err(message.clone());
-                    *state = SqliteCloseState::Retryable {
-                        connection,
-                        message,
-                    };
-                    Poll::Ready(result)
+                SqliteCloseState::Terminal { message, .. } => {
+                    return Poll::Ready(Err(message.clone()));
                 }
-                Poll::Ready(SqliteCloseAttempt::Failed(message)) => {
-                    let result = Err(message.clone());
-                    *state = SqliteCloseState::Finished(Err(message));
-                    Poll::Ready(result)
-                }
-            },
-            SqliteCloseState::Retryable { message, .. } => Poll::Ready(Err(message.clone())),
-            SqliteCloseState::Finished(result) => Poll::Ready(result.clone()),
+                SqliteCloseState::Closed => return Poll::Ready(Ok(())),
+            }
         }
     }
 
-    fn retry_after_failure(&self) -> bool {
-        let mut state = self
+    fn has_terminal_failure(&self) -> bool {
+        let state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::mem::replace(&mut *state, SqliteCloseState::Open);
-        match previous {
-            SqliteCloseState::Retryable { connection, .. } => {
-                *state = SqliteCloseState::Closing(self.close_future(connection));
-                true
-            }
-            previous => {
-                *state = previous;
-                false
-            }
-        }
-    }
-
-    fn reopen_after_failure(&self, closed: &AtomicBool) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if matches!(
-            &*state,
-            SqliteCloseState::Retryable { .. } | SqliteCloseState::Finished(Err(_))
-        ) {
-            *state = SqliteCloseState::Open;
-            closed.store(false, Ordering::Release);
-        }
+        matches!(&*state, SqliteCloseState::Terminal { .. })
     }
 }
 
@@ -342,6 +350,7 @@ impl HostResource for SqliteResource {
         ) {
             Ok(true) => Ok(CloseProgress::Ready),
             Ok(false) => Ok(CloseProgress::Pending),
+            Err(_) if self.close_lifecycle.has_terminal_failure() => Ok(CloseProgress::Pending),
             Err(message) => Err(sqlite_close_resource_error(message)),
         }
     }
@@ -349,12 +358,7 @@ impl HostResource for SqliteResource {
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
         match self.close_lifecycle.poll(cx) {
             Poll::Pending => Poll::Pending,
-            // A retryable adapter failure cannot become `Ready`: the resource
-            // table reclaims every ready resource, including cleanup errors.
-            Poll::Ready(Err(_)) if self.close_lifecycle.retry_after_failure() => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
+            Poll::Ready(Err(_)) if self.close_lifecycle.has_terminal_failure() => Poll::Pending,
             Poll::Ready(result) => Poll::Ready(result.map_err(sqlite_close_resource_error)),
         }
     }
@@ -1618,15 +1622,9 @@ pub(super) async fn builtin_sqlite_close_impl(
         context.interrupt.as_ref(),
         context.closed.as_ref(),
     ) {
-        context
-            .close_lifecycle
-            .reopen_after_failure(context.closed.as_ref());
         return Err(VmError::HostError(message));
     }
     if let Err(message) = std::future::poll_fn(|cx| context.close_lifecycle.poll(cx)).await {
-        context
-            .close_lifecycle
-            .reopen_after_failure(context.closed.as_ref());
         return Err(VmError::HostError(message));
     }
     let handle = context.handle;
@@ -1736,11 +1734,23 @@ impl SqliteHostExt for Vm {
 mod tests {
     use std::future::Future;
     use std::sync::mpsc;
-    use std::task::{Context, Poll, Waker};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::vm::resource::ResourceTable;
+
+    struct CountingWake(Arc<AtomicUsize>);
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn transaction_deadline_rolls_back_an_observed_write() {
@@ -1852,14 +1862,24 @@ mod tests {
         );
 
         let mut cx = Context::from_waker(Waker::noop());
-        assert!(matches!(table.poll_close(token, &mut cx), Poll::Pending));
+        let first_poll = table.poll_close(token, &mut cx);
         assert_eq!(close_lifecycle.failures_seen(), 1);
-        assert_eq!(table.len(), 1, "retryable close must retain the resource");
-        assert_eq!(
-            open_connections.load(Ordering::Acquire),
-            1,
-            "retryable close must retain the connection permit"
-        );
+        match first_poll {
+            Poll::Pending => {
+                assert_eq!(table.len(), 1, "pending close must retain the resource");
+                assert_eq!(
+                    open_connections.load(Ordering::Acquire),
+                    1,
+                    "pending close must retain the connection permit"
+                );
+            }
+            Poll::Ready(Ok(())) => {
+                assert!(table.is_empty());
+                assert_eq!(open_connections.load(Ordering::Acquire), 0);
+                return;
+            }
+            Poll::Ready(Err(error)) => panic!("transient retry must close cleanly: {error}"),
+        };
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1875,6 +1895,90 @@ mod tests {
         .expect("retry should close the resource");
         assert!(table.is_empty());
         assert_eq!(open_connections.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn persistent_close_failure_parks_without_self_waking_or_releasing_the_permit() {
+        let limits = SqliteLimits::default();
+        let options = OpenOptions {
+            path: ":memory:".to_string(),
+            mode: OpenMode::Memory,
+            root: None,
+            limits,
+            allow_unsafe_sql: false,
+        };
+        let (connection, interrupt) = open_connection(&options)
+            .await
+            .expect("adapter connection should open");
+        let open_connections = Arc::new(AtomicUsize::new(1));
+        let close_lifecycle = Arc::new(SqliteCloseLifecycle::new_with_failures(usize::MAX));
+        let resource = SqliteResource {
+            connection,
+            interrupt,
+            limits,
+            allow_unsafe_sql: false,
+            closed: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            close_lifecycle: Arc::clone(&close_lifecycle),
+            _connection_permit: ConnectionCountPermit {
+                open_connections: Arc::clone(&open_connections),
+            },
+        };
+        let program = crate::compile_source("null;")
+            .expect("test program should compile")
+            .program;
+        let mut vm = Vm::new(program);
+        vm.execution_scope()
+            .push_resource(resource)
+            .expect("SQLite resource should insert");
+        vm.reset_for_reuse().expect("reset should start");
+        assert!(
+            vm.scope_reset_pending(),
+            "failed cleanup must keep reset pending"
+        );
+        assert!(!vm.is_reusable(), "pending cleanup must block VM reuse");
+
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountingWake(Arc::clone(&wake_count))));
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(vm.poll_reset_for_reuse(&mut cx), Poll::Pending));
+        assert_eq!(
+            close_lifecycle.failures_seen(),
+            3,
+            "persistent failure must stop after the finite close-attempt budget"
+        );
+        assert_eq!(
+            wake_count.load(Ordering::SeqCst),
+            0,
+            "terminal cleanup failure must not self-wake"
+        );
+
+        for _ in 0..16 {
+            assert!(matches!(vm.poll_reset_for_reuse(&mut cx), Poll::Pending));
+        }
+        assert_eq!(
+            close_lifecycle.failures_seen(),
+            3,
+            "polling a parked failure must not start another close"
+        );
+        assert_eq!(wake_count.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            vm.host_context().resource_count(),
+            1,
+            "failed close must retain the resource"
+        );
+        assert_eq!(
+            open_connections.load(Ordering::Acquire),
+            1,
+            "failed close must retain the connection permit"
+        );
+        assert!(vm.scope_reset_pending());
+        assert!(!vm.is_reusable());
+        assert_eq!(
+            close_lifecycle.failures_seen(),
+            3,
+            "repeated reset polls must not double-close a parked connection"
+        );
     }
 
     #[tokio::test]
