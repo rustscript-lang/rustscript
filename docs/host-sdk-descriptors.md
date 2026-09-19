@@ -205,6 +205,32 @@ return `HostFutureOutput<T>` and use `HostFutureOutput::continue_with`; value
 mapping preserves that continuation. The HTTP SSE builtin uses this only to
 transfer an opened Hyper response into the generic callable-stream driver.
 
+### Tokio runtime lease for process-backed IO
+
+With the `async` feature, `io::popen` and `io::close` use Tokio process and pipe
+types exclusively. The embedding Tokio runtime that spawns a process-backed IO
+resource must remain alive and actively driven until `io::close` completes or a
+VM reset has been polled to quiescence. This includes Windows process pipes: do
+not shut the runtime down while a process pipe operation or process cleanup is
+still active.
+
+Process close and reset cleanup must be polled while a live Tokio runtime is
+current. If reset cleanup is polled outside such a context, it returns the
+retryable resource error `runtime_required` immediately. The child, its pipes,
+the closing execution scope, and the pending reset remain owned by the VM; the
+VM cannot be reused. Re-enter and drive the runtime, then poll the same reset
+again. `Vm::clear_async_bridge` also rejects an execution scope with live
+resources or operations, and rejects a pending reset, so the bridge can be
+released only after scope quiescence.
+
+`Vm`, process IO resource, and process IO handle `Drop` paths are strictly
+nonblocking. They issue only immediate best-effort direct-child kill requests
+and, on Unix, a process-group signal. They do not poll cleanup futures, wait for
+the leader, or run Windows tree termination. Abrupt Drop therefore has no
+eventual-reap guarantee. Embeddings that require deterministic tree termination
+and leader reaping must finish explicit `io::close` or reset while the runtime
+lease is valid.
+
 What the contract does and does not change:
 
 - The contract **replaces only the guest schema**. The adapter, binding class, and

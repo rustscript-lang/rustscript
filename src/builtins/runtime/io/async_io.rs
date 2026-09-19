@@ -4,6 +4,12 @@
 //! handles remain typed execution-scope resources because they span guest
 //! calls; transient reads, writes, flushes, and closes rely on the generic
 //! submitted-future lifecycle.
+//!
+//! Process resources borrow the embedding's Tokio runtime as a runtime lease:
+//! the runtime that spawns them must remain alive and actively driven until an
+//! explicit close or reset reaches quiescence. Abrupt Drop only sends immediate
+//! best-effort kill signals; it never waits and provides no eventual-reap
+//! guarantee.
 
 use std::future::Future;
 use std::io;
@@ -43,17 +49,55 @@ impl Drop for IoHandle {
     fn drop(&mut self) {
         match self {
             Self::PopenRead { child, .. } | Self::PopenWrite { child, .. } => {
-                let _ = start_terminate_child_tree(child);
+                let _ = start_terminate_child_tree_for_drop(child);
             }
             Self::File(_) => {}
         }
     }
 }
 
+type ProcessTreeCleanupFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'static>>;
+type PreparedProcessCleanup = (
+    Option<ProcessTreeCleanupFuture>,
+    bool,
+    bool,
+    Option<io::Error>,
+);
+
+#[cfg(windows)]
+fn prepare_process_cleanup(
+    child: &mut Child,
+    _terminate_tree: fn(u32) -> io::Result<()>,
+) -> PreparedProcessCleanup {
+    let pid = child.id().unwrap_or(0);
+    (
+        Some(Box::pin(terminate_process_id(pid))),
+        false,
+        false,
+        None,
+    )
+}
+
+#[cfg(not(windows))]
+fn prepare_process_cleanup(
+    child: &mut Child,
+    terminate_tree: fn(u32) -> io::Result<()>,
+) -> PreparedProcessCleanup {
+    (
+        None,
+        true,
+        true,
+        start_terminate_child_tree_with(child, terminate_tree).err(),
+    )
+}
+
 /// The typed resource stored in the execution scope for one async IO handle.
 struct IoResource {
     handle: Arc<Mutex<Option<IoHandle>>>,
     process_tree_terminator: fn(u32) -> io::Result<()>,
+    process_tree_cleanup: Option<ProcessTreeCleanupFuture>,
+    process_tree_cleanup_complete: bool,
+    leader_kill_started: bool,
     deferred_process_cleanup_error: Option<io::Error>,
 }
 
@@ -61,7 +105,10 @@ impl IoResource {
     fn new(handle: IoHandle) -> Self {
         Self {
             handle: Arc::new(Mutex::new(Some(handle))),
-            process_tree_terminator: terminate_process_id,
+            process_tree_terminator: signal_process_tree_for_drop,
+            process_tree_cleanup: None,
+            process_tree_cleanup_complete: false,
+            leader_kill_started: false,
             deferred_process_cleanup_error: None,
         }
     }
@@ -74,6 +121,9 @@ impl IoResource {
         Self {
             handle: Arc::new(Mutex::new(Some(handle))),
             process_tree_terminator,
+            process_tree_cleanup: None,
+            process_tree_cleanup_complete: false,
+            leader_kill_started: false,
             deferred_process_cleanup_error: None,
         }
     }
@@ -93,18 +143,26 @@ impl IoResource {
     fn begin_close_after_operations_quiesce(&mut self) -> ResourceResult<CloseProgress> {
         let process_tree_terminator = self.process_tree_terminator;
         let slot = self.exclusive_handle_slot()?;
-        let (progress, cleanup_error) = match slot.as_mut() {
+        let (progress, process_cleanup) = match slot.as_mut() {
             None => (CloseProgress::Ready, None),
             Some(IoHandle::File(_)) => {
                 slot.take();
                 (CloseProgress::Ready, None)
             }
-            Some(IoHandle::PopenRead { child, .. }) | Some(IoHandle::PopenWrite { child, .. }) => {
-                let cleanup_error =
-                    start_terminate_child_tree_with(child, process_tree_terminator).err();
-                (CloseProgress::Pending, cleanup_error)
-            }
+            Some(IoHandle::PopenRead { child, .. }) | Some(IoHandle::PopenWrite { child, .. }) => (
+                CloseProgress::Pending,
+                Some(prepare_process_cleanup(child, process_tree_terminator)),
+            ),
         };
+        let (
+            process_tree_cleanup,
+            process_tree_cleanup_complete,
+            leader_kill_started,
+            cleanup_error,
+        ) = process_cleanup.unwrap_or((None, true, true, None));
+        self.process_tree_cleanup = process_tree_cleanup;
+        self.process_tree_cleanup_complete = process_tree_cleanup_complete;
+        self.leader_kill_started = leader_kill_started;
         self.deferred_process_cleanup_error = cleanup_error;
         Ok(progress)
     }
@@ -112,6 +170,9 @@ impl IoResource {
     fn poll_process_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
         let Self {
             handle,
+            process_tree_cleanup,
+            process_tree_cleanup_complete,
+            leader_kill_started,
             deferred_process_cleanup_error,
             ..
         } = self;
@@ -128,17 +189,29 @@ impl IoResource {
         let poll = match slot.as_mut() {
             None | Some(IoHandle::File(_)) => Poll::Ready(Ok(())),
             Some(IoHandle::PopenRead { child, .. }) | Some(IoHandle::PopenWrite { child, .. }) => {
-                match child.try_wait() {
-                    Ok(Some(_)) => Poll::Ready(Ok(())),
-                    Err(error) => Poll::Ready(Err(error)),
-                    Ok(None) if tokio::runtime::Handle::try_current().is_err() => Poll::Pending,
-                    Ok(None) => {
-                        let mut wait = Box::pin(child.wait());
-                        match wait.as_mut().poll(cx) {
-                            Poll::Pending => Poll::Pending,
-                            Poll::Ready(result) => Poll::Ready(result.map(|_| ())),
-                        }
-                    }
+                if tokio::runtime::Handle::try_current().is_err() {
+                    return Poll::Ready(Err(runtime_required_resource_error()));
+                }
+                if !*process_tree_cleanup_complete {
+                    let cleanup = process_tree_cleanup
+                        .as_mut()
+                        .expect("pending process tree cleanup retains its future");
+                    let tree_result = match cleanup.as_mut().poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(result) => result,
+                    };
+                    process_tree_cleanup.take();
+                    *process_tree_cleanup_complete = true;
+                    let leader_result = child.start_kill().or_else(ignore_already_exited);
+                    *leader_kill_started = true;
+                    *deferred_process_cleanup_error =
+                        combine_process_cleanup_results(tree_result, leader_result).err();
+                }
+                debug_assert!(*leader_kill_started);
+                let mut wait = Box::pin(child.wait());
+                match wait.as_mut().poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(result) => Poll::Ready(result.map(|_| ())),
                 }
             }
         };
@@ -162,9 +235,9 @@ impl IoResource {
 impl Drop for IoResource {
     fn drop(&mut self) {
         if let Some(mutex) = Arc::get_mut(&mut self.handle)
-            && let Some(mut handle) = mutex.get_mut().take()
+            && let Some(handle) = mutex.get_mut().as_mut()
         {
-            let _ = start_close_io_handle(&mut handle);
+            start_close_io_handle_for_drop(handle);
         }
     }
 }
@@ -197,11 +270,20 @@ fn process_resource_error(error: io::Error) -> ResourceError {
     )
 }
 
-fn start_close_io_handle(handle: &mut IoHandle) -> ResourceResult<()> {
+fn runtime_required_resource_error() -> ResourceError {
+    ResourceError::new(
+        ResourceErrorCode::RuntimeRequired,
+        "io::resource",
+        "process cleanup requires polling from a live Tokio runtime",
+    )
+    .with_retryable_disposition()
+}
+
+fn start_close_io_handle_for_drop(handle: &mut IoHandle) {
     match handle {
-        IoHandle::File(_) => Ok(()),
+        IoHandle::File(_) => {}
         IoHandle::PopenRead { child, .. } | IoHandle::PopenWrite { child, .. } => {
-            start_terminate_child_tree(child).map_err(process_resource_error)
+            let _ = start_terminate_child_tree_for_drop(child);
         }
     }
 }
@@ -226,6 +308,16 @@ async fn close_shared_io_handle_with(
 }
 
 async fn close_io_handle(handle: &mut IoHandle) -> VmResult<()> {
+    if matches!(
+        handle,
+        IoHandle::PopenRead { .. } | IoHandle::PopenWrite { .. }
+    ) && tokio::runtime::Handle::try_current().is_err()
+    {
+        return Err(VmError::HostError(
+            "RuntimeRequired: io::close process cleanup must be polled from a live Tokio runtime"
+                .to_string(),
+        ));
+    }
     match handle {
         IoHandle::File(file) => {
             file.get_mut()
@@ -259,16 +351,17 @@ async fn kill_and_reap_child(child: &mut Child) -> io::Result<()> {
     }
 }
 
-async fn terminate_process_tree_and_leader<Tree, Leader, LeaderFuture>(
+async fn terminate_process_tree_and_leader<Tree, TreeFuture, Leader, LeaderFuture>(
     terminate_tree: Tree,
     terminate_leader: Leader,
 ) -> io::Result<()>
 where
-    Tree: FnOnce() -> io::Result<()>,
+    Tree: FnOnce() -> TreeFuture,
+    TreeFuture: Future<Output = io::Result<()>>,
     Leader: FnOnce() -> LeaderFuture,
     LeaderFuture: Future<Output = io::Result<()>>,
 {
-    let tree_result = terminate_tree();
+    let tree_result = terminate_tree().await;
     let leader_result = terminate_leader().await;
     combine_process_cleanup_results(tree_result, leader_result)
 }
@@ -290,8 +383,8 @@ fn combine_process_cleanup_results(
     }
 }
 
-fn start_terminate_child_tree(child: &mut Child) -> io::Result<()> {
-    start_terminate_child_tree_with(child, terminate_process_id)
+fn start_terminate_child_tree_for_drop(child: &mut Child) -> io::Result<()> {
+    start_terminate_child_tree_with(child, signal_process_tree_for_drop)
 }
 
 fn start_terminate_child_tree_with(
@@ -312,7 +405,7 @@ fn ignore_already_exited(error: io::Error) -> io::Result<()> {
     }
 }
 
-fn terminate_process_id(pid: u32) -> io::Result<()> {
+async fn terminate_process_id(pid: u32) -> io::Result<()> {
     if pid == 0 {
         return Ok(());
     }
@@ -326,9 +419,28 @@ fn terminate_process_id(pid: u32) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        run_taskkill_with(pid, std::process::Command::status)
+        run_taskkill_with(pid, |mut command| async move { command.status().await }).await
     }
     #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        Ok(())
+    }
+}
+
+fn signal_process_tree_for_drop(pid: u32) -> io::Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        terminate_unix_process_group_with(
+            pid,
+            |process_group, signal| unsafe { libc::kill(process_group, signal) },
+            io::Error::last_os_error,
+        )
+    }
+    #[cfg(not(unix))]
     {
         let _ = pid;
         Ok(())
@@ -359,13 +471,14 @@ where
 }
 
 #[cfg(any(windows, test))]
-fn run_taskkill_with<Run>(pid: u32, run: Run) -> io::Result<()>
+async fn run_taskkill_with<Run, RunFuture>(pid: u32, run: Run) -> io::Result<()>
 where
-    Run: FnOnce(&mut std::process::Command) -> io::Result<std::process::ExitStatus>,
+    Run: FnOnce(Command) -> RunFuture,
+    RunFuture: Future<Output = io::Result<std::process::ExitStatus>>,
 {
-    let mut command = std::process::Command::new("taskkill");
+    let mut command = Command::new("taskkill");
     command.args(["/T", "/F", "/PID", &pid.to_string()]);
-    let status = run(&mut command)?;
+    let status = run(command).await?;
     if status.success() {
         Ok(())
     } else {
@@ -765,7 +878,6 @@ fn spawn_shell_command(shell_command: &str, mode: &str) -> VmResult<IoHandle> {
     };
     #[cfg(unix)]
     process.process_group(0);
-    process.kill_on_drop(true);
     match mode {
         "r" => {
             process.stdout(Stdio::piped()).stdin(Stdio::null());
@@ -780,7 +892,7 @@ fn spawn_shell_command(shell_command: &str, mode: &str) -> VmResult<IoHandle> {
         .map_err(|error| VmError::HostError(format!("io_popen failed: {error}")))?;
     if mode == "r" {
         let Some(stdout) = child.stdout.take() else {
-            let cleanup = start_terminate_child_tree(&mut child);
+            let cleanup = start_terminate_child_tree_for_drop(&mut child);
             return Err(VmError::HostError(match cleanup {
                 Ok(()) => "io_popen('r') did not provide stdout pipe".to_string(),
                 Err(error) => format!(
@@ -794,7 +906,7 @@ fn spawn_shell_command(shell_command: &str, mode: &str) -> VmResult<IoHandle> {
         })
     } else {
         let Some(stdin) = child.stdin.take() else {
-            let cleanup = start_terminate_child_tree(&mut child);
+            let cleanup = start_terminate_child_tree_for_drop(&mut child);
             return Err(VmError::HostError(match cleanup {
                 Ok(()) => "io_popen('w') did not provide stdin pipe".to_string(),
                 Err(error) => format!(
@@ -816,6 +928,16 @@ mod tests {
 
     use super::*;
 
+    #[cfg(windows)]
+    static DROP_TREE_TERMINATION_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(windows)]
+    fn record_drop_tree_termination(_pid: u32) -> io::Result<()> {
+        DROP_TREE_TERMINATION_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
     fn file_resource() -> IoResource {
         let file = std::fs::File::open("Cargo.toml").expect("test fixture should exist");
         IoResource::new(IoHandle::File(BufReader::new(File::from_std(file))))
@@ -826,6 +948,25 @@ mod tests {
         started: Arc<StdMutex<bool>>,
     ) -> Pin<Box<dyn Future<Output = VmResult<()>> + Send + 'a>> {
         Box::pin(async move {
+            *started.lock().expect("started lock") = true;
+            pending().await
+        })
+    }
+
+    #[cfg(unix)]
+    fn start_process_kill_then_pending<'a>(
+        handle: &'a mut IoHandle,
+        started: Arc<StdMutex<bool>>,
+    ) -> Pin<Box<dyn Future<Output = VmResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            match handle {
+                IoHandle::PopenRead { child, .. } | IoHandle::PopenWrite { child, .. } => {
+                    child.start_kill().map_err(|error| {
+                        VmError::HostError(format!("test process kill failed: {error}"))
+                    })?;
+                }
+                IoHandle::File(_) => panic!("expected process handle"),
+            }
             *started.lock().expect("started lock") = true;
             pending().await
         })
@@ -850,6 +991,63 @@ mod tests {
         assert!(
             shared.lock().await.is_some(),
             "cancelling io::close must leave the real handle owned by the resource"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_process_close_retains_child_and_allows_retry_to_reap() {
+        let resource =
+            IoResource::new(spawn_shell_command("sleep 30", "r").expect("process should spawn"));
+        let shared = Arc::clone(&resource.handle);
+        let pid = {
+            let slot = shared.lock().await;
+            match slot.as_ref().expect("resource handle") {
+                IoHandle::PopenRead { child, .. } => child.id().expect("child pid"),
+                other => panic!("expected popen read handle, got {other:?}"),
+            }
+        };
+        let started = Arc::new(StdMutex::new(false));
+        let close_started = Arc::clone(&started);
+        let mut cancelled = Box::pin(close_shared_io_handle_with(
+            Arc::clone(&shared),
+            move |handle| start_process_kill_then_pending(handle, close_started),
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert!(matches!(cancelled.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(*started.lock().expect("started lock"));
+        drop(cancelled);
+        assert!(
+            shared.lock().await.is_some(),
+            "cancelled close must preserve the child and its pipe"
+        );
+
+        close_shared_io_handle_with(Arc::clone(&shared), close_io_handle_future)
+            .await
+            .expect("retry should terminate and reap the retained child");
+        assert!(shared.lock().await.is_none());
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "retry must reap the direct child"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_process_resource_does_not_run_synchronous_tree_termination() {
+        DROP_TREE_TERMINATION_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let resource = IoResource::new_with_process_tree_terminator(
+            spawn_shell_command("ping -n 30 127.0.0.1 >NUL", "r").expect("process should spawn"),
+            record_drop_tree_termination,
+        );
+
+        drop(resource);
+
+        assert_eq!(
+            DROP_TREE_TERMINATION_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Drop must use only the direct nonblocking child kill on Windows"
         );
     }
 
@@ -919,7 +1117,7 @@ mod tests {
         let leader_attempted = Arc::new(StdMutex::new(false));
         let attempted = Arc::clone(&leader_attempted);
         let error = terminate_process_tree_and_leader(
-            || {
+            || async {
                 Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "tree denied",
@@ -957,35 +1155,34 @@ mod tests {
         assert_eq!(error.raw_os_error(), Some(libc::EPERM));
     }
 
-    #[test]
-    fn taskkill_launch_failure_is_an_error() {
-        let launch = run_taskkill_with(42, |_| {
+    #[tokio::test]
+    async fn taskkill_launch_failure_is_an_error() {
+        let launch = run_taskkill_with(42, |_| async {
             Err(io::Error::new(io::ErrorKind::NotFound, "taskkill missing"))
         })
+        .await
         .expect_err("taskkill launch failure must propagate");
         assert_eq!(launch.kind(), io::ErrorKind::NotFound);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn unsuccessful_taskkill_status_is_an_error() {
-        let status = run_taskkill_with(42, |_| {
-            std::process::Command::new("sh")
-                .args(["-c", "exit 7"])
-                .status()
+    #[tokio::test]
+    async fn unsuccessful_taskkill_status_is_an_error() {
+        let status = run_taskkill_with(42, |_| async {
+            Command::new("sh").args(["-c", "exit 7"]).status().await
         })
+        .await
         .expect_err("unsuccessful taskkill status must propagate");
         assert!(status.to_string().contains("status"));
     }
 
     #[cfg(windows)]
-    #[test]
-    fn unsuccessful_taskkill_status_is_an_error() {
-        let status = run_taskkill_with(42, |_| {
-            std::process::Command::new("cmd")
-                .args(["/C", "exit", "7"])
-                .status()
+    #[tokio::test]
+    async fn unsuccessful_taskkill_status_is_an_error() {
+        let status = run_taskkill_with(42, |_| async {
+            Command::new("cmd").args(["/C", "exit", "7"]).status().await
         })
+        .await
         .expect_err("unsuccessful taskkill status must propagate");
         assert!(status.to_string().contains("status"));
     }
