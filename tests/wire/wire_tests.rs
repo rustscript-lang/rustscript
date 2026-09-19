@@ -68,62 +68,10 @@ fn wire_roundtrip_preserves_constants_and_code() {
     assert_eq!(decoded.type_map, program.type_map);
 }
 
-#[test]
-fn wire_v11_legacy_imports_decode_without_schema_metadata() {
-    let import = HostImport {
-        name: "legacy::import".to_string(),
-        arity: 0,
-        return_type: ValueType::Unknown,
-    };
-    let program = Program::with_imports_and_debug(
-        Vec::new(),
-        vec![vm::OpCode::Ret as u8],
-        vec![import.clone()],
-        None,
-    );
-    let encoded = encode_program(&program).expect("current encoding should succeed");
-    let marker_offset = 8 + 4 + 4 + program.code.len() + 4 + 4 + import.name.len() + 2;
-    assert_eq!(encoded[marker_offset], 0);
-    let mut legacy = encoded;
-    legacy.drain(marker_offset..marker_offset + 1);
-    strip_empty_named_struct_section(&mut legacy);
-    legacy[4..6].copy_from_slice(&11u16.to_le_bytes());
-
-    let decoded = decode_program(&legacy).expect("v11 payload should remain readable");
-    assert_eq!(decoded.imports, vec![import]);
-    assert!(decoded.host_import_schemas().is_empty());
-}
-
-#[test]
-fn wire_v11_zero_import_program_decodes_by_version() {
-    let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
-    let mut encoded = encode_program(&program).expect("current encoding should succeed");
-    strip_empty_named_struct_section(&mut encoded);
-    encoded[4..6].copy_from_slice(&11u16.to_le_bytes());
-
-    let decoded = decode_program(&encoded).expect("schema-less v11 payload should decode");
-    assert_eq!(decoded.code, program.code);
-    assert!(decoded.imports.is_empty());
-    assert!(decoded.host_import_schemas().is_empty());
-}
-
-fn strip_empty_named_struct_section(encoded: &mut Vec<u8>) {
-    assert!(
-        encoded.len() >= 4,
-        "encoded VMBC is too short to contain a named-struct section"
-    );
-    assert_eq!(
-        &encoded[encoded.len() - 4..],
-        &[0, 0, 0, 0],
-        "expected an empty named-struct count trailer on current encode"
-    );
-    encoded.truncate(encoded.len() - 4);
-}
-
 fn minimal_vmbc_prefix(constant_count: u32, code: &[u8], import_count: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"VMBC");
-    bytes.extend_from_slice(&12u16.to_le_bytes());
+    bytes.extend_from_slice(&14u16.to_le_bytes());
     bytes.extend_from_slice(&0u16.to_le_bytes());
     bytes.extend_from_slice(&constant_count.to_le_bytes());
     bytes.extend_from_slice(&(code.len() as u32).to_le_bytes());
@@ -149,7 +97,7 @@ fn decode_rejects_oversized_zero_byte_counts_before_allocation() {
     ));
 }
 
-fn v12_with_local_schema(schema: &[u8]) -> Vec<u8> {
+fn current_vmbc_with_local_schema(schema: &[u8]) -> Vec<u8> {
     let mut bytes = minimal_vmbc_prefix(0, &[vm::OpCode::Ret as u8], 0);
     bytes.extend_from_slice(&[1, 0]);
     bytes.extend_from_slice(&1u32.to_le_bytes());
@@ -167,10 +115,11 @@ fn v12_with_local_schema(schema: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes
 }
 
-fn v12_with_callable_frame_counts(frame_counts: &[u32]) -> Vec<u8> {
+fn current_vmbc_with_callable_frame_counts(frame_counts: &[u32]) -> Vec<u8> {
     let mut bytes = minimal_vmbc_prefix(0, &[vm::OpCode::Ret as u8], 0);
     bytes.extend_from_slice(&[0, 0]); // no type map, no debug info
     bytes.extend_from_slice(&0u32.to_le_bytes()); // script functions
@@ -189,10 +138,11 @@ fn v12_with_callable_frame_counts(frame_counts: &[u32]) -> Vec<u8> {
     bytes.extend_from_slice(&0u32.to_le_bytes()); // function regions
     bytes.extend_from_slice(&0u32.to_le_bytes()); // root callable bindings
     bytes.extend_from_slice(&0u32.to_le_bytes()); // exported callables
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // named structs
     bytes
 }
 
-fn v12_with_large_type_map(local_count: u32) -> Vec<u8> {
+fn current_vmbc_with_large_type_map(local_count: u32) -> Vec<u8> {
     let mut bytes = minimal_vmbc_prefix(0, &[vm::OpCode::Ret as u8], 0);
     bytes.extend_from_slice(&[1, 0]); // type map, strict=false
     bytes.extend_from_slice(&local_count.to_le_bytes());
@@ -212,6 +162,7 @@ fn v12_with_large_type_map(local_count: u32) -> Vec<u8> {
     bytes.extend_from_slice(&0u32.to_le_bytes()); // function regions
     bytes.extend_from_slice(&0u32.to_le_bytes()); // root callable bindings
     bytes.extend_from_slice(&0u32.to_le_bytes()); // exported callables
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // named structs
     bytes
 }
 
@@ -233,7 +184,7 @@ fn wire_roundtrip_preserves_root_resource_schema_for_embedded_decoder() {
 
 #[test]
 fn decode_debits_repeated_callable_frame_counts_from_one_budget() {
-    let bytes = v12_with_callable_frame_counts(&[40_000; 30]);
+    let bytes = current_vmbc_with_callable_frame_counts(&[40_000; 30]);
     assert!(
         matches!(
             decode_program(&bytes),
@@ -246,7 +197,7 @@ fn decode_debits_repeated_callable_frame_counts_from_one_budget() {
 
 #[test]
 fn decode_rejects_a_single_oversized_callable_frame() {
-    let bytes = v12_with_callable_frame_counts(&[65_537]);
+    let bytes = current_vmbc_with_callable_frame_counts(&[65_537]);
     assert!(matches!(
         decode_program(&bytes),
         Err(WireError::LengthTooLarge("callable frame locals", 65_537))
@@ -255,7 +206,7 @@ fn decode_rejects_a_single_oversized_callable_frame() {
 
 #[test]
 fn decode_rejects_oversized_program_frame_count_from_type_map() {
-    let bytes = v12_with_large_type_map(65_537);
+    let bytes = current_vmbc_with_large_type_map(65_537);
     assert!(matches!(
         decode_program(&bytes),
         Err(WireError::LengthTooLarge("type map locals", 65_537))
@@ -281,7 +232,7 @@ fn decode_rejects_oversized_nested_schema_counts_before_allocation() {
         (14, "schema object fields"),
         (15, "schema callable params"),
     ] {
-        let bytes = v12_with_local_schema(&schema_with_oversized_count(tag, TOO_MANY));
+        let bytes = current_vmbc_with_local_schema(&schema_with_oversized_count(tag, TOO_MANY));
         assert!(matches!(
             decode_program(&bytes),
             Err(WireError::LengthTooLarge(actual, count))
@@ -295,14 +246,14 @@ fn decode_rejects_oversized_resource_schema_key_before_allocation() {
     const TOO_MANY: u32 = 16 * 1024 * 1024 + 1;
     let mut schema = vec![17];
     schema.extend_from_slice(&TOO_MANY.to_le_bytes());
-    let bytes = v12_with_local_schema(&schema);
+    let bytes = current_vmbc_with_local_schema(&schema);
     assert!(matches!(
         decode_program(&bytes),
         Err(WireError::LengthTooLarge("string", count)) if count == TOO_MANY as usize
     ));
 }
 
-fn v12_with_oversized_import_schema_param_count(count: u32) -> Vec<u8> {
+fn current_vmbc_with_oversized_import_schema_param_count(count: u32) -> Vec<u8> {
     let mut bytes = minimal_vmbc_prefix(0, &[vm::OpCode::Ret as u8], 1);
     bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.push(b'h');
@@ -325,7 +276,7 @@ fn v12_with_oversized_import_schema_param_count(count: u32) -> Vec<u8> {
 #[test]
 fn decode_rejects_oversized_import_schema_parameter_count_before_allocation() {
     const TOO_MANY: u32 = 1_000_001;
-    let bytes = v12_with_oversized_import_schema_param_count(TOO_MANY);
+    let bytes = current_vmbc_with_oversized_import_schema_param_count(TOO_MANY);
     assert!(matches!(
         decode_program(&bytes),
         Err(WireError::LengthTooLarge("host import schema parameters", count))
@@ -420,20 +371,6 @@ fn decode_rejects_invalid_magic_version_and_truncation() {
         Err(WireError::UnsupportedVersion(99))
     ));
 
-    let mut old_version = encoded.clone();
-    old_version[4..6].copy_from_slice(&9u16.to_le_bytes());
-    assert!(matches!(
-        decode_program(&old_version),
-        Err(WireError::UnsupportedVersion(9))
-    ));
-
-    let mut previous_version = encoded.clone();
-    previous_version[4..6].copy_from_slice(&10u16.to_le_bytes());
-    assert!(matches!(
-        decode_program(&previous_version),
-        Err(WireError::UnsupportedVersion(10))
-    ));
-
     let truncated = &encoded[..encoded.len() - 1];
     assert!(matches!(
         decode_program(truncated),
@@ -489,7 +426,7 @@ fn validate_accepts_known_good_program() {
 }
 
 #[test]
-fn callable_metadata_roundtrips_vmbc_v12() {
+fn callable_metadata_roundtrips_current_vmbc() {
     let compiled = vm::compile_source_for_repl(
         r#"
             fn add_one(value: int) -> int { value + 1 }
@@ -850,7 +787,7 @@ fn literal_string_builtin_indices_are_appended_and_publicly_resolved() {
 }
 
 // ---------------------------------------------------------------------------
-// Milestone 6: CallScript wire support (VMBC V12)
+// CallScript wire support
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -859,7 +796,7 @@ fn call_script_roundtrips_validation_and_disassembly() {
     code.extend_from_slice(&7u32.to_le_bytes());
     code.push(2);
     code.push(vm::OpCode::Ret as u8);
-    // The V12 validator resolves the prototype id against the callable
+    // The validator resolves the prototype id against the callable
     // metadata, so the fixture carries a matching prototype (id 7, arity 2,
     // script-function target) plus one script function boundary.
     let program = Program::new(vec![], code).with_callable_metadata(
@@ -1066,22 +1003,14 @@ fn validate_rejects_call_script_targeting_host_import_prototype() {
 }
 
 #[test]
-fn call_script_wire_version_is_v14_and_v11_accepts_schema_less_program() {
+fn call_script_wire_version_is_v14() {
     let program = Program::new(vec![], vec![vm::OpCode::Ret as u8]);
     let encoded = encode_program(&program).expect("encode should succeed");
     assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
-
-    let mut old = encoded;
-    strip_empty_named_struct_section(&mut old);
-    old[4..6].copy_from_slice(&11u16.to_le_bytes());
-    decode_program(&old).expect("schema-less v11 program should decode");
 }
 
 #[test]
-fn call_script_no_script_program_code_bytes_unchanged_by_version_bump() {
-    // Version bumps must not alter instruction bytes for programs without
-    // script calls: encode a plain arithmetic program and verify the
-    // embedded code section is exactly the assembler output.
+fn current_vmbc_preserves_code_bytes_without_script_calls() {
     let mut bc = BytecodeBuilder::new();
     bc.ldc(0);
     bc.ldc(1);
@@ -1093,22 +1022,6 @@ fn call_script_no_script_program_code_bytes_unchanged_by_version_bump() {
     let decoded = decode_program(&encoded).expect("decode should succeed");
     assert_eq!(decoded.code, program.code);
     assert_eq!(decoded.constants, program.constants);
-}
-
-#[test]
-fn v12_trailing_zero_count_is_not_a_named_struct_table() {
-    let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
-    let mut encoded = encode_program(&program).expect("current encoding should succeed");
-    strip_empty_named_struct_section(&mut encoded);
-    encoded[4..6].copy_from_slice(&12u16.to_le_bytes());
-    decode_program(&encoded).expect("clean v12 without a named-struct section should decode");
-
-    let mut garbage = encoded;
-    garbage.extend_from_slice(&0u32.to_le_bytes());
-    assert!(
-        matches!(decode_program(&garbage), Err(WireError::TrailingBytes)),
-        "v12 must not treat a 4-byte zero trailer as an empty named-struct table"
-    );
 }
 
 #[test]
@@ -1133,16 +1046,4 @@ fn v14_roundtrip_preserves_guest_named_struct_payload() {
         decoded.named_struct_decls().contains_key("Point"),
         "VMBC v14 should preserve guest struct decls"
     );
-}
-
-#[test]
-fn v13_artifact_requires_recompilation_after_catalog_revision() {
-    let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
-    let mut encoded = encode_program(&program).expect("current program should encode");
-    encoded[4..6].copy_from_slice(&13u16.to_le_bytes());
-
-    assert!(matches!(
-        decode_program(&encoded),
-        Err(WireError::UnsupportedVersion(13))
-    ));
 }

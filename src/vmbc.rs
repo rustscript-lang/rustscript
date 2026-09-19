@@ -18,10 +18,7 @@ use crate::host_api::{
 use crate::vm::{HostImport, OpCode, Program, Value};
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V11: u16 = 11;
-const VERSION_V12: u16 = 12;
-const VERSION_V13: u16 = 13;
-const VERSION_V14: u16 = 14;
+const VERSION: u16 = 14;
 const FLAGS: u16 = 0;
 const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;
@@ -307,7 +304,7 @@ fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireErr
 pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION_V14.to_le_bytes());
+    out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&FLAGS.to_le_bytes());
     write_u32_count("constants", program.constants.len(), &mut out)?;
 
@@ -361,12 +358,9 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    let has_host_import_schemas = match version {
-        VERSION_V11 => false,
-        VERSION_V12 | VERSION_V14 => true,
-        VERSION_V13 => return Err(WireError::UnsupportedVersion(VERSION_V13)),
-        _ => return Err(WireError::UnsupportedVersion(version)),
-    };
+    if version != VERSION {
+        return Err(WireError::UnsupportedVersion(version));
+    }
 
     let flags = cursor.read_u16()?;
     if flags != FLAGS {
@@ -384,43 +378,30 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     let mut code = Vec::new();
     reserve_vec(&mut code, "code", code_bytes.len())?;
     code.extend_from_slice(code_bytes);
-    if version == VERSION_V11 && code.contains(&(OpCode::CallScript as u8)) {
-        // CallScript was added in V12. Keep the legacy version branch based
-        // on the version discriminant, independent of the import count.
-        return Err(WireError::UnsupportedVersion(VERSION_V11));
-    }
-    let import_count = cursor.read_count("imports", if has_host_import_schemas { 7 } else { 6 })?;
+    let import_count = cursor.read_count("imports", 7)?;
     let mut imports = Vec::new();
     reserve_vec(&mut imports, "imports", import_count)?;
     let mut host_import_schemas = Vec::new();
-    // Do not reserve `import_count` here: a V12 payload may contain a large
-    // number of `None` entries, while a schema-bearing payload is bounded by
-    // the shared host-schema budget as each element is decoded.
+    // Do not reserve `import_count` here: a payload may contain a large number
+    // of `None` entries, while a schema-bearing payload is bounded by the
+    // shared host-schema budget as each element is decoded.
     for _ in 0..import_count {
         let import = HostImport {
-            name: if has_host_import_schemas {
-                cursor.read_bounded_string("host import name", MAX_HOST_FUNCTION_NAME_LEN)?
-            } else {
-                cursor.read_string()?
-            },
+            name: cursor.read_bounded_string("host import name", MAX_HOST_FUNCTION_NAME_LEN)?,
             arity: cursor.read_u8()?,
             return_type: read_value_type(cursor.read_u8()?)?,
         };
-        if has_host_import_schemas {
-            let schema = read_optional_host_import_schema(&mut cursor)?;
-            if let Some(schema) = schema.as_ref()
-                && (schema.name != import.name || schema.arity() != import.arity as usize)
-            {
-                return Err(WireError::HostSchemaImportMismatch);
-            }
-            host_import_schemas.push(schema);
+        let schema = read_optional_host_import_schema(&mut cursor)?;
+        if let Some(schema) = schema.as_ref()
+            && (schema.name != import.name || schema.arity() != import.arity as usize)
+        {
+            return Err(WireError::HostSchemaImportMismatch);
         }
+        host_import_schemas.push(schema);
         imports.push(import);
     }
-    if has_host_import_schemas {
-        crate::host_api::validate_optional_host_import_schemas(&host_import_schemas)
-            .map_err(|error| WireError::InvalidHostSchemaComplexity(error.to_string()))?;
-    }
+    crate::host_api::validate_optional_host_import_schemas(&host_import_schemas)
+        .map_err(|error| WireError::InvalidHostSchemaComplexity(error.to_string()))?;
     let type_map = read_type_map(&mut cursor)?;
     let debug = read_debug_info(&mut cursor)?;
     let (
@@ -430,11 +411,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         root_callable_bindings,
         exported_callables,
     ) = read_callable_metadata(&mut cursor)?;
-    let named_struct_decls = if version >= VERSION_V13 {
-        read_named_struct_decls(&mut cursor)?
-    } else {
-        HashMap::new()
-    };
+    let named_struct_decls = read_named_struct_decls(&mut cursor)?;
 
     if !cursor.is_eof() {
         return Err(WireError::TrailingBytes);

@@ -1632,57 +1632,6 @@ fn owned_descriptor_keeps_the_take_owned_contract_and_adapter() {
 }
 
 #[test]
-fn runtime_owned_pending_descriptors_mark_the_registered_import() {
-    use vm::host_extension::{
-        HostAdapterDescriptor, HostBindingDescriptor, HostBindingKind, HostFunctionDescriptor,
-        HostModuleDescriptor,
-    };
-
-    fn pending_request_descriptor() -> HostFunctionDescriptor {
-        HostFunctionDescriptor {
-            schema: HostFunctionSchema::with_return(
-                "demo::request",
-                vec![HostParamSchema::value("request", HostTypeSchema::String)],
-                HostTypeSchema::String,
-            ),
-            binding: HostBindingDescriptor {
-                kind: HostBindingKind::StaticStackRuntimeOwned,
-            },
-            effects: vec![],
-            adapter: HostAdapterDescriptor::StaticStackRuntimeOwned(noop_host),
-            resource_types: vec![],
-        }
-    }
-
-    let module = HostModuleDescriptor {
-        name: "demo.pending",
-        functions: &[pending_request_descriptor],
-        resources: &[],
-    };
-    let mut registry = vm::HostFunctionRegistry::empty();
-    module
-        .install(&mut registry)
-        .expect("a runtime-owned pending descriptor installs");
-    assert!(registry.contains_name("demo::request"));
-
-    // A mismatched binding/adapter pair still fails closed.
-    let mismatched = HostFunctionDescriptor {
-        binding: HostBindingDescriptor {
-            kind: HostBindingKind::StaticStackRuntimeOwned,
-        },
-        adapter: HostAdapterDescriptor::StaticStack(noop_host),
-        ..pending_request_descriptor()
-    };
-    let mut target = vm::HostFunctionRegistry::empty();
-    let error = HostModuleDescriptor::install_descriptors(&mut target, &[mismatched])
-        .expect_err("a binding/adapter mismatch must fail closed");
-    assert!(
-        error.to_string().contains("binding/adapter mismatch"),
-        "{error}"
-    );
-}
-
-#[test]
 fn module_install_from_catalog_keeps_caller_identity_and_restricted_policy() {
     use vm::host_extension::HostModuleDescriptor;
 

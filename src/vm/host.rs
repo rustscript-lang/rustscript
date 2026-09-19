@@ -804,21 +804,6 @@ pub enum HostAsyncOpTerminal {
     Failed,
 }
 
-impl HostAsyncOpTerminal {
-    /// Returns the reason used when default cleanup finalizes this terminal
-    /// operation. Cleanup is a terminal resource-release action rather than a
-    /// new cancellation request, so every terminal state uses the stable
-    /// `Requested` compatibility reason; an actual cancellation reason is
-    /// delivered earlier through `request_cancel_op`.
-    pub const fn cleanup_reason(self) -> OperationCancelReason {
-        match self {
-            Self::Completed => OperationCancelReason::Requested,
-            Self::Cancelled => OperationCancelReason::Requested,
-            Self::Failed => OperationCancelReason::Requested,
-        }
-    }
-}
-
 pub trait HostAsyncBridge: Send {
     fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
         Err(VmError::HostError(
@@ -832,38 +817,18 @@ pub trait HostAsyncBridge: Send {
         &mut self,
         op_id: HostOpId,
         cx: &mut Context<'_>,
-    ) -> Poll<VmResult<HostFutureOutput>> {
-        self.poll_op(op_id, cx)
-            .map(|result| result.map(HostFutureOutput::Return))
-    }
-
-    /// Legacy cancellation hook kept for bridge implementations that do not
-    /// need a lifecycle reason. It is used as a best-effort fallback by the
-    /// default [`request_cancel_op`](Self::request_cancel_op) implementation.
-    fn cancel_op(&mut self, _op_id: HostOpId) {}
-
-    /// Legacy cancellation hook kept for bridge implementations that do not
-    /// need a lifecycle reason. New bridges should implement
-    /// [`request_cancel_op`](Self::request_cancel_op) and
-    /// [`poll_cancel_op`](Self::poll_cancel_op) instead.
-    fn cancel_op_with_reason(&mut self, op_id: HostOpId, _reason: OperationCancelReason) {
-        self.cancel_op(op_id);
-    }
+    ) -> Poll<VmResult<HostFutureOutput>>;
 
     /// Requests cancellation of one bridge-owned operation.
     ///
     /// Returning `Ok(())` only records that the request was accepted. It does
     /// not mean that the operation has stopped; callers must poll
     /// [`poll_cancel_op`](Self::poll_cancel_op) until it returns `Ready(Ok(()))`.
-    /// The default invokes the legacy best-effort hook, then fails explicitly so
-    /// an adapter that has not opted into acknowledgement can never claim
-    /// quiescence.
     fn request_cancel_op(
         &mut self,
         op_id: HostOpId,
-        reason: OperationCancelReason,
+        _reason: OperationCancelReason,
     ) -> VmResult<()> {
-        self.cancel_op_with_reason(op_id, reason);
         Err(VmError::HostError(format!(
             "async host bridge does not provide cancellation acknowledgement for op {op_id}"
         )))
@@ -881,13 +846,7 @@ pub trait HostAsyncBridge: Send {
 
     /// Runs bridge-side cleanup after a terminal/quiescent outcome has been
     /// reported. The VM invokes this at most once for each tracked operation.
-    /// The default preserves compatibility with bridges whose legacy
-    /// `cancel_op` method also removes completed operation state while routing
-    /// through the reason-aware hook for newer bridges.
-    fn cleanup_op(&mut self, op_id: HostOpId, terminal: HostAsyncOpTerminal) -> VmResult<()> {
-        self.cancel_op_with_reason(op_id, terminal.cleanup_reason());
-        Ok(())
-    }
+    fn cleanup_op(&mut self, op_id: HostOpId, terminal: HostAsyncOpTerminal) -> VmResult<()>;
 }
 
 pub type StaticHostFunction = fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>;
@@ -1573,18 +1532,6 @@ impl HostFunctionRegistry {
     pub fn authorize_registered_builtin_import(&mut self, name: &str) {
         self.capability_profile = Arc::new(self.capability_profile.with_host_import(name));
         self.invalidate_plan_cache();
-    }
-
-    /// Marks an exact import as owning its pending operation. Pending
-    /// dispatch is resolved from the generic VM operation/stream registries;
-    /// the marker is intentionally a registration hook with no domain state.
-    pub fn mark_exact_runtime_owned_pending(&mut self, name: &str) -> VmResult<()> {
-        if !self.contains_name(name) {
-            return Err(VmError::HostError(format!(
-                "cannot mark unregistered host import '{name}' as runtime-owned"
-            )));
-        }
-        Ok(())
     }
 
     pub fn register_catalog_stack<F>(

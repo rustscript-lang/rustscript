@@ -21,10 +21,7 @@ fn sqlite_host_functions_are_macro_owned_async_functions() {
         SQLITE_SOURCE.contains("tokio_rusqlite::Connection"),
         "the SQLite resource must use the maintained Tokio-facing adapter"
     );
-    assert!(
-        !SQLITE_SOURCE.contains("runtime_owned_pending"),
-        "SQLite async functions must use macro-owned future submission"
-    );
+
     assert_eq!(
         SQLITE_SOURCE.matches("HostFutureOutput::complete").count(),
         2,

@@ -22,7 +22,7 @@ One host function declaration produces, in a single macro expansion:
 | Part | Meaning |
 |---|---|
 | `schema` | The guest ABI: parameter names, types, passing modes, return type. This is the only fingerprint input. |
-| `binding` | The dispatch class (`Static`, `StaticStack`, `StaticStackRuntimeOwned`, `StaticArgs`, `StaticNonYieldingArgs`, `Owned`). |
+| `binding` | The dispatch class (`Static`, `StaticStack`, `StaticArgs`, `StaticNonYieldingArgs`, `Owned`). |
 | `adapter` | The concrete adapter or owned-dispatch factory installed into a registry. |
 | `effects` | Guest resource effects (borrow/borrow-mut/take-owned/create) and hidden host-state read/write effects. Runtime-only metadata; excluded from the fingerprint. |
 | `resource_types` | The concrete resource-type declarations this function contributes. |
@@ -220,11 +220,6 @@ What the contract does and does not change:
   source. Deriving the contract's key from that declaration (as above) keeps the
   two from drifting.
 
-`runtime_owned_pending` remains available for stack-shaped synchronous adapters
-whose pending operation is already owned by a generic VM operation registry.
-It requires a declared contract. Prefer an ordinary async declaration whenever
-the implementation can await the library future directly; do not wrap such a
-function in a domain-specific operation, resource, runtime, or thread.
 
 ## 4. Installing a module
 

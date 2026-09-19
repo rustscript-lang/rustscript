@@ -41,12 +41,8 @@ Both builtins are ordinary `#[pd_host_function] async fn` declarations. Their
 macro-generated wrappers own async-host submission; the HTTP module does not
 publish transient request, response, or stream resources.
 
-Removing those transport-only resource declarations is an intentional catalog
-artifact break. Catalog fingerprints use format v3, and bytecode/VMBC use ABI
-and wire version 14. VMBC v13 artifacts are rejected and must be recompiled;
-the runtime does not recreate unused resource declarations solely to retain an
-obsolete digest. Function schemas continue to receive exact validation at bind
-time.
+Catalog fingerprints use format v3, and bytecode/VMBC use ABI and wire version
+14. Function schemas receive exact validation at bind time.
 
 The HTTP and SSE behavior, cancellation, and native async bridge contracts are
 uniform across supported native targets. See
