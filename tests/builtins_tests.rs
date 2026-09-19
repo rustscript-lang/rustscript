@@ -1,5 +1,6 @@
 #![cfg(feature = "runtime")]
 
+#[cfg(any(not(feature = "async"), feature = "sqlite"))]
 #[path = "support/vm_reset.rs"]
 mod vm_reset;
 

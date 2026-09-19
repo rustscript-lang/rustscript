@@ -6,8 +6,6 @@ use vm::{
     Value, Vm, VmError, VmResult, VmStatus, compile_source,
 };
 
-use super::vm_reset::reset_for_reuse_to_ready;
-
 fn run_source(source: &str) -> Result<Vec<Value>, VmError> {
     let compiled =
         compile_source(&format!("use io;\n{source}")).expect("async io source should compile");
@@ -304,13 +302,44 @@ fn async_io_reset_kills_and_reaps_the_entire_popen_process_group() {
         descendant: Some(descendant_pid),
     };
 
-    tokio::runtime::Runtime::new()
+    let clear_error = vm
+        .clear_async_bridge()
+        .expect_err("a live process resource must retain its async bridge");
+    assert!(clear_error.to_string().contains("execution scope"));
+
+    let reset_error = vm
+        .reset_for_reuse()
+        .expect_err("off-runtime process reset must be retryable");
+    let VmError::ExecutionScope(scope_error) = reset_error else {
+        panic!("expected a resource-domain reset error, got {reset_error:?}");
+    };
+    let resource_error = scope_error
+        .into_resource_error()
+        .expect("runtime requirement must be a resource error");
+    assert_eq!(
+        resource_error.code(),
+        vm::resource::error::ResourceErrorCode::RuntimeRequired
+    );
+    assert!(resource_error.is_retryable());
+    assert!(vm.scope_reset_pending());
+    assert!(!vm.is_reusable());
+    assert_eq!(vm.execution_scope().resources().len(), 1);
+    assert!(vm.execution_scope().is_closing());
+    vm.clear_async_bridge()
+        .expect_err("a pending reset must retain its async bridge");
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .expect("reset runtime should build")
-        .block_on(async {
-            reset_for_reuse_to_ready(&mut vm).expect("reset should reach quiescence");
-        });
+        .block_on(std::future::poll_fn(|cx| vm.poll_reset_for_reuse(cx)))
+        .expect("retry under a live Tokio runtime should quiesce the reset");
     assert!(vm.execution_scope().resources().is_empty());
     assert!(vm.execution_scope().operations().is_empty());
+    assert!(!vm.scope_reset_pending());
+    assert!(vm.is_reusable());
+    vm.clear_async_bridge()
+        .expect("a quiescent VM may release its async bridge");
     assert!(
         !marker_path.exists(),
         "a killed process group must not run descendants"

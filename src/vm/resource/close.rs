@@ -33,6 +33,9 @@ pub enum CloseProgress {
 ///   `begin_close` returns [`CloseProgress::Pending`].
 /// - A concrete `Drop` remains the last-resort guard, but the VM may only reuse
 ///   a resource and its slot once `poll_close` completes.
+/// - Abrupt Drop must stay nonblocking. Resources that require asynchronous
+///   cleanup may issue an immediate best-effort cancellation/kill request, but
+///   must not poll, wait, or enter an executor from Drop.
 ///
 /// The `Any` supertrait lets the table reconnect each erased value to its
 /// concrete `TypeId` without ever naming a concrete class.

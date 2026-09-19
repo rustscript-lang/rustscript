@@ -21,6 +21,7 @@ use vm::resource::ResourceCloseReason;
 use vm::resource::ResourceTable;
 use vm::resource::close::{CloseProgress, HostResource};
 use vm::resource::error::{ResourceErrorCode, ResourceResult};
+use vm::{OpCode, Program, Vm};
 
 // ---------------------------------------------------------------- helpers
 
@@ -113,6 +114,45 @@ impl HostOperation for CancelAwareWorker {
     }
 }
 
+struct DropPendingResource {
+    begins: Arc<AtomicUsize>,
+    polls: Arc<AtomicUsize>,
+}
+
+impl HostResource for DropPendingResource {
+    fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
+        self.begins.fetch_add(1, Ordering::SeqCst);
+        Ok(CloseProgress::Pending)
+    }
+
+    fn poll_close(&mut self, _cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Poll::Pending
+    }
+}
+
+struct DropPendingOperation {
+    cancels: Arc<AtomicUsize>,
+    polls: Arc<AtomicUsize>,
+}
+
+impl HostOperation for DropPendingOperation {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Poll::Pending
+    }
+
+    fn cancel(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
+        self.cancels.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn poll_quiescent(&mut self, _cx: &mut Context<'_>) -> Poll<()> {
+        self.polls.fetch_add(1, Ordering::SeqCst);
+        Poll::Pending
+    }
+}
+
 // ------------------------------------------------------------------ scope
 
 #[test]
@@ -193,6 +233,50 @@ fn empty_scope_quiesces_cleanly() {
         Poll::Ready(Ok(ScopeCloseOutcome::Success)) => {}
         other => panic!("terminal poll must be idempotent, got {other:?}"),
     }
+}
+
+#[test]
+fn vm_drop_begins_resource_cleanup_without_polling_it() {
+    let begins = Arc::new(AtomicUsize::new(0));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    vm.execution_scope()
+        .push_resource(DropPendingResource {
+            begins: Arc::clone(&begins),
+            polls: Arc::clone(&polls),
+        })
+        .expect("resource");
+
+    drop(vm);
+
+    assert_eq!(begins.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        0,
+        "VM Drop must not poll resource cleanup futures"
+    );
+}
+
+#[test]
+fn scope_drop_cancels_operations_without_polling_quiescence() {
+    let cancels = Arc::new(AtomicUsize::new(0));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let mut scope = ExecutionScope::new().expect("scope");
+    scope
+        .start_operation(OperationSpec::new(DropPendingOperation {
+            cancels: Arc::clone(&cancels),
+            polls: Arc::clone(&polls),
+        }))
+        .expect("operation");
+
+    drop(scope);
+
+    assert_eq!(cancels.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        0,
+        "scope Drop must not poll operation futures or quiescence"
+    );
 }
 
 #[test]
