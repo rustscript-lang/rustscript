@@ -47,12 +47,7 @@ pub(crate) enum IoHandle {
 
 impl Drop for IoHandle {
     fn drop(&mut self) {
-        match self {
-            Self::PopenRead { child, .. } | Self::PopenWrite { child, .. } => {
-                let _ = start_terminate_child_tree_for_drop(child);
-            }
-            Self::File(_) => {}
-        }
+        start_close_io_handle_for_drop(self);
     }
 }
 
@@ -95,6 +90,7 @@ fn prepare_process_cleanup(
 struct IoResource {
     handle: Arc<Mutex<Option<IoHandle>>>,
     process_tree_terminator: fn(u32) -> io::Result<()>,
+    drop_process_tree_signaler: fn(u32) -> io::Result<()>,
     process_tree_cleanup: Option<ProcessTreeCleanupFuture>,
     process_tree_cleanup_complete: bool,
     leader_kill_started: bool,
@@ -106,6 +102,7 @@ impl IoResource {
         Self {
             handle: Arc::new(Mutex::new(Some(handle))),
             process_tree_terminator: signal_process_tree_for_drop,
+            drop_process_tree_signaler: signal_process_tree_for_drop,
             process_tree_cleanup: None,
             process_tree_cleanup_complete: false,
             leader_kill_started: false,
@@ -113,7 +110,7 @@ impl IoResource {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn new_with_process_tree_terminator(
         handle: IoHandle,
         process_tree_terminator: fn(u32) -> io::Result<()>,
@@ -121,6 +118,24 @@ impl IoResource {
         Self {
             handle: Arc::new(Mutex::new(Some(handle))),
             process_tree_terminator,
+            drop_process_tree_signaler: signal_process_tree_for_drop,
+            process_tree_cleanup: None,
+            process_tree_cleanup_complete: false,
+            leader_kill_started: false,
+            deferred_process_cleanup_error: None,
+        }
+    }
+
+    #[cfg(all(test, windows))]
+    fn new_with_process_terminators(
+        handle: IoHandle,
+        process_tree_terminator: fn(u32) -> io::Result<()>,
+        drop_process_tree_signaler: fn(u32) -> io::Result<()>,
+    ) -> Self {
+        Self {
+            handle: Arc::new(Mutex::new(Some(handle))),
+            process_tree_terminator,
+            drop_process_tree_signaler,
             process_tree_cleanup: None,
             process_tree_cleanup_complete: false,
             leader_kill_started: false,
@@ -165,6 +180,21 @@ impl IoResource {
         self.leader_kill_started = leader_kill_started;
         self.deferred_process_cleanup_error = cleanup_error;
         Ok(progress)
+    }
+
+    fn begin_close_for_drop_nonblocking(&mut self) -> CloseProgress {
+        let Some(slot) = Arc::get_mut(&mut self.handle).map(Mutex::get_mut) else {
+            return CloseProgress::Pending;
+        };
+        let Some(handle) = slot.as_mut() else {
+            return CloseProgress::Ready;
+        };
+        if matches!(handle, IoHandle::File(_)) {
+            slot.take();
+            return CloseProgress::Ready;
+        }
+        let _ = start_close_io_handle_for_drop_with(handle, self.drop_process_tree_signaler);
+        CloseProgress::Pending
     }
 
     fn poll_process_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
@@ -234,11 +264,7 @@ impl IoResource {
 
 impl Drop for IoResource {
     fn drop(&mut self) {
-        if let Some(mutex) = Arc::get_mut(&mut self.handle)
-            && let Some(handle) = mutex.get_mut().as_mut()
-        {
-            start_close_io_handle_for_drop(handle);
-        }
+        let _ = self.begin_close_for_drop_nonblocking();
     }
 }
 
@@ -255,6 +281,13 @@ pub(crate) fn io_file_resource() -> crate::host_extension::HostResourceTypeMeta 
 impl HostResource for IoResource {
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.begin_close_after_operations_quiesce()
+    }
+
+    fn begin_close_for_drop(
+        &mut self,
+        _reason: ResourceCloseReason,
+    ) -> ResourceResult<CloseProgress> {
+        Ok(self.begin_close_for_drop_nonblocking())
     }
 
     fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
@@ -280,10 +313,17 @@ fn runtime_required_resource_error() -> ResourceError {
 }
 
 fn start_close_io_handle_for_drop(handle: &mut IoHandle) {
+    let _ = start_close_io_handle_for_drop_with(handle, signal_process_tree_for_drop);
+}
+
+fn start_close_io_handle_for_drop_with(
+    handle: &mut IoHandle,
+    signal_tree: fn(u32) -> io::Result<()>,
+) -> io::Result<()> {
     match handle {
-        IoHandle::File(_) => {}
+        IoHandle::File(_) => Ok(()),
         IoHandle::PopenRead { child, .. } | IoHandle::PopenWrite { child, .. } => {
-            let _ = start_terminate_child_tree_for_drop(child);
+            start_terminate_child_tree_with(child, signal_tree)
         }
     }
 }
@@ -929,12 +969,12 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
-    static DROP_TREE_TERMINATION_CALLS: std::sync::atomic::AtomicUsize =
+    static DROP_TREE_SIGNAL_CALLS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
     #[cfg(windows)]
-    fn record_drop_tree_termination(_pid: u32) -> io::Result<()> {
-        DROP_TREE_TERMINATION_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    fn record_drop_tree_signal(_pid: u32) -> io::Result<()> {
+        DROP_TREE_SIGNAL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -994,7 +1034,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
     async fn cancelling_process_close_retains_child_and_allows_retry_to_reap() {
         let resource =
@@ -1035,22 +1075,24 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test(flavor = "current_thread")]
-    async fn dropping_process_resource_does_not_run_synchronous_tree_termination() {
-        DROP_TREE_TERMINATION_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
-        let resource = IoResource::new_with_process_tree_terminator(
+    async fn dropping_process_resource_exercises_only_the_drop_signal_helper() {
+        DROP_TREE_SIGNAL_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let resource = IoResource::new_with_process_terminators(
             spawn_shell_command("ping -n 30 127.0.0.1 >NUL", "r").expect("process should spawn"),
-            record_drop_tree_termination,
+            |_| panic!("Drop must not invoke taskkill or explicit-close waiting"),
+            record_drop_tree_signal,
         );
 
         drop(resource);
 
         assert_eq!(
-            DROP_TREE_TERMINATION_CALLS.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "Drop must use only the direct nonblocking child kill on Windows"
+            DROP_TREE_SIGNAL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Drop must invoke the immediate signal helper"
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn process_resource_close_polls_until_the_leader_is_reaped() {
         let mut resource =
@@ -1078,7 +1120,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn resource_shutdown_reaps_leader_before_reporting_tree_failure() {
         let handle = spawn_shell_command("sleep 30", "r").expect("process should spawn");
