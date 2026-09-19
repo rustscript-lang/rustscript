@@ -154,6 +154,8 @@ pub(crate) struct HostStreamContinuation {
     pub(crate) op_id: HostOpId,
     pub(crate) callback: Value,
     pub(crate) item: Option<Value>,
+    pub(crate) expected_return_type: Option<crate::bytecode::ValueType>,
+    pub(crate) expected_return_schema: Option<crate::host_api::HostImportSchema>,
     pub(crate) phase: HostStreamPhase,
     pub(crate) parent_stack_base: usize,
     pub(crate) parent_frame_count: usize,
@@ -232,6 +234,8 @@ impl Vm {
             op_id,
             callback,
             item: None,
+            expected_return_type: None,
+            expected_return_schema: None,
             phase: HostStreamPhase::AwaitItem,
             parent_stack_base: self.instance.stack.len(),
             parent_frame_count: self.instance.execution_frames.len(),
@@ -524,14 +528,25 @@ impl Vm {
                 if let Some(driver) = self.host.stream_drivers.get_mut(&op_id) {
                     driver.acknowledge_item();
                 }
-                if let Some(stream) = self.instance.host_stream.as_mut() {
-                    stream.phase = HostStreamPhase::AwaitItem;
-                }
+                let (expected_return_type, expected_return_schema) = self
+                    .instance
+                    .host_stream
+                    .as_mut()
+                    .map(|stream| {
+                        stream.phase = HostStreamPhase::AwaitItem;
+                        (
+                            stream.expected_return_type,
+                            stream.expected_return_schema.clone(),
+                        )
+                    })
+                    .ok_or(VmError::InvalidFrameState(
+                        "missing callable stream continuation",
+                    ))?;
                 self.instance.waiting_host_op = Some(crate::vm::host::WaitingHostOp {
                     op_id,
                     source: crate::vm::host::WaitingHostOpSource::CallableStream,
-                    expected_return_type: None,
-                    expected_return_schema: None,
+                    expected_return_type,
+                    expected_return_schema,
                 });
                 Ok(VmStatus::Waiting(op_id))
             }
@@ -563,6 +578,15 @@ impl Vm {
                 "missing callable stream continuation",
             ));
         };
+        let values = crate::vm::CallReturn::one(summary);
+        let validation_error = crate::vm::host::validate_host_call_return(
+            &values,
+            stream.expected_return_type,
+            stream.expected_return_schema.as_ref(),
+            &self.program,
+            self.host.execution_scope.resources(),
+        )
+        .err();
         let cleanup = self
             .host
             .begin_stream_termination(stream.op_id, termination)
@@ -572,17 +596,21 @@ impl Vm {
         if let Some(item) = stream.item {
             self.drop_value_with_contract(item);
         }
+        if let Some(error) = validation_error {
+            self.abort_host_invocation(stream.parent_stack_base, stream.parent_frame_count);
+            return Err(preserve_stream_cleanup(error, cleanup));
+        }
         if let Err(error) = cleanup {
             self.abort_host_invocation(stream.parent_stack_base, stream.parent_frame_count);
             return Err(error);
         }
-        self.instance.stack.push(summary);
+        values.push_onto_stack(&mut self.instance.stack);
         if self.host.has_pending_stream_terminations() {
             self.instance.waiting_host_op = Some(crate::vm::host::WaitingHostOp {
                 op_id: stream.op_id,
                 source: crate::vm::host::WaitingHostOpSource::CallableStreamTermination,
-                expected_return_type: None,
-                expected_return_schema: None,
+                expected_return_type: stream.expected_return_type,
+                expected_return_schema: stream.expected_return_schema,
             });
             Ok(false)
         } else {
@@ -617,5 +645,80 @@ impl Vm {
             self.drop_value_with_contract(item);
         }
         cleanup
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bytecode::{OpCode, Program, ValueType};
+    use crate::vm::host::{WaitingHostOp, WaitingHostOpSource};
+
+    struct CompleteWith(Value);
+
+    impl HostStreamDriver for CompleteWith {
+        fn poll_next(&mut self, _cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
+            Poll::Ready(Ok(HostStreamPoll::Complete(self.0.clone())))
+        }
+
+        fn apply_action(&mut self, _action: Value) -> VmResult<HostStreamAction> {
+            unreachable!("summary-only test driver has no callback items")
+        }
+    }
+
+    fn vm_waiting_for_int_summary(op_id: HostOpId) -> Vm {
+        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        vm.host
+            .stream_drivers
+            .insert(op_id, Box::new(CompleteWith(Value::string("malformed"))));
+        vm.instance.host_stream = Some(HostStreamContinuation {
+            op_id,
+            callback: Value::Null,
+            item: None,
+            expected_return_type: Some(ValueType::Int),
+            expected_return_schema: None,
+            phase: HostStreamPhase::AwaitItem,
+            parent_stack_base: 0,
+            parent_frame_count: 0,
+            parent_ip: 0,
+        });
+        vm.instance.waiting_host_op = Some(WaitingHostOp {
+            op_id,
+            source: WaitingHostOpSource::CallableStream,
+            expected_return_type: Some(ValueType::Int),
+            expected_return_schema: None,
+        });
+        vm
+    }
+
+    #[test]
+    fn eof_summary_is_validated_against_the_original_host_return_type() {
+        let mut vm = vm_waiting_for_int_summary(41);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let result = vm.poll_waiting_host_op(&mut cx);
+        let Poll::Ready(result) = result else {
+            panic!("summary driver should complete immediately");
+        };
+        let error = result.expect_err("malformed EOF summary must fail return validation");
+
+        assert!(matches!(error, VmError::TypeMismatch("int")));
+        assert!(vm.stack().is_empty());
+    }
+
+    #[test]
+    fn callback_stop_summary_is_validated_against_the_original_host_return_type() {
+        let mut vm = vm_waiting_for_int_summary(42);
+
+        let error = vm
+            .finish_callable_stream_with_termination(
+                Value::string("malformed"),
+                HostStreamTermination::Cancelled(OperationCancelReason::Requested),
+            )
+            .expect_err("malformed callback-stop summary must fail return validation");
+
+        assert!(matches!(error, VmError::TypeMismatch("int")));
+        assert!(vm.stack().is_empty());
     }
 }

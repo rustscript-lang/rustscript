@@ -70,8 +70,8 @@ fn call_script_executes_direct_call() {
     let compiled = compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
         .expect("direct call source should compile");
     let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
-        .expect("direct call program should encode as VMBC v13");
-    let program = decode_program(&bytes).expect("no-std should decode VMBC v13");
+        .expect("direct call program should encode as VMBC v14");
+    let program = decode_program(&bytes).expect("no-std should decode VMBC v14");
     assert!(
         program.code().windows(2).any(|pair| pair[0] == 0x1A),
         "compiler output should contain CallScript"

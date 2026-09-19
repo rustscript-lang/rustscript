@@ -865,6 +865,38 @@ async fn sse_rejects_disallowed_redirect_targets_before_connecting() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn sse_many_events_in_one_frame_materializes_one_per_callback_acknowledgement() {
+    let body = b"data: first\n\ndata: second event is deliberately over the line limit\n\n";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        String::from_utf8_lossy(body)
+    )
+    .into_bytes();
+    let response = Box::leak(response.into_boxed_slice());
+    let (port, server) = server(vec![response]);
+    let source = format!(
+        r#"use http;
+        fn stop_after_first_event(item: SseEvent) -> SseCallbackAction {{
+            {{action: if item.kind == "event" => {{ "stop" }} else => {{ "continue" }} }}
+        }}
+        http::client::sse(
+            {{"method":"GET","url":"http://127.0.0.1:{port}/events"}},
+            stop_after_first_event
+        );"#
+    );
+    let mut limits = config(port);
+    limits.max_sse_line_bytes = 16;
+
+    let vm = run_sse_source(&source, limits)
+        .await
+        .expect("the unacknowledged second event must not be materialized");
+    server.join().unwrap();
+    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("stopped"));
+    assert_eq!(field(&vm.stack()[0], "items"), &Value::Int(2));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn sse_stop_retires_without_end_and_returns_stopped_summary() {
     let (port, server) = server(vec![
         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",

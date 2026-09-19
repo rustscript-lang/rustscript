@@ -4495,6 +4495,18 @@ impl Vm {
             self.host.track_bridge_host_op(op_id)?;
         }
         let expected_return_schema = expected_return_schema.cloned();
+        if matches!(source, WaitingHostOpSource::CallableStream) {
+            let stream = self
+                .instance
+                .host_stream
+                .as_mut()
+                .filter(|stream| stream.op_id == op_id)
+                .ok_or(VmError::InvalidFrameState(
+                    "missing callable stream continuation for waiting operation",
+                ))?;
+            stream.expected_return_type = expected_return_type;
+            stream.expected_return_schema = expected_return_schema.clone();
+        }
         self.instance.waiting_host_op = Some(WaitingHostOp {
             op_id,
             source,
