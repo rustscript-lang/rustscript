@@ -11,7 +11,9 @@ use crate::vm::resource::error::{ResourceError, ResourceErrorCode};
 use crate::vm::resource::handle::ResourceHandle;
 use crate::vm::resource::table::ResourceTable;
 
-use super::async_host::{HostFuture, HostFutureOutput, preserve_stream_cleanup};
+use super::async_host::{
+    HostFuture, HostFutureOutput, HostFutureResolution, preserve_stream_cleanup,
+};
 use super::capability::CapabilityProfile;
 use super::*;
 
@@ -3130,8 +3132,8 @@ impl Vm {
         match poll_result {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(output)) => {
-                let values = match output.finish(self) {
-                    Ok(values) => values,
+                let resolution = match output.finish(self) {
+                    Ok(resolution) => resolution,
                     Err(err) => {
                         if bridge_owned {
                             let cleanup = self.host.complete_bridge_operation(
@@ -3147,36 +3149,117 @@ impl Vm {
                         return Poll::Ready(Err(err));
                     }
                 };
-                if bridge_owned {
-                    let validation = validate_host_call_return(
-                        &values,
-                        waiting.expected_return_type,
-                        waiting.expected_return_schema.as_ref(),
-                        &self.program,
-                        self.host.execution_scope.resources(),
-                    );
-                    if let Err(error) = validation {
-                        let cleanup = self
-                            .host
-                            .complete_bridge_operation(waiting.op_id, HostAsyncOpTerminal::Failed);
-                        self.instance.waiting_host_op = None;
-                        return Poll::Ready(Err(cleanup.err().unwrap_or(error)));
+                match resolution {
+                    HostFutureResolution::Return(values) => {
+                        if bridge_owned {
+                            let validation = validate_host_call_return(
+                                &values,
+                                waiting.expected_return_type,
+                                waiting.expected_return_schema.as_ref(),
+                                &self.program,
+                                self.host.execution_scope.resources(),
+                            );
+                            if let Err(error) = validation {
+                                let cleanup = self.host.complete_bridge_operation(
+                                    waiting.op_id,
+                                    HostAsyncOpTerminal::Failed,
+                                );
+                                self.instance.waiting_host_op = None;
+                                return Poll::Ready(Err(cleanup.err().unwrap_or(error)));
+                            }
+                            if let Err(error) = self.host.complete_bridge_operation(
+                                waiting.op_id,
+                                HostAsyncOpTerminal::Completed,
+                            ) {
+                                self.instance.waiting_host_op = None;
+                                return Poll::Ready(Err(error));
+                            }
+                            self.instance.waiting_host_op = None;
+                            values.push_onto_stack(&mut self.instance.stack);
+                            return Poll::Ready(Ok(()));
+                        }
+                        if let Err(error) = self.complete_waiting_host_op(waiting.op_id, values) {
+                            return Poll::Ready(Err(error));
+                        }
+                        Poll::Ready(Ok(()))
                     }
-                    if let Err(error) = self
-                        .host
-                        .complete_bridge_operation(waiting.op_id, HostAsyncOpTerminal::Completed)
-                    {
-                        self.instance.waiting_host_op = None;
-                        return Poll::Ready(Err(error));
-                    }
-                    self.instance.waiting_host_op = None;
-                    values.push_onto_stack(&mut self.instance.stack);
-                    return Poll::Ready(Ok(()));
+                    HostFutureResolution::Continue(outcome) => match outcome {
+                        CallOutcome::Return(values) => {
+                            let validation = validate_host_call_return(
+                                &values,
+                                waiting.expected_return_type,
+                                waiting.expected_return_schema.as_ref(),
+                                &self.program,
+                                self.host.execution_scope.resources(),
+                            );
+                            let terminal = if validation.is_ok() {
+                                HostAsyncOpTerminal::Completed
+                            } else {
+                                HostAsyncOpTerminal::Failed
+                            };
+                            if bridge_owned
+                                && let Err(error) =
+                                    self.host.complete_bridge_operation(waiting.op_id, terminal)
+                            {
+                                self.instance.waiting_host_op = None;
+                                return Poll::Ready(Err(error));
+                            }
+                            self.instance.waiting_host_op = None;
+                            if let Err(error) = validation {
+                                return Poll::Ready(Err(error));
+                            }
+                            values.push_onto_stack(&mut self.instance.stack);
+                            Poll::Ready(Ok(()))
+                        }
+                        CallOutcome::Pending(op_id) => {
+                            if bridge_owned
+                                && let Err(error) = self.host.complete_bridge_operation(
+                                    waiting.op_id,
+                                    HostAsyncOpTerminal::Completed,
+                                )
+                            {
+                                self.instance.waiting_host_op = None;
+                                return Poll::Ready(Err(error));
+                            }
+                            self.instance.waiting_host_op = None;
+                            let source = self.host_call_pending_source(op_id);
+                            if let Err(error) = self.set_waiting_host_op_with_return(
+                                op_id,
+                                source,
+                                waiting.expected_return_type,
+                                waiting.expected_return_schema.as_ref(),
+                            ) {
+                                let cleanup =
+                                    if matches!(source, WaitingHostOpSource::CallableStream) {
+                                        self.cancel_callable_stream_with_reason(
+                                            OperationCancelReason::Requested,
+                                        )
+                                    } else {
+                                        Ok(())
+                                    };
+                                return Poll::Ready(Err(preserve_stream_cleanup(error, cleanup)));
+                            }
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                        CallOutcome::Halt | CallOutcome::Yield => {
+                            if bridge_owned
+                                && let Err(error) = self.host.complete_bridge_operation(
+                                    waiting.op_id,
+                                    HostAsyncOpTerminal::Failed,
+                                )
+                            {
+                                self.instance.waiting_host_op = None;
+                                return Poll::Ready(Err(error));
+                            }
+                            self.instance.waiting_host_op = None;
+                            Poll::Ready(Err(VmError::HostError(
+                                "async host continuation returned a control-flow outcome"
+                                    .to_string(),
+                            )))
+                        }
+                    },
                 }
-                if let Err(error) = self.complete_waiting_host_op(waiting.op_id, values) {
-                    return Poll::Ready(Err(error));
-                }
-                Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(err)) => {
                 if matches!(waiting.source, WaitingHostOpSource::HostBridge) {

@@ -181,24 +181,29 @@ fn io_open_contract() -> vm::HostFunctionSchema {
 }
 ```
 
-The raw-handle functions of a module that schedules its own operation driver
-declare the contract alone. `runtime_owned_pending` is a separate opt-in for the
-adapter class whose pending operation is owned by the generic VM
-operation/stream registries instead of a registered driver — the standard
-example is the HTTP request and the SQLite statement family:
+Modules that can await library futures directly should declare ordinary async
+host functions. The macro captures any `#[pd_host_context]` value before the VM
+borrow ends, submits the future through the embedding's async bridge, and maps
+the resolved value through the declared contract:
 
 ```rust
-/// Streams one HTTP request, resolved by the runtime registries.
-#[pd_host_function(
-    name = "http::client::request",
-    contract = http_request_contract,
-    runtime_owned_pending
-)]
-pub(super) fn builtin_http_client_request(
-    vm: &mut Vm,
+/// Performs one bounded request through a shared library client.
+#[pd_host_function(name = "http::client::request", contract = http_request_contract)]
+pub(super) async fn builtin_http_client_request(
+    #[pd_host_context] context: HttpRequestContext,
     request: VmMapHandle,
-) -> VmResult<HostCallResult<VmMap>> { /* ... */ }
+) -> VmResult<VmMap> {
+    context.request(request).await
+}
 ```
+
+The context and parameter types of an async host function must own every value
+that crosses the suspension boundary. Owned callable schemas, including bare
+function types such as `VmCallable<fn(Event) -> Action>`, are accepted. When an
+async opening phase must hand control to generic VM continuation machinery,
+return `HostFutureOutput<T>` and use `HostFutureOutput::continue_with`; value
+mapping preserves that continuation. The HTTP SSE builtin uses this only to
+transfer an opened Hyper response into the generic callable-stream driver.
 
 What the contract does and does not change:
 
@@ -215,10 +220,11 @@ What the contract does and does not change:
   source. Deriving the contract's key from that declaration (as above) keeps the
   two from drifting.
 
-`runtime_owned_pending` requires a stack-shaped signature and is only valid
-alongside a declared contract. `io::*` (and `sqlite::open`) do **not** use it:
-they schedule a concrete operation driver in the execution scope and declare
-only `contract`.
+`runtime_owned_pending` remains available for stack-shaped synchronous adapters
+whose pending operation is already owned by a generic VM operation registry.
+It requires a declared contract. Prefer an ordinary async declaration whenever
+the implementation can await the library future directly; do not wrap such a
+function in a domain-specific operation, resource, runtime, or thread.
 
 ## 4. Installing a module
 

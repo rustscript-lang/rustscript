@@ -3,35 +3,21 @@ use std::time::{Duration, Instant};
 
 use pd_host_function::pd_host_function;
 
-use super::{arg, borrow_arg};
-use crate::HostCallResult;
+use super::typed::{VmMap, VmMapHandle};
+use super::{CallOutcome, CaptureAsyncHostContext, borrow_arg, return_one};
 use crate::host_api::{
-    HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema,
+    HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema, HostStructField,
+    HostStructSchema, HostTypeSchema,
 };
-use crate::vm::{HostFunctionRegistry, Vm, VmError, VmResult};
+use crate::vm::{HostFunctionRegistry, HostFutureOutput, Value, Vm, VmError, VmResult};
 
 mod config;
 pub(super) mod policy;
 pub(super) mod request;
-pub(super) mod resources;
 pub(super) mod sse;
 
 pub use config::HttpConfig;
 use policy::{ConnectionAdmission, ConnectionPermit};
-pub use request::{HttpRequestResource, HttpResponseResource};
-
-impl crate::host_extension::HostResourceType for HttpRequestResource {
-    const KEY: &'static str = "http.internal.request_worker";
-    const DESCRIPTION: &'static str =
-        "An in-flight HTTP request under the configured network policy";
-}
-
-impl crate::host_extension::HostResourceType for HttpResponseResource {
-    const KEY: &'static str = "http.internal.response_stream";
-    const DESCRIPTION: &'static str = "An open HTTP response body stream";
-}
-
-pub(crate) use sse::SseStreamResource;
 
 const DEFAULT_MAX_HTTP_IN_FLIGHT: usize = 64;
 
@@ -46,13 +32,16 @@ const DEFAULT_MAX_HTTP_IN_FLIGHT: usize = 64;
 struct HttpHostState {
     config: Option<HttpConfig>,
     admission: ConnectionAdmission,
+    client: request::HttpClient,
 }
 
 impl Default for HttpHostState {
     fn default() -> Self {
+        let config = HttpConfig::default();
         Self {
             config: None,
             admission: ConnectionAdmission::new(DEFAULT_MAX_HTTP_IN_FLIGHT),
+            client: request::build_client(&config),
         }
     }
 }
@@ -81,9 +70,11 @@ impl HttpHostExt for Vm {
             .module_state::<HttpHostState>()
             .map(|state| state.admission.clone())
             .unwrap_or_else(|| ConnectionAdmission::new(DEFAULT_MAX_HTTP_IN_FLIGHT));
+        let client = request::build_client(&config);
         ctx.set_module_state(HttpHostState {
             config: Some(config),
             admission,
+            client,
         });
         Ok(())
     }
@@ -122,21 +113,21 @@ impl HttpHostExt for Vm {
     }
 }
 
-/// Captured HTTP configuration plus a connection permit, used to open a
-/// request/stream without re-entering the VM.
+/// Captured HTTP configuration, shared Hyper client, and one in-flight permit.
 pub(super) struct HttpRequestContext {
-    pub(super) config: HttpConfig,
+    config: HttpConfig,
+    client: request::HttpClient,
     permit: ConnectionPermit,
+    prepared_request: Option<(request::HttpRequest, Instant)>,
 }
 
 impl HttpRequestContext {
-    /// Captures the persistent HTTP policy plus a shared in-flight permit for
-    /// one connection-oriented adapter.
+    /// Captures persistent HTTP state without leaving a VM borrow in the
+    /// macro-owned future.
     ///
-    /// The deadline is validated *before* the permit is acquired, preserving
-    /// the historical ordering guarantee (a script timeout that cannot form a
-    /// deadline is rejected even when the in-flight capacity is exhausted).
-    fn capture(
+    /// Deadline validation precedes admission so an unrepresentable script
+    /// timeout remains the first reported error even when capacity is full.
+    pub(super) fn capture_for(
         vm: &mut Vm,
         script_timeout: Option<Duration>,
         protocol: &str,
@@ -162,13 +153,33 @@ impl HttpRequestContext {
             VmError::HostError("HTTP max_stream_duration cannot form a deadline".to_string())
         })?;
         let permit = state.admission.acquire()?;
-        Ok((Self { config, permit }, deadline))
+        Ok((
+            Self {
+                config,
+                client: state.client.clone(),
+                permit,
+                prepared_request: None,
+            },
+            deadline,
+        ))
+    }
+}
+
+impl CaptureAsyncHostContext for HttpRequestContext {
+    fn capture(vm: &mut Vm) -> VmResult<Self> {
+        Self::capture_for(vm, None, "HTTP").map(|(context, _)| context)
     }
 
-    /// Consumes the captured permit, transferring it to the caller (e.g. the
-    /// SSE driver that releases it when the stream finishes).
-    fn into_permit(self) -> ConnectionPermit {
-        self.permit
+    fn capture_with_args(vm: &mut Vm, args: &[Value]) -> VmResult<Self> {
+        let mut context = Self::capture(vm)?;
+        let request = match args.first() {
+            Some(Value::Map(request)) => request,
+            Some(_) => return Err(VmError::TypeMismatch("http request map")),
+            None => return Err(VmError::StackUnderflow),
+        };
+        context.prepared_request =
+            Some(request::prepare_buffered_request(&context.config, request)?);
+        Ok(context)
     }
 }
 
@@ -179,105 +190,77 @@ impl HttpRequestContext {
 /// registered by [`HttpExtension`] byte-for-byte.
 pub fn http_host_catalog() -> Arc<HostApiCatalog> {
     Arc::clone(HTTP_HOST_CATALOG.get_or_init(|| {
-        super::host_modules::module_catalog(
-            "http",
-            HTTP_CATALOG_FUNCTIONS,
-            &[
-                http_request_resource,
-                http_response_resource,
-                sse_stream_resource,
-                request_builder_resource,
-                buffered_response_resource,
-                http_headers_resource,
-                sse_summary_resource,
-            ],
-            HTTP_NAMED_STRUCTS,
-        )
+        super::host_modules::module_catalog("http", HTTP_CATALOG_FUNCTIONS, &[], HTTP_NAMED_STRUCTS)
     }))
 }
 
 static HTTP_HOST_CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
 
-fn buffered_request_contract() -> HostFunctionSchema {
+/// Guest contract for `http::client::request`.
+///
+/// The request resolves directly to a typed `HttpResponse`; transport and pool
+/// state stay hidden in the host implementation.
+fn http_request_contract() -> HostFunctionSchema {
     HostFunctionSchema::with_return(
         "http::client::request",
-        vec![HostParamSchema::with_passing(
+        vec![HostParamSchema::value(
             "request",
-            HostTypeSchema::Resource(
-                crate::host_api::ResourceTypeKey::new("http.request").expect("static key"),
-            ),
-            HostParamPassing::TakeOwned,
+            http_request_struct(&http_request_header_struct(), &http_request_body_struct())
+                .as_type(),
         )],
-        HostTypeSchema::Resource(
-            crate::host_api::ResourceTypeKey::new("http.response").expect("static key"),
-        ),
+        http_response_struct(&http_response_header_struct(&http_header_value_struct())).as_type(),
     )
 }
 
 /// Guest contract for `http::client::sse`.
 ///
-/// SSE streams return an immutable summary resource and invoke positional callbacks.
+/// The callback observes one typed `SseEvent` and returns a typed
+/// `SseCallbackAction`; the stream resolves to a typed `SseSummary`.
 fn http_sse_contract() -> HostFunctionSchema {
-    sse::sse_contract(false, false)
+    let response_header = http_response_header_struct(&http_header_value_struct());
+    let callback = HostTypeSchema::Callable {
+        params: vec![sse_event_struct(&response_header).as_type()],
+        result: Box::new(sse_callback_action_struct().as_type()),
+    };
+    HostFunctionSchema::with_return(
+        "http::client::sse",
+        vec![
+            HostParamSchema::value(
+                "request",
+                sse_request_struct(&http_request_header_struct(), &http_request_body_struct())
+                    .as_type(),
+            ),
+            HostParamSchema::with_passing("on_event", callback, HostParamPassing::Value),
+        ],
+        sse_summary_struct(&response_header).as_type(),
+    )
 }
 
-fn http_sse_open_contract() -> HostFunctionSchema {
-    sse::sse_contract(true, false)
-}
-
-fn http_sse_only_timeout_contract() -> HostFunctionSchema {
-    sse::sse_contract(false, true)
-}
-
-fn http_sse_timeout_contract() -> HostFunctionSchema {
-    sse::sse_contract(true, true)
-}
-
-/// The SSE surface uses resource types and positional callbacks; it declares
-/// no host named structs.
-const HTTP_NAMED_STRUCTS: &[(&str, &str)] = &[];
+/// The HTTP named structs, in the published declaration order.
+///
+/// The bodies come from the descriptors; this list is the published order and
+/// documentation, so a descriptor-derived catalog renders identically.
+const HTTP_NAMED_STRUCTS: &[(&str, &str)] = &[
+    ("HttpRequestHeader", ""),
+    ("HttpHeaderValue", ""),
+    ("HttpResponseHeader", ""),
+    ("HttpRequestBody", ""),
+    ("SseEvent", ""),
+    ("HttpRequest", ""),
+    ("SseRequest", ""),
+    ("HttpResponse", ""),
+    ("SseCallbackAction", ""),
+    ("SseSummary", ""),
+];
 
 /// The HTTP host catalog surface: one descriptor per `http::client::*` member.
 const HTTP_CATALOG_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
-    resources::new_descriptor,
-    resources::set_header_descriptor,
-    resources::set_body_text_descriptor,
-    resources::set_body_bytes_descriptor,
     builtin_http_client_request_descriptor,
-    resources::status_descriptor,
-    resources::url_descriptor,
-    resources::response_header_values_descriptor,
-    resources::response_header_names_descriptor,
-    resources::body_descriptor,
-    resources::headers_values_descriptor,
-    resources::headers_names_descriptor,
-    resources::sse_outcome_descriptor,
-    resources::sse_status_descriptor,
-    resources::sse_headers_descriptor,
-    resources::sse_url_descriptor,
-    resources::sse_items_descriptor,
-    resources::sse_bytes_received_descriptor,
-    resources::sse_bytes_sent_descriptor,
     sse::builtin_http_client_sse_descriptor,
-    sse::builtin_http_client_sse_open_descriptor,
-    sse::builtin_http_client_sse_only_timeout_descriptor,
-    sse::builtin_http_client_sse_timeout_descriptor,
 ];
 
 fn http_catalog_module() -> crate::host_extension::HostModuleDescriptor {
-    super::host_modules::catalog_module(
-        "http",
-        HTTP_CATALOG_FUNCTIONS,
-        &[
-            http_request_resource,
-            http_response_resource,
-            sse_stream_resource,
-            request_builder_resource,
-            buffered_response_resource,
-            http_headers_resource,
-            sse_summary_resource,
-        ],
-    )
+    super::host_modules::catalog_module("http", HTTP_CATALOG_FUNCTIONS, &[])
 }
 
 /// The standard `http` host module.
@@ -292,33 +275,128 @@ pub(super) fn http_host_module() -> super::host_modules::StandardHostModule {
     }
 }
 
-/// The canonical declarations for the HTTP resource types.
-pub(super) fn http_request_resource() -> crate::host_extension::HostResourceTypeMeta {
-    crate::host_extension::HostResourceTypeMeta::of::<HttpRequestResource>()
+fn opt(inner: HostTypeSchema) -> HostTypeSchema {
+    HostTypeSchema::Optional(Box::new(inner))
 }
 
-pub(super) fn http_response_resource() -> crate::host_extension::HostResourceTypeMeta {
-    crate::host_extension::HostResourceTypeMeta::of::<HttpResponseResource>()
+pub(super) fn array(inner: HostTypeSchema) -> HostTypeSchema {
+    HostTypeSchema::Array(Box::new(inner))
 }
 
-pub(super) fn sse_stream_resource() -> crate::host_extension::HostResourceTypeMeta {
-    crate::host_extension::HostResourceTypeMeta::of::<SseStreamResource>()
+pub(super) fn http_request_header_struct() -> HostStructSchema {
+    HostStructSchema::new(
+        "HttpRequestHeader",
+        vec![
+            HostStructField::new("name", HostTypeSchema::String),
+            HostStructField::new("value", HostTypeSchema::String),
+        ],
+    )
 }
 
-fn request_builder_resource() -> crate::host_extension::HostResourceTypeMeta {
-    crate::host_extension::HostResourceTypeMeta::of::<resources::HttpRequest>()
+pub(super) fn http_header_value_struct() -> HostStructSchema {
+    HostStructSchema::new(
+        "HttpHeaderValue",
+        vec![
+            HostStructField::new("kind", HostTypeSchema::String),
+            HostStructField::new("text", opt(HostTypeSchema::String)),
+            HostStructField::new("bytes", opt(HostTypeSchema::Bytes)),
+        ],
+    )
 }
 
-fn buffered_response_resource() -> crate::host_extension::HostResourceTypeMeta {
-    crate::host_extension::HostResourceTypeMeta::of::<resources::HttpResponse>()
+pub(super) fn http_response_header_struct(header_value: &HostStructSchema) -> HostStructSchema {
+    HostStructSchema::new(
+        "HttpResponseHeader",
+        vec![
+            HostStructField::new("name", HostTypeSchema::String),
+            HostStructField::new("value", header_value.as_type()),
+        ],
+    )
 }
 
-fn http_headers_resource() -> crate::host_extension::HostResourceTypeMeta {
-    crate::host_extension::HostResourceTypeMeta::of::<resources::HttpHeaders>()
+pub(super) fn http_request_body_struct() -> HostStructSchema {
+    HostStructSchema::new(
+        "HttpRequestBody",
+        vec![
+            HostStructField::new("kind", HostTypeSchema::String),
+            HostStructField::new("text", opt(HostTypeSchema::String)),
+            HostStructField::new("bytes", opt(HostTypeSchema::Bytes)),
+        ],
+    )
 }
 
-fn sse_summary_resource() -> crate::host_extension::HostResourceTypeMeta {
-    crate::host_extension::HostResourceTypeMeta::of::<resources::SseSummary>()
+pub(super) fn sse_event_struct(response_header: &HostStructSchema) -> HostStructSchema {
+    HostStructSchema::new(
+        "SseEvent",
+        vec![
+            HostStructField::new("kind", HostTypeSchema::String),
+            HostStructField::new("status", opt(HostTypeSchema::Int)),
+            HostStructField::new("headers", opt(array(response_header.as_type()))),
+            HostStructField::new("url", opt(HostTypeSchema::String)),
+            HostStructField::new("event", opt(HostTypeSchema::String)),
+            HostStructField::new("data", opt(HostTypeSchema::String)),
+            HostStructField::new("id", opt(HostTypeSchema::String)),
+            HostStructField::new("retry_ms", opt(HostTypeSchema::Int)),
+        ],
+    )
+}
+
+pub(super) fn http_request_struct(
+    request_header: &HostStructSchema,
+    request_body: &HostStructSchema,
+) -> HostStructSchema {
+    HostStructSchema::new(
+        "HttpRequest",
+        vec![
+            HostStructField::new("method", HostTypeSchema::String),
+            HostStructField::new("url", HostTypeSchema::String),
+            HostStructField::new("headers", opt(array(request_header.as_type()))),
+            HostStructField::new("body", opt(request_body.as_type())),
+        ],
+    )
+}
+
+pub(super) fn sse_request_struct(
+    request_header: &HostStructSchema,
+    request_body: &HostStructSchema,
+) -> HostStructSchema {
+    let mut fields = http_request_struct(request_header, request_body).fields;
+    fields.push(HostStructField::new("timeout_ms", opt(HostTypeSchema::Int)));
+    HostStructSchema::new("SseRequest", fields)
+}
+
+pub(super) fn http_response_struct(response_header: &HostStructSchema) -> HostStructSchema {
+    HostStructSchema::new(
+        "HttpResponse",
+        vec![
+            HostStructField::new("status", HostTypeSchema::Int),
+            HostStructField::new("headers", array(response_header.as_type())),
+            HostStructField::new("body", HostTypeSchema::Bytes),
+            HostStructField::new("url", HostTypeSchema::String),
+        ],
+    )
+}
+
+pub(super) fn sse_callback_action_struct() -> HostStructSchema {
+    HostStructSchema::new(
+        "SseCallbackAction",
+        vec![HostStructField::new("action", HostTypeSchema::String)],
+    )
+}
+
+pub(super) fn sse_summary_struct(response_header: &HostStructSchema) -> HostStructSchema {
+    HostStructSchema::new(
+        "SseSummary",
+        vec![
+            HostStructField::new("outcome", HostTypeSchema::String),
+            HostStructField::new("status", HostTypeSchema::Int),
+            HostStructField::new("headers", array(response_header.as_type())),
+            HostStructField::new("url", HostTypeSchema::String),
+            HostStructField::new("items", HostTypeSchema::Int),
+            HostStructField::new("bytes_received", HostTypeSchema::Int),
+            HostStructField::new("bytes_sent", HostTypeSchema::Int),
+        ],
+    )
 }
 
 /// Registers every HTTP host function into `registry` using the exact
@@ -374,17 +452,24 @@ impl crate::vm::HostExtension for HttpExtension {
     }
 }
 
-/// Starts a buffered request, consuming the request builder.
-#[pd_host_function(
-    name = "http::client::request",
-    contract = buffered_request_contract,
-    runtime_owned_pending
-)]
-pub(super) fn builtin_http_client_request(
-    vm: &mut Vm,
-    request: crate::vm::resource::ResourceOwned<resources::HttpRequest>,
-) -> VmResult<HostCallResult<i64>> {
-    request::perform_buffered_request(vm, request)
+/// Starts an HTTP request under the VM's configured network policy.
+#[pd_host_function(name = "http::client::request", contract = http_request_contract)]
+pub(super) async fn builtin_http_client_request(
+    #[pd_host_context] context: HttpRequestContext,
+    request: VmMapHandle,
+) -> VmResult<VmMap> {
+    let HttpRequestContext {
+        config,
+        client,
+        permit,
+        prepared_request,
+    } = context;
+    let _permit = permit;
+    let _ = request;
+    let (request, deadline) = prepared_request.ok_or_else(|| {
+        VmError::HostError("HTTP request capture did not prepare the request".to_string())
+    })?;
+    request::perform_buffered_request(&client, &config, &request, deadline).await
 }
 
 #[cfg(test)]
@@ -414,7 +499,7 @@ mod tests {
         vm.configure_http(HttpConfig::default())
             .expect("default config should be valid");
 
-        let error = super::HttpRequestContext::capture(&mut vm, Some(Duration::MAX), "SSE")
+        let error = super::HttpRequestContext::capture_for(&mut vm, Some(Duration::MAX), "SSE")
             .err()
             .expect("an unrepresentable script timeout should be rejected");
         assert!(error.to_string().contains("timeout_ms"), "{error}");
@@ -451,8 +536,8 @@ mod tests {
         assert!(validate_url(&config, SchemeFamily::Http, &default_port).is_err());
     }
 
-    #[test]
-    fn pinned_resolution_preserves_the_original_host_and_validated_address() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn pinned_resolution_preserves_the_original_host_and_validated_address() {
         let config = HttpConfig {
             allowed_schemes: vec!["http".to_string()],
             allowed_hosts: vec!["127.0.0.1".to_string()],
@@ -461,17 +546,9 @@ mod tests {
             ..HttpConfig::default()
         };
         let url = "http://127.0.0.1:8080/".parse().expect("valid pinned URL");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime should build");
 
-        let target = runtime
-            .block_on(super::policy::resolve_url(
-                &config,
-                SchemeFamily::Http,
-                &url,
-            ))
+        let target = super::policy::resolve_url(&config, SchemeFamily::Http, &url)
+            .await
             .expect("target should resolve under policy");
 
         assert_eq!(target.host, "127.0.0.1");
@@ -576,14 +653,7 @@ mod contract_tests {
                 .map(|schema| HostImport {
                     name: schema.name.clone(),
                     arity: schema.arity() as u8,
-                    return_type: match &schema.return_type {
-                        HostTypeSchema::Null => ValueType::Null,
-                        HostTypeSchema::Int | HostTypeSchema::Resource(_) => ValueType::Int,
-                        HostTypeSchema::String => ValueType::String,
-                        HostTypeSchema::Bytes => ValueType::Bytes,
-                        HostTypeSchema::Array(_) => ValueType::Array,
-                        _ => ValueType::Map,
-                    },
+                    return_type: ValueType::Map,
                 })
                 .collect::<Vec<_>>();
             let schema_slots = schemas.into_iter().map(Some).collect::<Vec<_>>();
