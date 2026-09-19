@@ -2701,24 +2701,20 @@ impl Vm {
             .insert(builtin_call_index, host_slot);
     }
 
-    pub fn set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) -> VmResult<()> {
-        if self.host.has_active_bridge_operations()
-            || self
-                .instance
-                .waiting_host_op
-                .as_ref()
-                .is_some_and(|waiting| {
-                    matches!(
-                        waiting.source,
-                        crate::vm::host::WaitingHostOpSource::HostBridge
-                    )
-                })
+    fn ensure_async_bridge_mutation_is_quiescent(&self, action: &str) -> VmResult<()> {
+        if self.instance.waiting_host_op.is_some()
+            || self.instance.host_stream.is_some()
+            || !self.host.async_work_is_quiescent()
         {
-            return Err(VmError::HostError(
-                "cannot replace async bridge while an active host operation is present".to_string(),
-            ));
+            return Err(VmError::HostError(format!(
+                "cannot {action} async bridge while VM async work, an active host operation, or execution scope lifecycle is not quiescent"
+            )));
         }
-        self.cancel_waiting_host_op_with_reason(OperationCancelReason::Requested)?;
+        Ok(())
+    }
+
+    pub fn set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) -> VmResult<()> {
+        self.ensure_async_bridge_mutation_is_quiescent("replace")?;
         self.host.async_bridge = Some(bridge);
         Ok(())
     }
@@ -2730,32 +2726,7 @@ impl Vm {
     /// process-backed async IO may still need the embedding Tokio runtime to
     /// complete cleanup and reap its direct child.
     pub fn clear_async_bridge(&mut self) -> VmResult<()> {
-        if self.host.scope_reset_pending
-            || !self.host.execution_scope.resources().is_empty()
-            || !self.host.execution_scope.operations().is_empty()
-        {
-            return Err(VmError::HostError(
-                "cannot clear async bridge while the execution scope has live resources, operations, or a pending reset"
-                    .to_string(),
-            ));
-        }
-        if self.host.has_active_bridge_operations()
-            || self
-                .instance
-                .waiting_host_op
-                .as_ref()
-                .is_some_and(|waiting| {
-                    matches!(
-                        waiting.source,
-                        crate::vm::host::WaitingHostOpSource::HostBridge
-                    )
-                })
-        {
-            return Err(VmError::HostError(
-                "cannot clear async bridge while an active host operation is present".to_string(),
-            ));
-        }
-        self.cancel_waiting_host_op_with_reason(OperationCancelReason::Requested)?;
+        self.ensure_async_bridge_mutation_is_quiescent("clear")?;
         self.host.async_bridge = None;
         Ok(())
     }
