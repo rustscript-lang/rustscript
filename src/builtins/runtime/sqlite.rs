@@ -14,11 +14,15 @@
 //! retains its operation lease in the adapter closure until that work finishes or
 //! is discarded.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::fs;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(test)]
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -41,6 +45,69 @@ use crate::vm::{
 
 /// SQLite `progress_handler` step cadence used to enforce transaction deadlines.
 const SQLITE_PROGRESS_STEPS: i32 = 1_000;
+
+#[cfg(test)]
+struct TransactionCommitDeadlineGate {
+    reached: Sender<()>,
+    release: Receiver<()>,
+    commit_hook_vetoed: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRANSACTION_COMMIT_DEADLINE_GATE:
+        RefCell<Option<TransactionCommitDeadlineGate>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct TransactionCommitDeadlineGateGuard {
+    previous: Option<TransactionCommitDeadlineGate>,
+}
+
+#[cfg(test)]
+impl Drop for TransactionCommitDeadlineGateGuard {
+    fn drop(&mut self) {
+        TRANSACTION_COMMIT_DEADLINE_GATE.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
+#[cfg(test)]
+fn install_transaction_commit_deadline_gate(
+    gate: TransactionCommitDeadlineGate,
+) -> TransactionCommitDeadlineGateGuard {
+    let previous = TRANSACTION_COMMIT_DEADLINE_GATE.with(|slot| slot.replace(Some(gate)));
+    TransactionCommitDeadlineGateGuard { previous }
+}
+
+#[cfg(test)]
+fn wait_at_transaction_commit_deadline_gate() -> bool {
+    TRANSACTION_COMMIT_DEADLINE_GATE.with(|slot| {
+        let slot = slot.borrow();
+        let Some(gate) = slot.as_ref() else {
+            return false;
+        };
+        gate.reached
+            .send(())
+            .expect("deadline gate controller should remain available");
+        gate.release
+            .recv()
+            .expect("deadline gate controller should release the transaction");
+        true
+    })
+}
+
+#[cfg(test)]
+fn record_transaction_commit_hook(vetoed: bool) {
+    if vetoed {
+        TRANSACTION_COMMIT_DEADLINE_GATE.with(|slot| {
+            if let Some(gate) = slot.borrow().as_ref() {
+                gate.commit_hook_vetoed.store(true, Ordering::Release);
+            }
+        });
+    }
+}
 
 /// Maximum adapter close attempts, including the initial request.
 const SQLITE_CLOSE_MAX_ATTEMPTS: usize = 3;
@@ -1536,17 +1603,45 @@ fn parse_transaction_statements(
         .collect()
 }
 
+fn transaction_deadline_error(max_transaction_ms: u64) -> VmError {
+    VmError::HostError(format!(
+        "SQLite transaction exceeded the configured {max_transaction_ms} ms deadline"
+    ))
+}
+
+fn set_transaction_busy_timeout(
+    connection: &Connection,
+    deadline: Instant,
+    max_transaction_ms: u64,
+    busy_timeout_ms: u64,
+) -> VmResult<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(transaction_deadline_error(max_transaction_ms));
+    }
+    connection
+        .busy_timeout(remaining.min(Duration::from_millis(busy_timeout_ms)))
+        .map_err(sqlite_error)
+}
+
 fn transaction_with_connection(
     connection: &mut Connection,
     statements: Vec<TransactionStatement>,
     max_transaction_ms: u64,
+    busy_timeout_ms: u64,
 ) -> VmResult<Vec<Value>> {
     let deadline = Instant::now()
         .checked_add(Duration::from_millis(max_transaction_ms))
         .ok_or_else(|| {
             VmError::HostError("SQLite transaction deadline is out of range".to_string())
         })?;
-    transaction_with_connection_until(connection, statements, deadline, max_transaction_ms)
+    transaction_with_connection_until(
+        connection,
+        statements,
+        deadline,
+        max_transaction_ms,
+        busy_timeout_ms,
+    )
 }
 
 fn transaction_with_connection_until(
@@ -1554,6 +1649,7 @@ fn transaction_with_connection_until(
     statements: Vec<TransactionStatement>,
     deadline: Instant,
     max_transaction_ms: u64,
+    busy_timeout_ms: u64,
 ) -> VmResult<Vec<Value>> {
     connection
         .progress_handler(
@@ -1561,17 +1657,33 @@ fn transaction_with_connection_until(
             Some(move || Instant::now() >= deadline),
         )
         .map_err(sqlite_error)?;
+    if let Err(error) = connection.commit_hook(Some(move || {
+        let vetoed = Instant::now() >= deadline;
+        #[cfg(test)]
+        record_transaction_commit_hook(vetoed);
+        vetoed
+    })) {
+        connection
+            .progress_handler(0, None::<fn() -> bool>)
+            .map_err(sqlite_error)?;
+        return Err(sqlite_error(error));
+    }
     let result = (|| {
+        set_transaction_busy_timeout(connection, deadline, max_transaction_ms, busy_timeout_ms)?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error)?;
         let mut results = Vec::with_capacity(statements.len());
         for statement in statements {
             if Instant::now() >= deadline {
-                return Err(VmError::HostError(format!(
-                    "SQLite transaction exceeded the configured {max_transaction_ms} ms deadline"
-                )));
+                return Err(transaction_deadline_error(max_transaction_ms));
             }
+            set_transaction_busy_timeout(
+                &transaction,
+                deadline,
+                max_transaction_ms,
+                busy_timeout_ms,
+            )?;
             let result = if statement.query {
                 let value = query_with_connection(
                     &transaction,
@@ -1594,20 +1706,44 @@ fn transaction_with_connection_until(
             }
         }
         if Instant::now() >= deadline {
-            return Err(VmError::HostError(format!(
-                "SQLite transaction exceeded the configured {max_transaction_ms} ms deadline"
-            )));
+            return Err(transaction_deadline_error(max_transaction_ms));
         }
+        #[cfg(test)]
+        // A gated test must proceed directly to `commit` after crossing the
+        // deadline so the installed commit hook owns the veto.
+        let deadline_gate_enabled = wait_at_transaction_commit_deadline_gate();
+        #[cfg(not(test))]
+        set_transaction_busy_timeout(&transaction, deadline, max_transaction_ms, busy_timeout_ms)?;
+        #[cfg(test)]
+        if !deadline_gate_enabled {
+            set_transaction_busy_timeout(
+                &transaction,
+                deadline,
+                max_transaction_ms,
+                busy_timeout_ms,
+            )?;
+        }
+        // SQLite invokes the commit hook after it has obtained the
+        // rollback-journal EXCLUSIVE lock and before commit phase one. The
+        // hook therefore closes the race where the bounded busy handler wakes
+        // after the deadline and would otherwise complete a late commit.
         transaction.commit().map_err(sqlite_error)?;
         Ok(results)
     })();
-    connection
+    let commit_hook_cleanup = connection
+        .commit_hook(None::<fn() -> bool>)
+        .map_err(sqlite_error);
+    let progress_cleanup = connection
         .progress_handler(0, None::<fn() -> bool>)
-        .map_err(sqlite_error)?;
+        .map_err(sqlite_error);
+    let busy_timeout_cleanup = connection
+        .busy_timeout(Duration::from_millis(busy_timeout_ms))
+        .map_err(sqlite_error);
+    commit_hook_cleanup?;
+    progress_cleanup?;
+    busy_timeout_cleanup?;
     if Instant::now() >= deadline && result.is_err() {
-        return Err(VmError::HostError(format!(
-            "SQLite transaction exceeded the configured {max_transaction_ms} ms deadline"
-        )));
+        return Err(transaction_deadline_error(max_transaction_ms));
     }
     result
 }
@@ -1626,6 +1762,7 @@ pub(super) async fn builtin_sqlite_transaction_impl(
         context.allow_unsafe_sql,
     )?;
     let max_transaction_ms = context.limits.max_transaction_ms;
+    let busy_timeout_ms = context.limits.busy_timeout_ms;
     let closed = Arc::clone(&context.closed);
     let value = context
         .connection
@@ -1636,7 +1773,7 @@ pub(super) async fn builtin_sqlite_transaction_impl(
                     "SQLite database is already closed".to_string(),
                 ));
             }
-            transaction_with_connection(connection, statements, max_transaction_ms)
+            transaction_with_connection(connection, statements, max_transaction_ms, busy_timeout_ms)
         })
         .await
         .map_err(adapter_call_error)?;
@@ -1826,6 +1963,7 @@ mod tests {
                 statements,
                 Instant::now() + Duration::from_millis(500),
                 500,
+                limits.busy_timeout_ms,
             )
         });
 
@@ -1847,6 +1985,199 @@ mod tests {
             .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
             .expect("verification query should succeed");
         assert_eq!(count, 0, "the observed write must be rolled back");
+        drop(verifier);
+        fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
+    }
+
+    #[test]
+    fn transaction_commit_hook_vetoes_expired_deadline_and_hooks_are_restored() {
+        let mut connection = Connection::open_in_memory().expect("test connection should open");
+        connection
+            .execute_batch("CREATE TABLE items (value INTEGER)")
+            .expect("test table should be created");
+        let limits = SqliteLimits::default();
+        let original_busy_timeout_ms = 1_337;
+        connection
+            .busy_timeout(Duration::from_millis(original_busy_timeout_ms))
+            .expect("original busy timeout should be configured");
+
+        let (gate_reached_tx, gate_reached_rx) = mpsc::channel();
+        let (gate_release_tx, gate_release_rx) = mpsc::channel();
+        let commit_hook_vetoed = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let gate_controller = std::thread::spawn(move || {
+            let reached = gate_reached_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            if reached {
+                while Instant::now() < deadline {
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                }
+            }
+            gate_release_tx
+                .send(())
+                .expect("transaction should remain at the deadline gate");
+            reached
+        });
+        let _gate_guard = install_transaction_commit_deadline_gate(TransactionCommitDeadlineGate {
+            reached: gate_reached_tx,
+            release: gate_release_rx,
+            commit_hook_vetoed: Arc::clone(&commit_hook_vetoed),
+        });
+        let statements = vec![TransactionStatement {
+            sql: "INSERT INTO items (value) VALUES (1)".to_string(),
+            params: Vec::new(),
+            query: false,
+            limits,
+            after_execute: None,
+        }];
+
+        let result = transaction_with_connection_until(
+            &mut connection,
+            statements,
+            deadline,
+            1_000,
+            original_busy_timeout_ms,
+        );
+        assert!(
+            gate_controller
+                .join()
+                .expect("gate controller should not panic"),
+            "transaction must reach the pre-commit deadline gate"
+        );
+        let error = result.expect_err("the expired commit must be vetoed");
+        assert!(
+            error.to_string().contains("1000 ms deadline"),
+            "commit deadline must surface explicitly, got: {error}"
+        );
+        assert!(
+            commit_hook_vetoed.load(Ordering::Acquire),
+            "the installed commit hook must veto the expired commit"
+        );
+        assert!(
+            connection.is_autocommit(),
+            "the vetoed transaction must restore autocommit"
+        );
+        let count_after_veto: i64 = connection
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .expect("row count should remain queryable after the veto");
+        assert_eq!(count_after_veto, 0, "the vetoed write must not persist");
+        let restored_busy_timeout: i64 = connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("restored busy timeout should remain queryable");
+        assert_eq!(
+            restored_busy_timeout, original_busy_timeout_ms as i64,
+            "the original busy timeout must be restored"
+        );
+
+        connection
+            .execute_batch(
+                "WITH RECURSIVE numbers(value) AS (\
+                     VALUES(1) \
+                     UNION ALL \
+                     SELECT value + 1 FROM numbers WHERE value < 5000\
+                 ) \
+                 INSERT INTO items SELECT value FROM numbers",
+            )
+            .expect("a later write on the same connection should succeed");
+        let count_after_reuse: i64 = connection
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .expect("row count should remain queryable after connection reuse");
+        assert_eq!(
+            count_after_reuse, 5_000,
+            "progress and commit hooks must not leak into later writes"
+        );
+    }
+
+    #[test]
+    fn transaction_deadline_rolls_back_when_commit_waits_for_reader() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rustscript-sqlite-commit-deadline-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("temporary SQLite root should be created");
+        let database_path = root.join("state.db");
+        Connection::open(&database_path)
+            .expect("setup connection should open")
+            .execute_batch("PRAGMA journal_mode = DELETE; CREATE TABLE items (value INTEGER)")
+            .expect("setup table should be created in rollback-journal mode");
+
+        let reader = Connection::open(&database_path).expect("reader connection should open");
+        reader
+            .execute_batch("BEGIN")
+            .expect("reader transaction should begin");
+        let visible_count: i64 = reader
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .expect("reader should acquire a shared lock");
+        assert_eq!(
+            visible_count, 0,
+            "the reader should see the initial database state"
+        );
+
+        let (write_observed_tx, write_observed_rx) = mpsc::channel();
+        let worker_path = database_path.clone();
+        let transaction = std::thread::spawn(move || {
+            let mut connection =
+                Connection::open(worker_path).expect("transaction connection should open");
+            connection
+                .busy_timeout(Duration::from_secs(2))
+                .expect("commit should wait for the reader past the transaction deadline");
+            let limits = SqliteLimits::default();
+            let statements = vec![TransactionStatement {
+                sql: "INSERT INTO items (value) VALUES (1)".to_string(),
+                params: Vec::new(),
+                query: false,
+                limits,
+                after_execute: Some(Box::new(move || {
+                    write_observed_tx
+                        .send(())
+                        .expect("write observation receiver should remain open");
+                })),
+            }];
+            let result = transaction_with_connection_until(
+                &mut connection,
+                statements,
+                Instant::now() + Duration::from_millis(100),
+                100,
+                2_000,
+            );
+            let restored_busy_timeout: i64 = connection
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .expect("configured busy timeout should remain queryable");
+            (result, connection.is_autocommit(), restored_busy_timeout)
+        });
+
+        write_observed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the INSERT must execute while the reader holds its shared lock");
+        std::thread::sleep(Duration::from_millis(250));
+        reader
+            .execute_batch("ROLLBACK")
+            .expect("reader should release its shared lock");
+        drop(reader);
+
+        let (result, is_autocommit, restored_busy_timeout) = transaction
+            .join()
+            .expect("transaction worker should not panic");
+        let error = result.expect_err("a commit unblocked after the deadline must roll back");
+        assert!(
+            error.to_string().contains("100 ms deadline"),
+            "commit deadline must surface explicitly, got: {error}"
+        );
+        assert!(is_autocommit, "the timed-out transaction must be closed");
+        assert_eq!(
+            restored_busy_timeout, 2_000,
+            "the connection busy timeout must be restored after rollback"
+        );
+
+        let verifier = Connection::open(&database_path)
+            .expect("verification connection should reopen the database");
+        let count: i64 = verifier
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .expect("verification query should succeed");
+        assert_eq!(count, 0, "a late commit must not persist its write");
         drop(verifier);
         fs::remove_dir_all(root).expect("temporary SQLite root should be removed");
     }
