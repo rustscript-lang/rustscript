@@ -97,18 +97,38 @@ fn async_io_popen_reads_through_tokio_process_pipe() {
 }
 
 #[test]
-fn io_implementations_do_not_create_private_threads_or_runtimes() {
+fn io_implementations_use_only_generic_async_and_inline_sync_lifecycles() {
     let async_source = include_str!("../../src/builtins/runtime/io/async_io.rs");
     let blocking_source = include_str!("../../src/builtins/runtime/io/blocking.rs");
 
-    // The async implementation must run on the bridge's executor: it must
-    // not spawn its own threads or build its own tokio runtime.
-    assert!(!async_source.contains("thread::Builder"));
-    assert!(!async_source.contains("runtime::Builder"));
-    assert!(!async_source.contains("spawn_blocking"));
-    // The blocking implementation must not create a private runtime either;
-    // per-op worker threads are driven by the blocking path itself.
-    assert!(!blocking_source.contains("runtime::Builder"));
+    for forbidden in [
+        "std::thread",
+        "thread::Builder",
+        "JoinHandle",
+        "runtime::Builder",
+        "spawn_blocking",
+        "submit_host_future",
+        "HostAsyncBridge",
+        "HostOperation",
+        "IoOperationLease",
+        "active_operations",
+        "close_waker",
+        "close_scheduled",
+        "close_future",
+        "owner_alive",
+        "OperationSpec",
+        "schedule_io_task",
+        "worker_done",
+    ] {
+        assert!(
+            !async_source.contains(forbidden),
+            "async IO must not contain `{forbidden}` lifecycle machinery"
+        );
+        assert!(
+            !blocking_source.contains(forbidden),
+            "blocking IO must be synchronous inline code without `{forbidden}`"
+        );
+    }
 }
 
 #[cfg(unix)]

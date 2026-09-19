@@ -5,20 +5,17 @@
 //! metadata, and [`io_host_module`]. Only the function *implementations* are
 //! selected per target and per feature:
 //!
-//! - `async` (non-wasm32): `async_io` drives IO through tokio and submits async
-//!   host functions via the generic async host bridge.
-//! - default (non-wasm32): `blocking` drives IO through worker threads
-//!   registered as concrete operation drivers in the execution scope.
+//! - `async` (non-wasm32): `async_io` awaits Tokio file/process operations
+//!   through ordinary annotated async host functions.
+//! - default (non-wasm32): `blocking` performs synchronous IO inline without
+//!   worker threads or private operation machinery.
 //! - wasm32: `wasm` (the `io_wasm.rs` backend) keeps the catalog surface and
 //!   rejects every IO call with a host error; the target has no file system.
 //!
-//! The non-wasm32 implementations share the same execution-scope resource
-//! model: live handles are `IoResource`s owned by the VM's execution scope and
-//! in-flight IO work is driven by concrete operation drivers registered in the
-//! same scope. Only the concurrency mechanism differs. Every backend declares
-//! the same [`IO_FILE_KEY`] and [`IO_FILE_DESCRIPTION`] for its own concrete
-//! handle type, so the guest contract and the target it compiles for cannot
-//! drift.
+//! Native backends retain only script-visible file/process handles as typed
+//! execution-scope resources. Every backend declares the same [`IO_FILE_KEY`]
+//! and [`IO_FILE_DESCRIPTION`] for its concrete handle type, so the guest
+//! contract and the target it compiles for cannot drift.
 
 use super::borrow_arg;
 #[cfg(all(feature = "async", not(target_arch = "wasm32")))]
@@ -26,10 +23,8 @@ use super::{CallOutcome, CaptureAsyncHostContext, return_one};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::vm::Vm;
 
-/// The synchronous host-call channel that hands a pending operation id back to
-/// the VM. The blocking and wasm backends schedule a concrete operation driver;
-/// the async backend submits a future through the generic bridge instead.
-#[cfg(any(not(feature = "async"), target_arch = "wasm32"))]
+/// The synchronous pending-call channel used only by the wasm32 stub backend.
+#[cfg(target_arch = "wasm32")]
 pub(super) use super::HostCallResult;
 
 /// The canonical catalog key of the `io.file` resource type.
