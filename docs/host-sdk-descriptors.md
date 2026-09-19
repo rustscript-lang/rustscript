@@ -303,13 +303,13 @@ Each module declares two things:
 - `owned` — **every** descriptor the module owns, including functions still
   dispatched through the generated namespaced-builtin path.
 
-`tests/standard_host_descriptor_arch_tests.rs` proves that the two agree: every
-standard `#[pd_host_function]` has exactly one descriptor owner, every ownership
-list is declared by a file that belongs to a module `standard_host_modules()`
-composes (a module this build's gates turn off is the only exemption, and it is
-stated in the guard), no gated module leaks into the derived catalog, and any
-intentional catalog revision updates the fingerprint format plus artifact ABI
-with explicit prior-artifact rejection coverage.
+`tests/standard_host_descriptor_arch_tests.rs` checks the composed descriptors
+and catalogs directly: module names are unique and deterministically ordered,
+every published function belongs to its module's ownership list, and the merged
+catalog preserves the expected module and aggregate fingerprints. It also checks
+that resource declarations and named structs follow the selected modules, public
+returns stay typed, and native-only HTTP and SQLite surfaces do not appear when
+their build gates are off.
 
 ## 7. Compatibility window
 

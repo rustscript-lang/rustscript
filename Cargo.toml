@@ -87,8 +87,6 @@ cranelift-jit = { version = "0.129.1", optional = true }
 cranelift-module = { version = "0.129.1", optional = true }
 cranelift-native = { version = "0.129.1", optional = true }
 pd-host-function = { path = "./pd-host-function", version = "0.1.0" }
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "hooks", "limits"], optional = true }
-tokio-rusqlite = { version = "0.8", optional = true }
 edge_abi = { package = "pd-edge-abi", version = "0.1.1", default-features = false, optional = true }
 futures-channel = "0.3"
 paste = "1"
@@ -104,6 +102,8 @@ http-body-util = { version = "0.1", optional = true }
 hyper = { version = "1", default-features = false, features = ["client", "http1"], optional = true }
 hyper-rustls = { version = "0.27.7", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"], optional = true }
 hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "tokio"], optional = true }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled", "hooks", "limits"], optional = true }
+tokio-rusqlite = { version = "0.8", optional = true }
 tower-service = { version = "0.3", optional = true }
 url = { version = "2", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "fs", "io-util", "process", "macros"], optional = true }

@@ -55,9 +55,10 @@ fn parse_catalog_source_accepts_the_checked_in_catalog() {
     ))
     .expect("read authoritative catalog");
     let entries = parse_catalog_source(&source, "catalog.rs");
-    // The SQLite namespace is optional (mirrors the build.rs feature filter):
-    // when the feature is off, the generated catalog excludes it.
-    #[cfg(not(feature = "sqlite"))]
+    // The SQLite namespace is native-only (mirrors the build.rs filter): when
+    // the feature is off or the target family is wasm, the generated catalog
+    // excludes it.
+    #[cfg(not(all(feature = "sqlite", not(target_family = "wasm"))))]
     let entries: Vec<_> = entries
         .into_iter()
         .filter(|entry| !entry.source_name.starts_with("sqlite::"))
