@@ -1637,11 +1637,11 @@ mod tests {
     fn cli_build_features_report_compiled_capabilities() {
         let features = super::cli_build_features();
 
-        #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+        #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
         let mut modules = vec!["bytes", "io", "re", "json", "jit", "math"];
-        #[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
+        #[cfg(not(all(feature = "sqlite", not(target_family = "wasm"))))]
         let modules = ["bytes", "io", "re", "json", "jit", "math"];
-        #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+        #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
         modules.push("sqlite");
         assert_eq!(
             features,

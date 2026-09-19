@@ -1,16 +1,8 @@
 //! SQLite guest contracts and the SQLite host catalog surface.
 //!
-//! This module is deliberately not feature-gated: the standard guest catalog
-//! declares the SQLite surface for every build, exactly as it did before the
-//! descriptors, so a program compiled against the standard catalog always
-//! resolves the same imports. The concrete adapters and the connection
-//! resource type live in the feature-gated [`super::sqlite`] module; when that
-//! module is compiled out, the surface is still declared from the same
-//! contract functions with an adapter that fails closed.
-//!
 //! Every named struct and every function schema below is the single source of
-//! the SQLite guest contract: the feature-gated host functions attach these
-//! contracts directly, and the catalog is derived from them.
+//! the SQLite guest contract: the host functions attach these contracts
+//! directly, and the catalog is derived from them.
 
 use crate::host_api::{
     HostFunctionSchema, HostParamPassing, HostParamSchema, HostStructField, HostStructSchema,
@@ -23,33 +15,9 @@ pub(super) const SQLITE_CONNECTION_KEY: &str = "sqlite.connection";
 /// The canonical `sqlite.connection` resource description.
 pub(super) const SQLITE_CONNECTION_DESCRIPTION: &str = "An open SQLite connection";
 
-/// Resource type declaration used when the SQLite host module is compiled out.
-///
-/// The concrete scope resource is [`super::sqlite`]'s `SqliteResource`; this
-/// marker only carries the guest-visible declaration for the catalog, so the
-/// disabled build keeps the same resource key and description.
-#[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-pub(super) struct SqliteConnectionResourceMarker;
-
-#[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-impl crate::vm::resource::HostResource for SqliteConnectionResourceMarker {}
-
-#[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-impl crate::host_extension::HostResourceType for SqliteConnectionResourceMarker {
-    const KEY: &'static str = SQLITE_CONNECTION_KEY;
-    const DESCRIPTION: &'static str = SQLITE_CONNECTION_DESCRIPTION;
-}
-
 /// The canonical declaration for the `sqlite.connection` resource type.
 pub(super) fn sqlite_connection_resource() -> HostResourceTypeMeta {
-    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
-    {
-        super::sqlite::concrete_sqlite_connection_resource()
-    }
-    #[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-    {
-        HostResourceTypeMeta::of::<SqliteConnectionResourceMarker>()
-    }
+    super::sqlite::concrete_sqlite_connection_resource()
 }
 
 /// The `sqlite.connection` resource key, taken from its single declaration.
@@ -335,77 +303,9 @@ pub(super) const SQLITE_NAMED_STRUCTS: &[(&str, &str)] = &[
 // coincide; parameter labels, result cells, and mixed transaction outputs use
 // the typed named structs declared in `super`.
 
-/// Fails closed when the SQLite host module is not compiled into the build.
-#[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-fn sqlite_module_unavailable(
-    _vm: &mut crate::vm::Vm,
-    _args: &[crate::vm::Value],
-) -> crate::vm::VmResult<crate::vm::CallOutcome> {
-    Err(crate::vm::VmError::HostError(
-        "the SQLite host module is not compiled into this build".to_string(),
-    ))
-}
-
-/// One SQLite catalog entry for builds without the SQLite host module.
-#[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-fn sqlite_unavailable_descriptor(
-    contract: fn() -> HostFunctionSchema,
-) -> crate::host_extension::HostFunctionDescriptor {
-    crate::host_extension::HostFunctionDescriptor {
-        schema: contract(),
-        binding: crate::host_extension::HostBindingDescriptor {
-            kind: crate::host_extension::HostBindingKind::StaticStack,
-        },
-        effects: crate::host_extension::guest_resource_effects(&contract()),
-        adapter: crate::host_extension::HostAdapterDescriptor::StaticStack(
-            sqlite_module_unavailable,
-        ),
-        resource_types: Vec::new(),
-    }
-}
-
-#[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-fn sqlite_open_unavailable_descriptor() -> crate::host_extension::HostFunctionDescriptor {
-    sqlite_unavailable_descriptor(sqlite_open_contract)
-}
-
-#[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-fn sqlite_execute_unavailable_descriptor() -> crate::host_extension::HostFunctionDescriptor {
-    sqlite_unavailable_descriptor(sqlite_execute_contract)
-}
-
-#[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-fn sqlite_query_unavailable_descriptor() -> crate::host_extension::HostFunctionDescriptor {
-    sqlite_unavailable_descriptor(sqlite_query_contract)
-}
-
-#[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-fn sqlite_transaction_unavailable_descriptor() -> crate::host_extension::HostFunctionDescriptor {
-    sqlite_unavailable_descriptor(sqlite_transaction_contract)
-}
-
-#[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-fn sqlite_close_unavailable_descriptor() -> crate::host_extension::HostFunctionDescriptor {
-    sqlite_unavailable_descriptor(sqlite_close_contract)
-}
-
 /// Every SQLite catalog function this build owns.
-pub(super) const SQLITE_FUNCTIONS: &[fn() -> HostFunctionDescriptor] = {
-    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
-    {
-        super::sqlite::SQLITE_CATALOG_FUNCTIONS
-    }
-    #[cfg(not(all(feature = "sqlite", not(target_arch = "wasm32"))))]
-    {
-        &[
-            sqlite_open_unavailable_descriptor,
-            sqlite_execute_unavailable_descriptor,
-            sqlite_query_unavailable_descriptor,
-            sqlite_transaction_unavailable_descriptor,
-            sqlite_close_unavailable_descriptor,
-        ]
-    }
-};
+pub(super) const SQLITE_FUNCTIONS: &[fn() -> HostFunctionDescriptor] =
+    super::sqlite::SQLITE_CATALOG_FUNCTIONS;
 
 /// The SQLite catalog surface for this build.
 pub(super) fn sqlite_catalog_module() -> crate::host_extension::HostModuleDescriptor {
@@ -413,12 +313,6 @@ pub(super) fn sqlite_catalog_module() -> crate::host_extension::HostModuleDescri
 }
 
 /// The standard `sqlite` host module.
-///
-/// The guest catalog surface is part of the standard catalog in **every**
-/// build, exactly as before the descriptors: a program compiled against the
-/// standard catalog always resolves the same SQLite imports. The features only
-/// select the adapters — with the SQLite host module compiled in they are the
-/// real host functions, otherwise they fail closed at the runtime boundary.
 pub(super) fn sqlite_standard_host_module() -> super::host_modules::StandardHostModule {
     use super::host_modules::StandardHostModule;
 

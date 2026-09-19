@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
     not(target_family = "wasm")
 ))]
 use vm::http_host_catalog;
-#[cfg(feature = "runtime")]
+#[cfg(all(feature = "runtime", feature = "sqlite", not(target_family = "wasm")))]
 use vm::sqlite_host_catalog;
 #[cfg(feature = "runtime")]
 use vm::{HostApiCatalog, jit_host_catalog, standard_host_catalog, timer_host_catalog};
@@ -324,44 +324,6 @@ fn affected_public_host_catalogs_have_no_reachable_map_or_unknown() {
     assert_no_public_dynamic_schema("timer", &timer_host_catalog());
     #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
     assert_no_public_dynamic_schema("http", &http_host_catalog());
-    #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
     assert_no_public_dynamic_schema("sqlite", &sqlite_host_catalog());
-}
-
-#[cfg(all(feature = "runtime", not(feature = "sqlite")))]
-#[test]
-fn standard_catalog_keeps_sqlite_editor_schema_without_sqlite_runtime() {
-    let sqlite = sqlite_host_catalog();
-    assert!(
-        sqlite.function("sqlite::query").is_some(),
-        "the standalone editor/compiler catalog must retain SQLite declarations"
-    );
-    let query = sqlite
-        .function("sqlite::query")
-        .expect("SQLite query declaration");
-    let value = sqlite
-        .struct_named("SqliteValue")
-        .expect("SQLite value named struct");
-    assert_eq!(
-        query.params[2].ty,
-        HostTypeSchema::Array(Box::new(value.as_type())),
-        "SQLite query params must stay typed without the runtime feature"
-    );
-    assert_no_public_dynamic_schema("sqlite", &sqlite);
-
-    let catalog = standard_host_catalog();
-    assert!(
-        catalog.function("sqlite::open").is_some(),
-        "the editor/compiler catalog must retain SQLite schema declarations"
-    );
-    assert!(
-        catalog.struct_named("SqliteOpenOptions").is_some(),
-        "the editor/compiler catalog must retain SQLite named structs"
-    );
-    assert!(
-        vm::default_host_callables()
-            .iter()
-            .all(|callable| !callable.name.starts_with("sqlite::")),
-        "the executable default host surface must remain feature-gated"
-    );
 }

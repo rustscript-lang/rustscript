@@ -394,14 +394,11 @@ impl CaptureAsyncHostContext for SqliteOpenContext {
 
 #[derive(Clone)]
 pub(super) struct SqliteConnectionContext {
-    handle: ResourceHandle,
     connection: tokio_rusqlite::Connection,
-    interrupt: Arc<rusqlite::InterruptHandle>,
     limits: SqliteLimits,
     allow_unsafe_sql: bool,
     closed: Arc<AtomicBool>,
     in_flight: Arc<AtomicUsize>,
-    close_lifecycle: Arc<SqliteCloseLifecycle>,
 }
 
 impl SqliteConnectionContext {
@@ -455,6 +452,33 @@ impl CaptureAsyncHostContext for SqliteConnectionContext {
             }
         };
         lookup_connection(vm, db_id)
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct SqliteCloseContext {
+    handle: ResourceHandle,
+    close_lifecycle: Arc<SqliteCloseLifecycle>,
+}
+
+impl CaptureAsyncHostContext for SqliteCloseContext {
+    fn capture(_vm: &mut Vm) -> VmResult<Self> {
+        Err(VmError::HostError(
+            "SQLite close context requires call arguments".to_string(),
+        ))
+    }
+
+    fn capture_with_args(vm: &mut Vm, args: &[Value]) -> VmResult<Self> {
+        let db_id = match args.first() {
+            Some(Value::Int(value)) => *value,
+            Some(_) => return Err(VmError::TypeMismatch("int")),
+            None => {
+                return Err(VmError::HostError(
+                    "missing SQLite database argument".to_string(),
+                ));
+            }
+        };
+        capture_close_connection(vm, db_id)
     }
 }
 
@@ -568,13 +592,36 @@ fn lookup_connection(vm: &mut Vm, handle_id: i64) -> VmResult<SqliteConnectionCo
         ));
     }
     Ok(SqliteConnectionContext {
-        handle,
         connection: resource.connection.clone(),
-        interrupt: Arc::clone(&resource.interrupt),
         limits: resource.limits,
         allow_unsafe_sql: resource.allow_unsafe_sql,
         closed: Arc::clone(&resource.closed),
         in_flight: Arc::clone(&resource.in_flight),
+    })
+}
+
+fn capture_close_connection(vm: &mut Vm, handle_id: i64) -> VmResult<SqliteCloseContext> {
+    let handle = sqlite_handle(handle_id)?;
+    let token = vm
+        .execution_scope()
+        .resources()
+        .typed::<SqliteResource>(handle)
+        .map_err(|error| VmError::HostError(format!("unknown SQLite database: {error}")))?;
+    let resource = vm
+        .execution_scope()
+        .resources()
+        .get::<SqliteResource>(&token)
+        .map_err(|error| VmError::HostError(format!("SQLite database borrow failed: {error}")))?;
+    resource
+        .close_lifecycle
+        .begin(
+            resource.connection.clone(),
+            resource.interrupt.as_ref(),
+            resource.closed.as_ref(),
+        )
+        .map_err(VmError::HostError)?;
+    Ok(SqliteCloseContext {
+        handle,
         close_lifecycle: Arc::clone(&resource.close_lifecycle),
     })
 }
@@ -1600,30 +1647,9 @@ pub(super) async fn builtin_sqlite_transaction_impl(
 /// Closes the adapter connection, then removes its VM resource.
 #[pd_host_function(name = "sqlite::close", contract = super::sqlite_schema::sqlite_close_contract)]
 pub(super) async fn builtin_sqlite_close_impl(
-    #[pd_host_context] context: SqliteConnectionContext,
+    #[pd_host_context] context: SqliteCloseContext,
     _db_id: i64,
 ) -> VmResult<HostFutureOutput<()>> {
-    let lease = context.begin_operation()?;
-    if context.closed.swap(true, Ordering::AcqRel) {
-        return Err(VmError::HostError(
-            "SQLite database is already closed".to_string(),
-        ));
-    }
-    context.interrupt.interrupt();
-    let _ = context
-        .connection
-        .call(move |_connection| {
-            drop(lease);
-            Ok::<(), VmError>(())
-        })
-        .await;
-    if let Err(message) = context.close_lifecycle.begin(
-        context.connection.clone(),
-        context.interrupt.as_ref(),
-        context.closed.as_ref(),
-    ) {
-        return Err(VmError::HostError(message));
-    }
     if let Err(message) = std::future::poll_fn(|cx| context.close_lifecycle.poll(cx)).await {
         return Err(VmError::HostError(message));
     }
@@ -1982,6 +2008,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canceled_blocked_close_can_be_reentered_and_reclaims_the_resource() {
+        let limits = SqliteLimits::default();
+        let options = OpenOptions {
+            path: ":memory:".to_string(),
+            mode: OpenMode::Memory,
+            root: None,
+            limits,
+            allow_unsafe_sql: false,
+        };
+        let (connection, interrupt) = open_connection(&options)
+            .await
+            .expect("adapter connection should open");
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let blocker_connection = connection.clone();
+        let mut blocker = Box::pin(blocker_connection.call(move |_connection| {
+            release_rx
+                .recv()
+                .expect("blocked adapter call should be released");
+            Ok::<(), VmError>(())
+        }));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(blocker.as_mut().poll(&mut cx), Poll::Pending));
+
+        let open_connections = Arc::new(AtomicUsize::new(1));
+        let closed = Arc::new(AtomicBool::new(false));
+        let resource = SqliteResource {
+            connection,
+            interrupt,
+            limits,
+            allow_unsafe_sql: false,
+            closed: Arc::clone(&closed),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            close_lifecycle: Arc::new(SqliteCloseLifecycle::new()),
+            _connection_permit: ConnectionCountPermit {
+                open_connections: Arc::clone(&open_connections),
+            },
+        };
+        let program = crate::compile_source("null;")
+            .expect("test program should compile")
+            .program;
+        let mut vm = Vm::new(program);
+        let token = vm
+            .execution_scope()
+            .push_resource(resource)
+            .expect("SQLite resource should insert");
+        let handle_id = handle_value(token.handle());
+
+        let context = capture_close_connection(&mut vm, handle_id)
+            .expect("the first close should capture its resource");
+        assert!(
+            closed.load(Ordering::Acquire),
+            "close capture must begin the resource-owned lifecycle before suspension"
+        );
+        let mut close = Box::pin(builtin_sqlite_close_impl(context, handle_id));
+        assert!(matches!(close.as_mut().poll(&mut cx), Poll::Pending));
+        drop(close);
+        assert_eq!(vm.host_context().resource_count(), 1);
+        assert_eq!(open_connections.load(Ordering::Acquire), 1);
+
+        let context = capture_close_connection(&mut vm, handle_id)
+            .expect("a cancelled close should remain available for re-entry");
+        let close = builtin_sqlite_close_impl(context, handle_id);
+        release_tx
+            .send(())
+            .expect("blocked adapter call should still be waiting");
+        blocker.await.expect("blocked adapter call should finish");
+        let output = tokio::time::timeout(Duration::from_secs(5), close)
+            .await
+            .expect("re-entered close should finish")
+            .expect("re-entered close should succeed");
+        match output {
+            HostFutureOutput::VmCompletion(completion) => {
+                completion(&mut vm).expect("close completion should remove the resource");
+            }
+            HostFutureOutput::Return(()) => {
+                panic!("close must remove its resource on the VM thread")
+            }
+            HostFutureOutput::VmContinuation(_) => panic!("close must not install a continuation"),
+        }
+
+        assert_eq!(vm.host_context().resource_count(), 0);
+        assert_eq!(open_connections.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
     async fn canceled_host_future_holds_operation_slot_until_adapter_closure_finishes() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2006,19 +2117,16 @@ mod tests {
             limits,
             allow_unsafe_sql: false,
         };
-        let (connection, interrupt) = open_connection(&options)
+        let (connection, _interrupt) = open_connection(&options)
             .await
             .expect("adapter connection should open");
         let in_flight = Arc::new(AtomicUsize::new(0));
         let context = SqliteConnectionContext {
-            handle: ResourceHandle::encode(1, 0, 1).expect("test handle should encode"),
             connection: connection.clone(),
-            interrupt,
             limits,
             allow_unsafe_sql: false,
             closed: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::clone(&in_flight),
-            close_lifecycle: Arc::new(SqliteCloseLifecycle::new()),
         };
         let mut operation = Box::pin(builtin_sqlite_execute_impl(
             context,
@@ -2064,19 +2172,16 @@ mod tests {
             limits,
             allow_unsafe_sql: false,
         };
-        let (connection, interrupt) = open_connection(&options)
+        let (connection, _interrupt) = open_connection(&options)
             .await
             .expect("adapter connection should open");
         let in_flight = Arc::new(AtomicUsize::new(0));
         let context = SqliteConnectionContext {
-            handle: ResourceHandle::encode(1, 0, 1).expect("test handle should encode"),
             connection: connection.clone(),
-            interrupt,
             limits,
             allow_unsafe_sql: false,
             closed: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::clone(&in_flight),
-            close_lifecycle: Arc::new(SqliteCloseLifecycle::new()),
         };
 
         builtin_sqlite_execute_impl(context.clone(), 1, String::new(), Arc::new(Vec::new()))

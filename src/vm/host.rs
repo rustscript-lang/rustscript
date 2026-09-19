@@ -3267,11 +3267,11 @@ impl Vm {
             match self.poll_waiting_host_op(&mut cx) {
                 Poll::Ready(result) => return result,
                 Poll::Pending => {
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(not(target_family = "wasm"))]
                     {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
-                    #[cfg(target_arch = "wasm32")]
+                    #[cfg(target_family = "wasm")]
                     {
                         return Err(VmError::HostError(
                             "blocking host-op wait is unsupported on wasm32 runtime".to_string(),
