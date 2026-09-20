@@ -1,19 +1,10 @@
 # Host SDK: descriptors, resources, and effects
 
-This guide is for anyone authoring a host module or migrating an existing host
-extension onto the current SDK. It describes the preferred authoring surface:
-a `#[pd_host_function]` declaration is the single source of a function's guest
+This guide describes the current Host SDK authoring surface, where a
+`#[pd_host_function]` declaration is the single source of a function's guest
 schema, runtime binding, typed resource requirements, named-struct contract, and
 hidden host-state effects. A module then lists its functions explicitly; the
 guest catalog is derived from those descriptors.
-
-The legacy `HostApiBuilder::{resource,named_struct,function}` and
-`HostFunctionRegistry::register_*` APIs remain public and fully supported during
-the compatibility window (see [Compatibility window](#compatibility-window)).
-New modules should not need them.
-
-Organization freeze outcomes:
-[host-descriptor-migration-report.md](host-descriptor-migration-report.md).
 
 ## 1. The model
 
@@ -53,7 +44,7 @@ explicit and reproducible.
 
 ```rust
 use pd_host_function::pd_host_function;
-use vm::{ResourceRef, ResourceOwned, VmResult, resource};
+use vm::{resource, ResourceOwned, ResourceRef, Vm, VmError, VmResult};
 
 /// A typed host resource with a canonical declaration.
 pub struct Counter(u64);
@@ -65,16 +56,36 @@ impl vm::HostResourceType for Counter {
     const DESCRIPTION: &'static str = "A monotonic counter";
 }
 
+fn counter_resource() -> vm::HostResourceTypeMeta {
+    vm::HostResourceTypeMeta::of::<Counter>()
+}
+
+fn counter_key() -> vm::ResourceTypeKey {
+    counter_resource().schema.key
+}
+
+fn make_counter_contract() -> vm::HostFunctionSchema {
+    vm::HostFunctionSchema::with_return(
+        "demo::make_counter",
+        vec![vm::HostParamSchema::value("seed", vm::HostTypeSchema::Int)],
+        vm::HostTypeSchema::Resource(counter_key()),
+    )
+}
+
 /// Creates a counter and returns its handle.
-#[pd_host_function(name = "demo::make_counter")]
-pub fn make_counter(seed: i64) -> VmResult<resource::Resource<Counter>> {
-    Ok(resource::Resource::new(Counter(seed as u64)))
+#[pd_host_function(name = "demo::make_counter", contract = make_counter_contract)]
+pub fn make_counter(vm: &mut Vm, seed: i64) -> VmResult<i64> {
+    let token = vm
+        .host_context()
+        .push_resource(Counter(seed as u64))
+        .map_err(|error| VmError::HostError(error.to_string()))?;
+    Ok(token.handle().raw() as i64)
 }
 
 /// Reads the current count.
 #[pd_host_function(name = "demo::read_counter")]
 pub fn read_counter(counter: ResourceRef<'_, Counter>) -> VmResult<i64> {
-    Ok(*counter as u64 as i64)
+    Ok(counter.get().0 as i64)
 }
 
 /// Consumes the counter.
@@ -89,9 +100,9 @@ Rules that follow from the table above:
 
 - **Typed resource wrappers carry the effect.** `ResourceRef<'_, T>` is a
   `Borrow<T>` effect, `ResourceMut<'_, T>` is `BorrowMut<T>`, `ResourceOwned<T>`
-  is `TakeOwned<T>`, and returning `Resource<T>` is `Create<T>`. The guest
-  parameter/return schemas and the resource declarations both come from those
-  wrappers; nothing needs to be repeated in a catalog.
+  is `TakeOwned<T>`. A creation path inserts `T` through `HostContext`, returns
+  the raw `i64` token expected by the current adapter, and declares a typed
+  resource return contract; that contract supplies the `Create<T>` effect.
 - **One declaration per resource type.** Implement `HostResourceType` once. Every
   function that mentions `T` contributes that declaration, identical duplicates
   dedupe, and the same key claimed by a different Rust type fails before any
@@ -128,82 +139,122 @@ boundary — resolve it in a separate host call.
 ### Named structs
 
 Rust signatures cannot spell field names. For a fixed-shape value, implement
-`HostNamedStruct` and mark the declaration:
+`HostNamedStruct` and mark the declaration. `HostNamedStruct` supplies only the
+schema; the returned Rust value must also use the adapter's runtime conversion:
 
 ```rust
-pub struct JitConfig;
+pub struct JitConfig {
+    enabled: bool,
+}
 
 impl vm::HostNamedStruct for JitConfig {
     const NAME: &'static str = "JitConfig";
+
     fn host_struct_fields() -> Vec<vm::HostStructField> {
         vec![vm::HostStructField::new("enabled", vm::HostTypeSchema::Bool)]
     }
 }
 
+impl vm::IntoHostCallOutcome for JitConfig {
+    fn into_host_call_outcome(self) -> vm::CallOutcome {
+        vm::CallOutcome::Return(vm::return_one(vm::Value::map(vec![(
+            vm::Value::string("enabled"),
+            vm::Value::Bool(self.enabled),
+        )])))
+    }
+}
+
+/// Returns the current JIT configuration.
 #[pd_host_function(name = "jit::get_config")]
 #[pd_host_named_struct]
-pub fn get_config(vm: &mut Vm) -> VmResult<JitConfig> { /* ... */ }
+pub fn get_config() -> VmResult<JitConfig> {
+    Ok(JitConfig { enabled: true })
+}
 ```
 
 The generated descriptor emits the full `Named { name, fields }` schema and the
-module catalog derives the named struct from it. Do **not** model public host
+module catalog derives the named struct from it. The adapter has a blanket
+`IntoHostCallOutcome` implementation for built-in scalar and container outputs
+that implement `IntoVmValue`. The public SDK re-exports
+`IntoHostCallOutcome`, so a custom named Rust type implements that trait and
+returns its map-shaped `Value` explicitly, as shown. Do **not** model public host
 request/result/event values as `Map(unknown)` or `unknown`; the
 `tests/typed_host_no_dynamic_contract_tests.rs` guard fails the build if a public
 standard function regresses to a dynamic schema.
 
-## 3. Raw handles and declared contracts
+## 3. Async functions and declared contracts
 
-Some hosting surfaces already expose a raw `i64` scope token (I/O handles and
-SQLite connections in the standard library) and cannot change the Rust signature
-without touching their worker/operation internals. Those functions declare their
-guest contract explicitly, **on the same function**, instead of duplicating a
-catalog entry:
+Standard I/O and SQLite use ordinary macro-generated async host functions. A
+function may keep an internal raw `i64` execution-scope token while its explicit
+contract exposes a typed guest resource. Put that contract on the same function
+instead of duplicating a catalog entry.
+
+Every value that crosses an `.await` must be owned. Implement
+`CaptureAsyncHostContext` to copy or clone the required VM state before the VM
+borrow ends, and use owned parameters such as `String`, `VmMap`, or
+`VmArrayHandle`. The current `io::open` shape is representative (body details
+are abbreviated):
 
 ```rust
-/// Opens an I/O handle.
-#[pd_host_function(
-    name = "io::open",
-    contract = super::io_open_contract,  // declared next to the function
-)]
-pub(super) fn builtin_io_open(vm: &mut Vm, path: &str, mode: &str) -> VmResult<HostCallResult<i64>> {
-    /* unchanged runtime path; the returned id is a driver-scheduled pending op */
+#[derive(Clone)]
+pub(crate) struct IoPolicyContext {
+    policy: Option<IoPolicy>,
 }
 
-fn io_open_contract() -> vm::HostFunctionSchema {
-    vm::HostFunctionSchema::with_return(
-        "io::open",
-        vec![
-            vm::HostParamSchema::value("path", vm::HostTypeSchema::String),
-            vm::HostParamSchema::value("mode", vm::HostTypeSchema::String),
-        ],
-        vm::HostTypeSchema::Resource(io_file_key()), // typed `io.file` resource
-    )
+impl vm::CaptureAsyncHostContext for IoPolicyContext {
+    fn capture(vm: &mut Vm) -> VmResult<Self> {
+        Ok(Self { policy: io_policy(vm) })
+    }
+}
+
+#[pd_host_function(name = "io::open", contract = super::io_open_contract)]
+pub(crate) async fn builtin_io_open(
+    #[pd_host_context] context: IoPolicyContext,
+    path: String,
+    mode: String,
+) -> VmResult<vm::HostFutureOutput<i64>> {
+    // Mode validation and `OpenOptions` setup are omitted here.
+    let path = authorize_io_path(context.policy.as_ref(), &path, writes).await?;
+    let file = options
+        .open(path)
+        .await
+        .map_err(|error| VmError::HostError(format!("io_open failed: {error}")))?;
+    let handle = IoHandle::File(BufReader::new(file));
+    Ok(vm::HostFutureOutput::complete(move |vm| {
+        let token = vm
+            .execution_scope()
+            .push_resource(IoResource::new(handle))
+            .map_err(|error| VmError::HostError(format!(
+                "io resource insert failed: {error}"
+            )))?;
+        Ok(token.into_handle().raw() as i64)
+    }))
 }
 ```
 
-Modules that can await library futures directly should declare ordinary async
-host functions. The macro captures any `#[pd_host_context]` value before the VM
-borrow ends, submits the future through the embedding's async bridge, and maps
-the resolved value through the declared contract:
+When context depends on a resource-token argument, implement
+`capture_with_args(vm, args)` to validate the token and clone the owned resource
+state before submission. `IoHandleContext`, `SqliteConnectionContext`, and
+`SqliteCloseContext` use that form; the raw token parameter remains in the Rust
+signature for contract binding but is not borrowed across suspension.
 
-```rust
-/// Performs one bounded request through a shared library client.
-#[pd_host_function(name = "http::client::request", contract = http_request_contract)]
-pub(super) async fn builtin_http_client_request(
-    #[pd_host_context] context: HttpRequestContext,
-    request: VmMapHandle,
-) -> VmResult<VmMap> {
-    context.request(request).await
-}
-```
+The generated wrapper captures `#[pd_host_context]` and converts ordinary
+parameters before creating the future. It then calls `Vm::submit_host_future`,
+which assigns an operation id and submits the boxed future to the embedding's
+generic `HostAsyncBridge`. The bridge owns polling on its executor; the VM tracks
+that submitted operation and resolves the result through the declared contract.
+The embedding must keep the bridge's executor and runtime alive and driven until
+its submitted futures finish. Process-backed I/O also requires a live Tokio
+runtime while close or reset cleanup is polled, as detailed below.
 
-The context and parameter types of an async host function must own every value
-that crosses the suspension boundary. Owned callable schemas, including bare
-function types such as `VmCallable<fn(Event) -> Action>`, are accepted. When an
-async opening phase must hand control to generic VM continuation machinery,
-return `HostFutureOutput<T>` and use `HostFutureOutput::continue_with`; value
-mapping preserves that continuation. The HTTP SSE builtin uses this only to
-transfer an opened Hyper response into the generic callable-stream driver.
+Owned callable schemas, including bare function types such as
+`VmCallable<fn(Event) -> Action>`, are accepted. Use
+`HostFutureOutput::complete` when the resolved future must briefly re-enter the
+VM to insert or retire a resource. When an async opening phase must hand control
+to generic VM continuation machinery, return `HostFutureOutput<T>` and use
+`HostFutureOutput::continue_with`; value mapping preserves that continuation.
+The HTTP SSE builtin uses this only to transfer an opened Hyper response into
+the generic callable-stream driver.
 
 ### Tokio runtime lease for process-backed IO
 
@@ -233,18 +284,19 @@ lease is valid.
 
 What the contract does and does not change:
 
-- The contract **replaces only the guest schema**. The adapter, binding class, and
-  host-state effects still come from the one macro expansion — there is no second
-  registration path to keep in sync.
+- The contract **replaces only the guest schema**. The adapter, binding class,
+  async submission, and host-state effects still come from the one macro
+  expansion — there is no second registration path to keep in sync.
 - Guest resource effects are **derived from the contract schema**, so the raw
-  handle signature cannot drift from what the guest sees.
+  token signature cannot drift from what the guest sees.
 - The contract's declared name is validated against the function name at
   construction; a renamed function cannot silently keep a stale contract.
 - Resource *declarations* stay with the module: implement `HostResourceType` once
   for the concrete type and list it in `HostModuleDescriptor::resources`. Then the
   resource key, its description, and its Rust type identity have exactly one
-  source. Deriving the contract's key from that declaration (as above) keeps the
-  two from drifting.
+  source. The current I/O module follows this rule with `io_file_key()`, which
+  returns `io_file_resource().schema.key`; contract code should likewise obtain
+  the key from its canonical resource factory instead of repeating a key string.
 
 
 ## 4. Installing a module
@@ -336,78 +388,3 @@ catalog preserves the expected module and aggregate fingerprints. It also checks
 that resource declarations and named structs follow the selected modules, public
 returns stay typed, and native-only HTTP and SQLite surfaces do not appear when
 their build gates are off.
-
-## 7. Compatibility window
-
-Still public and supported, for downstream migration:
-
-- `HostApiBuilder::{resource, named_struct, function}`.
-- `HostFunctionRegistry::register`, `register_static`, `register_stack`,
-  `register_static_stack`, `register_args`, `register_static_args`,
-  `register_static_non_yielding_args`, and the catalog/exact-family
-  registrations, including `register_exact_owned`.
-- The per-module `register_*_builtin_module{,_from_catalog}` entry points.
-
-Preferred for new code:
-
-- `HostModuleDescriptor` + `install` / `install_from_catalog`,
-  `HostFunctionDescriptor`, `HostResourceType`, `HostOwnedAdapterFactory`.
-
-Removal threshold: the legacy builder and low-level registry APIs are removed
-only after every repository in the organization migration matrix has passed its
-gate against a frozen core SHA. Until then, legacy catalogs compose with
-descriptor modules through `install_from_catalog`.
-
-## 8. Before and after
-
-**Before** (one function, four places to keep in sync):
-
-```rust
-// 1. the runtime adapter
-#[pd_host_function(name = "demo::read_counter")]
-fn read_counter(vm: &mut Vm, handle: i64) -> VmResult<i64> { /* ... */ }
-
-// 2. a hand-written resource entry
-builder.resource(ResourceTypeSchema::new(counter_key(), "A monotonic counter"));
-
-// 3. a hand-written function schema
-builder.function(HostFunctionSchema::with_return(
-    "demo::read_counter",
-    vec![HostParamSchema::with_passing(
-        "counter",
-        HostTypeSchema::Resource(counter_key()),
-        HostParamPassing::Borrow,
-    )],
-    HostTypeSchema::Int,
-));
-
-// 4. an adapter table plus an exact registration
-const ADAPTER_CONTRACTS: &[AdapterContract] = &[AdapterContract {
-    name: "demo::read_counter",
-    arity: 1,
-    adapter: read_counter_adapter,
-}];
-registry.transactionally(|staged| { /* validate, register, authorize */ })
-```
-
-**After** (one function, one declaration, one module list):
-
-```rust
-#[pd_host_function(name = "demo::read_counter")]
-fn read_counter(counter: ResourceRef<'_, Counter>) -> VmResult<i64> {
-    Ok(*counter as u64 as i64)
-}
-
-pub fn demo_module() -> HostModuleDescriptor {
-    HostModuleDescriptor {
-        name: "demo",
-        functions: &[read_counter_descriptor],
-        resources: &[],
-    }
-}
-
-demo_module().install(registry)?; // validates and installs transactionally
-```
-
-The wrapper, the schema, the resource declaration, the binding class, the
-effects, and the exact registry entry all come from the single declaration.
