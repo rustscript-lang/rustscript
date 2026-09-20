@@ -44,7 +44,7 @@ explicit and reproducible.
 
 ```rust
 use pd_host_function::pd_host_function;
-use vm::{ResourceRef, ResourceOwned, VmResult, resource};
+use vm::{resource, ResourceOwned, ResourceRef, Vm, VmError, VmResult};
 
 /// A typed host resource with a canonical declaration.
 pub struct Counter(u64);
@@ -56,16 +56,36 @@ impl vm::HostResourceType for Counter {
     const DESCRIPTION: &'static str = "A monotonic counter";
 }
 
+fn counter_resource() -> vm::HostResourceTypeMeta {
+    vm::HostResourceTypeMeta::of::<Counter>()
+}
+
+fn counter_key() -> vm::ResourceTypeKey {
+    counter_resource().schema.key
+}
+
+fn make_counter_contract() -> vm::HostFunctionSchema {
+    vm::HostFunctionSchema::with_return(
+        "demo::make_counter",
+        vec![vm::HostParamSchema::value("seed", vm::HostTypeSchema::Int)],
+        vm::HostTypeSchema::Resource(counter_key()),
+    )
+}
+
 /// Creates a counter and returns its handle.
-#[pd_host_function(name = "demo::make_counter")]
-pub fn make_counter(seed: i64) -> VmResult<resource::Resource<Counter>> {
-    Ok(resource::Resource::new(Counter(seed as u64)))
+#[pd_host_function(name = "demo::make_counter", contract = make_counter_contract)]
+pub fn make_counter(vm: &mut Vm, seed: i64) -> VmResult<i64> {
+    let token = vm
+        .host_context()
+        .push_resource(Counter(seed as u64))
+        .map_err(|error| VmError::HostError(error.to_string()))?;
+    Ok(token.handle().raw() as i64)
 }
 
 /// Reads the current count.
 #[pd_host_function(name = "demo::read_counter")]
 pub fn read_counter(counter: ResourceRef<'_, Counter>) -> VmResult<i64> {
-    Ok(*counter as u64 as i64)
+    Ok(counter.get().0 as i64)
 }
 
 /// Consumes the counter.
@@ -80,9 +100,9 @@ Rules that follow from the table above:
 
 - **Typed resource wrappers carry the effect.** `ResourceRef<'_, T>` is a
   `Borrow<T>` effect, `ResourceMut<'_, T>` is `BorrowMut<T>`, `ResourceOwned<T>`
-  is `TakeOwned<T>`, and returning `Resource<T>` is `Create<T>`. The guest
-  parameter/return schemas and the resource declarations both come from those
-  wrappers; nothing needs to be repeated in a catalog.
+  is `TakeOwned<T>`. A creation path inserts `T` through `HostContext`, returns
+  the raw `i64` token expected by the current adapter, and declares a typed
+  resource return contract; that contract supplies the `Create<T>` effect.
 - **One declaration per resource type.** Implement `HostResourceType` once. Every
   function that mentions `T` contributes that declaration, identical duplicates
   dedupe, and the same key claimed by a different Rust type fails before any
@@ -119,25 +139,45 @@ boundary — resolve it in a separate host call.
 ### Named structs
 
 Rust signatures cannot spell field names. For a fixed-shape value, implement
-`HostNamedStruct` and mark the declaration:
+`HostNamedStruct` and mark the declaration. `HostNamedStruct` supplies only the
+schema; the returned Rust value must also use the adapter's runtime conversion:
 
 ```rust
-pub struct JitConfig;
+pub struct JitConfig {
+    enabled: bool,
+}
 
 impl vm::HostNamedStruct for JitConfig {
     const NAME: &'static str = "JitConfig";
+
     fn host_struct_fields() -> Vec<vm::HostStructField> {
         vec![vm::HostStructField::new("enabled", vm::HostTypeSchema::Bool)]
     }
 }
 
+impl vm::IntoHostCallOutcome for JitConfig {
+    fn into_host_call_outcome(self) -> vm::CallOutcome {
+        vm::CallOutcome::Return(vm::return_one(vm::Value::map(vec![(
+            vm::Value::string("enabled"),
+            vm::Value::Bool(self.enabled),
+        )])))
+    }
+}
+
+/// Returns the current JIT configuration.
 #[pd_host_function(name = "jit::get_config")]
 #[pd_host_named_struct]
-pub fn get_config(vm: &mut Vm) -> VmResult<JitConfig> { /* ... */ }
+pub fn get_config() -> VmResult<JitConfig> {
+    Ok(JitConfig { enabled: true })
+}
 ```
 
 The generated descriptor emits the full `Named { name, fields }` schema and the
-module catalog derives the named struct from it. Do **not** model public host
+module catalog derives the named struct from it. The adapter has a blanket
+`IntoHostCallOutcome` implementation for built-in scalar and container outputs
+that implement `IntoVmValue`. The public SDK re-exports
+`IntoHostCallOutcome`, so a custom named Rust type implements that trait and
+returns its map-shaped `Value` explicitly, as shown. Do **not** model public host
 request/result/event values as `Map(unknown)` or `unknown`; the
 `tests/typed_host_no_dynamic_contract_tests.rs` guard fails the build if a public
 standard function regresses to a dynamic schema.
@@ -254,8 +294,9 @@ What the contract does and does not change:
 - Resource *declarations* stay with the module: implement `HostResourceType` once
   for the concrete type and list it in `HostModuleDescriptor::resources`. Then the
   resource key, its description, and its Rust type identity have exactly one
-  source. Deriving the contract's key from that declaration (as above) keeps the
-  two from drifting.
+  source. The current I/O module follows this rule with `io_file_key()`, which
+  returns `io_file_resource().schema.key`; contract code should likewise obtain
+  the key from its canonical resource factory instead of repeating a key string.
 
 
 ## 4. Installing a module

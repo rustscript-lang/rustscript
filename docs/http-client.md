@@ -251,6 +251,8 @@ The network future never owns or re-enters the VM. Callback error, protocol comp
 | `allow_private_ips` | `false` | Reject private and other special-use addresses |
 | `max_redirects` | 5 | Buffered/SSE redirect bound |
 | `max_request_body_bytes` | 1 MiB | Request body bound |
+| `max_request_header_count` | 100 | Caller-supplied request header field-count bound |
+| `max_request_header_bytes` | 64 KiB | Serialized caller-supplied request header block bound |
 | `max_response_body_bytes` | 8 MiB | Buffered response body bound |
 | `connect_timeout` | 10 s | DNS/connect/TLS phase bound |
 | `request_timeout` | 30 s | Buffered request total duration |
