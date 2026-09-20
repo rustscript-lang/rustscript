@@ -7,11 +7,9 @@ use crate::compiler::{StructDecl, TypeSchema};
 use crate::host_api::HostImportSchema;
 
 /// Bytecode ABI version used for VM-internal cache identity (JIT trace cache,
-/// program cache keys). The VMBC wire format version lives in `src/vmbc.rs`
-/// (`VERSION_V13`); both were bumped together for the static builtin ID break
-/// and again for the direct script-call (`CallScript`) opcode break. Version 13
-/// adds an explicit guest named-struct declaration section.
-pub const BYTECODE_ABI_VERSION: u16 = 13;
+/// program cache keys). The VMBC wire format version lives in `src/vmbc.rs`;
+/// both current formats use version 14 and catalog fingerprint v3.
+pub const BYTECODE_ABI_VERSION: u16 = 14;
 
 pub type SharedString = Arc<String>;
 pub type SharedBytes = Arc<Vec<u8>>;

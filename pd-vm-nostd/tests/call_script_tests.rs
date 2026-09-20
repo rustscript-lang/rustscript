@@ -1,6 +1,6 @@
 //! Milestone 7: `CallScript` parity in the no_std + alloc runtime.
 //!
-//! Programs are produced by the std VMBC encoder (V13) or hand-built with
+//! Programs are produced by the current std VMBC encoder or hand-built with
 //! `CallScript` bytecode (0x1A, prototype_id:u32 LE, argc:u8) so the wire
 //! contract and the typed validation/execution failures are pinned
 //! independently of the compiler.
@@ -70,8 +70,8 @@ fn call_script_executes_direct_call() {
     let compiled = compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
         .expect("direct call source should compile");
     let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
-        .expect("direct call program should encode as VMBC v13");
-    let program = decode_program(&bytes).expect("no-std should decode VMBC v13");
+        .expect("direct call program should encode as VMBC v14");
+    let program = decode_program(&bytes).expect("no-std should decode VMBC v14");
     assert!(
         program.code().windows(2).any(|pair| pair[0] == 0x1A),
         "compiler output should contain CallScript"
@@ -247,20 +247,6 @@ fn call_script_validation_rejects_truncated_operands() {
     assert!(
         matches!(err, WireError::TruncatedOperand { .. }),
         "expected TruncatedOperand, got {err:?}"
-    );
-}
-
-#[test]
-fn call_script_rejects_v11_wire_version() {
-    let compiled = compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
-        .expect("direct call source should compile");
-    let mut bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
-        .expect("direct call program should encode");
-    bytes[4..6].copy_from_slice(&11u16.to_le_bytes());
-    let err = decode_program(&bytes).expect_err("VMBC v11 must be rejected");
-    assert!(
-        matches!(err, WireError::UnsupportedVersion(11)),
-        "expected UnsupportedVersion(11), got {err:?}"
     );
 }
 

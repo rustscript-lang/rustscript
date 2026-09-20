@@ -50,8 +50,22 @@ impl HostAsyncBridge for TokioHostDriver {
         poll
     }
 
-    fn cancel_op(&mut self, op_id: HostOpId) {
+    fn request_cancel_op(
+        &mut self,
+        op_id: HostOpId,
+        _reason: vm::operation::OperationCancelReason,
+    ) -> VmResult<()> {
         self.submitted.remove(&op_id);
+        Ok(())
+    }
+
+    fn poll_cancel_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn cleanup_op(&mut self, op_id: HostOpId, _terminal: vm::HostAsyncOpTerminal) -> VmResult<()> {
+        self.submitted.remove(&op_id);
+        Ok(())
     }
 }
 
@@ -178,6 +192,53 @@ fn spawn_test_server() -> (u16, thread::JoinHandle<()>) {
             .expect("response should be writable");
     });
     (port, handle)
+}
+
+fn spawn_keep_alive_server() -> (u16, mpsc::Receiver<usize>, thread::JoinHandle<()>) {
+    let listener = bind_test_listener();
+    let port = listener
+        .local_addr()
+        .expect("keep-alive listener should have an address")
+        .port();
+    let (sender, receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut accepted = 0;
+        let mut stream: Option<TcpStream> = None;
+        for _ in 0..2 {
+            let mut request = Vec::new();
+            loop {
+                if stream.is_none() {
+                    let (next, _) = accept_test_connection(&listener)
+                        .expect("keep-alive request connection should arrive");
+                    stream = Some(next);
+                    accepted += 1;
+                }
+                let socket = stream.as_mut().expect("connection should exist");
+                let mut byte = [0_u8; 1];
+                match socket.read(&mut byte) {
+                    Ok(0) if request.is_empty() => {
+                        stream = None;
+                    }
+                    Ok(0) => panic!("request ended before its headers"),
+                    Ok(_) => {
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(error) => panic!("keep-alive request should be readable: {error}"),
+                }
+            }
+            assert!(request.starts_with(b"GET / HTTP/1.1"));
+            stream
+                .as_mut()
+                .expect("connection should exist")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .expect("keep-alive response should be writable");
+        }
+        sender.send(accepted).expect("connection count receiver");
+    });
+    (port, receiver, handle)
 }
 
 fn spawn_response_server(response: Vec<u8>) -> (u16, thread::JoinHandle<()>) {
@@ -479,6 +540,36 @@ async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
         response_field(&vm.stack()[0], "body"),
         &Value::bytes(b"ok".to_vec())
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn http_client_pool_reuses_a_connection_across_vm_reset() {
+    let (port, accepted_connections, server) = spawn_keep_alive_server();
+    let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+    vm.configure_http(local_http_config(port))
+        .expect("HTTP configuration should be valid");
+    install_host_driver(&mut vm);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut vm)
+        .expect("default host registry should bind HTTP");
+
+    drive_vm_to_halt(&mut vm)
+        .await
+        .expect("first HTTP request should complete");
+    vm.reset_for_reuse()
+        .expect("an idle VM should reset synchronously");
+    drive_vm_to_halt(&mut vm)
+        .await
+        .expect("second HTTP request should complete");
+
+    assert_eq!(
+        accepted_connections
+            .recv_timeout(TEST_IO_TIMEOUT)
+            .expect("server should report connection count"),
+        1,
+        "the per-VM Hyper client must retain and reuse its pooled connection"
+    );
+    server.join().expect("keep-alive server should finish");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1041,6 +1132,35 @@ fn cached_plan_refreshes_after_a_sibling_registry_mutation() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn tls_handshake_obeys_connect_phase_timeout() {
+    let listener = bind_test_listener();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (_socket, _) = accept_test_connection(&listener).unwrap();
+        thread::sleep(std::time::Duration::from_millis(400));
+    });
+    let mut vm = Vm::new(build_request_program(format!("https://127.0.0.1:{port}/")));
+    let mut config = local_http_config(port);
+    config.allowed_schemes = vec!["https".to_string()];
+    config.connect_timeout = std::time::Duration::from_millis(25);
+    config.request_timeout = std::time::Duration::from_millis(500);
+    vm.configure_http(config).unwrap();
+    install_host_driver(&mut vm);
+    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+
+    let started = Instant::now();
+    let error = drive_vm_to_halt(&mut vm)
+        .await
+        .expect_err("stalled TLS handshake must time out");
+    assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    assert!(
+        error.to_string().contains("connect phase deadline"),
+        "{error}"
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn max_stream_duration_does_not_shorten_buffered_requests() {
     let listener = bind_test_listener();
     let port = listener.local_addr().unwrap().port();
@@ -1293,6 +1413,18 @@ fn spawn_pending_then_response_server() -> (u16, mpsc::Receiver<()>, thread::Joi
     (port, ready_receiver, handle)
 }
 
+async fn poll_pending_http_transport(vm: &mut Vm) {
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            vm.await_waiting_host_op(),
+        )
+        .await
+        .is_err(),
+        "pending HTTP request unexpectedly completed"
+    );
+}
+
 async fn reset_and_wait(vm: &mut Vm) -> Result<(), vm::VmError> {
     vm.reset_for_reuse()?;
     std::future::poll_fn(|cx| vm.poll_reset_for_reuse(cx)).await
@@ -1310,6 +1442,7 @@ async fn reset_retires_buffered_http_future_and_releases_its_permit() {
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
     assert!(matches!(vm.run(), Ok(VmStatus::Waiting(_))));
+    poll_pending_http_transport(&mut vm).await;
     ready
         .recv()
         .expect("first request should reach the transport");
@@ -1330,8 +1463,8 @@ async fn reset_retires_buffered_http_future_and_releases_its_permit() {
     server.join().expect("pending server should finish");
 }
 
-#[test]
-fn shutdown_and_drop_retire_buffered_http_futures() {
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_and_drop_retire_buffered_http_futures() {
     for shutdown in [true, false] {
         let (port, ready, server) = spawn_pending_server();
         let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
@@ -1343,6 +1476,7 @@ fn shutdown_and_drop_retire_buffered_http_futures() {
             .bind_vm_cached(&mut vm)
             .expect("default host registry should bind HTTP");
         assert!(matches!(vm.run(), Ok(VmStatus::Waiting(_))));
+        poll_pending_http_transport(&mut vm).await;
         ready
             .recv()
             .expect("request should reach the transport before teardown");

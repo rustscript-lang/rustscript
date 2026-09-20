@@ -26,18 +26,26 @@ compiled runtime surface and generated metadata synchronized.
 
 ## Native API
 
-On a supported native target, enabling `http-client` preserves the public API:
+On a supported native target, enabling `http-client` preserves the source-level
+HTTP call signatures and embedding entry points:
 
 - `HttpConfig` controls request and stream limits, redirects, timeouts, and
   capability policy;
 - `HttpExtension` and `HttpHostExt` install the native HTTP host integration;
 - `register_http_builtin_module` and `http_host_catalog` expose the native
-  resource schema and callable metadata;
+  callable metadata;
 - `http::client::request` returns a bounded `HttpResponse`; and
 - `http::client::sse` drives a bounded SSE stream through a script callback.
 
-The HTTP and SSE behavior, resource lifecycle, cancellation, and native async
-bridge contracts are unchanged by the wasm boundary. See
+Both builtins are ordinary `#[pd_host_function] async fn` declarations. Their
+macro-generated wrappers own async-host submission; the HTTP module does not
+publish transient request, response, or stream resources.
+
+Catalog fingerprints use format v3, and bytecode/VMBC use ABI and wire version
+14. Function schemas receive exact validation at bind time.
+
+The HTTP and SSE behavior, cancellation, and native async bridge contracts are
+uniform across supported native targets. See
 [`callable-runtime.md`](callable-runtime.md) for the general callable and
 host-runtime contract.
 
@@ -243,6 +251,8 @@ The network future never owns or re-enters the VM. Callback error, protocol comp
 | `allow_private_ips` | `false` | Reject private and other special-use addresses |
 | `max_redirects` | 5 | Buffered/SSE redirect bound |
 | `max_request_body_bytes` | 1 MiB | Request body bound |
+| `max_request_header_count` | 100 | Caller-supplied request header field-count bound |
+| `max_request_header_bytes` | 64 KiB | Serialized caller-supplied request header block bound |
 | `max_response_body_bytes` | 8 MiB | Buffered response body bound |
 | `connect_timeout` | 10 s | DNS/connect/TLS phase bound |
 | `request_timeout` | 30 s | Buffered request total duration |
@@ -252,34 +262,56 @@ The network future never owns or re-enters the VM. Callback error, protocol comp
 | `max_stream_duration` | 5 min | Host maximum total duration for SSE calls |
 | `stream_idle_timeout` | 30 s | Wait-for-network-data bound |
 
-The shared in-flight connection default is 64. Zero values for streaming byte limits or any timeout are invalid configuration; buffered `max_request_body_bytes` and `max_response_body_bytes` may be zero to prohibit request or response payload bytes. `HttpConfig::default()` allows `https`. Embeddings should set explicit host and port allowlists and add `http` only when cleartext transport is required. Buffered HTTP and SSE accept only `http`/`https`.
+The shared in-flight HTTP call default is 64. Zero values for streaming byte limits or any timeout are invalid configuration; buffered `max_request_body_bytes` and `max_response_body_bytes` may be zero to prohibit request or response payload bytes. `HttpConfig::default()` allows `https`. Embeddings should set explicit host and port allowlists and add `http` only when cleartext transport is required. Buffered HTTP and SSE accept only `http`/`https`.
 
 ## Destination policy and protocol transports
 
-Every protocol uses the same admission, address-pinning, and security policy:
+Every protocol uses the same admission and connection-time address-validation
+policy:
 
 - URLs require a host and reject userinfo;
 - both the protocol's scheme family and the configured scheme allowlist must admit the URL;
 - host and effective port must match their configured allowlists;
-- every DNS result is validated, and the selected validated address is pinned for the connection;
+- admission resolves the target and validates every returned address; when Hyper opens a connection, its connector resolves the hostname again and validates every address from that lookup before allowing a connect;
 - when private addresses are disabled, private, loopback, link-local, multicast, unspecified, documentation, transition, reserved, and other special-use IPv4/IPv6 ranges are rejected; IPv4-mapped IPv6 addresses receive the IPv4 checks;
-- the original validated hostname remains the TLS SNI name and HTTP `Host` authority when connecting to a pinned address;
+- the admitted hostname remains the TLS SNI name and HTTP `Host` authority; the address selected during admission is not pinned to the connection;
 - buffered HTTP and SSE revalidate every redirect and remove `Authorization` and `Cookie` on a cross-origin redirect;
 - ambient proxy settings are ignored. There is no implicit cookie jar, authentication source, or global proxy state.
 
 The policy snapshot taken at call admission applies for the complete operation.
+Every request and redirect target receives an admission-time DNS/private-address
+check. Hyper's connector performs its own lookup whenever it opens a new
+connection and rejects the lookup if any returned address is disallowed. This
+prevents a target from reaching a disallowed private address through DNS
+rebinding without claiming that the admission-selected address is the one used
+for the socket.
 
-Buffered HTTP and SSE use direct Hyper HTTP/1 over Tokio/Rustls connections and perform no independent DNS lookup outside the shared admission and pinning path.
+Buffered HTTP and SSE share one cloneable Hyper client stored in per-VM HTTP
+module state. Hyper owns HTTP/1 transport setup, connection pooling, idle
+connection lifecycle, and pooled-connection retry behavior. VM reset/reuse
+retains this library client and its pool; HTTP configuration replacement builds
+a new client for the new policy snapshot. The host does not maintain a custom
+pool, sender cache, connection worker, private Tokio runtime, or reconnect state
+machine.
 
 ## Deliberately absent APIs and semantics
 
 RustScript core provides no script-visible HTTP request ID, response/stream handle, `next`, `next_event`, or `cancel` callable. Streams cannot detach from their caller. There is no multiplexing, background reader, automatic reconnect, provider/model interpretation, agent loop, or platform retry policy. Applications implement provider-specific JSON, `[DONE]`, tool-call deltas, retry rules, and reconnect decisions in RSS or downstream hosts.
 
-## Cancellation migration
+## Async ownership and cancellation
 
-PR #13 introduced HTTP-private pending-operation and abort-handle maps, one abort pair per request, HTTP owner routes, request-local runtimes, and HTTP-synthesized cancellation errors. The callable streaming contract supersedes those mechanisms. Buffered requests and SSE submit ordinary futures through the embedding-owned async bridge; HTTP has no private pending map, abort map, operation-ID namespace, token owner route, or cancellation state machine.
+Buffered requests and SSE opening run as macro-owned async host futures. HTTP has
+no private pending map, abort map, operation-ID namespace, token owner route, or
+cancellation state machine. After an SSE response opens, only the generic
+callable-stream driver retains the Hyper response body, parser, deadlines,
+callback continuation, and in-flight permit needed for callback re-entry and
+backpressure.
 
-The generic `src/builtins/runtime/cancellation.rs` remains for non-HTTP runtime callers. HTTP does not depend on `CancellationToken`, `CancellationReason`, `OperationOwner::Http`, or owner-wide cancellation routing. Embedding-owned retirement of a pending future remains VM lifecycle control and rejects late completion; dropping an `Invocation` also retires active producer/callback waits and returns the VM and connection permit for reuse. This lifecycle cleanup is not an HTTP API-level cancellation facility.
+The generic `src/builtins/runtime/cancellation.rs` remains for non-HTTP runtime
+callers. Embedding-owned retirement drops a pending HTTP future and rejects late
+completion. Dropping an `Invocation` also retires active producer/callback waits
+and returns the VM and connection permit for reuse. This lifecycle cleanup is
+not an HTTP API-level cancellation facility.
 
 ## Target and backend notes
 

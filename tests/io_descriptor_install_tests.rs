@@ -287,10 +287,11 @@ fn io_module_install_rejects_a_descriptor_list_whose_adapters_disagree() {
 /// The IO calls the round-trip script makes. Each one is dispatched through the
 /// installed descriptor and must be driven to completion as a pending host
 /// operation.
+#[cfg(feature = "async")]
 const ROUND_TRIP_IO_CALLS: usize = 7;
 
-/// Submitted-future count of the async host driver; stays zero on the blocking
-/// backend, which drives registered operation drivers instead.
+/// Submitted-future count of the async host driver; stays zero on the inline
+/// synchronous backend.
 type SubmittedOps = std::sync::Arc<std::sync::atomic::AtomicUsize>;
 
 /// One driven run: the final stack plus the number of pending host operations
@@ -405,8 +406,30 @@ fn install_async_driver(vm: &mut Vm) -> SubmittedOps {
             poll
         }
 
-        fn cancel_op(&mut self, op_id: HostOpId) {
+        fn request_cancel_op(
+            &mut self,
+            op_id: HostOpId,
+            _reason: vm::operation::OperationCancelReason,
+        ) -> VmResult<()> {
             self.submitted.remove(&op_id);
+            Ok(())
+        }
+
+        fn poll_cancel_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut Context<'_>,
+        ) -> Poll<VmResult<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn cleanup_op(
+            &mut self,
+            op_id: HostOpId,
+            _terminal: vm::HostAsyncOpTerminal,
+        ) -> VmResult<()> {
+            self.submitted.remove(&op_id);
+            Ok(())
         }
     }
 
@@ -418,8 +441,8 @@ fn install_async_driver(vm: &mut Vm) -> SubmittedOps {
     count
 }
 
-/// The blocking backend schedules concrete operation drivers in the execution
-/// scope, so it submits no futures and needs no bridge.
+/// The synchronous backend completes inline, so it submits no futures and
+/// needs no bridge.
 #[cfg(not(feature = "async"))]
 fn install_async_driver(_vm: &mut Vm) -> SubmittedOps {
     SubmittedOps::default()
@@ -427,8 +450,8 @@ fn install_async_driver(_vm: &mut Vm) -> SubmittedOps {
 
 /// Asserts that the pending operations the run loop drove were resolved by the
 /// backend that is compiled in: the async backend resolves each one through the
-/// submitted-future bridge, the blocking backend through its registered
-/// operation driver.
+/// submitted-future bridge, while the synchronous backend yields no pending
+/// operation.
 fn assert_pending_ops_resolved_by_backend(submitted: &SubmittedOps, driven_ops: usize) {
     use std::sync::atomic::Ordering;
     let submitted = submitted.load(Ordering::SeqCst);
@@ -445,10 +468,13 @@ fn assert_pending_ops_resolved_by_backend(submitted: &SubmittedOps, driven_ops: 
     }
     #[cfg(not(feature = "async"))]
     {
-        assert_eq!(submitted, 0, "the blocking backend must not submit futures");
         assert_eq!(
-            driven_ops, ROUND_TRIP_IO_CALLS,
-            "the blocking backend must drive one registered operation driver per IO call"
+            submitted, 0,
+            "the synchronous backend must not submit futures"
+        );
+        assert_eq!(
+            driven_ops, 0,
+            "the synchronous backend must complete every IO call inline"
         );
     }
 }
@@ -479,7 +505,7 @@ fn assert_rejected_call_left_no_io_state(vm: &mut Vm, submitted: &SubmittedOps) 
     assert_eq!(
         submitted.load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "the blocking adapter must reject a policy violation before scheduling work"
+        "the synchronous adapter must reject a policy violation inline"
     );
 }
 
@@ -578,7 +604,7 @@ fn installed_io_descriptors_reject_a_stale_handle_after_close() {
     assert_eq!(
         submitted.load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "the blocking backend must not submit futures"
+        "the synchronous backend must not submit futures"
     );
     let _ = fs::remove_dir_all(&dir);
 }

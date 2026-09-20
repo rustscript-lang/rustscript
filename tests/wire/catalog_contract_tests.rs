@@ -27,9 +27,9 @@ const EXTENSION_BLOCK_END: u16 = 0xFF8F;
 const SPECIAL_CALL_BLOCK_START: u16 = 0xFF90;
 const SPECIAL_CALL_BLOCK_END: u16 = 0xFFA1;
 const ORDINARY_BLOCK_START: u16 = 0xFFA2;
-#[cfg(feature = "sqlite")]
+#[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
 const SQLITE_RESERVED_TOP_START: u16 = 0xFFFC;
-#[cfg(feature = "sqlite")]
+#[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
 const SQLITE_RESERVED_TOP_END: u16 = u16::MAX;
 
 /// Reserved sentinel gap inside the special-call block (see the catalog docs
@@ -84,15 +84,15 @@ fn parse_catalog(source: &str) -> Vec<CatalogEntry> {
             feature_gate: parts[4].to_string(),
         });
     }
-    // The SQLite namespace is optional (mirrors the build.rs feature filter):
-    // when the feature is off, the generated catalog excludes it, so the
-    // parsed raw catalog must agree.
-    #[cfg(not(feature = "sqlite"))]
+    // The SQLite namespace is native-only (mirrors the build.rs filter): when
+    // the feature is off or the target family is wasm, the generated catalog
+    // excludes it, so the parsed raw catalog must agree.
+    #[cfg(not(all(feature = "sqlite", not(target_family = "wasm"))))]
     entries.retain(|entry| !entry.source_name.starts_with("sqlite::"));
     entries
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
 #[test]
 fn sqlite_top_u16_ids_are_explicitly_reserved_for_frozen_entries() {
     let entries = parse_catalog(&catalog_source());
@@ -279,10 +279,10 @@ fn checked_in_nostd_mirror_matches_std_catalog() {
         };
         let id = u16::from_str_radix(hex.trim().trim_start_matches("0x"), 16)
             .unwrap_or_else(|err| panic!("mirror const {const_name} has invalid id: {err}"));
-        // The SQLite namespace is optional (mirrors the build.rs feature
-        // filter): when the feature is off, the mirror's sqlite consts are
-        // excluded from the sync contract.
-        #[cfg(not(feature = "sqlite"))]
+        // The SQLite namespace is native-only (mirrors the build.rs filter):
+        // when the feature is off or the target family is wasm, the mirror's
+        // sqlite consts are excluded from the sync contract.
+        #[cfg(not(all(feature = "sqlite", not(target_family = "wasm"))))]
         if const_name.starts_with("SQLITE_") {
             continue;
         }
@@ -387,9 +387,9 @@ fn appending_or_reordering_catalog_entries_does_not_renumber_existing_ids() {
 
     // Appending a new entry at the next free ordinary ID (append-only
     // allocation) must not renumber any existing entry. When the optional
-    // SQLite namespace is enabled the ordinary block (0xFFA2..=0xFFFF) is
-    // exactly full, so there is nothing to append and the property is
-    // trivially preserved.
+    // SQLite namespace is enabled on a native target the ordinary block
+    // (0xFFA2..=0xFFFF) is exactly full, so there is nothing to append and the
+    // property is trivially preserved.
     let mut used: Vec<u16> = entries.iter().map(|entry| entry.id).collect();
     used.sort_unstable();
     let Some(next_free) =

@@ -23,7 +23,7 @@ fn expand_pd_host_function(
     attr: Punctuated<Meta, Token![,]>,
     mut item: ItemFn,
 ) -> Result<proc_macro2::TokenStream, Error> {
-    let (guest_name, contract, runtime_owned_pending) = parse_function_args(&attr)?;
+    let (guest_name, contract) = parse_function_args(&attr)?;
     let is_async = item.sig.asyncness.is_some();
     let docs = doc_string(&item.attrs);
     let mut resource_params = Vec::<(String, ResourceSpec)>::new();
@@ -127,7 +127,6 @@ fn expand_pd_host_function(
         &resource_params,
         &state_params,
         contract.as_ref(),
-        runtime_owned_pending,
     )?;
     for input in &mut item.sig.inputs {
         if let FnArg::Typed(pat_type) = input {
@@ -224,6 +223,16 @@ fn is_async_owned_type(ty: &Type) -> bool {
         Type::Paren(paren) => is_async_owned_type(&paren.elem),
         Type::Reference(_) | Type::Slice(_) => false,
         Type::Tuple(tuple) => tuple.elems.iter().all(is_async_owned_type),
+        Type::BareFn(function) => {
+            function
+                .inputs
+                .iter()
+                .all(|input| is_async_owned_type(&input.ty))
+                && match &function.output {
+                    ReturnType::Default => true,
+                    ReturnType::Type(_, output) => is_async_owned_type(output),
+                }
+        }
         Type::Path(path) => {
             let Some(segment) = path.path.segments.last() else {
                 return false;
@@ -248,8 +257,7 @@ fn is_async_owned_type(ty: &Type) -> bool {
 }
 
 /// Parses `#[pd_host_function(name = "...")]` plus the optional
-/// `contract = <path>` guest-schema override and the optional
-/// `runtime_owned_pending` dispatch flag.
+/// `contract = <path>` guest-schema override.
 ///
 /// `contract` names a zero-argument callable returning a
 /// [`HostFunctionSchema`](pd_host_schema) for functions whose guest contract
@@ -257,21 +265,13 @@ fn is_async_owned_type(ty: &Type) -> bool {
 /// fixed-shape map returns). The contract is declared next to the function it
 /// describes, so the adapter, binding class, and effects still come from one
 /// macro expansion and there is no parallel catalog entry.
-///
-/// `runtime_owned_pending` selects the stack dispatch class whose pending
-/// operation is owned by the generic runtime operation/stream registries
-/// instead of a registered operation driver.
 fn parse_function_args(
     args: &Punctuated<Meta, Token![,]>,
-) -> Result<(LitStr, Option<syn::Path>, bool), Error> {
+) -> Result<(LitStr, Option<syn::Path>), Error> {
     let mut name: Option<LitStr> = None;
     let mut contract: Option<syn::Path> = None;
-    let mut runtime_owned_pending = false;
     for meta in args {
         match meta {
-            Meta::Path(path) if path.is_ident("runtime_owned_pending") => {
-                runtime_owned_pending = true;
-            }
             Meta::NameValue(name_value) if name_value.path.is_ident("name") => {
                 let syn::Expr::Lit(expr_lit) = &name_value.value else {
                     return Err(Error::new_spanned(
@@ -312,7 +312,7 @@ fn parse_function_args(
                 return Err(Error::new_spanned(
                     other,
                     "#[pd_host_function] only supports name = \"...\", an optional \
-                     contract = <path>, and the runtime_owned_pending dispatch flag",
+                     contract = <path>",
                 ));
             }
         }
@@ -323,7 +323,7 @@ fn parse_function_args(
             "expected #[pd_host_function(name = \"...\")]",
         ));
     };
-    Ok((name, contract, runtime_owned_pending))
+    Ok((name, contract))
 }
 
 fn doc_string(attrs: &[syn::Attribute]) -> String {
@@ -996,7 +996,6 @@ fn generate_host_function_descriptor(
     resource_params: &[(String, ResourceSpec)],
     state_params: &[(String, StateSpec)],
     contract: Option<&syn::Path>,
-    runtime_owned_pending: bool,
 ) -> Result<proc_macro2::TokenStream, Error> {
     let descriptor_name =
         syn::Ident::new(&format!("{wrapper_name}_descriptor"), wrapper_name.span());
@@ -1016,7 +1015,6 @@ fn generate_host_function_descriptor(
             state_params,
             binding,
             item,
-            runtime_owned_pending,
         );
     }
 
@@ -1242,15 +1240,7 @@ fn generate_contract_host_function_descriptor(
     state_params: &[(String, StateSpec)],
     binding: GeneratedBinding,
     item: &ItemFn,
-    runtime_owned_pending: bool,
 ) -> Result<proc_macro2::TokenStream, Error> {
-    if runtime_owned_pending && !matches!(binding, GeneratedBinding::Stack) {
-        return Err(Error::new_spanned(
-            &item.sig.ident,
-            "runtime_owned_pending requires a stack-dispatch signature (`&mut Vm` or a resource \
-             parameter)",
-        ));
-    }
     let mut state_effect_tokens = Vec::new();
     for input in &item.sig.inputs {
         let FnArg::Typed(pat_type) = input else {
@@ -1276,15 +1266,8 @@ fn generate_contract_host_function_descriptor(
         });
     }
 
-    let (mut binding_kind, adapter, adapter_fn) =
+    let (binding_kind, adapter, adapter_fn) =
         generated_adapter_tokens(sdk, adapter_name, wrapper_name, binding);
-    let mut adapter = adapter;
-    if runtime_owned_pending {
-        binding_kind = quote!(#sdk::host_extension::HostBindingKind::StaticStackRuntimeOwned);
-        adapter = quote!(#sdk::host_extension::HostAdapterDescriptor::StaticStackRuntimeOwned(
-            #adapter_name
-        ));
-    }
 
     Ok(quote! {
         #adapter_fn
@@ -1716,6 +1699,25 @@ mod tests {
     }
 
     #[test]
+    fn async_callable_wrapper_accepts_owned_bare_function_schema() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::async_stream");
+        let item: ItemFn = parse_quote! {
+            /// Streams through an owned callback asynchronously.
+            async fn async_stream(
+                callback: VmCallable<fn(VmMap) -> VmMap>,
+            ) -> VmResult<HostFutureOutput<VmMap>> {
+                todo!()
+            }
+        };
+
+        let expanded = expand_pd_host_function(attr, item)
+            .expect("an owned callable wrapper may cross the async boundary")
+            .to_string();
+        assert!(expanded.contains("VmCallable < fn (VmMap) -> VmMap >"));
+        assert!(expanded.contains("submit_host_future"));
+    }
+
+    #[test]
     fn callable_wrapper_preserves_parameter_and_result_schema() {
         let ty: Type = parse_quote!(VmCallable<fn(VmMap) -> VmMap>);
         assert_eq!(type_label(&ty).unwrap(), "fn(map) -> map");
@@ -1769,48 +1771,6 @@ mod tests {
         assert!(expanded.contains("vm : & mut super :: super :: Vm"));
         assert!(expanded.contains("borrow_resource"));
         assert!(expanded.contains("ResourceHandle :: from_raw"));
-    }
-
-    #[test]
-    fn runtime_owned_pending_flag_selects_the_pending_owning_stack_adapter() {
-        let attr: Punctuated<Meta, Token![,]> = parse_quote!(
-            name = "http::client::request",
-            contract = http_request_contract,
-            runtime_owned_pending
-        );
-        let item: ItemFn = parse_quote! {
-            /// Suspends until the generic runtime operation registry completes it.
-            fn request(vm: &mut Vm, request: VmMapHandle) -> VmResult<HostCallResult<VmMap>> {
-                todo!()
-            }
-        };
-        let expanded = expand_pd_host_function(attr, item).unwrap().to_string();
-        assert!(
-            expanded.contains("StaticStackRuntimeOwned"),
-            "the dispatch flag must select the pending-owning stack adapter: {expanded}"
-        );
-        assert!(
-            expanded.contains("declared_host_contract"),
-            "the guest contract is still declared on the same function: {expanded}"
-        );
-    }
-
-    #[test]
-    fn runtime_owned_pending_flag_requires_a_stack_dispatch_signature() {
-        let attr: Punctuated<Meta, Token![,]> = parse_quote!(
-            name = "demo::count",
-            contract = demo_count_contract,
-            runtime_owned_pending
-        );
-        let item: ItemFn = parse_quote! {
-            /// A non-yielding signature cannot own a pending operation.
-            fn count() -> i64 {
-                todo!()
-            }
-        };
-        let error = expand_pd_host_function(attr, item)
-            .expect_err("the pending flag requires a stack-dispatch signature");
-        assert!(error.to_string().contains("runtime_owned_pending requires"));
     }
 
     #[test]

@@ -5,31 +5,26 @@
 //! metadata, and [`io_host_module`]. Only the function *implementations* are
 //! selected per target and per feature:
 //!
-//! - `async` (non-wasm32): `async_io` drives IO through tokio and submits async
-//!   host functions via the generic async host bridge.
-//! - default (non-wasm32): `blocking` drives IO through worker threads
-//!   registered as concrete operation drivers in the execution scope.
+//! - `async` (non-wasm32): `async_io` awaits Tokio file/process operations
+//!   through ordinary annotated async host functions.
+//! - default (non-wasm32): `blocking` performs synchronous IO inline without
+//!   worker threads or private operation machinery.
 //! - wasm32: `wasm` (the `io_wasm.rs` backend) keeps the catalog surface and
 //!   rejects every IO call with a host error; the target has no file system.
 //!
-//! The non-wasm32 implementations share the same execution-scope resource
-//! model: live handles are `IoResource`s owned by the VM's execution scope and
-//! in-flight IO work is driven by concrete operation drivers registered in the
-//! same scope. Only the concurrency mechanism differs. Every backend declares
-//! the same [`IO_FILE_KEY`] and [`IO_FILE_DESCRIPTION`] for its own concrete
-//! handle type, so the guest contract and the target it compiles for cannot
-//! drift.
+//! Native backends retain only script-visible file/process handles as typed
+//! execution-scope resources. Every backend declares the same [`IO_FILE_KEY`]
+//! and [`IO_FILE_DESCRIPTION`] for its concrete handle type, so the guest
+//! contract and the target it compiles for cannot drift.
 
 use super::borrow_arg;
-#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "async", not(target_family = "wasm")))]
 use super::{CallOutcome, CaptureAsyncHostContext, return_one};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use crate::vm::Vm;
 
-/// The synchronous host-call channel that hands a pending operation id back to
-/// the VM. The blocking and wasm backends schedule a concrete operation driver;
-/// the async backend submits a future through the generic bridge instead.
-#[cfg(any(not(feature = "async"), target_arch = "wasm32"))]
+/// The synchronous pending-call channel used only by the wasm32 stub backend.
+#[cfg(target_family = "wasm")]
 pub(super) use super::HostCallResult;
 
 /// The canonical catalog key of the `io.file` resource type.
@@ -50,7 +45,7 @@ pub(crate) const IO_FILE_DESCRIPTION: &str = "An open file handle";
 // rejects every IO call regardless of policy, so the type and its accessors
 // exist only where they are consulted.
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IoPolicy {
     pub allowed_roots: Vec<String>,
@@ -60,7 +55,7 @@ pub struct IoPolicy {
     pub max_write_bytes: usize,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 impl Default for IoPolicy {
     fn default() -> Self {
         Self {
@@ -74,13 +69,13 @@ impl Default for IoPolicy {
 }
 
 /// I/O host configuration owned by the I/O host implementation.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub trait IoHostExt {
     fn configure_io(&mut self, policy: IoPolicy);
     fn clear_io_configuration(&mut self);
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 impl IoHostExt for Vm {
     fn configure_io(&mut self, mut policy: IoPolicy) {
         policy.allowed_roots.sort();
@@ -97,7 +92,7 @@ impl IoHostExt for Vm {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub(super) fn io_policy(vm: &Vm) -> Option<IoPolicy> {
     vm.host
         .get_module_state::<IoPolicy>()
@@ -107,22 +102,22 @@ pub(super) fn io_policy(vm: &Vm) -> Option<IoPolicy> {
 
 // ---- cfg-selected implementations -----------------------------------------
 
-#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "async", not(target_family = "wasm")))]
 mod async_io;
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
+#[cfg(all(not(feature = "async"), not(target_family = "wasm")))]
 mod blocking;
 /// The wasm32 backend lives beside the native ones in the runtime module and is
 /// pulled in here so it inherits this module's contracts, catalog, ownership
 /// list, and resource metadata.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 #[path = "../io_wasm.rs"]
 mod wasm;
 
-#[cfg(all(feature = "async", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "async", not(target_family = "wasm")))]
 pub(crate) use async_io::*;
-#[cfg(all(not(feature = "async"), not(target_arch = "wasm32")))]
+#[cfg(all(not(feature = "async"), not(target_family = "wasm")))]
 pub(crate) use blocking::*;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub(crate) use wasm::*;
 
 // ---- guest contracts -------------------------------------------------------

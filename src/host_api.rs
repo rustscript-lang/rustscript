@@ -121,7 +121,7 @@ const FINGERPRINT_DOMAIN_MAGIC: &[u8; 8] = b"rss-hapi";
 /// The fingerprint wire/format version. Bump whenever the canonical byte
 /// encoding or semantic interpretation changes so old and new digests are
 /// never compared across versions.
-const FINGERPRINT_FORMAT_VERSION: u8 = 2;
+const FINGERPRINT_FORMAT_VERSION: u8 = 3;
 
 /// Error returned when a [`ResourceTypeKey`] cannot be constructed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5101,8 +5101,8 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_version_is_two() {
-        assert_eq!(FINGERPRINT_FORMAT_VERSION, 2);
+    fn fingerprint_version_is_three() {
+        assert_eq!(FINGERPRINT_FORMAT_VERSION, 3);
     }
 
     #[test]
@@ -5858,7 +5858,10 @@ mod tests {
             &bytes[..FINGERPRINT_DOMAIN_MAGIC.len()],
             FINGERPRINT_DOMAIN_MAGIC
         );
-        assert_eq!(bytes[FINGERPRINT_DOMAIN_MAGIC.len()], 2);
+        assert_eq!(
+            bytes[FINGERPRINT_DOMAIN_MAGIC.len()],
+            FINGERPRINT_FORMAT_VERSION
+        );
         assert_eq!(catalog.canonical_bytes(), bytes);
     }
 

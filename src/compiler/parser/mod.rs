@@ -316,9 +316,9 @@ impl Parser {
     }
 
     /// Catalog-aware REPL constructor: combines the predeclared-locals path
-    /// with an optional [`HostApiCatalog`] snapshot so REPL compiles emit
-    /// exact V13 `HostImport` schemas against the standard snapshot (when a
-    /// catalog is supplied) instead of name-only imports.
+    /// with an optional [`HostApiCatalog`] snapshot so REPL compiles emit exact
+    /// `HostImport` schemas against the standard snapshot (when a catalog is
+    /// supplied) instead of name-only imports.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_with_predeclared_locals_and_host_catalog(
         source: &str,

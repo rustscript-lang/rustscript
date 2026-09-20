@@ -1854,12 +1854,12 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     {
         f()
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     {
         const COMPILER_STACK_SIZE: usize = 32 * 1024 * 1024;
         let handle = std::thread::Builder::new()

@@ -792,7 +792,7 @@ impl Drop for OperationRegistry {
         // Best-effort teardown: cancel pending operations so the owning
         // drivers can release resources. The summary is intentionally ignored;
         // counting failures is irrelevant while the registry is being dropped.
-        let _ = self.cancel_all(OperationCancelReason::VmReset);
+        let _ = self.cancel_all(OperationCancelReason::VmDrop);
     }
 }
 

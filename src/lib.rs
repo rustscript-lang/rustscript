@@ -24,7 +24,7 @@ pub mod vmbc;
 pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, assemble};
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::print::{PrintHostFunction, PrintlnHostFunction, format_value};
-#[cfg(all(feature = "runtime", feature = "sqlite", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "runtime", feature = "sqlite", not(target_family = "wasm")))]
 pub use builtins::runtime::sqlite::{SqliteHostExt, SqliteLimits, SqlitePolicy};
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
@@ -34,9 +34,10 @@ pub use builtins::runtime::{
     installed_timer_counts, register_owned_timer, register_timer_builtin_module,
     register_timer_builtin_module_from_catalog, timer_host_catalog,
 };
-#[cfg(all(feature = "runtime", feature = "sqlite", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "runtime", feature = "sqlite", not(target_family = "wasm")))]
 pub use builtins::runtime::{
     register_sqlite_builtin_module, register_sqlite_builtin_module_from_catalog,
+    sqlite_host_catalog,
 };
 #[cfg(feature = "runtime")]
 pub(crate) fn install_default_host_functions(registry: &mut vm::HostFunctionRegistry) {
@@ -69,10 +70,10 @@ pub use builtins::runtime::{
 pub use builtins::runtime::{
     DEFAULT_REGEX_CACHE_CAPACITY, RegexCache, RegexCacheVmExt, StandardHostModule, io_host_catalog,
     jit_host_catalog, register_jit_builtin_module, register_jit_builtin_module_from_catalog,
-    sqlite_host_catalog, standard_catalog_modules, standard_composition, standard_host_catalog,
+    standard_catalog_modules, standard_composition, standard_host_catalog,
     standard_host_catalog_fingerprint, standard_host_modules,
 };
-#[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "runtime", not(target_family = "wasm")))]
 pub use builtins::runtime::{IoHostExt, IoPolicy};
 pub use builtins::{
     BUILTIN_CATALOG, BuiltinFunction, BuiltinNamespaceMemberSpec, BuiltinNamespaceSpec,

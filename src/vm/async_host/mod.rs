@@ -36,14 +36,32 @@ pub(crate) use stream::{
 /// future has resolved.
 pub type HostVmCompletion<T> = Box<dyn FnOnce(&mut Vm) -> VmResult<T> + Send + 'static>;
 
+/// A continuation installed after the async phase has resolved.
+///
+/// This is the narrow escape hatch for host calls that must transfer from a
+/// library future into a generic VM-owned continuation such as a callable
+/// stream. The continuation runs once on the VM thread and may return a new
+/// pending operation without letting the async future borrow or re-enter the
+/// VM while it is being polled.
+pub type HostVmContinuation = Box<dyn FnOnce(&mut Vm) -> VmResult<CallOutcome> + Send + 'static>;
+
+/// The result of resolving a [`HostFutureOutput`] against the VM.
+#[derive(Debug)]
+pub(crate) enum HostFutureResolution<T = CallReturn> {
+    Return(T),
+    Continue(CallOutcome),
+}
+
 /// The terminal result of a submitted async host call.
 ///
 /// `T` is the value produced without further VM access (`Return`), or the
 /// value produced by a completion closure that borrows the VM once
-/// (`VmCompletion`).
+/// (`VmCompletion`). `VmContinuation` transfers the call into a generic
+/// VM-owned pending continuation after the library future has completed.
 pub enum HostFutureOutput<T = CallReturn> {
     Return(T),
     VmCompletion(HostVmCompletion<T>),
+    VmContinuation(HostVmContinuation),
 }
 
 impl<T> HostFutureOutput<T> {
@@ -58,8 +76,18 @@ impl<T> HostFutureOutput<T> {
         Self::VmCompletion(Box::new(completion))
     }
 
+    /// Wraps a continuation that runs once on the VM thread after the async
+    /// phase and may transfer the host call to another generic pending driver.
+    pub fn continue_with(
+        continuation: impl FnOnce(&mut Vm) -> VmResult<CallOutcome> + Send + 'static,
+    ) -> Self {
+        Self::VmContinuation(Box::new(continuation))
+    }
+
     /// Maps the produced value through `map`, deferring the mapping until
-    /// the completion closure (if any) has run against the VM.
+    /// the completion closure (if any) has run against the VM. A VM
+    /// continuation already returns a call-level outcome and passes through
+    /// unchanged.
     pub fn map<U: Send + 'static>(
         self,
         map: impl FnOnce(T) -> U + Send + 'static,
@@ -72,17 +100,22 @@ impl<T> HostFutureOutput<T> {
             Self::VmCompletion(completion) => {
                 HostFutureOutput::VmCompletion(Box::new(move |vm| completion(vm).map(map)))
             }
+            Self::VmContinuation(continuation) => HostFutureOutput::VmContinuation(continuation),
         }
     }
 }
 
 impl HostFutureOutput<CallReturn> {
     /// Resolves the terminal output against the VM: a `Return` value is
-    /// returned directly; a `VmCompletion` closure runs with `&mut Vm`.
-    pub(crate) fn finish(self, vm: &mut Vm) -> VmResult<CallReturn> {
+    /// returned directly, a `VmCompletion` closure runs with `&mut Vm`, and a
+    /// `VmContinuation` produces the next call-level outcome.
+    pub(crate) fn finish(self, vm: &mut Vm) -> VmResult<HostFutureResolution> {
         match self {
-            Self::Return(values) => Ok(values),
-            Self::VmCompletion(completion) => completion(vm),
+            Self::Return(values) => Ok(HostFutureResolution::Return(values)),
+            Self::VmCompletion(completion) => completion(vm).map(HostFutureResolution::Return),
+            Self::VmContinuation(continuation) => {
+                continuation(vm).map(HostFutureResolution::Continue)
+            }
         }
     }
 }

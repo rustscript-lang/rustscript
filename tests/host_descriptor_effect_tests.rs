@@ -112,7 +112,7 @@ fn value_only_catalog_fingerprint_is_stable() {
     assert_eq!(schemas[0].fingerprint, catalog.fingerprint());
     let rebuilt = value_only_catalog();
     assert_eq!(catalog.fingerprint(), rebuilt.fingerprint());
-    assert_eq!(catalog.fingerprint().to_string(), "b8b323eb678acb33");
+    assert_eq!(catalog.fingerprint().to_string(), "900fe90d1c222a2a");
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn named_struct_catalog_preserves_inline_fields() {
     );
     let rebuilt = named_struct_catalog();
     assert_eq!(catalog.fingerprint(), rebuilt.fingerprint());
-    assert_eq!(catalog.fingerprint().to_string(), "1ae5b55fa213c708");
+    assert_eq!(catalog.fingerprint().to_string(), "8e9381404a23e061");
 }
 
 #[test]
@@ -146,7 +146,7 @@ fn borrowed_resource_catalog_uses_borrow_passing() {
     );
     let rebuilt = borrowed_resource_catalog();
     assert_eq!(catalog.fingerprint(), rebuilt.fingerprint());
-    assert_eq!(catalog.fingerprint().to_string(), "3feba549802b8453");
+    assert_eq!(catalog.fingerprint().to_string(), "a9669bd807fe6fee");
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn mutable_resource_catalog_uses_borrow_mut_passing() {
     assert_eq!(schemas[0].params[0].passing, HostParamPassing::BorrowMut);
     let rebuilt = mutable_resource_catalog();
     assert_eq!(catalog.fingerprint(), rebuilt.fingerprint());
-    assert_eq!(catalog.fingerprint().to_string(), "5e72bc2ba4ad83c4");
+    assert_eq!(catalog.fingerprint().to_string(), "f7b1760ec6e726e9");
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn owned_resource_catalog_uses_take_owned_passing() {
     assert_eq!(schemas[0].params[0].passing, HostParamPassing::TakeOwned);
     let rebuilt = owned_resource_catalog();
     assert_eq!(catalog.fingerprint(), rebuilt.fingerprint());
-    assert_eq!(catalog.fingerprint().to_string(), "0b4c23d5c9d8dbcd");
+    assert_eq!(catalog.fingerprint().to_string(), "d523381d8a16c5a4");
 }
 
 #[test]
@@ -179,7 +179,7 @@ fn resource_return_catalog_declares_resource_schema() {
     );
     let rebuilt = resource_return_catalog();
     assert_eq!(catalog.fingerprint(), rebuilt.fingerprint());
-    assert_eq!(catalog.fingerprint().to_string(), "b2ff5d0e37985029");
+    assert_eq!(catalog.fingerprint().to_string(), "7dbb2227244cabb2");
 }
 
 #[test]
@@ -240,7 +240,7 @@ fn guest_resource_effects_are_tied_to_existing_passing_modes() {
     );
 
     let catalog = borrowed_resource_catalog();
-    assert_eq!(catalog.fingerprint().to_string(), "3feba549802b8453");
+    assert_eq!(catalog.fingerprint().to_string(), "a9669bd807fe6fee");
 }
 
 #[test]
@@ -1628,57 +1628,6 @@ fn owned_descriptor_keeps_the_take_owned_contract_and_adapter() {
             vm::host_extension::HostAdapterDescriptor::Owned(_)
         ),
         "the owned adapter factory must be retained verbatim"
-    );
-}
-
-#[test]
-fn runtime_owned_pending_descriptors_mark_the_registered_import() {
-    use vm::host_extension::{
-        HostAdapterDescriptor, HostBindingDescriptor, HostBindingKind, HostFunctionDescriptor,
-        HostModuleDescriptor,
-    };
-
-    fn pending_request_descriptor() -> HostFunctionDescriptor {
-        HostFunctionDescriptor {
-            schema: HostFunctionSchema::with_return(
-                "demo::request",
-                vec![HostParamSchema::value("request", HostTypeSchema::String)],
-                HostTypeSchema::String,
-            ),
-            binding: HostBindingDescriptor {
-                kind: HostBindingKind::StaticStackRuntimeOwned,
-            },
-            effects: vec![],
-            adapter: HostAdapterDescriptor::StaticStackRuntimeOwned(noop_host),
-            resource_types: vec![],
-        }
-    }
-
-    let module = HostModuleDescriptor {
-        name: "demo.pending",
-        functions: &[pending_request_descriptor],
-        resources: &[],
-    };
-    let mut registry = vm::HostFunctionRegistry::empty();
-    module
-        .install(&mut registry)
-        .expect("a runtime-owned pending descriptor installs");
-    assert!(registry.contains_name("demo::request"));
-
-    // A mismatched binding/adapter pair still fails closed.
-    let mismatched = HostFunctionDescriptor {
-        binding: HostBindingDescriptor {
-            kind: HostBindingKind::StaticStackRuntimeOwned,
-        },
-        adapter: HostAdapterDescriptor::StaticStack(noop_host),
-        ..pending_request_descriptor()
-    };
-    let mut target = vm::HostFunctionRegistry::empty();
-    let error = HostModuleDescriptor::install_descriptors(&mut target, &[mismatched])
-        .expect_err("a binding/adapter mismatch must fail closed");
-    assert!(
-        error.to_string().contains("binding/adapter mismatch"),
-        "{error}"
     );
 }
 

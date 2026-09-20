@@ -31,9 +31,9 @@ fn encoded_scalar_program() -> Vec<u8> {
 }
 
 #[test]
-fn embedded_decoder_reads_host_generated_v13() {
+fn embedded_decoder_reads_host_generated_v14() {
     let bytes = encoded_scalar_program();
-    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v13");
+    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v14");
 
     assert_eq!(
         program.code(),
@@ -139,31 +139,16 @@ fn embedded_decoder_skips_named_host_schema_from_std_encode() {
         .with_host_import_schemas(vec![schema])
         .expect("schema alignment");
     let bytes = encode_program(&program).expect("named host schema should encode");
-    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 14);
     let decoded = decode_program(&bytes).expect("embedded decoder should skip Named host schemas");
     assert_eq!(decoded.imports().len(), 1);
     assert_eq!(decoded.imports()[0].name, "embedded::named");
 }
 
-#[test]
-fn embedded_decoder_reads_legacy_v11_without_schema_markers() {
-    let program = Program::new(
-        vec![Value::Int(7)],
-        vec![OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8],
-    );
-    let mut bytes = encode_program(&program).expect("legacy fixture should encode");
-    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
-    bytes.truncate(bytes.len() - 4);
-    bytes[4..6].copy_from_slice(&11u16.to_le_bytes());
-
-    let decoded = decode_program(&bytes).expect("embedded decoder should accept VMBC v11");
-    assert_eq!(decoded.constants()[0], EmbeddedValue::Int(7));
-}
-
 fn minimal_vmbc_prefix(constant_count: u32, code: &[u8], import_count: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"VMBC");
-    bytes.extend_from_slice(&12u16.to_le_bytes());
+    bytes.extend_from_slice(&14u16.to_le_bytes());
     bytes.extend_from_slice(&0u16.to_le_bytes());
     bytes.extend_from_slice(&constant_count.to_le_bytes());
     bytes.extend_from_slice(&(code.len() as u32).to_le_bytes());
@@ -189,7 +174,7 @@ fn embedded_decoder_rejects_oversized_zero_byte_counts_before_allocation() {
     ));
 }
 
-fn v12_with_local_schema(schema: &[u8]) -> Vec<u8> {
+fn current_vmbc_with_local_schema(schema: &[u8]) -> Vec<u8> {
     let mut bytes = minimal_vmbc_prefix(0, &[EmbeddedOpCode::Ret as u8], 0);
     bytes.extend_from_slice(&[1, 0]);
     bytes.extend_from_slice(&1u32.to_le_bytes());
@@ -207,10 +192,11 @@ fn v12_with_local_schema(schema: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes
 }
 
-fn v12_with_callable_frame_counts(frame_counts: &[u32]) -> Vec<u8> {
+fn current_vmbc_with_callable_frame_counts(frame_counts: &[u32]) -> Vec<u8> {
     let mut bytes = minimal_vmbc_prefix(0, &[EmbeddedOpCode::Ret as u8], 0);
     bytes.extend_from_slice(&[0, 0]); // no type map, no debug info
     bytes.extend_from_slice(&0u32.to_le_bytes()); // script functions
@@ -229,10 +215,11 @@ fn v12_with_callable_frame_counts(frame_counts: &[u32]) -> Vec<u8> {
     bytes.extend_from_slice(&0u32.to_le_bytes()); // function regions
     bytes.extend_from_slice(&0u32.to_le_bytes()); // root callable bindings
     bytes.extend_from_slice(&0u32.to_le_bytes()); // exported callables
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // named structs
     bytes
 }
 
-fn v12_with_large_type_map(local_count: u32) -> Vec<u8> {
+fn current_vmbc_with_large_type_map(local_count: u32) -> Vec<u8> {
     let mut bytes = minimal_vmbc_prefix(0, &[EmbeddedOpCode::Ret as u8], 0);
     bytes.extend_from_slice(&[1, 0]); // type map, strict=false
     bytes.extend_from_slice(&local_count.to_le_bytes());
@@ -252,6 +239,7 @@ fn v12_with_large_type_map(local_count: u32) -> Vec<u8> {
     bytes.extend_from_slice(&0u32.to_le_bytes()); // function regions
     bytes.extend_from_slice(&0u32.to_le_bytes()); // root callable bindings
     bytes.extend_from_slice(&0u32.to_le_bytes()); // exported callables
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // named structs
     bytes
 }
 
@@ -274,7 +262,7 @@ fn embedded_decoder_accepts_root_resource_schema_tag_17() {
 
 #[test]
 fn embedded_decoder_debits_repeated_callable_frame_counts_from_one_budget() {
-    let bytes = v12_with_callable_frame_counts(&[40_000; 30]);
+    let bytes = current_vmbc_with_callable_frame_counts(&[40_000; 30]);
     assert!(
         matches!(
             decode_program(&bytes),
@@ -297,7 +285,7 @@ fn embedded_decoder_validates_the_complete_resource_schema_key() {
         schema.extend_from_slice(&(key.len() as u32).to_le_bytes());
         schema.extend_from_slice(key);
         assert!(matches!(
-            decode_program(&v12_with_local_schema(&schema)),
+            decode_program(&current_vmbc_with_local_schema(&schema)),
             Err(WireError::InvalidResourceKey)
         ));
     }
@@ -307,14 +295,14 @@ fn embedded_decoder_validates_the_complete_resource_schema_key() {
     schema.extend_from_slice(&(key_with_trailing_byte.len() as u32).to_le_bytes());
     schema.extend_from_slice(key_with_trailing_byte);
     assert!(matches!(
-        decode_program(&v12_with_local_schema(&schema)),
+        decode_program(&current_vmbc_with_local_schema(&schema)),
         Err(WireError::InvalidResourceKey)
     ));
 }
 
 #[test]
 fn embedded_decoder_rejects_a_single_oversized_callable_frame() {
-    let bytes = v12_with_callable_frame_counts(&[65_537]);
+    let bytes = current_vmbc_with_callable_frame_counts(&[65_537]);
     assert!(matches!(
         decode_program(&bytes),
         Err(WireError::LengthTooLarge("callable frame locals", 65_537))
@@ -323,7 +311,7 @@ fn embedded_decoder_rejects_a_single_oversized_callable_frame() {
 
 #[test]
 fn embedded_decoder_rejects_oversized_program_frame_count_from_type_map() {
-    let bytes = v12_with_large_type_map(65_537);
+    let bytes = current_vmbc_with_large_type_map(65_537);
     assert!(matches!(
         decode_program(&bytes),
         Err(WireError::LengthTooLarge("type map locals", 65_537))
@@ -343,7 +331,7 @@ fn schema_with_oversized_count(tag: u8, count: u32) -> Vec<u8> {
 fn embedded_decoder_rejects_oversized_nested_schema_counts() {
     const TOO_MANY: u32 = 1_000_001;
     for tag in [9, 11, 12, 14, 15] {
-        let bytes = v12_with_local_schema(&schema_with_oversized_count(tag, TOO_MANY));
+        let bytes = current_vmbc_with_local_schema(&schema_with_oversized_count(tag, TOO_MANY));
         assert!(matches!(
             decode_program(&bytes),
             Err(WireError::LengthTooLarge(_, count)) if count == TOO_MANY as usize
@@ -509,8 +497,7 @@ fn embedded_runtime_executes_compiler_generated_capturing_callable() {
 
 #[test]
 fn call_script_opcode_is_0x1a_in_both_crates() {
-    // The historical callable-creation opcode slot (0x1A) is now the static
-    // script-call opcode in both the std and embedded opcode tables.
+    // The static script-call opcode is identical in the std and embedded tables.
     assert_eq!(OpCode::try_from(0x1a), Ok(OpCode::CallScript));
     assert_eq!(
         EmbeddedOpCode::try_from(0x1a),
@@ -524,7 +511,7 @@ fn append_wire_string(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(value.as_bytes());
 }
 
-fn v12_with_named_host_return_schema(schema: &[u8]) -> Vec<u8> {
+fn current_vmbc_with_named_host_return_schema(schema: &[u8]) -> Vec<u8> {
     let mut bytes = minimal_vmbc_prefix(0, &[EmbeddedOpCode::Ret as u8], 1);
     bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.push(b'h');
@@ -536,6 +523,7 @@ fn v12_with_named_host_return_schema(schema: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(&0u64.to_le_bytes());
     bytes.push(0);
     bytes.push(0);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -566,7 +554,7 @@ fn nested_named_host_schema(depth: usize) -> Vec<u8> {
 
 #[test]
 fn embedded_decoder_accepts_empty_named_host_schema() {
-    let bytes = v12_with_named_host_return_schema(&empty_named_host_schema("Point"));
+    let bytes = current_vmbc_with_named_host_return_schema(&empty_named_host_schema("Point"));
     decode_program(&bytes).expect("empty Named host schema should skip");
 }
 
@@ -576,7 +564,7 @@ fn embedded_decoder_rejects_truncated_named_host_schema() {
     append_wire_string(&mut schema, "Point");
     schema.extend_from_slice(&1u32.to_le_bytes());
     assert_eq!(
-        decode_program(&v12_with_named_host_return_schema(&schema)),
+        decode_program(&current_vmbc_with_named_host_return_schema(&schema)),
         Err(WireError::UnexpectedEof)
     );
 }
@@ -588,7 +576,7 @@ fn embedded_decoder_rejects_oversized_named_host_field_count() {
     append_wire_string(&mut schema, "Point");
     schema.extend_from_slice(&TOO_MANY.to_le_bytes());
     assert!(matches!(
-        decode_program(&v12_with_named_host_return_schema(&schema)),
+        decode_program(&current_vmbc_with_named_host_return_schema(&schema)),
         Err(WireError::LengthTooLarge("host named struct fields", count))
             if count == TOO_MANY as usize
     ));
@@ -602,7 +590,7 @@ fn embedded_decoder_rejects_malformed_nested_named_host_schema() {
     append_wire_string(&mut schema, "inner");
     schema.push(99);
     assert_eq!(
-        decode_program(&v12_with_named_host_return_schema(&schema)),
+        decode_program(&current_vmbc_with_named_host_return_schema(&schema)),
         Err(WireError::InvalidValueType(99))
     );
 }
@@ -617,19 +605,19 @@ fn embedded_decoder_rejects_truncated_nested_named_host_schema() {
     append_wire_string(&mut schema, "Inner");
     schema.extend_from_slice(&1u32.to_le_bytes());
     assert_eq!(
-        decode_program(&v12_with_named_host_return_schema(&schema)),
+        decode_program(&current_vmbc_with_named_host_return_schema(&schema)),
         Err(WireError::UnexpectedEof)
     );
 }
 
 #[test]
 fn embedded_decoder_rejects_oversized_nested_named_host_depth() {
-    let bytes = v12_with_named_host_return_schema(&nested_named_host_schema(64));
+    let bytes = current_vmbc_with_named_host_return_schema(&nested_named_host_schema(64));
     assert_eq!(decode_program(&bytes), Err(WireError::SchemaTooDeep));
 }
 
 #[test]
-fn embedded_decoder_reads_v13_guest_named_struct_payload() {
+fn embedded_decoder_reads_v14_guest_named_struct_payload() {
     let compiled = compile_source(
         r#"
         struct Point { x: int, y: int }
@@ -639,7 +627,7 @@ fn embedded_decoder_reads_v13_guest_named_struct_payload() {
     )
     .expect("guest Named source should compile");
     let bytes = encode_program(&compiled.program).expect("struct-bearing program should encode");
-    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 14);
     let program = decode_program(&bytes).expect("embedded decoder should skip guest named structs");
     assert_eq!(program.code().last().copied(), Some(OpCode::Ret as u8));
 }
@@ -676,16 +664,4 @@ fn embedded_decoder_rejects_duplicate_named_struct_names() {
     bytes.push(14);
     bytes.extend_from_slice(&0u32.to_le_bytes());
     assert_eq!(decode_program(&bytes), Err(WireError::InvalidValueType(0)));
-}
-
-#[test]
-fn embedded_decoder_rejects_v12_trailing_zero_named_struct_garbage() {
-    let mut bytes = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
-        .expect("empty program should encode");
-    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
-    bytes.truncate(bytes.len() - 4);
-    bytes[4..6].copy_from_slice(&12u16.to_le_bytes());
-    decode_program(&bytes).expect("clean v12 should decode");
-    bytes.extend_from_slice(&0u32.to_le_bytes());
-    assert_eq!(decode_program(&bytes), Err(WireError::TrailingBytes));
 }

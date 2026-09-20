@@ -8,9 +8,7 @@ use super::{
 };
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V11: u16 = 11;
-const VERSION_V12: u16 = 12;
-const VERSION_V13: u16 = 13;
+const VERSION: u16 = 14;
 const FLAGS: u16 = 0;
 const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;
@@ -73,11 +71,9 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    let has_host_import_schemas = match version {
-        VERSION_V11 => false,
-        VERSION_V12 | VERSION_V13 => true,
-        _ => return Err(WireError::UnsupportedVersion(version)),
-    };
+    if version != VERSION {
+        return Err(WireError::UnsupportedVersion(version));
+    }
     let flags = cursor.read_u16()?;
     if flags != FLAGS {
         return Err(WireError::UnsupportedFlags(flags));
@@ -94,10 +90,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     let mut code = Vec::new();
     reserve(&mut code, "code", code_bytes.len())?;
     code.extend_from_slice(code_bytes);
-    if version == VERSION_V11 && code.contains(&(OpCode::CallScript as u8)) {
-        return Err(WireError::UnsupportedVersion(VERSION_V11));
-    }
-    let import_count = cursor.read_count("imports", if has_host_import_schemas { 7 } else { 6 })?;
+    let import_count = cursor.read_count("imports", 7)?;
     let mut imports = Vec::new();
     reserve(&mut imports, "imports", import_count)?;
     for _ in 0..import_count {
@@ -106,12 +99,10 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
             arity: cursor.read_u8()?,
             return_type: read_value_type(cursor.read_u8()?)?,
         });
-        if has_host_import_schemas {
-            match cursor.read_u8()? {
-                0 => {}
-                1 => skip_host_import_schema(&mut cursor)?,
-                value => return Err(WireError::InvalidBool(value)),
-            }
+        match cursor.read_u8()? {
+            0 => {}
+            1 => skip_host_import_schema(&mut cursor)?,
+            value => return Err(WireError::InvalidBool(value)),
         }
     }
 
@@ -124,9 +115,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         root_callable_bindings,
         exported_callables,
     ) = read_callable_metadata(&mut cursor)?;
-    if version >= VERSION_V13 {
-        skip_named_struct_decls(&mut cursor)?;
-    }
+    skip_named_struct_decls(&mut cursor)?;
     if !cursor.is_empty() {
         return Err(WireError::TrailingBytes);
     }
@@ -488,7 +477,7 @@ fn read_callable_metadata(cursor: &mut Cursor<'_>) -> Result<CallableMetadata, W
 }
 
 /// Deterministically reject malformed or inconsistent `CallScript` operands,
-/// mirroring the std VMBC V12 decoder: truncated operands, out-of-range
+/// mirroring the standard VMBC decoder: truncated operands, out-of-range
 /// prototype ids, prototypes that do not target a script function, and argc
 /// values that disagree with the prototype arity.
 fn validate_call_script_operands(

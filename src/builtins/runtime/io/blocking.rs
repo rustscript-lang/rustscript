@@ -1,24 +1,14 @@
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
-use std::ops::{Deref, DerefMut};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
-use std::thread::JoinHandle;
 
 use pd_host_function::pd_host_function;
 
-use super::HostCallResult;
-use crate::vm::operation::driver::HostOperation;
-use crate::vm::operation::error::{OperationError, OperationErrorCode, OperationResult};
-use crate::vm::operation::reason::OperationCancelReason;
-use crate::vm::operation::{OperationId, OperationOutcome, OperationSpec};
 use crate::vm::resource::close::{CloseProgress, HostResource};
 use crate::vm::resource::error::{ResourceError, ResourceErrorCode, ResourceResult};
-use crate::vm::resource::{ResourceCloseReason, ResourceHandle};
-use crate::vm::{CallReturn, HostOpId, Value, Vm, VmError, VmResult};
+use crate::vm::resource::{Resource, ResourceCloseReason, ResourceHandle};
+use crate::vm::{Vm, VmError, VmResult};
 
 /// A file / child-process backed IO handle.
 pub(super) enum IoHandle {
@@ -27,227 +17,72 @@ pub(super) enum IoHandle {
     PopenWrite { child: Child },
 }
 
-/// Shared lifecycle state for one typed IO resource.
-///
-/// The handle cell is also the admission lock for workers: a worker increments
-/// `active_workers` while holding the cell lock before taking the handle, and a
-/// close marks the resource closed before inspecting that same cell. This
-/// makes a close racing with a worker either reject the worker or observe it as
-/// active; it can never mistake an owned handle for an idle resource.
-struct IoResourceState {
-    handle: Mutex<Option<IoHandle>>,
-    closed: AtomicBool,
-    active_workers: AtomicUsize,
-    close_waker: Mutex<Option<Waker>>,
-    close_error: Mutex<Option<String>>,
-}
-
-impl IoResourceState {
-    fn new(handle: IoHandle) -> Self {
-        Self {
-            handle: Mutex::new(Some(handle)),
-            closed: AtomicBool::new(false),
-            active_workers: AtomicUsize::new(0),
-            close_waker: Mutex::new(None),
-            close_error: Mutex::new(None),
-        }
-    }
-
-    /// Takes the handle for one worker and records its ownership before
-    /// releasing the admission lock.
-    fn take_handle(self: &Arc<Self>) -> Option<IoHandleLease> {
-        let mut slot = self
-            .handle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.closed.load(Ordering::Acquire) {
-            return None;
-        }
-        let handle = slot.take()?;
-        self.active_workers.fetch_add(1, Ordering::AcqRel);
-        Some(IoHandleLease {
-            state: Arc::clone(self),
-            handle: Some(handle),
-            active: true,
-        })
-    }
-
-    fn mark_closed(&self) {
-        let _guard = self
-            .handle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.closed.store(true, Ordering::Release);
-    }
-
-    fn register_close_waker(&self, waker: &Waker) {
-        let mut guard = self
-            .close_waker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.active_workers.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        *guard = Some(waker.clone());
-        if self.active_workers.load(Ordering::Acquire) == 0
-            && let Some(waker) = guard.take()
-        {
-            waker.wake();
-        }
-    }
-
-    fn release_worker(&self) {
-        let previous = self.active_workers.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "IO worker release without an active worker");
-        if previous == 1
-            && let Some(waker) = self
-                .close_waker
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-        {
-            waker.wake();
-        }
-    }
-
-    fn record_close_error(&self, error: &VmError) {
-        let mut guard = self
-            .close_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.is_none() {
-            *guard = Some(error.to_string());
-        }
-    }
-
-    fn cleanup_error(&self) -> Option<ResourceError> {
-        self.close_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .map(|message| {
-                ResourceError::new(
-                    ResourceErrorCode::ResourceCleanupFailed,
-                    "io::resource",
-                    message.clone(),
-                )
-            })
-    }
-}
-
-impl Drop for IoResourceState {
-    fn drop(&mut self) {
-        let handle = self
-            .handle
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(handle) = handle {
-            let _ = close_io_handle(handle);
-        }
-    }
-}
-
-/// A worker-owned handle lease. Normal completion explicitly restores the
-/// handle to an open resource, while close/cancellation/unwind paths close it
-/// instead. In either case the active-worker count is decremented and a
-/// pending resource close is woken.
-struct IoHandleLease {
-    state: Arc<IoResourceState>,
-    handle: Option<IoHandle>,
-    active: bool,
-}
-
-impl Deref for IoHandleLease {
-    type Target = IoHandle;
-
-    fn deref(&self) -> &Self::Target {
-        self.handle.as_ref().expect("active IO lease has a handle")
-    }
-}
-
-impl DerefMut for IoHandleLease {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.handle.as_mut().expect("active IO lease has a handle")
-    }
-}
-
-impl IoHandleLease {
-    fn restore(mut self) -> VmResult<()> {
-        self.release_inner(false)
-    }
-
-    fn close(mut self) -> VmResult<()> {
-        self.release_inner(true)
-    }
-
-    fn release_inner(&mut self, force_close: bool) -> VmResult<()> {
-        if !self.active {
-            return Ok(());
-        }
-        let Some(handle) = self.handle.take() else {
-            self.active = false;
-            self.state.release_worker();
-            return Ok(());
-        };
-
-        let mut handle = Some(handle);
-        let should_close = if force_close {
-            true
-        } else {
-            let mut slot = self
-                .state
-                .handle
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if self.state.closed.load(Ordering::Acquire) {
-                true
-            } else {
-                *slot = handle.take();
-                false
-            }
-        };
-
-        let result = if should_close {
-            close_io_handle(handle.expect("IO lease close owns its handle"))
-        } else {
-            Ok(())
-        };
-        if let Err(error) = &result {
-            self.state.record_close_error(error);
-        }
-        self.active = false;
-        self.state.release_worker();
-        result
-    }
-}
-
-impl Drop for IoHandleLease {
-    fn drop(&mut self) {
-        if self.active {
-            // A normal worker calls `restore`/`close` explicitly. Reaching this
-            // guard means an unwind or failed handoff, so never return a live
-            // process handle to the resource table implicitly.
-            let _ = self.release_inner(true);
-        }
-    }
-}
-
 /// The typed resource stored in the execution scope for one IO handle.
 struct IoResource {
-    state: Arc<IoResourceState>,
+    handle: Option<IoHandle>,
+    explicit_cleanup: fn(&mut IoHandle) -> VmResult<()>,
+    drop_cleanup: fn(&mut IoHandle) -> VmResult<()>,
+    drop_cleanup_started: bool,
 }
 
 impl IoResource {
     fn new(handle: IoHandle) -> Self {
         Self {
-            state: Arc::new(IoResourceState::new(handle)),
+            handle: Some(handle),
+            explicit_cleanup: close_io_handle,
+            drop_cleanup: start_close_io_handle_for_drop,
+            drop_cleanup_started: false,
         }
     }
 
-    /// Takes the inner handle for a worker thread and records its lease.
-    fn take_handle(&self) -> Option<IoHandleLease> {
-        self.state.take_handle()
+    #[cfg(test)]
+    fn new_with_process_cleanup(
+        handle: IoHandle,
+        explicit_cleanup: fn(&mut IoHandle) -> VmResult<()>,
+        drop_cleanup: fn(&mut IoHandle) -> VmResult<()>,
+    ) -> Self {
+        Self {
+            handle: Some(handle),
+            explicit_cleanup,
+            drop_cleanup,
+            drop_cleanup_started: false,
+        }
+    }
+
+    fn close_explicit(&mut self) -> VmResult<()> {
+        let Some(handle) = self.handle.as_mut() else {
+            return Ok(());
+        };
+        (self.explicit_cleanup)(handle)?;
+        self.handle.take();
+        Ok(())
+    }
+
+    fn begin_close_for_drop_nonblocking(&mut self) -> ResourceResult<CloseProgress> {
+        let Some(handle) = self.handle.as_mut() else {
+            return Ok(CloseProgress::Ready);
+        };
+        if matches!(handle, IoHandle::File(_)) {
+            self.handle.take();
+            return Ok(CloseProgress::Ready);
+        }
+        if !self.drop_cleanup_started {
+            (self.drop_cleanup)(handle).map_err(|error| {
+                ResourceError::new(
+                    ResourceErrorCode::ResourceCleanupFailed,
+                    "io::resource",
+                    error.to_string(),
+                )
+            })?;
+            self.drop_cleanup_started = true;
+        }
+        Ok(CloseProgress::Pending)
+    }
+}
+
+impl Drop for IoResource {
+    fn drop(&mut self) {
+        let _ = self.begin_close_for_drop_nonblocking();
     }
 }
 
@@ -263,591 +98,72 @@ pub(crate) fn io_file_resource() -> crate::host_extension::HostResourceTypeMeta 
 
 impl HostResource for IoResource {
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
-        // Marking closed while holding the same admission lock used by worker
-        // leases makes the close boundary linearizable: a worker either
-        // restores before close begins, or observes closed and cleans up.
-        let mut slot = self
-            .state
-            .handle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.state.closed.store(true, Ordering::Release);
-        if self.state.active_workers.load(Ordering::Acquire) != 0 {
-            return Ok(CloseProgress::Pending);
-        }
-        let handle = slot.take();
-        drop(slot);
-
-        if let Some(error) = self.state.cleanup_error() {
-            return Err(error);
-        }
-        if let Some(handle) = handle {
-            close_io_handle(handle).map_err(|error| {
-                self.state.record_close_error(&error);
-                ResourceError::new(
-                    ResourceErrorCode::ResourceCleanupFailed,
-                    "io::resource",
-                    error.to_string(),
-                )
-            })?;
-        }
-        Ok(CloseProgress::Ready)
-    }
-
-    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
-        if self.state.active_workers.load(Ordering::Acquire) != 0 {
-            self.state.register_close_waker(cx.waker());
-            if self.state.active_workers.load(Ordering::Acquire) != 0 {
-                return Poll::Pending;
-            }
-        }
-
-        if let Some(error) = self.state.cleanup_error() {
-            return Poll::Ready(Err(error));
-        }
-        let handle = self
-            .state
-            .handle
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(handle) = handle
-            && let Err(error) = close_io_handle(handle)
-        {
-            self.state.record_close_error(&error);
-            return Poll::Ready(Err(ResourceError::new(
+        self.close_explicit().map_err(|error| {
+            ResourceError::new(
                 ResourceErrorCode::ResourceCleanupFailed,
                 "io::resource",
                 error.to_string(),
-            )));
-        }
-        Poll::Ready(Ok(()))
-    }
-}
-
-/// Shared state between one IO worker thread, its [`IoOpDriver`] operation,
-/// and the adapter-owned completion hook on the VM thread.
-///
-/// The worker writes the terminal [`signal`](IoOpShared::signal), the
-/// guest-visible [`value`](IoOpShared::value), and any opened handle or
-/// close target; the driver reflects the signal into the operation registry
-/// and the VM wrapper reads the value out of the mailbox after the registry
-/// drive returns terminal.
-struct IoOpShared {
-    cancelled: AtomicBool,
-    worker_done: AtomicBool,
-    signal: Mutex<Option<Result<(), String>>>,
-    value: Mutex<Option<VmResult<CallReturn>>>,
-    opened: Mutex<Option<IoHandle>>,
-    target: Mutex<Option<ResourceHandle>>,
-    waker: Mutex<Option<Waker>>,
-    quiescence_waker: Mutex<Option<Waker>>,
-    worker: Mutex<Option<JoinHandle<()>>>,
-    cancel_hook: Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
-}
-
-impl IoOpShared {
-    fn new() -> Self {
-        Self {
-            cancelled: AtomicBool::new(false),
-            worker_done: AtomicBool::new(false),
-            signal: Mutex::new(None),
-            value: Mutex::new(None),
-            opened: Mutex::new(None),
-            target: Mutex::new(None),
-            waker: Mutex::new(None),
-            quiescence_waker: Mutex::new(None),
-            worker: Mutex::new(None),
-            cancel_hook: Mutex::new(None),
-        }
-    }
-
-    fn mark_worker_done(&self) {
-        self.worker_done.store(true, Ordering::Release);
-        if let Some(waker) = self
-            .quiescence_waker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            waker.wake();
-        }
-    }
-
-    fn is_quiescent(&self) -> bool {
-        self.worker_done.load(Ordering::Acquire)
-    }
-
-    fn register_quiescence_waker(&self, waker: &Waker) {
-        let mut guard = self
-            .quiescence_waker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.is_quiescent() {
-            return;
-        }
-        *guard = Some(waker.clone());
-        if self.is_quiescent()
-            && let Some(waker) = guard.take()
-        {
-            waker.wake();
-        }
-    }
-
-    fn install_cancel_hook(&self, hook: impl FnOnce() + Send + 'static) {
-        let mut hook = Some(Box::new(hook) as Box<dyn FnOnce() + Send + 'static>);
-        {
-            let mut guard = self
-                .cancel_hook
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !self.cancelled.load(Ordering::Acquire) {
-                *guard = hook.take();
-            }
-        }
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-
-    fn cancel_work(&self) {
-        if let Some(hook) = self
-            .cancel_hook
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            hook();
-        }
-    }
-
-    fn set_worker(&self, worker: JoinHandle<()>) {
-        *self
-            .worker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(worker);
-    }
-
-    fn join_worker(&self) -> bool {
-        let worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        worker.is_some_and(|worker| worker.join().is_err())
-    }
-
-    /// The worker's terminal publish: stores the signal and wakes any
-    /// registered waker (check-register-double-check in the driver's poll).
-    fn publish(&self, signal: Result<(), String>) {
-        *self
-            .signal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(signal);
-        if let Some(waker) = self
-            .waker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            waker.wake();
-        }
-    }
-
-    fn take_signal(&self) -> Option<Result<(), String>> {
-        self.signal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-    }
-
-    fn register_waker(&self, waker: &Waker) {
-        *self
-            .waker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(waker.clone());
-    }
-
-    /// The worker's failure path: records the guest-visible `VmError` in the
-    /// value mailbox and publishes a textual signal for the operation driver.
-    fn fail(&self, error: VmError) {
-        let message = error.to_string();
-        *self
-            .value
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Err(error));
-        self.publish(Err(message));
-    }
-
-    /// Publishes a terminal operation while preserving a guest-visible value
-    /// (including an error that must still retire a close target).
-    fn complete(&self, value: VmResult<CallReturn>) {
-        *self
-            .value
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(value);
-        self.publish(Ok(()));
-    }
-
-    /// The worker's success path: records the guest-visible value and
-    /// publishes a success signal.
-    fn succeed(&self, value: CallReturn) {
-        self.complete(Ok(value));
-    }
-}
-
-impl Drop for IoOpShared {
-    fn drop(&mut self) {
-        let handle = self
-            .opened
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(handle) = handle {
-            let _ = close_io_handle(handle);
-        }
-    }
-}
-
-/// A concrete [`HostOperation`] driver for one pending IO operation.
-///
-/// The worker thread performs the actual IO; this driver reflects the
-/// worker's terminal signal into the operation registry and honours
-/// cancellation by flagging the shared state so the worker aborts promptly.
-struct IoOpDriver {
-    shared: Arc<IoOpShared>,
-    name: String,
-}
-
-impl IoOpDriver {
-    fn new(shared: Arc<IoOpShared>, name: impl Into<String>) -> Self {
-        Self {
-            shared,
-            name: name.into(),
-        }
-    }
-
-    fn worker_failed(&self, message: impl Into<String>) -> Poll<OperationResult<()>> {
-        Poll::Ready(Err(OperationError::new(
-            OperationErrorCode::OperationDriverFailed,
-            "io::operation",
-            message,
-        )))
-    }
-}
-
-impl HostOperation for IoOpDriver {
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
-        if !self.shared.is_quiescent() {
-            self.shared.register_waker(cx.waker());
-            self.shared.register_quiescence_waker(cx.waker());
-            if !self.shared.is_quiescent() {
-                return Poll::Pending;
-            }
-        }
-        if self.shared.cancelled.load(Ordering::Acquire) {
-            return self.worker_failed(format!("{} was cancelled", self.name));
-        }
-        match self.shared.take_signal() {
-            Some(Ok(())) => Poll::Ready(Ok(())),
-            Some(Err(message)) => self.worker_failed(message),
-            None => self.worker_failed(format!(
-                "{} worker terminated without a completion signal",
-                self.name
-            )),
-        }
-    }
-
-    fn cancel(&mut self, _reason: OperationCancelReason) -> OperationResult<()> {
-        self.shared.cancelled.store(true, Ordering::Release);
-        self.shared.cancel_work();
-        Ok(())
-    }
-
-    fn is_quiescent(&self) -> bool {
-        self.shared.is_quiescent()
-    }
-
-    fn register_quiescence_waker(&mut self, cx: &Context<'_>) {
-        self.shared.register_quiescence_waker(cx.waker());
-    }
-
-    fn cancel_and_wait(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
-        self.cancel(reason)?;
-        if self.shared.join_worker() {
-            return Err(OperationError::new(
-                OperationErrorCode::OperationDriverFailed,
-                "io::operation",
-                format!("{} worker panicked while cancelling", self.name),
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for IoOpDriver {
-    fn drop(&mut self) {
-        if !self.shared.is_quiescent() {
-            self.shared.cancelled.store(true, Ordering::Release);
-            self.shared.cancel_work();
-        }
-        let _ = self.shared.join_worker();
-    }
-}
-
-/// Completes one operation after the generic scope registry reports a
-/// terminal outcome. The adapter owns the mailbox and any resource-table
-/// mutation; the VM only invokes this opaque completion hook.
-fn finish_io_operation(
-    vm: &mut Vm,
-    op_id: OperationId,
-    outcome: OperationOutcome,
-    shared: Arc<IoOpShared>,
-) -> VmResult<CallReturn> {
-    if matches!(outcome, OperationOutcome::Cancelled(_)) || shared.cancelled.load(Ordering::Acquire)
-    {
-        // The completion hook can be discarded after cancellation. Clean up
-        // an opened child here as well as in `IoOpShared::drop`, so ownership
-        // is released as soon as the worker has quiesced.
-        if let Some(handle) = shared
-            .opened
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            let _ = close_io_handle(handle);
-        }
-        return Err(VmError::HostError("IO operation cancelled".to_string()));
-    }
-
-    // An opened handle (io::open / io::popen) becomes a typed IO resource in
-    // the scope; the script-visible handle is its raw resource token. The
-    // resource state's drop guard closes the handle if table admission fails.
-    if let Some(handle) = shared
-        .opened
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-    {
-        let resource = IoResource::new(handle);
-        let token = vm
-            .execution_scope()
-            .push_resource(resource)
-            .map_err(|error| {
-                VmError::HostError(format!(
-                    "scoped operation {} resource insert failed: {error}",
-                    op_id.raw()
-                ))
-            })?;
-        *shared
-            .value
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(Ok(CallReturn::one(Value::Int(token.handle().raw() as i64))));
-    }
-
-    // A closed handle (io::close) retires the exact resource entry through
-    // the generic scope close (exact-once). A close operation is successful
-    // only once both the underlying handle and the scope entry are retired.
-    if let Some(target) = shared
-        .target
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-    {
-        let progress = vm
-            .execution_scope()
-            .close_resource::<IoResource>(target, ResourceCloseReason::Requested)
-            .map_err(VmError::ExecutionScope)?;
-        if progress != CloseProgress::Ready {
-            return Err(VmError::HostError(format!(
-                "scoped operation {} resource retirement remained pending",
-                op_id.raw()
-            )));
-        }
-    }
-
-    let value = shared
-        .value
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    value.ok_or_else(|| {
-        VmError::HostError(format!(
-            "scoped operation {} completed without a result",
-            op_id.raw()
-        ))
-    })?
-}
-
-/// Maximum UTF-8 byte length passed to `thread::Builder::name` for an IO
-/// worker. The sanitized ASCII name also avoids embedded NULs and platform
-/// surprises from an operation name supplied by a future caller.
-const IO_WORKER_THREAD_NAME_MAX_LEN: usize = 32;
-
-fn io_worker_thread_name(operation: &str) -> String {
-    let mut name = String::from("pd-vm-io-");
-    for byte in operation.bytes() {
-        if name.len() == IO_WORKER_THREAD_NAME_MAX_LEN {
-            break;
-        }
-        let safe = match byte {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' => byte,
-            _ => b'_',
-        };
-        name.push(safe as char);
-    }
-    name
-}
-
-struct WorkerCompletion {
-    shared: Arc<IoOpShared>,
-}
-
-impl Drop for WorkerCompletion {
-    fn drop(&mut self) {
-        self.shared.mark_worker_done();
-    }
-}
-
-/// Spawns a worker thread for an IO operation and registers its driver in
-/// the VM's execution scope. Returns the packed [`OperationId`] raw value
-/// to hand to the guest as the pending op id.
-fn schedule_io_task(
-    vm: &mut Vm,
-    name: &str,
-    work: impl FnOnce(&IoOpShared) + Send + 'static,
-) -> VmResult<HostOpId> {
-    let name = name.to_string();
-    let shared = Arc::new(IoOpShared::new());
-    let driver_shared = Arc::clone(&shared);
-    let worker_shared = Arc::clone(&shared);
-    let worker_name = name.clone();
-
-    let op_id = vm
-        .execution_scope()
-        .start_operation(OperationSpec::new(IoOpDriver::new(driver_shared, name)))
-        .map_err(|error| {
-            VmError::HostError(format!(
-                "failed to start io operation '{}': {error}",
-                worker_name
-            ))
+            )
         })?;
-    if let Err(error) = vm.register_scoped_operation_completion(op_id, {
-        let completion_shared = Arc::clone(&shared);
-        move |vm, outcome| finish_io_operation(vm, op_id, outcome, completion_shared)
-    }) {
-        let _ = vm
-            .execution_scope()
-            .abort_operation(op_id, OperationCancelReason::Requested);
-        return Err(error);
+        Ok(CloseProgress::Ready)
     }
-    let raw = op_id.raw();
-    let thread_name = io_worker_thread_name(&worker_name);
 
-    std::thread::Builder::new()
-        .name(thread_name)
-        .spawn(move || {
-            let _completion = WorkerCompletion {
-                shared: Arc::clone(&worker_shared),
-            };
-            if worker_shared.cancelled.load(Ordering::Acquire) {
-                worker_shared.publish(Err(format!("io operation '{worker_name}' was cancelled")));
-                return;
-            }
-            work(&worker_shared);
-        })
-        .map(|worker| {
-            shared.set_worker(worker);
-        })
-        .map_err(|error| {
-            // Roll back the registered operation so no orphaned op lingers.
-            shared.mark_worker_done();
-            vm.discard_scoped_operation_completion(op_id);
-            let _ = vm
-                .execution_scope()
-                .abort_operation(op_id, OperationCancelReason::Requested);
-            VmError::HostError(format!("failed to spawn io task: {error}"))
-        })?;
-
-    Ok(raw)
-}
-
-fn finish_io_worker(shared: &IoOpShared, handle: IoHandleLease, result: VmResult<CallReturn>) {
-    let result = match handle.restore() {
-        Ok(()) => result,
-        Err(error) => Err(error),
-    };
-    match result {
-        Ok(value) => shared.succeed(value),
-        Err(error) => shared.fail(error),
+    fn begin_close_for_drop(
+        &mut self,
+        _reason: ResourceCloseReason,
+    ) -> ResourceResult<CloseProgress> {
+        self.begin_close_for_drop_nonblocking()
     }
 }
 
-/// Opens a file handle for runtime I/O.
+/// Opens a file handle for runtime I/O inline on non-async builds.
 #[pd_host_function(name = "io::open", contract = super::io_open_contract)]
-pub(super) fn builtin_io_open(
-    vm: &mut Vm,
-    path: &str,
-    mode: &str,
-) -> VmResult<HostCallResult<i64>> {
-    let writes = matches!(mode, "w" | "a" | "r+" | "w+" | "a+");
-    let path = authorize_blocking_io_path(vm, path, writes)?
-        .display()
-        .to_string();
-    let mode = mode.to_string();
-    let op_id = schedule_io_task(vm, "io::open", move |shared| {
-        let mut options = OpenOptions::new();
-        match mode.as_str() {
-            "r" => {
-                options.read(true);
-            }
-            "w" => {
-                options.write(true).create(true).truncate(true);
-            }
-            "a" => {
-                options.write(true).create(true).append(true);
-            }
-            "r+" => {
-                options.read(true).write(true);
-            }
-            "w+" => {
-                options.read(true).write(true).create(true).truncate(true);
-            }
-            "a+" => {
-                options.read(true).write(true).create(true).append(true);
-            }
-            other => {
-                shared.fail(VmError::HostError(format!(
-                    "unsupported io_open mode '{other}', expected r/w/a/r+/w+/a+",
-                )));
-                return;
-            }
+pub(super) fn builtin_io_open(vm: &mut Vm, path: &str, mode: &str) -> VmResult<i64> {
+    let writes = match mode {
+        "r" => false,
+        "w" | "a" | "r+" | "w+" | "a+" => true,
+        other => {
+            return Err(VmError::HostError(format!(
+                "unsupported io_open mode '{other}', expected r/w/a/r+/w+/a+"
+            )));
         }
-
-        match options.open(path) {
-            Ok(file) => {
-                *shared
-                    .opened
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(IoHandle::File(file));
-                shared.publish(Ok(()));
-            }
-            Err(err) => {
-                shared.fail(VmError::HostError(format!("io_open failed: {err}")));
-            }
+    };
+    let path = authorize_blocking_io_path(vm, path, writes)?;
+    let mut options = OpenOptions::new();
+    match mode {
+        "r" => {
+            options.read(true);
         }
-    })?;
-    Ok(HostCallResult::Pending(op_id))
+        "w" => {
+            options.write(true).create(true).truncate(true);
+        }
+        "a" => {
+            options.write(true).create(true).append(true);
+        }
+        "r+" => {
+            options.read(true).write(true);
+        }
+        "w+" => {
+            options.read(true).write(true).create(true).truncate(true);
+        }
+        "a+" => {
+            options.read(true).write(true).create(true).append(true);
+        }
+        _ => unreachable!("mode validated above"),
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| VmError::HostError(format!("io_open failed: {error}")))?;
+    let token = vm
+        .execution_scope()
+        .push_resource(IoResource::new(IoHandle::File(file)))
+        .map_err(|error| VmError::HostError(format!("io resource insert failed: {error}")))?;
+    Ok(token.into_handle().raw() as i64)
 }
 
 /// Starts a child process and returns a process-backed handle.
 #[pd_host_function(name = "io::popen")]
-pub(super) fn builtin_io_popen(
-    vm: &mut Vm,
-    command: &str,
-    mode: &str,
-) -> VmResult<HostCallResult<i64>> {
+pub(super) fn builtin_io_popen(vm: &mut Vm, command: &str, mode: &str) -> VmResult<i64> {
     if mode != "r" && mode != "w" {
         return Err(VmError::HostError(format!(
             "unsupported io_popen mode '{mode}', expected r or w"
@@ -861,136 +177,91 @@ pub(super) fn builtin_io_popen(
             "io_popen requires the process capability".to_string(),
         ));
     }
-    let command = command.to_string();
-    let mode = mode.to_string();
-    let op_id = schedule_io_task(vm, "io::popen", move |shared| {
-        let child = match spawn_shell_command(command.as_str(), mode.as_str()) {
-            Ok(child) => child,
-            Err(err) => {
-                shared.fail(err);
-                return;
-            }
-        };
-        let child_guard = SpawnedChildGuard::new(child);
-        let child_pid = child_guard.id();
-        shared.install_cancel_hook(move || terminate_process_tree(child_pid));
-        let handle = match mode.as_str() {
-            "r" => {
-                if child_guard.stdout_is_none() {
-                    let err =
-                        VmError::HostError("io_popen('r') did not provide stdout pipe".to_string());
-                    shared.fail(err);
-                    return;
-                }
-                IoHandle::PopenRead {
-                    child: child_guard.into_child(),
-                }
-            }
-            "w" => {
-                if child_guard.stdin_is_none() {
-                    let err =
-                        VmError::HostError("io_popen('w') did not provide stdin pipe".to_string());
-                    shared.fail(err);
-                    return;
-                }
-                IoHandle::PopenWrite {
-                    child: child_guard.into_child(),
-                }
-            }
-            _ => unreachable!("mode validated above"),
-        };
-        *shared
-            .opened
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
-        shared.publish(Ok(()));
-    })?;
-    Ok(HostCallResult::Pending(op_id))
+    let handle = spawn_shell_command(command, mode)?;
+    let token = vm
+        .execution_scope()
+        .push_resource(IoResource::new(handle))
+        .map_err(|error| VmError::HostError(format!("io resource insert failed: {error}")))?;
+    Ok(token.into_handle().raw() as i64)
 }
 
 /// Reads all remaining text from an I/O handle.
 #[pd_host_function(name = "io::read_all", contract = super::io_read_all_contract)]
-pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<String>> {
-    let (_handle, resource) = io_resource_for_handle(vm, handle_id)?;
-    let op_id = schedule_io_task(vm, "io::read_all", move |shared| {
-        let mut handle = match resource.take_handle() {
-            Some(handle) => handle,
-            None => {
-                let err = VmError::HostError("io_read_all handle is already closing".to_string());
-                shared.fail(err);
-                return;
-            }
-        };
-        install_process_cancel_hook(shared, &handle, &resource.state);
-        let mut out = String::new();
-        let result = match &mut *handle {
-            IoHandle::File(file) => file
-                .read_to_string(&mut out)
-                .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))
-                .map(|_| CallReturn::one(Value::string(out))),
-            IoHandle::PopenRead { child } => match child.stdout.as_mut() {
-                Some(stdout) => stdout
-                    .read_to_string(&mut out)
-                    .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))
-                    .map(|_| CallReturn::one(Value::string(out))),
-                None => Err(VmError::HostError(
-                    "io_read_all popen handle missing stdout".to_string(),
-                )),
-            },
-            IoHandle::PopenWrite { .. } => Err(VmError::HostError(
+pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<String> {
+    let limit = super::io_policy(vm).map(|policy| policy.max_read_bytes);
+    let token = io_resource_for_handle(vm, handle_id)?;
+    let mut resource = vm
+        .execution_scope()
+        .resources_mut()
+        .get_mut(&token)
+        .map_err(|error| io_borrow_error(handle_id, error))?;
+    let handle = resource
+        .handle
+        .as_mut()
+        .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
+    let mut out = String::new();
+    match handle {
+        IoHandle::File(file) => file.read_to_string(&mut out),
+        IoHandle::PopenRead { child } => child
+            .stdout
+            .as_mut()
+            .ok_or_else(|| {
+                VmError::HostError("io_read_all popen handle missing stdout".to_string())
+            })?
+            .read_to_string(&mut out),
+        IoHandle::PopenWrite { .. } => {
+            return Err(VmError::HostError(
                 "io_read_all requires a readable handle".to_string(),
-            )),
-        };
-        finish_io_worker(shared, handle, result);
-    })?;
-    Ok(HostCallResult::Pending(op_id))
+            ));
+        }
+    }
+    .map_err(|error| VmError::HostError(format!("io_read_all failed: {error}")))?;
+    if limit.is_some_and(|limit| out.len() > limit) {
+        return Err(VmError::HostError(
+            "io_read_all exceeded read limit".to_string(),
+        ));
+    }
+    Ok(out)
 }
 
 /// Reads a single line of text from an I/O handle.
 #[pd_host_function(name = "io::read_line")]
-pub(super) fn builtin_io_read_line(
-    vm: &mut Vm,
-    handle_id: i64,
-) -> VmResult<HostCallResult<String>> {
-    let (_handle, resource) = io_resource_for_handle(vm, handle_id)?;
-    let op_id = schedule_io_task(vm, "io::read_line", move |shared| {
-        let mut handle = match resource.take_handle() {
-            Some(handle) => handle,
-            None => {
-                let err = VmError::HostError("io_read_line handle is already closing".to_string());
-                shared.fail(err);
-                return;
-            }
-        };
-        install_process_cancel_hook(shared, &handle, &resource.state);
-        let result = match &mut *handle {
-            IoHandle::File(file) => {
-                read_line_from_reader(file).map(|line| CallReturn::one(Value::string(line)))
-            }
-            IoHandle::PopenRead { child } => match child.stdout.as_mut() {
-                Some(stdout) => {
-                    read_line_from_reader(stdout).map(|line| CallReturn::one(Value::string(line)))
-                }
-                None => Err(VmError::HostError(
-                    "io_read_line popen handle missing stdout".to_string(),
-                )),
-            },
-            IoHandle::PopenWrite { .. } => Err(VmError::HostError(
+pub(super) fn builtin_io_read_line(vm: &mut Vm, handle_id: i64) -> VmResult<String> {
+    let limit = super::io_policy(vm).map(|policy| policy.max_read_bytes);
+    let token = io_resource_for_handle(vm, handle_id)?;
+    let mut resource = vm
+        .execution_scope()
+        .resources_mut()
+        .get_mut(&token)
+        .map_err(|error| io_borrow_error(handle_id, error))?;
+    let handle = resource
+        .handle
+        .as_mut()
+        .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
+    let line = match handle {
+        IoHandle::File(file) => read_line_from_reader(file)?,
+        IoHandle::PopenRead { child } => {
+            read_line_from_reader(child.stdout.as_mut().ok_or_else(|| {
+                VmError::HostError("io_read_line popen handle missing stdout".to_string())
+            })?)?
+        }
+        IoHandle::PopenWrite { .. } => {
+            return Err(VmError::HostError(
                 "io_read_line requires a readable handle".to_string(),
-            )),
-        };
-        finish_io_worker(shared, handle, result);
-    })?;
-    Ok(HostCallResult::Pending(op_id))
+            ));
+        }
+    };
+    if limit.is_some_and(|limit| line.len() > limit) {
+        return Err(VmError::HostError(
+            "io_read_line exceeded read limit".to_string(),
+        ));
+    }
+    Ok(line)
 }
 
 /// Writes text to an I/O handle.
 #[pd_host_function(name = "io::write")]
-pub(super) fn builtin_io_write(
-    vm: &mut Vm,
-    handle_id: i64,
-    text: &str,
-) -> VmResult<HostCallResult<i64>> {
+pub(super) fn builtin_io_write(vm: &mut Vm, handle_id: i64, text: &str) -> VmResult<i64> {
     if super::io_policy(vm)
         .as_ref()
         .is_some_and(|policy| text.len() > policy.max_write_bytes)
@@ -999,338 +270,109 @@ pub(super) fn builtin_io_write(
             "io_write exceeded write limit".to_string(),
         ));
     }
-    let bytes = text.as_bytes().to_vec();
-    let (_handle, resource) = io_resource_for_handle(vm, handle_id)?;
-    let op_id = schedule_io_task(vm, "io::write", move |shared| {
-        let mut handle = match resource.take_handle() {
-            Some(handle) => handle,
-            None => {
-                let err = VmError::HostError("io_write handle is already closing".to_string());
-                shared.fail(err);
-                return;
-            }
-        };
-        install_process_cancel_hook(shared, &handle, &resource.state);
-        let result = match &mut *handle {
-            IoHandle::File(file) => file
-                .write(&bytes)
-                .map_err(|err| VmError::HostError(format!("io_write failed: {err}")))
-                .map(|written| CallReturn::one(Value::Int(written as i64))),
-            IoHandle::PopenWrite { child } => match child.stdin.as_mut() {
-                Some(stdin) => stdin
-                    .write(&bytes)
-                    .map_err(|err| VmError::HostError(format!("io_write failed: {err}")))
-                    .map(|written| CallReturn::one(Value::Int(written as i64))),
-                None => Err(VmError::HostError(
-                    "io_write popen handle missing stdin".to_string(),
-                )),
-            },
-            IoHandle::PopenRead { .. } => Err(VmError::HostError(
+    let token = io_resource_for_handle(vm, handle_id)?;
+    let mut resource = vm
+        .execution_scope()
+        .resources_mut()
+        .get_mut(&token)
+        .map_err(|error| io_borrow_error(handle_id, error))?;
+    let handle = resource
+        .handle
+        .as_mut()
+        .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
+    let written = match handle {
+        IoHandle::File(file) => file.write(text.as_bytes()),
+        IoHandle::PopenWrite { child } => child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| VmError::HostError("io_write popen handle missing stdin".to_string()))?
+            .write(text.as_bytes()),
+        IoHandle::PopenRead { .. } => {
+            return Err(VmError::HostError(
                 "io_write requires a writable handle".to_string(),
-            )),
-        };
-        finish_io_worker(shared, handle, result);
-    })?;
-    Ok(HostCallResult::Pending(op_id))
+            ));
+        }
+    }
+    .map_err(|error| VmError::HostError(format!("io_write failed: {error}")))?;
+    Ok(written as i64)
 }
 
 /// Flushes buffered output for an I/O handle.
 #[pd_host_function(name = "io::flush")]
-pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
-    let (_handle, resource) = io_resource_for_handle(vm, handle_id)?;
-    let op_id = schedule_io_task(vm, "io::flush", move |shared| {
-        let mut handle = match resource.take_handle() {
-            Some(handle) => handle,
-            None => {
-                let err = VmError::HostError("io_flush handle is already closing".to_string());
-                shared.fail(err);
-                return;
-            }
-        };
-        install_process_cancel_hook(shared, &handle, &resource.state);
-        let result = match &mut *handle {
-            IoHandle::File(file) => file
-                .flush()
-                .map_err(|err| VmError::HostError(format!("io_flush failed: {err}")))
-                .map(|_| CallReturn::one(Value::Bool(true))),
-            IoHandle::PopenWrite { child } => match child.stdin.as_mut() {
-                Some(stdin) => stdin
-                    .flush()
-                    .map_err(|err| VmError::HostError(format!("io_flush failed: {err}")))
-                    .map(|_| CallReturn::one(Value::Bool(true))),
-                None => Err(VmError::HostError(
-                    "io_flush popen handle missing stdin".to_string(),
-                )),
-            },
-            IoHandle::PopenRead { .. } => Ok(CallReturn::one(Value::Bool(true))),
-        };
-        finish_io_worker(shared, handle, result);
-    })?;
-    Ok(HostCallResult::Pending(op_id))
+pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<bool> {
+    let token = io_resource_for_handle(vm, handle_id)?;
+    let mut resource = vm
+        .execution_scope()
+        .resources_mut()
+        .get_mut(&token)
+        .map_err(|error| io_borrow_error(handle_id, error))?;
+    let handle = resource
+        .handle
+        .as_mut()
+        .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
+    match handle {
+        IoHandle::File(file) => file.flush(),
+        IoHandle::PopenWrite { child } => child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| VmError::HostError("io_flush popen handle missing stdin".to_string()))?
+            .flush(),
+        IoHandle::PopenRead { .. } => Ok(()),
+    }
+    .map_err(|error| VmError::HostError(format!("io_flush failed: {error}")))?;
+    Ok(true)
 }
 
 /// Closes an I/O handle.
 #[pd_host_function(name = "io::close", contract = super::io_close_contract)]
-pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
-    let (target, resource) = io_resource_for_handle(vm, handle_id)?;
-    let op_id = schedule_io_task(vm, "io::close", move |shared| {
-        // Close the underlying handle exactly once on the worker thread.
-        let result = match resource.take_handle() {
-            Some(handle) => {
-                install_process_cancel_hook(shared, &handle, &resource.state);
-                handle.close()
-            }
-            None => Err(VmError::HostError(
-                "io_close handle is already closing".to_string(),
-            )),
-        };
-        *shared
-            .target
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(target);
-        match result {
-            Ok(()) => shared.succeed(CallReturn::one(Value::Bool(true))),
-            Err(error) => shared.complete(Err(error)),
+pub(super) fn builtin_io_close(vm: &mut Vm, handle_id: i64) -> VmResult<bool> {
+    let token = io_resource_for_handle(vm, handle_id)?;
+    let handle = token.handle();
+    {
+        let mut resource = vm
+            .execution_scope()
+            .resources_mut()
+            .get_mut(&token)
+            .map_err(|error| io_borrow_error(handle_id, error))?;
+        if resource.handle.is_none() {
+            return Err(VmError::HostError("io handle is closed".to_string()));
         }
-    })?;
-    Ok(HostCallResult::Pending(op_id))
+        resource.close_explicit()?;
+    }
+    let progress = vm
+        .execution_scope()
+        .close_resource::<IoResource>(handle, ResourceCloseReason::Requested)
+        .map_err(|error| {
+            VmError::HostError(format!("io_close scope retirement failed: {error}"))
+        })?;
+    if progress != CloseProgress::Ready {
+        return Err(VmError::HostError(
+            "io_close scope retirement is still pending".to_string(),
+        ));
+    }
+    Ok(true)
 }
 
 /// Returns whether a file system path exists.
 #[pd_host_function(name = "io::exists")]
-pub(super) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<HostCallResult<bool>> {
-    let path = authorize_blocking_io_path(vm, path, false)?
-        .display()
-        .to_string();
-    let op_id = schedule_io_task(vm, "io::exists", move |shared| {
-        shared.succeed(CallReturn::one(Value::Bool(
-            std::path::Path::new(path.as_str()).exists(),
-        )));
-    })?;
-    Ok(HostCallResult::Pending(op_id))
+pub(super) fn builtin_io_exists(vm: &mut Vm, path: &str) -> VmResult<bool> {
+    Ok(authorize_blocking_io_path(vm, path, false)?.exists())
 }
 
-struct SpawnedChildGuard {
-    child: Option<Child>,
-}
-
-impl SpawnedChildGuard {
-    fn new(child: Child) -> Self {
-        Self { child: Some(child) }
-    }
-
-    fn id(&self) -> u32 {
-        self.child.as_ref().expect("child guard owns a child").id()
-    }
-
-    fn stdout_is_none(&self) -> bool {
-        self.child
-            .as_ref()
-            .expect("child guard owns a child")
-            .stdout
-            .is_none()
-    }
-
-    fn stdin_is_none(&self) -> bool {
-        self.child
-            .as_ref()
-            .expect("child guard owns a child")
-            .stdin
-            .is_none()
-    }
-
-    fn into_child(mut self) -> Child {
-        self.child.take().expect("child guard owns a child")
-    }
-}
-
-impl Drop for SpawnedChildGuard {
-    fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = terminate_child_tree(child);
-        }
-    }
-}
-
-fn install_process_cancel_hook(
-    shared: &IoOpShared,
-    handle: &IoHandle,
-    state: &Arc<IoResourceState>,
-) {
-    let pid = match handle {
-        IoHandle::PopenRead { child } | IoHandle::PopenWrite { child } => child.id(),
-        IoHandle::File(_) => return,
-    };
-    let state = Arc::clone(state);
-    shared.install_cancel_hook(move || {
-        // A cancelled process operation has already invalidated the process
-        // stream. Marking the resource closed makes the worker lease reap the
-        // child instead of restoring a killed, unreaped Child.
-        state.mark_closed();
-        terminate_process_tree(pid);
-    });
-}
-
-fn terminate_process_tree(pid: u32) {
-    let _ = terminate_process_tree_result(pid);
-}
-
-fn terminate_process_tree_result(pid: u32) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let pid = libc::pid_t::try_from(pid).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid child pid")
-        })?;
-        // `spawn_shell_command` puts the shell in its own process group, so a
-        // negative pid terminates the shell and descendants without touching
-        // the VM process group.
-        let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
-        if result == 0 {
-            Ok(())
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        }
-    }
-    #[cfg(windows)]
-    {
-        let status = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("taskkill exited with {status}"),
-            ))
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        Ok(())
-    }
-}
-
-/// Terminates a child and reaps it. The only `wait` below is reached after a
-/// tree termination signal and a direct leader kill have been attempted; an
-/// already exited child is reaped by `try_wait` instead.
-fn terminate_child_tree(child: &mut Child) -> VmResult<()> {
-    let tree_error = terminate_process_tree_result(child.id()).err();
-    let status = child
-        .try_wait()
-        .map_err(|error| VmError::HostError(format!("io_close popen status failed: {error}")))?;
-    if status.is_some() {
-        return Ok(());
-    }
-
-    let mut reaped = false;
-    let direct_error = match child.kill() {
-        Ok(()) => None,
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-            if child
-                .try_wait()
-                .map_err(|status_error| {
-                    VmError::HostError(format!("io_close popen status failed: {status_error}"))
-                })?
-                .is_some()
-            {
-                reaped = true;
-                None
-            } else {
-                Some(error)
-            }
-        }
-        Err(error) => Some(error),
-    };
-    if let Some(error) = direct_error {
-        return Err(VmError::HostError(format!(
-            "io_close popen terminate failed: {error}"
-        )));
-    }
-
-    if !reaped {
-        child
-            .wait()
-            .map_err(|error| VmError::HostError(format!("io_close popen wait failed: {error}")))?;
-    }
-    if let Some(error) = tree_error {
-        return Err(VmError::HostError(format!(
-            "io_close popen process-tree terminate failed: {error}"
-        )));
-    }
-    Ok(())
-}
-
-fn spawn_shell_command(command: &str, mode: &str) -> VmResult<Child> {
-    let mut process = if cfg!(windows) {
-        let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg(command);
-        cmd
-    } else {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(command);
-        cmd
-    };
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        process.process_group(0);
-    }
-
-    match mode {
-        "r" => {
-            process.stdout(Stdio::piped()).stdin(Stdio::null());
-        }
-        "w" => {
-            process.stdin(Stdio::piped()).stdout(Stdio::null());
-        }
-        _ => {}
-    }
-
-    process
-        .spawn()
-        .map_err(|err| VmError::HostError(format!("io_popen failed: {err}")))
-}
-
-/// Parses a script-visible integer handle into a typed scope token and
-/// returns the raw scope handle plus shared resource cells, validating
-/// staleness and type through the generic typed table.
-fn io_resource_for_handle(
-    vm: &mut Vm,
-    handle_id: i64,
-) -> VmResult<(ResourceHandle, Arc<IoResource>)> {
+fn io_resource_for_handle(vm: &mut Vm, handle_id: i64) -> VmResult<Resource<IoResource>> {
     let handle = io_parse_handle(handle_id)?;
-    let token = vm
-        .execution_scope()
+    vm.execution_scope()
         .resources()
         .typed::<IoResource>(handle)
         .map_err(|error| {
             VmError::HostError(format!(
                 "io handle {handle_id} is not a live IO handle: {error}"
             ))
-        })?;
-    let resource = vm
-        .execution_scope()
-        .resources()
-        .get::<IoResource>(&token)
-        .map_err(|error| {
-            VmError::HostError(format!("io handle {handle_id} borrow failed: {error}"))
-        })?;
-    // Clone the shared resource state so the worker can take/restore the
-    // handle while the resource itself stays in the scope table.
-    Ok((
-        handle,
-        Arc::new(IoResource {
-            state: Arc::clone(&resource.state),
-        }),
-    ))
+        })
+}
+
+fn io_borrow_error(handle_id: i64, error: impl std::fmt::Display) -> VmError {
+    VmError::HostError(format!("io handle {handle_id} borrow failed: {error}"))
 }
 
 fn io_parse_handle(handle_id: i64) -> VmResult<ResourceHandle> {
@@ -1343,8 +385,6 @@ fn io_parse_handle(handle_id: i64) -> VmResult<ResourceHandle> {
         .map_err(|error| VmError::HostError(format!("invalid io handle id {handle_id}: {error}")))
 }
 
-/// Authorizes one IO path against the configured policy, mirroring the
-/// async path: a policy with no matching allowed root denies the path.
 fn authorize_blocking_io_path(vm: &Vm, path: &str, writes: bool) -> VmResult<PathBuf> {
     let requested = PathBuf::from(path);
     let Some(policy) = super::io_policy(vm) else {
@@ -1393,16 +433,228 @@ fn canonicalize_blocking_target(path: &Path) -> VmResult<PathBuf> {
     Ok(canonical_parent.join(name))
 }
 
-fn close_io_handle(mut handle: IoHandle) -> VmResult<()> {
-    match &mut handle {
+fn spawn_shell_command(command: &str, mode: &str) -> VmResult<IoHandle> {
+    let mut process = if cfg!(windows) {
+        let mut shell = Command::new("cmd");
+        shell.arg("/C").arg(command);
+        shell
+    } else {
+        let mut shell = Command::new("sh");
+        shell.arg("-c").arg(command);
+        shell
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        process.process_group(0);
+    }
+    match mode {
+        "r" => {
+            process.stdout(Stdio::piped()).stdin(Stdio::null());
+        }
+        "w" => {
+            process.stdin(Stdio::piped()).stdout(Stdio::null());
+        }
+        _ => unreachable!("mode validated above"),
+    }
+    let mut child = process
+        .spawn()
+        .map_err(|error| VmError::HostError(format!("io_popen failed: {error}")))?;
+    match mode {
+        "r" if child.stdout.is_some() => Ok(IoHandle::PopenRead { child }),
+        "w" if child.stdin.is_some() => Ok(IoHandle::PopenWrite { child }),
+        "r" => {
+            let cleanup = terminate_child_tree(&mut child);
+            Err(VmError::HostError(match cleanup {
+                Ok(()) => "io_popen('r') did not provide stdout pipe".to_string(),
+                Err(error) => format!(
+                    "io_popen('r') did not provide stdout pipe; process cleanup failed: {error}"
+                ),
+            }))
+        }
+        "w" => {
+            let cleanup = terminate_child_tree(&mut child);
+            Err(VmError::HostError(match cleanup {
+                Ok(()) => "io_popen('w') did not provide stdin pipe".to_string(),
+                Err(error) => format!(
+                    "io_popen('w') did not provide stdin pipe; process cleanup failed: {error}"
+                ),
+            }))
+        }
+        _ => unreachable!("mode validated above"),
+    }
+}
+
+fn close_io_handle(handle: &mut IoHandle) -> VmResult<()> {
+    match handle {
         IoHandle::File(file) => file
             .flush()
-            .map_err(|err| VmError::HostError(format!("io_close flush failed: {err}"))),
+            .map_err(|error| VmError::HostError(format!("io_close flush failed: {error}"))),
         IoHandle::PopenRead { child } => terminate_child_tree(child),
         IoHandle::PopenWrite { child } => {
             let _ = child.stdin.take();
             terminate_child_tree(child)
         }
+    }
+}
+
+fn start_close_io_handle_for_drop(handle: &mut IoHandle) -> VmResult<()> {
+    match handle {
+        IoHandle::File(_) => Ok(()),
+        IoHandle::PopenRead { child } => start_terminate_child_tree_for_drop(child),
+        IoHandle::PopenWrite { child } => {
+            let _ = child.stdin.take();
+            start_terminate_child_tree_for_drop(child)
+        }
+    }
+    .map_err(|error| VmError::HostError(format!("io drop popen terminate failed: {error}")))
+}
+
+fn terminate_child_tree(child: &mut Child) -> VmResult<()> {
+    let pid = child.id();
+    terminate_process_tree_and_leader(
+        || terminate_process_tree(pid),
+        || kill_and_reap_child(child),
+    )
+    .map_err(|error| VmError::HostError(format!("io_close popen terminate failed: {error}")))
+}
+
+fn kill_and_reap_child(child: &mut Child) -> io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    match child.kill() {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
+        Err(error) => return Err(error),
+    }
+    child.wait().map(|_| ())
+}
+
+fn start_terminate_child_tree_for_drop(child: &mut Child) -> io::Result<()> {
+    let pid = child.id();
+    let tree_result = signal_process_tree_for_drop(pid);
+    let leader_result = child.kill().or_else(ignore_already_exited);
+    combine_process_cleanup_results(tree_result, leader_result)
+}
+
+fn ignore_already_exited(error: io::Error) -> io::Result<()> {
+    if error.kind() == io::ErrorKind::InvalidInput {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn terminate_process_tree_and_leader<Tree, Leader>(
+    terminate_tree: Tree,
+    terminate_leader: Leader,
+) -> io::Result<()>
+where
+    Tree: FnOnce() -> io::Result<()>,
+    Leader: FnOnce() -> io::Result<()>,
+{
+    let tree_result = terminate_tree();
+    let leader_result = terminate_leader();
+    combine_process_cleanup_results(tree_result, leader_result)
+}
+
+fn combine_process_cleanup_results(
+    tree_result: io::Result<()>,
+    leader_result: io::Result<()>,
+) -> io::Result<()> {
+    match (tree_result, leader_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(tree_error), Ok(())) => Err(tree_error),
+        (Ok(()), Err(leader_error)) => Err(leader_error),
+        (Err(tree_error), Err(leader_error)) => Err(io::Error::new(
+            tree_error.kind(),
+            format!(
+                "process-tree termination failed: {tree_error}; direct leader cleanup also failed: {leader_error}"
+            ),
+        )),
+    }
+}
+
+fn terminate_process_tree(pid: u32) -> io::Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        terminate_unix_process_group_with(
+            pid,
+            |process_group, signal| unsafe { libc::kill(process_group, signal) },
+            io::Error::last_os_error,
+        )
+    }
+    #[cfg(windows)]
+    {
+        run_taskkill_with(pid, Command::status)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        Ok(())
+    }
+}
+
+fn signal_process_tree_for_drop(pid: u32) -> io::Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        terminate_unix_process_group_with(
+            pid,
+            |process_group, signal| unsafe { libc::kill(process_group, signal) },
+            io::Error::last_os_error,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn terminate_unix_process_group_with<Kill, LastError>(
+    pid: u32,
+    kill: Kill,
+    last_error: LastError,
+) -> io::Result<()>
+where
+    Kill: FnOnce(libc::pid_t, libc::c_int) -> libc::c_int,
+    LastError: FnOnce() -> io::Error,
+{
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process id exceeds pid_t"))?;
+    if kill(-pid, libc::SIGKILL) == 0 {
+        return Ok(());
+    }
+    let error = last_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn run_taskkill_with<Run>(pid: u32, run: Run) -> io::Result<()>
+where
+    Run: FnOnce(&mut Command) -> io::Result<std::process::ExitStatus>,
+{
+    let mut command = Command::new("taskkill");
+    command.args(["/T", "/F", "/PID", &pid.to_string()]);
+    let status = run(&mut command)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "taskkill exited with status {status}"
+        )))
     }
 }
 
@@ -1412,7 +664,7 @@ fn read_line_from_reader(reader: &mut impl Read) -> VmResult<String> {
     loop {
         let read = reader
             .read(&mut one)
-            .map_err(|err| VmError::HostError(format!("io_read_line failed: {err}")))?;
+            .map_err(|error| VmError::HostError(format!("io_read_line failed: {error}")))?;
         if read == 0 {
             break;
         }
@@ -1426,364 +678,289 @@ fn read_line_from_reader(reader: &mut impl Read) -> VmResult<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::io;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
-    #[test]
-    fn io_worker_thread_name_is_sanitized_and_bounded() {
-        assert_eq!(
-            io_worker_thread_name("io::read_all"),
-            "pd-vm-io-io__read_all"
-        );
-        let name = io_worker_thread_name("io::operation/with spaces\0 and a very long suffix");
-        assert!(name.len() <= IO_WORKER_THREAD_NAME_MAX_LEN);
-        assert!(name.is_ascii());
-        assert!(
-            name.bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        );
-        assert!(!name.contains('\0'));
+    static DROP_CLEANUP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static EXPLICIT_CLEANUP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PROCESS_CLEANUP_TEST_LOCK: Mutex<()> = Mutex::new(());
+    #[cfg(windows)]
+    static WINDOWS_TASKKILL_CALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(windows)]
+    static WINDOWS_WAIT_CALLBACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_drop_cleanup(_handle: &mut IoHandle) -> VmResult<()> {
+        DROP_CLEANUP_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
-    #[test]
-    fn io_driver_waits_for_worker_completion_before_reporting_ready() {
-        let shared = Arc::new(IoOpShared::new());
-        let release = Arc::new(AtomicBool::new(false));
-        let worker_shared = Arc::clone(&shared);
-        let worker_release = Arc::clone(&release);
-        let worker = std::thread::spawn(move || {
-            while !worker_release.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-            worker_shared.publish(Ok(()));
-            worker_shared.mark_worker_done();
-        });
-        shared.set_worker(worker);
-        let mut driver = IoOpDriver::new(Arc::clone(&shared), "io::test");
-        let mut cx = Context::from_waker(Waker::noop());
-
-        assert!(matches!(driver.poll(&mut cx), Poll::Pending));
-        assert!(!driver.is_quiescent());
-
-        release.store(true, Ordering::Release);
-        while !driver.is_quiescent() {
-            std::thread::yield_now();
+    fn record_explicit_cleanup(handle: &mut IoHandle) -> VmResult<()> {
+        EXPLICIT_CLEANUP_CALLS.fetch_add(1, Ordering::SeqCst);
+        match handle {
+            IoHandle::PopenRead { child } | IoHandle::PopenWrite { child } => child
+                .wait()
+                .map(|_| ())
+                .map_err(|error| VmError::HostError(format!("test child wait failed: {error}"))),
+            IoHandle::File(_) => panic!("expected process handle"),
         }
-        assert!(matches!(driver.poll(&mut cx), Poll::Ready(Ok(()))));
+    }
+
+    fn fail_explicit_cleanup(_handle: &mut IoHandle) -> VmResult<()> {
+        Err(VmError::HostError(
+            "injected explicit cleanup failure".to_string(),
+        ))
+    }
+
+    #[cfg(windows)]
+    fn record_windows_drop_cleanup(handle: &mut IoHandle) -> VmResult<()> {
+        DROP_CLEANUP_CALLS.fetch_add(1, Ordering::SeqCst);
+        start_close_io_handle_for_drop(handle)
+    }
+
+    #[cfg(windows)]
+    fn record_windows_explicit_cleanup(handle: &mut IoHandle) -> VmResult<()> {
+        use std::os::windows::process::ExitStatusExt as _;
+
+        let child = match handle {
+            IoHandle::PopenRead { child } | IoHandle::PopenWrite { child } => child,
+            IoHandle::File(_) => panic!("expected process handle"),
+        };
+        run_taskkill_with(child.id(), |_| {
+            WINDOWS_TASKKILL_CALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(std::process::ExitStatus::from_raw(0))
+        })
+        .map_err(|error| VmError::HostError(format!("test taskkill failed: {error}")))?;
+        WINDOWS_WAIT_CALLBACK_CALLS.fetch_add(1, Ordering::SeqCst);
+        child
+            .wait()
+            .map(|_| ())
+            .map_err(|error| VmError::HostError(format!("test child wait failed: {error}")))
+    }
+
+    fn exited_process_handle() -> IoHandle {
+        let command = if cfg!(windows) { "exit /B 0" } else { "exit 0" };
+        spawn_shell_command(command, "r").expect("test process should spawn")
     }
 
     #[test]
-    fn io_resource_close_stays_pending_while_worker_owns_handle() {
-        let path = std::env::temp_dir().join(format!(
-            "pd-vm-blocking-io-resource-close-{}",
-            std::process::id()
-        ));
-        let file = std::fs::File::create(&path).expect("test file should open");
-        let mut resource = IoResource::new(IoHandle::File(file));
-        let worker_handle = resource.take_handle().expect("worker should take handle");
-        let close = resource
-            .begin_close(ResourceCloseReason::Requested)
-            .expect("begin close should succeed");
-        assert_eq!(close, CloseProgress::Pending);
+    fn process_resource_drop_uses_only_nonblocking_cleanup_path() {
+        let _guard = PROCESS_CLEANUP_TEST_LOCK.lock().expect("test lock");
+        DROP_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        EXPLICIT_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        let resource = IoResource::new_with_process_cleanup(
+            exited_process_handle(),
+            record_explicit_cleanup,
+            record_drop_cleanup,
+        );
 
-        let wake_count = Arc::new(AtomicUsize::new(0));
-        struct CloseWake(Arc<AtomicUsize>);
-        impl std::task::Wake for CloseWake {
-            fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
+        drop(resource);
 
-            fn wake_by_ref(self: &Arc<Self>) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        let waker = Waker::from(Arc::new(CloseWake(Arc::clone(&wake_count))));
-        let mut cx = Context::from_waker(&waker);
-        assert!(matches!(
-            HostResource::poll_close(&mut resource, &mut cx),
-            Poll::Pending
-        ));
-        drop(worker_handle);
-        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
-
-        assert!(matches!(
-            HostResource::poll_close(&mut resource, &mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        let _ = std::fs::remove_file(path);
+        assert_eq!(DROP_CLEANUP_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(EXPLICIT_CLEANUP_CALLS.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn io_resource_worker_release_after_close_does_not_restore_handle() {
-        let path = std::env::temp_dir().join(format!(
-            "pd-vm-blocking-io-resource-worker-close-{}",
-            std::process::id()
-        ));
-        let file = std::fs::File::create(&path).expect("test file should open");
-        let mut resource = IoResource::new(IoHandle::File(file));
-        let worker_handle = resource.take_handle().expect("worker should take handle");
+    fn successful_explicit_process_cleanup_retires_ready() {
+        let _guard = PROCESS_CLEANUP_TEST_LOCK.lock().expect("test lock");
+        DROP_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        EXPLICIT_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        let mut resource = IoResource::new_with_process_cleanup(
+            exited_process_handle(),
+            record_explicit_cleanup,
+            record_drop_cleanup,
+        );
+
+        resource
+            .close_explicit()
+            .expect("explicit cleanup should complete");
         assert_eq!(
             resource
                 .begin_close(ResourceCloseReason::Requested)
-                .expect("begin close should succeed"),
-            CloseProgress::Pending
+                .expect("retirement should complete"),
+            CloseProgress::Ready
         );
+        drop(resource);
 
-        worker_handle
-            .restore()
-            .expect("worker cleanup after close should succeed");
-        assert_eq!(resource.state.active_workers.load(Ordering::Acquire), 0);
+        assert_eq!(EXPLICIT_CLEANUP_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(DROP_CLEANUP_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn failed_builtin_close_preserves_process_resource_for_retry() {
+        let _guard = PROCESS_CLEANUP_TEST_LOCK.lock().expect("test lock");
+        DROP_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        EXPLICIT_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        let mut vm = Vm::new(crate::vm::Program::new(
+            Vec::new(),
+            vec![crate::vm::OpCode::Ret as u8],
+        ));
+        let token = vm
+            .execution_scope()
+            .push_resource(IoResource::new_with_process_cleanup(
+                exited_process_handle(),
+                fail_explicit_cleanup,
+                record_drop_cleanup,
+            ))
+            .expect("resource insert");
+        let handle = token.handle();
+        let raw = handle.raw() as i64;
+
+        let args = [crate::vm::Value::Int(raw)];
+        let error = builtin_io_close(&mut vm, &args).expect_err("cleanup failure must propagate");
         assert!(
-            resource
-                .state
-                .handle
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_none()
+            error
+                .to_string()
+                .contains("injected explicit cleanup failure")
         );
-        let mut cx = Context::from_waker(Waker::noop());
-        assert!(matches!(
-            HostResource::poll_close(&mut resource, &mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[cfg(unix)]
-    struct ProcessTreeCleanup {
-        leader: u32,
-        descendant: i32,
-        marker: PathBuf,
-    }
-
-    #[cfg(unix)]
-    impl Drop for ProcessTreeCleanup {
-        fn drop(&mut self) {
-            terminate_process_tree(self.leader);
-            unsafe {
-                libc::kill(self.descendant, libc::SIGKILL);
-            }
-            let _ = std::fs::remove_file(&self.marker);
-        }
-    }
-
-    #[cfg(unix)]
-    fn live_popen_for_test() -> (SpawnedChildGuard, PathBuf, i32) {
-        static TEST_PROCESS_COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let suffix = TEST_PROCESS_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let marker = std::env::temp_dir().join(format!(
-            "pd-vm-blocking-io-popen-{0}-{suffix}.marker",
-            std::process::id()
-        ));
-        let command = format!(
-            r#"sleep 30 & child=$!; printf '%s\n' "$child" > '{}'; wait "$child""#,
-            marker.display()
-        );
-        let child = spawn_shell_command(&command, "r").expect("test popen should spawn");
-        let guard = SpawnedChildGuard::new(child);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let descendant = loop {
-            if let Ok(contents) = std::fs::read_to_string(&marker)
-                && let Ok(pid) = contents.trim().parse::<i32>()
-            {
-                break pid;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "popen test child did not publish its descendant marker"
-            );
-            std::thread::yield_now();
-        };
-        (guard, marker, descendant)
-    }
-
-    #[cfg(unix)]
-    fn process_is_running(pid: i32) -> bool {
-        let path = format!("/proc/{pid}/stat");
-        let Ok(stat) = std::fs::read_to_string(path) else {
-            return false;
-        };
-        let Some((_, state)) = stat.split_once(") ") else {
-            return true;
-        };
-        !state.starts_with('Z')
-    }
-
-    #[cfg(unix)]
-    fn wait_for_process_exit(pid: i32) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while process_is_running(pid) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "popen descendant remained alive after process-tree close"
-            );
-            std::thread::yield_now();
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn closing_live_popen_terminates_and_reaps_the_process_tree() {
-        let (child, marker, descendant) = live_popen_for_test();
-        let _cleanup = ProcessTreeCleanup {
-            leader: child.id(),
-            descendant,
-            marker: marker.clone(),
-        };
-        close_io_handle(IoHandle::PopenRead {
-            child: child.into_child(),
-        })
-        .expect("closing a live popen must terminate and reap it");
-        wait_for_process_exit(descendant);
-        let _ = std::fs::remove_file(marker);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_worker_lease_drop_terminates_and_reaps_process_tree() {
-        let (child, marker, descendant) = live_popen_for_test();
-        let leader = child.id();
-        let _cleanup = ProcessTreeCleanup {
-            leader,
-            descendant,
-            marker: marker.clone(),
-        };
-        let resource = IoResource::new(IoHandle::PopenRead {
-            child: child.into_child(),
-        });
-        let worker_handle = resource.take_handle().expect("worker should take handle");
-        drop(worker_handle);
-        wait_for_process_exit(descendant);
-        let _ = std::fs::remove_file(marker);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_resource_handoff_terminates_and_reaps_opened_process_tree() {
-        let (child, marker, descendant) = live_popen_for_test();
-        let _cleanup = ProcessTreeCleanup {
-            leader: child.id(),
-            descendant,
-            marker: marker.clone(),
-        };
-        let mut vm = Vm::new(crate::Program::new(
-            Vec::new(),
-            vec![crate::OpCode::Ret as u8],
-        ));
-        let shared = Arc::new(IoOpShared::new());
-        *shared
-            .opened
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(IoHandle::PopenRead {
-            child: child.into_child(),
-        });
-        let op_id = vm
+        let recovered = vm
             .execution_scope()
-            .start_operation(OperationSpec::new(IoOpDriver::new(
-                Arc::clone(&shared),
-                "io::test-handoff",
-            )))
-            .expect("test operation should start");
-        vm.execution_scope()
-            .begin_close(ResourceCloseReason::Requested)
-            .expect("scope should start closing");
-        let error = finish_io_operation(&mut vm, op_id, OperationOutcome::Completed, shared)
-            .expect_err("resource insertion into a closing scope must fail");
-        assert!(error.to_string().contains("resource insert failed"));
-        wait_for_process_exit(descendant);
-        let _ = std::fs::remove_file(marker);
-    }
-
-    #[test]
-    fn close_completion_does_not_report_success_while_resource_retirement_is_pending() {
-        let path = std::env::temp_dir().join(format!(
-            "pd-vm-blocking-io-close-pending-{}",
-            std::process::id()
-        ));
-        let file = std::fs::File::create(&path).expect("test file should open");
-        let resource = IoResource::new(IoHandle::File(file));
-        let worker_resource = IoResource {
-            state: Arc::clone(&resource.state),
-        };
-        let mut vm = Vm::new(crate::Program::new(
-            Vec::new(),
-            vec![crate::OpCode::Ret as u8],
-        ));
-        let token = vm
-            .execution_scope()
-            .push_resource(resource)
-            .expect("resource should insert");
-        let worker_handle = worker_resource
-            .take_handle()
-            .expect("worker should take handle");
-        let shared = Arc::new(IoOpShared::new());
-        *shared
-            .target
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token.handle());
-        *shared
-            .value
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(Ok(CallReturn::one(Value::Bool(true))));
-        let op_id = vm
-            .execution_scope()
-            .start_operation(OperationSpec::new(IoOpDriver::new(
-                Arc::clone(&shared),
-                "io::test-close-pending",
-            )))
-            .expect("test operation should start");
-
-        let error = finish_io_operation(&mut vm, op_id, OperationOutcome::Completed, shared)
-            .expect_err("pending resource retirement must not report success");
-        assert!(error.to_string().contains("remained pending"));
-
-        worker_handle
-            .restore()
-            .expect("worker cleanup after close should succeed");
-        let mut cx = Context::from_waker(Waker::noop());
-        assert!(matches!(
+            .resources()
+            .typed::<IoResource>(handle)
+            .expect("failed close must leave the resource live");
+        assert!(
             vm.execution_scope()
-                .resources_mut()
-                .poll_close(token, &mut cx),
-            Poll::Ready(Ok(()))
-        ));
-        let _ = std::fs::remove_file(path);
+                .resources()
+                .get(&recovered)
+                .expect("resource borrow")
+                .handle
+                .is_some()
+        );
+        vm.execution_scope()
+            .resources_mut()
+            .get_mut(&recovered)
+            .expect("resource borrow")
+            .explicit_cleanup = record_explicit_cleanup;
+
+        assert!(builtin_io_close(&mut vm, &args).expect("retry should close the resource"));
+        assert!(
+            vm.execution_scope()
+                .resources()
+                .typed::<IoResource>(handle)
+                .is_err(),
+            "successful retry must retire the resource"
+        );
+        assert_eq!(EXPLICIT_CLEANUP_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(DROP_CLEANUP_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drop_path_skips_taskkill_and_wait_cleanup() {
+        let _guard = PROCESS_CLEANUP_TEST_LOCK.lock().expect("test lock");
+        DROP_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        WINDOWS_TASKKILL_CALLBACK_CALLS.store(0, Ordering::SeqCst);
+        WINDOWS_WAIT_CALLBACK_CALLS.store(0, Ordering::SeqCst);
+        let resource = IoResource::new_with_process_cleanup(
+            exited_process_handle(),
+            record_windows_explicit_cleanup,
+            record_windows_drop_cleanup,
+        );
+
+        drop(resource);
+
+        assert_eq!(DROP_CLEANUP_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(WINDOWS_TASKKILL_CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(WINDOWS_WAIT_CALLBACK_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_explicit_close_can_run_taskkill_and_wait_callbacks() {
+        let _guard = PROCESS_CLEANUP_TEST_LOCK.lock().expect("test lock");
+        DROP_CLEANUP_CALLS.store(0, Ordering::SeqCst);
+        WINDOWS_TASKKILL_CALLBACK_CALLS.store(0, Ordering::SeqCst);
+        WINDOWS_WAIT_CALLBACK_CALLS.store(0, Ordering::SeqCst);
+        let mut resource = IoResource::new_with_process_cleanup(
+            exited_process_handle(),
+            record_windows_explicit_cleanup,
+            record_windows_drop_cleanup,
+        );
+
+        resource
+            .close_explicit()
+            .expect("explicit cleanup should complete");
+        drop(resource);
+
+        assert_eq!(WINDOWS_TASKKILL_CALLBACK_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(WINDOWS_WAIT_CALLBACK_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(DROP_CLEANUP_CALLS.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn close_completion_reports_scope_retirement_errors() {
-        let mut vm = Vm::new(crate::Program::new(
-            Vec::new(),
-            vec![crate::OpCode::Ret as u8],
-        ));
-        let file = std::fs::File::open("Cargo.toml").expect("test file should open");
-        let token = vm
-            .execution_scope()
-            .push_resource(IoResource::new(IoHandle::File(file)))
-            .expect("resource should insert");
-        vm.execution_scope()
-            .close_resource::<IoResource>(token.handle(), ResourceCloseReason::Requested)
-            .expect("initial close should retire resource");
+    fn process_tree_failure_still_attempts_direct_blocking_leader_cleanup() {
+        let leader_attempted = Cell::new(false);
+        let error = terminate_process_tree_and_leader(
+            || {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "tree denied",
+                ))
+            },
+            || {
+                leader_attempted.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("tree failure must propagate");
 
-        let shared = Arc::new(IoOpShared::new());
-        *shared
-            .target
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token.handle());
-        *shared
-            .value
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(Ok(CallReturn::one(Value::Bool(true))));
-        let op_id = vm
-            .execution_scope()
-            .start_operation(OperationSpec::new(IoOpDriver::new(
-                Arc::clone(&shared),
-                "io::test-close",
-            )))
-            .expect("test operation should start");
-        let error = finish_io_operation(&mut vm, op_id, OperationOutcome::Completed, shared)
-            .expect_err("stale scope retirement must be visible to the caller");
-        assert!(error.to_string().contains("execution scope"));
+        assert!(leader_attempted.get());
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("tree denied"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_group_signal_treats_esrch_as_success() {
+        terminate_unix_process_group_with(
+            42,
+            |_, _| -1,
+            || io::Error::from_raw_os_error(libc::ESRCH),
+        )
+        .expect("an already absent process group is successfully terminated");
+
+        let error = terminate_unix_process_group_with(
+            42,
+            |_, _| -1,
+            || io::Error::from_raw_os_error(libc::EPERM),
+        )
+        .expect_err("other process group failures must propagate");
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn taskkill_launch_failure_is_an_error() {
+        let launch = run_taskkill_with(42, |_| {
+            Err(io::Error::new(io::ErrorKind::NotFound, "taskkill missing"))
+        })
+        .expect_err("taskkill launch failure must propagate");
+        assert_eq!(launch.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsuccessful_taskkill_status_is_an_error() {
+        let status = run_taskkill_with(42, |_| {
+            std::process::Command::new("sh")
+                .args(["-c", "exit 7"])
+                .status()
+        })
+        .expect_err("unsuccessful taskkill status must propagate");
+        assert!(status.to_string().contains("status"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unsuccessful_taskkill_status_is_an_error() {
+        let status = run_taskkill_with(42, |_| {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit", "7"])
+                .status()
+        })
+        .expect_err("unsuccessful taskkill status must propagate");
+        assert!(status.to_string().contains("status"));
     }
 }

@@ -281,16 +281,41 @@ impl HostAsyncBridge for ControlledBridge {
         Ok(())
     }
 
-    fn poll_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+        Poll::Ready(Err(VmError::HostError(format!(
+            "unknown external host operation {op_id}"
+        ))))
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        _op_id: HostOpId,
+        _cx: &mut Context<'_>,
+    ) -> Poll<VmResult<vm::HostFutureOutput>> {
         if self.state.lock().expect("bridge state").complete {
-            Poll::Ready(Ok(CallReturn::one(Value::Bool(false))))
+            Poll::Ready(Ok(vm::HostFutureOutput::returning(CallReturn::one(
+                Value::Bool(false),
+            ))))
         } else {
             Poll::Pending
         }
     }
 
-    fn cancel_op(&mut self, _op_id: HostOpId) {
+    fn request_cancel_op(
+        &mut self,
+        _op_id: HostOpId,
+        _reason: vm::operation::OperationCancelReason,
+    ) -> VmResult<()> {
         self.state.lock().expect("bridge state").cancellations += 1;
+        Ok(())
+    }
+
+    fn poll_cancel_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn cleanup_op(&mut self, _op_id: HostOpId, _terminal: vm::HostAsyncOpTerminal) -> VmResult<()> {
+        Ok(())
     }
 }
 
@@ -1112,8 +1137,10 @@ fn backend_installs_independent_bridges_for_waiting_timer_callbacks() {
 
     let waker = std::task::Waker::from(Arc::new(NoopWake));
     let mut cx = Context::from_waker(&waker);
-    assert!(matches!(first.callback.poll(&mut cx), Poll::Pending));
-    assert!(matches!(second.callback.poll(&mut cx), Poll::Pending));
+    let first_poll = first.callback.poll(&mut cx);
+    assert!(matches!(first_poll, Poll::Pending), "{first_poll:?}");
+    let second_poll = second.callback.poll(&mut cx);
+    assert!(matches!(second_poll, Poll::Pending), "{second_poll:?}");
 
     first_state.lock().expect("first bridge state").complete = true;
     assert!(matches!(
