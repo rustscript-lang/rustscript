@@ -264,22 +264,25 @@ The shared in-flight HTTP call default is 64. Zero values for streaming byte lim
 
 ## Destination policy and protocol transports
 
-Every protocol uses the same admission, address-pinning, and security policy:
+Every protocol uses the same admission and connection-time address-validation
+policy:
 
 - URLs require a host and reject userinfo;
 - both the protocol's scheme family and the configured scheme allowlist must admit the URL;
 - host and effective port must match their configured allowlists;
-- every DNS result is validated, and the selected validated address is pinned for the connection;
+- admission resolves the target and validates every returned address; when Hyper opens a connection, its connector resolves the hostname again and validates every address from that lookup before allowing a connect;
 - when private addresses are disabled, private, loopback, link-local, multicast, unspecified, documentation, transition, reserved, and other special-use IPv4/IPv6 ranges are rejected; IPv4-mapped IPv6 addresses receive the IPv4 checks;
-- the original validated hostname remains the TLS SNI name and HTTP `Host` authority when connecting to a pinned address;
+- the admitted hostname remains the TLS SNI name and HTTP `Host` authority; the address selected during admission is not pinned to the connection;
 - buffered HTTP and SSE revalidate every redirect and remove `Authorization` and `Cookie` on a cross-origin redirect;
 - ambient proxy settings are ignored. There is no implicit cookie jar, authentication source, or global proxy state.
 
 The policy snapshot taken at call admission applies for the complete operation.
 Every request and redirect target receives an admission-time DNS/private-address
-check. Hyper's connector repeats the address check on the DNS results used when
-it opens a new connection, retaining the original hostname for HTTP authority
-and TLS SNI.
+check. Hyper's connector performs its own lookup whenever it opens a new
+connection and rejects the lookup if any returned address is disallowed. This
+prevents a target from reaching a disallowed private address through DNS
+rebinding without claiming that the admission-selected address is the one used
+for the socket.
 
 Buffered HTTP and SSE share one cloneable Hyper client stored in per-VM HTTP
 module state. Hyper owns HTTP/1 transport setup, connection pooling, idle
