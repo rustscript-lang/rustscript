@@ -1,19 +1,10 @@
 # Host SDK: descriptors, resources, and effects
 
-This guide is for anyone authoring a host module or migrating an existing host
-extension onto the current SDK. It describes the preferred authoring surface:
-a `#[pd_host_function]` declaration is the single source of a function's guest
+This guide describes the current Host SDK authoring surface, where a
+`#[pd_host_function]` declaration is the single source of a function's guest
 schema, runtime binding, typed resource requirements, named-struct contract, and
 hidden host-state effects. A module then lists its functions explicitly; the
 guest catalog is derived from those descriptors.
-
-The legacy `HostApiBuilder::{resource,named_struct,function}` and
-`HostFunctionRegistry::register_*` APIs remain public and fully supported during
-the compatibility window (see [Compatibility window](#compatibility-window)).
-New modules should not need them.
-
-Organization freeze outcomes:
-[host-descriptor-migration-report.md](host-descriptor-migration-report.md).
 
 ## 1. The model
 
@@ -356,78 +347,3 @@ catalog preserves the expected module and aggregate fingerprints. It also checks
 that resource declarations and named structs follow the selected modules, public
 returns stay typed, and native-only HTTP and SQLite surfaces do not appear when
 their build gates are off.
-
-## 7. Compatibility window
-
-Still public and supported, for downstream migration:
-
-- `HostApiBuilder::{resource, named_struct, function}`.
-- `HostFunctionRegistry::register`, `register_static`, `register_stack`,
-  `register_static_stack`, `register_args`, `register_static_args`,
-  `register_static_non_yielding_args`, and the catalog/exact-family
-  registrations, including `register_exact_owned`.
-- The per-module `register_*_builtin_module{,_from_catalog}` entry points.
-
-Preferred for new code:
-
-- `HostModuleDescriptor` + `install` / `install_from_catalog`,
-  `HostFunctionDescriptor`, `HostResourceType`, `HostOwnedAdapterFactory`.
-
-Removal threshold: the legacy builder and low-level registry APIs are removed
-only after every repository in the organization migration matrix has passed its
-gate against a frozen core SHA. Until then, legacy catalogs compose with
-descriptor modules through `install_from_catalog`.
-
-## 8. Before and after
-
-**Before** (one function, four places to keep in sync):
-
-```rust
-// 1. the runtime adapter
-#[pd_host_function(name = "demo::read_counter")]
-fn read_counter(vm: &mut Vm, handle: i64) -> VmResult<i64> { /* ... */ }
-
-// 2. a hand-written resource entry
-builder.resource(ResourceTypeSchema::new(counter_key(), "A monotonic counter"));
-
-// 3. a hand-written function schema
-builder.function(HostFunctionSchema::with_return(
-    "demo::read_counter",
-    vec![HostParamSchema::with_passing(
-        "counter",
-        HostTypeSchema::Resource(counter_key()),
-        HostParamPassing::Borrow,
-    )],
-    HostTypeSchema::Int,
-));
-
-// 4. an adapter table plus an exact registration
-const ADAPTER_CONTRACTS: &[AdapterContract] = &[AdapterContract {
-    name: "demo::read_counter",
-    arity: 1,
-    adapter: read_counter_adapter,
-}];
-registry.transactionally(|staged| { /* validate, register, authorize */ })
-```
-
-**After** (one function, one declaration, one module list):
-
-```rust
-#[pd_host_function(name = "demo::read_counter")]
-fn read_counter(counter: ResourceRef<'_, Counter>) -> VmResult<i64> {
-    Ok(*counter as u64 as i64)
-}
-
-pub fn demo_module() -> HostModuleDescriptor {
-    HostModuleDescriptor {
-        name: "demo",
-        functions: &[read_counter_descriptor],
-        resources: &[],
-    }
-}
-
-demo_module().install(registry)?; // validates and installs transactionally
-```
-
-The wrapper, the schema, the resource declaration, the binding class, the
-effects, and the exact registry entry all come from the single declaration.
