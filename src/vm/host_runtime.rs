@@ -406,6 +406,27 @@ impl HostRuntime {
         Ok(())
     }
 
+    /// Cancels one submitted host future and makes the existing synchronous
+    /// retirement attempt. A bridge may defer its cancellation acknowledgement;
+    /// in that case the operation remains tracked for the normal reset/poll
+    /// lifecycle, with no second cancellation request.
+    pub(crate) fn cancel_and_retire_submitted_host_op(
+        &mut self,
+        op_id: HostOpId,
+        reason: OperationCancelReason,
+    ) -> VmResult<()> {
+        if !self.submitted_host_ops.contains(&op_id) {
+            return Ok(());
+        }
+        self.request_cancel_host_op(op_id, reason)?;
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        match self.poll_bridge_operation_cancellation(op_id, &mut cx) {
+            Poll::Pending => Ok(()),
+            Poll::Ready(result) => result,
+        }
+    }
+
     pub(crate) fn request_cancel_submitted_host_ops(
         &mut self,
         reason: OperationCancelReason,

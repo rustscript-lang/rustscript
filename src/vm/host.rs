@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll, Wake, Waker};
@@ -4607,6 +4607,20 @@ impl Vm {
         self.instance.waiting_host_op = waiting_host_op;
     }
 
+    fn rollback_owned_pending_host_op(
+        &mut self,
+        op_id: HostOpId,
+        submitted_host_ops_before: &HashSet<HostOpId>,
+    ) -> VmResult<()> {
+        if submitted_host_ops_before.contains(&op_id)
+            || !self.host.submitted_host_ops.contains(&op_id)
+        {
+            return Ok(());
+        }
+        self.host
+            .cancel_and_retire_submitted_host_op(op_id, OperationCancelReason::Requested)
+    }
+
     /// Executes an owned host function: the call operands are drained from the
     /// operand stack into an [`OwnedHostCall`] and ownership of the arguments
     /// the function takes transfers to it.
@@ -4665,6 +4679,7 @@ impl Vm {
         self.instance.call_depth += 1;
         let args = saved_stack.split_off(arg_start);
         let waiting_host_op = self.instance.waiting_host_op.clone();
+        let submitted_host_ops_before = self.host.submitted_host_ops.clone();
         self.host.begin_owned_dispatch_mutation();
         let (call_result, untaken) = {
             let mut call = OwnedHostCall::new(self, args);
@@ -4781,13 +4796,15 @@ impl Vm {
                 let resume_ip = match self.call_resume_ip(call_ip) {
                     Ok(resume_ip) => resume_ip,
                     Err(error) => {
+                        let cleanup =
+                            self.rollback_owned_pending_host_op(op_id, &submitted_host_ops_before);
                         self.rollback_owned_dispatch(
                             saved_stack,
                             untaken,
                             host_stack,
                             waiting_host_op.clone(),
                         );
-                        return Err(error);
+                        return Err(preserve_stream_cleanup(error, cleanup));
                     }
                 };
                 if let Err(error) = self.set_waiting_host_op_with_return(
@@ -4796,8 +4813,10 @@ impl Vm {
                     expected_return_type,
                     expected_return_schema,
                 ) {
+                    let cleanup =
+                        self.rollback_owned_pending_host_op(op_id, &submitted_host_ops_before);
                     self.rollback_owned_dispatch(saved_stack, untaken, host_stack, waiting_host_op);
-                    return Err(error);
+                    return Err(preserve_stream_cleanup(error, cleanup));
                 }
                 saved_stack.append(&mut host_stack);
                 self.instance.stack = saved_stack;
@@ -5588,8 +5607,10 @@ mod tests {
 /// tests of the modules that build on this seam.
 #[cfg(test)]
 mod owned_dispatch_tests {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
 
     use super::*;
     use crate::bytecode::{
@@ -5604,6 +5625,104 @@ mod owned_dispatch_tests {
     impl HostOwnedFunction for NoopOwned {
         fn call(&mut self, _call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
             Ok(CallOutcome::Return(CallReturn::none()))
+        }
+    }
+
+    struct FutureDropSpy(Arc<AtomicUsize>);
+
+    impl Drop for FutureDropSpy {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn pending_test_future(drops: Arc<AtomicUsize>) -> HostFuture {
+        let drop_spy = FutureDropSpy(drops);
+        Box::pin(async move {
+            let _drop_spy = drop_spy;
+            std::future::pending::<()>().await;
+            Ok(HostFutureOutput::returning(CallReturn::none()))
+        })
+    }
+
+    struct OwnedPendingBridge {
+        futures: HashMap<HostOpId, HostFuture>,
+        submissions: Arc<Mutex<Vec<HostOpId>>>,
+        cancellations: Arc<Mutex<Vec<(HostOpId, OperationCancelReason)>>>,
+        cleanups: Arc<Mutex<Vec<(HostOpId, HostAsyncOpTerminal)>>>,
+    }
+
+    impl HostAsyncBridge for OwnedPendingBridge {
+        fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
+            self.submissions
+                .lock()
+                .expect("submission lock")
+                .push(op_id);
+            if self.futures.insert(op_id, future).is_some() {
+                return Err(VmError::HostError(format!(
+                    "duplicate submitted host op {op_id}"
+                )));
+            }
+            Ok(())
+        }
+
+        fn poll_op(
+            &mut self,
+            op_id: HostOpId,
+            _cx: &mut Context<'_>,
+        ) -> Poll<VmResult<CallReturn>> {
+            Poll::Ready(Err(VmError::HostError(format!(
+                "unexpected external op {op_id}"
+            ))))
+        }
+
+        fn poll_submitted_op(
+            &mut self,
+            op_id: HostOpId,
+            cx: &mut Context<'_>,
+        ) -> Poll<VmResult<HostFutureOutput>> {
+            let result = match self.futures.get_mut(&op_id) {
+                Some(future) => future.as_mut().poll(cx),
+                None => {
+                    return Poll::Ready(Err(VmError::HostError(format!(
+                        "unknown submitted host op {op_id}"
+                    ))));
+                }
+            };
+            if result.is_ready() {
+                self.futures.remove(&op_id);
+            }
+            result
+        }
+
+        fn request_cancel_op(
+            &mut self,
+            op_id: HostOpId,
+            reason: OperationCancelReason,
+        ) -> VmResult<()> {
+            self.cancellations
+                .lock()
+                .expect("cancellation lock")
+                .push((op_id, reason));
+            self.futures.remove(&op_id);
+            Ok(())
+        }
+
+        fn poll_cancel_op(
+            &mut self,
+            _op_id: HostOpId,
+            _cx: &mut Context<'_>,
+        ) -> Poll<VmResult<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn cleanup_op(&mut self, op_id: HostOpId, terminal: HostAsyncOpTerminal) -> VmResult<()> {
+            self.cleanups
+                .lock()
+                .expect("cleanup lock")
+                .push((op_id, terminal));
+            self.futures.remove(&op_id);
+            Ok(())
         }
     }
 
@@ -6370,7 +6489,7 @@ mod owned_dispatch_tests {
 
     struct PendingOwned {
         calls: Arc<AtomicUsize>,
-        pending_op: HostOpId,
+        future_drops: Arc<AtomicUsize>,
         marker: i64,
     }
 
@@ -6378,7 +6497,14 @@ mod owned_dispatch_tests {
         fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             call.vm().instance.stack.push(Value::Int(self.marker));
-            Ok(CallOutcome::Pending(self.pending_op))
+            let future_drops = Arc::clone(&self.future_drops);
+            let drop_spy = FutureDropSpy(future_drops);
+            call.vm().submit_host_future(Box::pin(async move {
+                let _drop_spy = drop_spy;
+                Ok(HostFutureOutput::returning(CallReturn::one(Value::Bool(
+                    true,
+                ))))
+            }))
         }
     }
 
@@ -6436,25 +6562,48 @@ mod owned_dispatch_tests {
     }
 
     #[test]
-    fn owned_pending_setup_failures_restore_stack_waiting_state_and_allow_reuse() {
+    fn owned_pending_setup_failures_cancel_new_submissions_restore_state_and_allow_reuse() {
         for force_waiting_setup_failure in [false, true] {
             let schema = pending_value_schema();
             let calls = Arc::new(AtomicUsize::new(0));
+            let future_drops = Arc::new(AtomicUsize::new(0));
+            let submissions = Arc::new(Mutex::new(Vec::new()));
+            let cancellations = Arc::new(Mutex::new(Vec::new()));
+            let cleanups = Arc::new(Mutex::new(Vec::new()));
             let factory_calls = Arc::clone(&calls);
+            let factory_future_drops = Arc::clone(&future_drops);
             let mut registry = HostFunctionRegistry::empty();
             registry
                 .register_exact_owned("test::pending", 2, schema.clone(), move |_context| {
                     Box::new(PendingOwned {
                         calls: Arc::clone(&factory_calls),
-                        pending_op: 7,
+                        future_drops: Arc::clone(&factory_future_drops),
                         marker: 99,
                     })
                 })
                 .expect("register pending owned host");
             let mut vm = bound_vm(pending_value_program(&schema), &registry);
-            let previous_waiting = force_waiting_setup_failure.then_some(WaitingHostOp {
-                op_id: 99,
-                source: WaitingHostOpSource::Manual,
+            vm.set_async_bridge(Box::new(OwnedPendingBridge {
+                futures: HashMap::new(),
+                submissions: Arc::clone(&submissions),
+                cancellations: Arc::clone(&cancellations),
+                cleanups: Arc::clone(&cleanups),
+            }))
+            .expect("owned pending bridge should install");
+            let preexisting_op = if force_waiting_setup_failure {
+                let CallOutcome::Pending(op_id) = vm
+                    .submit_host_future(pending_test_future(Arc::clone(&future_drops)))
+                    .expect("pre-existing future submission")
+                else {
+                    panic!("pre-existing future should suspend");
+                };
+                Some(op_id)
+            } else {
+                None
+            };
+            let previous_waiting = preexisting_op.map(|op_id| WaitingHostOp {
+                op_id,
+                source: WaitingHostOpSource::HostBridge,
                 expected_return_type: None,
                 expected_return_schema: None,
             });
@@ -6501,22 +6650,119 @@ mod owned_dispatch_tests {
                 vm.host.host_functions.first(),
                 Some(VmHostFunction::OwnedDynamic(Some(_)))
             ));
+            let submitted = submissions.lock().expect("submission lock").clone();
+            let new_op = *submitted.last().expect("owned handler submission");
+            assert_ne!(Some(new_op), preexisting_op);
+            assert_eq!(
+                *cancellations.lock().expect("cancellation lock"),
+                vec![(new_op, OperationCancelReason::Requested)],
+                "rollback must cancel only the operation created by the handler"
+            );
+            assert_eq!(
+                *cleanups.lock().expect("cleanup lock"),
+                vec![(new_op, HostAsyncOpTerminal::Cancelled)],
+                "rollback must retire the cancelled operation"
+            );
+            assert_eq!(
+                future_drops.load(Ordering::SeqCst),
+                1,
+                "rollback must drop the handler's pending future"
+            );
+            assert!(!vm.host.submitted_host_ops.contains(&new_op));
+            assert!(!vm.host.is_bridge_operation_tracked(new_op));
+            if let Some(preexisting_op) = preexisting_op {
+                assert!(vm.host.submitted_host_ops.contains(&preexisting_op));
+                assert!(vm.host.is_bridge_operation_tracked(preexisting_op));
+                assert!(
+                    !vm.host.async_work_is_quiescent(),
+                    "an unrelated pre-existing operation must remain active"
+                );
+            } else {
+                assert!(vm.host.submitted_host_ops.is_empty());
+                assert!(vm.host.async_work_is_quiescent());
+            }
 
             vm.reset_for_reuse()
                 .expect("VM must reset after pending setup rollback");
             assert!(vm.is_reusable());
-            assert_eq!(
-                vm.run().expect("reused VM should enter pending state"),
-                VmStatus::Waiting(7)
+            assert!(vm.host.async_work_is_quiescent());
+            assert!(vm.host.submitted_host_ops.is_empty());
+            assert!(
+                !vm.host
+                    .is_bridge_operation_tracked(preexisting_op.unwrap_or(new_op)),
+                "reset must leave the prior bridge operation retired"
             );
-            vm.complete_host_op(7, CallReturn::one(Value::Bool(true)))
-                .expect("manual pending operation should complete");
+            let expected_cancellations = preexisting_op.map_or_else(
+                || vec![(new_op, OperationCancelReason::Requested)],
+                |preexisting_op| {
+                    vec![
+                        (new_op, OperationCancelReason::Requested),
+                        (preexisting_op, OperationCancelReason::VmReset),
+                    ]
+                },
+            );
+            assert_eq!(
+                *cancellations.lock().expect("cancellation lock"),
+                expected_cancellations,
+                "reset must not cancel the retired handler operation twice"
+            );
+            let expected_cleanups = preexisting_op.map_or_else(
+                || vec![(new_op, HostAsyncOpTerminal::Cancelled)],
+                |preexisting_op| {
+                    vec![
+                        (new_op, HostAsyncOpTerminal::Cancelled),
+                        (preexisting_op, HostAsyncOpTerminal::Cancelled),
+                    ]
+                },
+            );
+            assert_eq!(
+                *cleanups.lock().expect("cleanup lock"),
+                expected_cleanups,
+                "reset must not retire the handler operation twice"
+            );
+            assert_eq!(
+                future_drops.load(Ordering::SeqCst),
+                if preexisting_op.is_some() { 2 } else { 1 },
+                "reset must retire any unrelated pre-existing future separately"
+            );
+            let submissions_before_reuse = submissions.lock().expect("submission lock").len();
+            let status = vm.run().expect("reused VM should enter pending state");
+            let reused_op = *submissions
+                .lock()
+                .expect("submission lock")
+                .last()
+                .expect("reused submission");
+            assert_eq!(status, VmStatus::Waiting(reused_op));
+            assert_eq!(
+                submissions.lock().expect("submission lock").len(),
+                submissions_before_reuse + 1
+            );
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            assert!(matches!(
+                vm.poll_waiting_host_op(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
             assert_eq!(
                 vm.resume().expect("reused VM should resume"),
                 VmStatus::Halted
             );
             assert_eq!(vm.stack(), &[Value::Int(99), Value::Bool(true)]);
             assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let mut expected_cleanups_after_reuse = expected_cleanups.clone();
+            expected_cleanups_after_reuse.push((reused_op, HostAsyncOpTerminal::Completed));
+            assert_eq!(
+                *cleanups.lock().expect("cleanup lock"),
+                expected_cleanups_after_reuse,
+                "normal completion must retire the reused bridge operation"
+            );
+            assert!(vm.host.submitted_host_ops.is_empty());
+            assert!(vm.host.async_work_is_quiescent());
+            assert_eq!(
+                future_drops.load(Ordering::SeqCst),
+                if preexisting_op.is_some() { 3 } else { 2 },
+                "normal completion must retire the reused future"
+            );
         }
     }
 
