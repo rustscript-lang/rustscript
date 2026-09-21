@@ -764,7 +764,7 @@ impl ExactHostCallContract {
 /// value transfer is simply not a resource operation.
 struct GuardedOwnedHostFunction {
     inner: Box<dyn HostOwnedFunction>,
-    schema: HostImportSchema,
+    schema: Arc<HostImportSchema>,
 }
 
 impl HostOwnedFunction for GuardedOwnedHostFunction {
@@ -900,6 +900,81 @@ pub enum RegistrySchemaError {
 type HostPlanCache =
     HashMap<(Vec<HostImport>, Vec<Option<HostImportSchema>>), Arc<HostBindingPlan>>;
 
+/// Live identity shared by registry snapshots and prepared programs.
+///
+/// Registry mutation publishes a new state/token and advances the generation
+/// through this witness. A prepared program can therefore detect mutation even
+/// when the registry was updated transactionally and replaced its ordinary
+/// generation atomics with a copy-on-write snapshot.
+struct RegistryIdentity {
+    state: RwLock<Arc<()>>,
+    generation_token: RwLock<Arc<()>>,
+    generation: AtomicU64,
+}
+
+impl RegistryIdentity {
+    fn new(state: Arc<()>, generation_token: Arc<()>, generation: u64) -> Self {
+        Self {
+            state: RwLock::new(state),
+            generation_token: RwLock::new(generation_token),
+            generation: AtomicU64::new(generation),
+        }
+    }
+
+    fn current_matches(
+        &self,
+        state: &Arc<()>,
+        generation_token: &Arc<()>,
+        generation: u64,
+    ) -> bool {
+        self.generation.load(Ordering::Relaxed) == generation
+            && Arc::ptr_eq(
+                &self
+                    .state
+                    .read()
+                    .expect("registry identity state lock should not be poisoned"),
+                state,
+            )
+            && Arc::ptr_eq(
+                &self
+                    .generation_token
+                    .read()
+                    .expect("registry identity token lock should not be poisoned"),
+                generation_token,
+            )
+    }
+
+    fn publish(&self, state: Arc<()>, generation_token: Arc<()>, generation: u64) {
+        *self
+            .state
+            .write()
+            .expect("registry identity state lock should not be poisoned") = state;
+        *self
+            .generation_token
+            .write()
+            .expect("registry identity token lock should not be poisoned") = generation_token;
+        self.generation.store(generation, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Self {
+        Self::new(
+            Arc::clone(
+                &self
+                    .state
+                    .read()
+                    .expect("registry identity state lock should not be poisoned"),
+            ),
+            Arc::clone(
+                &self
+                    .generation_token
+                    .read()
+                    .expect("registry identity token lock should not be poisoned"),
+            ),
+            self.generation.load(Ordering::Relaxed),
+        )
+    }
+}
+
 impl std::fmt::Display for RegistrySchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -973,20 +1048,46 @@ fn same_dispatch_shape(lhs: &HostImportSchema, rhs: &HostImportSchema) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostBindingPlan {
-    import_signature: Vec<HostImport>,
-    import_schemas: Vec<Option<HostImportSchema>>,
-    registry_slots: Vec<u16>,
-    registry_schemas: Vec<Option<HostImportSchema>>,
-    resolved_calls: Vec<u16>,
-    allowed_builtin_calls: Vec<u16>,
+    import_signature: Arc<[HostImport]>,
+    import_schemas: Arc<[Option<HostImportSchema>]>,
+    registry_slots: Arc<[u16]>,
+    registry_schemas: Arc<[Option<HostImportSchema>]>,
+    resolved_calls: Arc<[u16]>,
+    allowed_builtin_calls: Arc<[u16]>,
     allow_default_builtin_capabilities: bool,
-    allowed_host_function_slots: Vec<u16>,
+    allowed_host_function_slots: Arc<[u16]>,
     allow_default_host_capabilities: bool,
     capability_profile: Arc<CapabilityProfile>,
     capability_fingerprint: u64,
     registry_state: Arc<()>,
     registry_generation_token: Arc<()>,
     registry_generation: u64,
+}
+
+#[derive(Clone)]
+struct HostDispatchTemplate {
+    entries: Arc<[RegistryEntryKind]>,
+    schemas: Arc<[Option<HostImportSchema>]>,
+    guarded_owned_schemas: Arc<[Option<Arc<HostImportSchema>>]>,
+    resolved_calls: Arc<[u16]>,
+    allowed_builtin_calls: Arc<[u16]>,
+    allowed_host_function_slots: Arc<[u16]>,
+    named_struct_schemas: Arc<HashMap<String, crate::compiler::TypeSchema>>,
+    standard_composition: Option<Arc<dyn super::standard_composition::StandardSurfaceComposition>>,
+}
+
+/// Immutable host binding prepared once for one immutable program.
+///
+/// The dispatch template contains only immutable descriptors and factory
+/// closures. Every [`Vm`] receives fresh host-function instances for dynamic
+/// entries and fresh runtime/module state; no mutable host object is shared.
+#[derive(Clone)]
+pub struct BoundHostProgram {
+    program: Arc<Program>,
+    plan: Arc<HostBindingPlan>,
+    dispatch: Arc<HostDispatchTemplate>,
+    registry: Arc<HostFunctionRegistry>,
+    registry_identity: Arc<RegistryIdentity>,
 }
 
 #[derive(Clone)]
@@ -1002,6 +1103,7 @@ pub struct HostFunctionRegistry {
     registry_state: Arc<()>,
     registry_generation_token: Arc<()>,
     registry_generation: Arc<AtomicU64>,
+    registry_identity: Arc<RegistryIdentity>,
     /// Caller-provided standard-surface composition strategy, if installed.
     ///
     /// This is explicit per-instance state: the outer standard-runtime
@@ -1020,6 +1122,13 @@ impl Default for HostFunctionRegistry {
 
 impl HostFunctionRegistry {
     pub fn empty() -> Self {
+        let registry_state = Arc::new(());
+        let registry_generation_token = Arc::new(());
+        let registry_identity = Arc::new(RegistryIdentity::new(
+            Arc::clone(&registry_state),
+            Arc::clone(&registry_generation_token),
+            0,
+        ));
         Self {
             entries: Arc::new(Vec::new()),
             by_name: Arc::new(HashMap::new()),
@@ -1029,9 +1138,10 @@ impl HostFunctionRegistry {
             allow_default_builtin_capabilities: true,
             allow_default_host_capabilities: true,
             capability_profile: Arc::new(CapabilityProfile::allow_all()),
-            registry_state: Arc::new(()),
-            registry_generation_token: Arc::new(()),
+            registry_state,
+            registry_generation_token,
             registry_generation: Arc::new(AtomicU64::new(0)),
+            registry_identity,
             standard_composition: None,
             named_struct_schemas: Arc::new(HashMap::new()),
         }
@@ -1154,6 +1264,11 @@ impl HostFunctionRegistry {
     fn invalidate_plan_cache(&mut self) {
         self.registry_state = Arc::new(());
         self.registry_generation.fetch_add(1, Ordering::Relaxed);
+        self.registry_identity.publish(
+            Arc::clone(&self.registry_state),
+            Arc::clone(&self.registry_generation_token),
+            self.registry_generation.load(Ordering::Relaxed),
+        );
         self.plan_cache = Arc::new(RwLock::new(HashMap::new()));
     }
 
@@ -1435,12 +1550,20 @@ impl HostFunctionRegistry {
         F: FnOnce(&mut Self) -> VmResult<R>,
     {
         let mut staged = self.clone();
-        // Clone shares the generation AtomicU64. Staging must not bump the live
-        // counter if this call later rolls back.
+        // Keep staging isolated so a failed transaction cannot invalidate live
+        // prepared programs. The live identity is published only on commit.
         staged.registry_generation = Arc::new(AtomicU64::new(
             self.registry_generation.load(Ordering::Relaxed),
         ));
+        staged.registry_identity = Arc::new(self.registry_identity.snapshot());
         let result = register(&mut staged)?;
+        let live_identity = Arc::clone(&self.registry_identity);
+        live_identity.publish(
+            Arc::clone(&staged.registry_state),
+            Arc::clone(&staged.registry_generation_token),
+            staged.registry_generation.load(Ordering::Relaxed),
+        );
+        staged.registry_identity = live_identity;
         *self = staged;
         Ok(result)
     }
@@ -1646,6 +1769,64 @@ impl HostFunctionRegistry {
         Ok(())
     }
 
+    /// Prepares an immutable host dispatch artifact for one immutable program.
+    ///
+    /// Schema matching, capability validation, registry-slot resolution and
+    /// dispatch-template construction happen here. Dynamic factories remain
+    /// in the template and are invoked only when a VM needs its own mutable
+    /// host instance.
+    pub fn bind_program_once(&self, program: Arc<Program>) -> VmResult<Arc<BoundHostProgram>> {
+        if let Some(composition) = self.standard_composition.as_ref() {
+            let mut composed = self.clone();
+            composition.ensure_surfaces(&program.imports, &mut composed)?;
+            composed.standard_composition = Some(Arc::clone(composition));
+            return composed.bind_program_once_inner(program);
+        }
+        self.bind_program_once_inner(program)
+    }
+
+    fn bind_program_once_inner(&self, program: Arc<Program>) -> VmResult<Arc<BoundHostProgram>> {
+        self.validate_program_capabilities(&program)?;
+        let plan =
+            self.prepare_shared_plan_with_schemas(&program.imports, &program.host_import_schemas)?;
+        let dispatch = self.prepare_dispatch_template(&plan)?;
+        let registry = Arc::new(self.clone());
+        Ok(Arc::new(BoundHostProgram {
+            program,
+            plan,
+            dispatch: Arc::new(dispatch),
+            registry,
+            registry_identity: Arc::clone(&self.registry_identity),
+        }))
+    }
+
+    fn prepare_dispatch_template(&self, plan: &HostBindingPlan) -> VmResult<HostDispatchTemplate> {
+        let mut entries = Vec::with_capacity(plan.registry_slots.len());
+        for &registry_slot in plan.registry_slots.iter() {
+            let entry = self
+                .entries
+                .get(usize::from(registry_slot))
+                .ok_or(VmError::InvalidCall(registry_slot))?;
+            entries.push(entry.kind.clone());
+        }
+        Ok(HostDispatchTemplate {
+            entries: Arc::from(entries.into_boxed_slice()),
+            schemas: Arc::clone(&plan.registry_schemas),
+            guarded_owned_schemas: Arc::from(
+                plan.registry_schemas
+                    .iter()
+                    .map(|schema| schema.as_ref().map(|schema| Arc::new(schema.clone())))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
+            resolved_calls: Arc::clone(&plan.resolved_calls),
+            allowed_builtin_calls: Arc::clone(&plan.allowed_builtin_calls),
+            allowed_host_function_slots: Arc::clone(&plan.allowed_host_function_slots),
+            named_struct_schemas: Arc::clone(&self.named_struct_schemas),
+            standard_composition: self.standard_composition.clone(),
+        })
+    }
+
     pub fn prepare_plan(&self, imports: &[HostImport]) -> VmResult<HostBindingPlan> {
         Ok(self.prepare_shared_plan(imports)?.as_ref().clone())
     }
@@ -1683,6 +1864,11 @@ impl HostFunctionRegistry {
                 &plan.registry_generation_token,
             )
             && self.registry_generation.load(Ordering::Relaxed) == plan.registry_generation
+            && self.registry_identity.current_matches(
+                &plan.registry_state,
+                &plan.registry_generation_token,
+                plan.registry_generation,
+            )
     }
 
     fn plan_for_imports(
@@ -1786,7 +1972,7 @@ impl HostFunctionRegistry {
             })
             .collect::<Vec<_>>();
         let import_key = imports.to_vec();
-        let registry_schemas = registry_slots
+        let registry_schemas: Vec<Option<HostImportSchema>> = registry_slots
             .iter()
             .map(|slot| {
                 self.entries
@@ -1795,14 +1981,19 @@ impl HostFunctionRegistry {
             })
             .collect();
         let computed = Arc::new(HostBindingPlan {
-            import_signature: import_key,
-            import_schemas: import_schemas.to_vec(),
-            registry_slots,
-            registry_schemas,
-            resolved_calls,
-            allowed_builtin_calls: self.allowed_builtin_calls.as_ref().clone(),
+            import_signature: Arc::from(import_key.into_boxed_slice()),
+            import_schemas: Arc::from(import_schemas.to_vec().into_boxed_slice()),
+            registry_slots: Arc::from(registry_slots.into_boxed_slice()),
+            registry_schemas: Arc::from(registry_schemas.into_boxed_slice()),
+            resolved_calls: Arc::from(resolved_calls.into_boxed_slice()),
+            allowed_builtin_calls: Arc::from(
+                self.allowed_builtin_calls
+                    .as_ref()
+                    .clone()
+                    .into_boxed_slice(),
+            ),
             allow_default_builtin_capabilities: self.allow_default_builtin_capabilities,
-            allowed_host_function_slots,
+            allowed_host_function_slots: Arc::from(allowed_host_function_slots.into_boxed_slice()),
             allow_default_host_capabilities: self.allow_default_host_capabilities,
             capability_profile: Arc::clone(&self.capability_profile),
             capability_fingerprint: self.capability_profile.fingerprint(),
@@ -1820,13 +2011,14 @@ impl HostFunctionRegistry {
 
     pub fn bind_vm_with_plan(&self, vm: &mut Vm, plan: &HostBindingPlan) -> VmResult<()> {
         self.validate_program_capabilities(&vm.program)?;
-        if vm.program.imports != plan.import_signature {
+        if vm.program.imports.as_slice() != plan.import_signature.as_ref() {
             return Err(VmError::HostError(
                 "host binding plan does not match vm import signature".to_string(),
             ));
         }
         if normalize_import_schemas(&vm.program.imports, &vm.program.host_import_schemas)?
-            != plan.import_schemas
+            .as_slice()
+            != plan.import_schemas.as_ref()
         {
             return Err(VmError::HostError(
                 "host binding plan does not match vm catalog schema identity".to_string(),
@@ -1860,7 +2052,7 @@ impl HostFunctionRegistry {
         }
 
         vm.host.host_functions.reserve(plan.registry_slots.len());
-        for &registry_slot in &plan.registry_slots {
+        for &registry_slot in plan.registry_slots.iter() {
             let entry = self
                 .entries
                 .get(registry_slot as usize)
@@ -1893,7 +2085,7 @@ impl HostFunctionRegistry {
                         Some(schema) if schema_requires_guard(schema) => {
                             Box::new(GuardedOwnedHostFunction {
                                 inner: function,
-                                schema: schema.clone(),
+                                schema: Arc::new(schema.clone()),
                             })
                         }
                         _ => function,
@@ -1902,17 +2094,125 @@ impl HostFunctionRegistry {
                 }
             }
             let host_slot = vm.host.host_function_schemas.len() - 1;
-            if let Some(schema) = vm.host.host_function_schemas.get_mut(host_slot) {
-                *schema = plan.registry_schemas.get(host_slot).cloned().flatten();
-            }
+            vm.host.host_function_schemas.set(
+                host_slot,
+                plan.registry_schemas.get(host_slot).cloned().flatten(),
+            );
         }
         vm.set_default_host_fallback_enabled(false);
         vm.host.named_struct_schemas = Arc::clone(&self.named_struct_schemas);
-        vm.host.allowed_builtin_calls = plan.allowed_builtin_calls.clone();
+        vm.host.allowed_builtin_calls = Arc::from(
+            plan.allowed_builtin_calls
+                .as_ref()
+                .to_vec()
+                .into_boxed_slice(),
+        );
         vm.host.allow_default_builtin_capabilities = plan.allow_default_builtin_capabilities;
-        vm.host.allowed_host_function_slots = plan.allowed_host_function_slots.clone();
+        vm.host.allowed_host_function_slots = Arc::from(
+            plan.allowed_host_function_slots
+                .as_ref()
+                .to_vec()
+                .into_boxed_slice(),
+        );
         vm.host.allow_default_host_capabilities = plan.allow_default_host_capabilities;
-        vm.install_resolved_calls(plan.resolved_calls.clone())?;
+        vm.install_shared_resolved_calls(Arc::from(
+            plan.resolved_calls.as_ref().to_vec().into_boxed_slice(),
+        ))?;
+        Ok(())
+    }
+}
+
+impl BoundHostProgram {
+    pub(crate) fn program_arc(&self) -> Arc<Program> {
+        Arc::clone(&self.program)
+    }
+
+    fn validate_current(&self) -> VmResult<()> {
+        if !Arc::ptr_eq(
+            &self.registry.capability_profile,
+            &self.plan.capability_profile,
+        ) {
+            return Err(VmError::HostError(
+                "bound host program belongs to a different capability profile".to_string(),
+            ));
+        }
+        if !self.registry_identity.current_matches(
+            &self.plan.registry_state,
+            &self.plan.registry_generation_token,
+            self.plan.registry_generation,
+        ) {
+            return Err(VmError::HostError(
+                "bound host program is stale for this registry".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn instantiate_into(&self, vm: &mut Vm) -> VmResult<()> {
+        self.validate_current()?;
+        if !Arc::ptr_eq(&vm.program, &self.program) {
+            return Err(VmError::HostError(
+                "bound host program does not match vm program".to_string(),
+            ));
+        }
+        if !vm.host.host_functions.is_empty() || !vm.host.host_function_symbols.is_empty() {
+            return Err(VmError::HostError(
+                "bound host program requires an unbound vm".to_string(),
+            ));
+        }
+        if self.dispatch.entries.len() != self.dispatch.schemas.len()
+            || self.dispatch.entries.len() != self.dispatch.guarded_owned_schemas.len()
+        {
+            return Err(VmError::HostError(
+                "bound host dispatch template is internally inconsistent".to_string(),
+            ));
+        }
+
+        vm.host.host_functions.reserve(self.dispatch.entries.len());
+        for (host_slot, entry) in self.dispatch.entries.iter().enumerate() {
+            let function = match entry {
+                RegistryEntryKind::Factory(factory) => VmHostFunction::Dynamic(factory()),
+                RegistryEntryKind::Static(function) => VmHostFunction::Static(*function),
+                RegistryEntryKind::StackFactory(factory) => VmHostFunction::StackDynamic(factory()),
+                RegistryEntryKind::StackStatic(function) => VmHostFunction::StackStatic(*function),
+                RegistryEntryKind::ArgsFactory(factory) => VmHostFunction::ArgsDynamic(factory()),
+                RegistryEntryKind::ArgsStatic(function) => VmHostFunction::ArgsStatic(*function),
+                RegistryEntryKind::ArgsStaticNonYielding(function) => {
+                    VmHostFunction::ArgsStaticNonYielding(*function)
+                }
+                RegistryEntryKind::OwnedFactory(factory) => {
+                    let function = factory(OwnedHostContext {
+                        registry: &self.registry,
+                    });
+                    let function: Box<dyn HostOwnedFunction> =
+                        match self.dispatch.guarded_owned_schemas[host_slot].as_ref() {
+                            Some(schema) if schema_requires_guard(schema) => {
+                                Box::new(GuardedOwnedHostFunction {
+                                    inner: function,
+                                    schema: Arc::clone(schema),
+                                })
+                            }
+                            _ => function,
+                        };
+                    VmHostFunction::OwnedDynamic(Some(function))
+                }
+            };
+            vm.host.host_functions.push(function);
+        }
+        vm.host.resolved_calls_dirty = true;
+
+        vm.host.allow_default_host_fallback = false;
+        vm.host.standard_composition = self.dispatch.standard_composition.clone();
+        vm.host.named_struct_schemas = Arc::clone(&self.dispatch.named_struct_schemas);
+        vm.host
+            .host_function_schemas
+            .replace_shared(Arc::clone(&self.dispatch.schemas));
+        vm.host.allowed_builtin_calls = Arc::clone(&self.dispatch.allowed_builtin_calls);
+        vm.host.allow_default_builtin_capabilities = self.plan.allow_default_builtin_capabilities;
+        vm.host.allowed_host_function_slots =
+            Arc::clone(&self.dispatch.allowed_host_function_slots);
+        vm.host.allow_default_host_capabilities = self.plan.allow_default_host_capabilities;
+        vm.install_shared_resolved_calls(Arc::clone(&self.dispatch.resolved_calls))?;
         Ok(())
     }
 }
@@ -4481,7 +4781,10 @@ impl Vm {
         Ok(())
     }
 
-    pub(super) fn install_resolved_calls(&mut self, resolved_calls: Vec<u16>) -> VmResult<()> {
+    pub(super) fn install_shared_resolved_calls(
+        &mut self,
+        resolved_calls: Arc<[u16]>,
+    ) -> VmResult<()> {
         if self.program.imports.len() != resolved_calls.len() {
             return Err(VmError::HostError(format!(
                 "resolved call cache size mismatch: expected {}, got {}",
@@ -4489,7 +4792,7 @@ impl Vm {
                 resolved_calls.len()
             )));
         }
-        for &index in &resolved_calls {
+        for &index in resolved_calls.iter() {
             if index as usize >= self.host.host_functions.len() {
                 return Err(VmError::InvalidCall(index));
             }
@@ -4555,7 +4858,7 @@ impl Vm {
             resolved.push(bound);
         }
 
-        self.host.resolved_calls = resolved;
+        self.host.resolved_calls = Arc::from(resolved.into_boxed_slice());
         self.host.resolved_calls_dirty = false;
         Ok(())
     }

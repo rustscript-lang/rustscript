@@ -6,11 +6,297 @@ use build_script::{
     HostBindingKind, HostExecutionKind, callable_param_expr, classify_host_binding,
     infer_host_execution,
 };
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use syn::parse_quote;
 use vm::{
-    BuiltinFunction, CapabilityProfile, HostExecution, HostFunctionRegistry, JitConfig,
-    JitTraceTerminal, Value, Vm, VmStatus, compile_source, default_host_callables,
+    BuiltinFunction, BytecodeBuilder, CallOutcome, CallReturn, CapabilityProfile, HostApiBuilder,
+    HostFunction, HostFunctionRegistry, HostFunctionSchema, HostImport, HostImportSchema,
+    HostParamSchema, HostTypeSchema, JitConfig, JitTraceTerminal, Program, Value, Vm, VmStatus,
+    compile_source,
 };
+
+fn schema_for(function: &HostFunctionSchema) -> (HostImport, HostImportSchema) {
+    let mut builder = HostApiBuilder::new();
+    builder.function(function.clone());
+    let catalog = builder.build().expect("test catalog");
+    let schema = HostImportSchema::from_function(&catalog, function);
+    let import = HostImport {
+        name: function.name.clone(),
+        arity: function.params.len() as u8,
+        return_type: match function.return_type {
+            HostTypeSchema::Null => vm::ValueType::Null,
+            HostTypeSchema::Int => vm::ValueType::Int,
+            HostTypeSchema::Float => vm::ValueType::Float,
+            HostTypeSchema::Number => vm::ValueType::Float,
+            HostTypeSchema::Bool => vm::ValueType::Bool,
+            HostTypeSchema::String => vm::ValueType::String,
+            HostTypeSchema::Bytes => vm::ValueType::Bytes,
+            HostTypeSchema::Array(_) => vm::ValueType::Array,
+            HostTypeSchema::Map(_) | HostTypeSchema::Named { .. } => vm::ValueType::Map,
+            HostTypeSchema::Callable { .. } => vm::ValueType::Callable,
+            HostTypeSchema::Resource(_) | HostTypeSchema::Optional(_) | HostTypeSchema::Unknown => {
+                vm::ValueType::Unknown
+            }
+        },
+    };
+    (import, schema)
+}
+
+fn program_with_imports(
+    imports: Vec<HostImport>,
+    schemas: Vec<HostImportSchema>,
+    code: Vec<u8>,
+) -> Arc<Program> {
+    Arc::new(
+        Program::with_imports_and_debug(Vec::new(), code, imports, None)
+            .with_host_import_schemas(schemas)
+            .expect("aligned host schemas"),
+    )
+}
+
+fn return_int(_vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+    Ok(CallOutcome::Return(CallReturn::one(Value::Int(7))))
+}
+
+struct IsolatedCounterHost {
+    calls: usize,
+}
+
+impl HostFunction for IsolatedCounterHost {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        self.calls += 1;
+        Ok(CallOutcome::Return(CallReturn::one(Value::Int(
+            self.calls as i64,
+        ))))
+    }
+}
+
+#[test]
+fn one_bound_program_constructs_ten_thousand_vms() {
+    let function = HostFunctionSchema::with_return("bound::value", Vec::new(), HostTypeSchema::Int);
+    let (import, schema) = schema_for(&function);
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ret();
+    let program = program_with_imports(vec![import], vec![schema.clone()], bytecode.finish());
+
+    let mut registry = HostFunctionRegistry::empty();
+    registry
+        .register_catalog_static(schema, return_int)
+        .expect("static binding");
+    let bound = registry
+        .bind_program_once(Arc::clone(&program))
+        .expect("prepare bound program");
+
+    for _ in 0..10_000 {
+        let vm = Vm::new_bound(Arc::clone(&bound)).expect("construct bound vm");
+        assert_eq!(vm.bound_function_count(), 1);
+    }
+}
+
+#[test]
+fn bound_program_keeps_mutable_host_state_per_vm() {
+    let function =
+        HostFunctionSchema::with_return("bound::counter", Vec::new(), HostTypeSchema::Int);
+    let (import, schema) = schema_for(&function);
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.call(0, 0);
+    bytecode.ret();
+    let program = program_with_imports(vec![import], vec![schema.clone()], bytecode.finish());
+
+    let factory_count = Arc::new(AtomicUsize::new(0));
+    let mut registry = HostFunctionRegistry::empty();
+    registry
+        .register_catalog(schema, {
+            let factory_count = Arc::clone(&factory_count);
+            move || {
+                factory_count.fetch_add(1, Ordering::SeqCst);
+                Box::new(IsolatedCounterHost { calls: 0 })
+            }
+        })
+        .expect("counter binding");
+    let bound = registry
+        .bind_program_once(Arc::clone(&program))
+        .expect("prepare counter binding");
+    assert_eq!(factory_count.load(Ordering::SeqCst), 0);
+
+    let mut first = Vm::new_bound(Arc::clone(&bound)).expect("first bound vm");
+    let mut second = Vm::new_bound(bound).expect("second bound vm");
+    assert_eq!(factory_count.load(Ordering::SeqCst), 2);
+    assert_eq!(first.run().expect("first run"), VmStatus::Halted);
+    assert_eq!(second.run().expect("second run"), VmStatus::Halted);
+    assert_eq!(first.stack(), &[Value::Int(1)]);
+    assert_eq!(second.stack(), &[Value::Int(1)]);
+}
+
+#[test]
+fn bound_program_preserves_full_schema_overloads() {
+    let int_function = HostFunctionSchema::with_return(
+        "bound::overloaded",
+        vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+        HostTypeSchema::Int,
+    );
+    let string_function = HostFunctionSchema::with_return(
+        "bound::overloaded",
+        vec![HostParamSchema::value("value", HostTypeSchema::String)],
+        HostTypeSchema::String,
+    );
+    let mut catalog_builder = HostApiBuilder::new();
+    catalog_builder.function(int_function.clone());
+    catalog_builder.function(string_function.clone());
+    let catalog = catalog_builder.build().expect("overload catalog");
+    let int_schema = HostImportSchema::from_function(&catalog, &int_function);
+    let string_schema = HostImportSchema::from_function(&catalog, &string_function);
+
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ldc(0);
+    bytecode.call(0, 1);
+    bytecode.ldc(1);
+    bytecode.call(1, 1);
+    bytecode.ret();
+    let program = Arc::new(
+        Program::with_imports_and_debug(
+            vec![Value::Int(1), Value::string("x")],
+            bytecode.finish(),
+            vec![
+                HostImport {
+                    name: "bound::overloaded".to_string(),
+                    arity: 1,
+                    return_type: vm::ValueType::Int,
+                },
+                HostImport {
+                    name: "bound::overloaded".to_string(),
+                    arity: 1,
+                    return_type: vm::ValueType::String,
+                },
+            ],
+            None,
+        )
+        .with_host_import_schemas(vec![int_schema.clone(), string_schema.clone()])
+        .expect("aligned overload schemas"),
+    );
+    let mut registry = HostFunctionRegistry::empty();
+    registry
+        .register_catalog_static(int_schema, return_int)
+        .expect("integer overload");
+    registry
+        .register_catalog_static(string_schema, |_vm, _args| {
+            Ok(CallOutcome::Return(CallReturn::one(Value::string("text"))))
+        })
+        .expect("string overload");
+    let bound = registry
+        .bind_program_once(program)
+        .expect("prepare overload binding");
+    let mut vm = Vm::new_bound(bound).expect("construct overload vm");
+    assert_eq!(vm.run().expect("run overload vm"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(7), Value::string("text")]);
+}
+
+#[test]
+fn bound_program_rejects_registry_generation_changes() {
+    let function =
+        HostFunctionSchema::with_return("bound::generation", Vec::new(), HostTypeSchema::Int);
+    let (import, schema) = schema_for(&function);
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ret();
+    let program = program_with_imports(vec![import], vec![schema.clone()], bytecode.finish());
+    let mut registry = HostFunctionRegistry::empty();
+    registry
+        .register_catalog_static(schema, return_int)
+        .expect("generation binding");
+    let bound = registry
+        .bind_program_once(program)
+        .expect("prepare generation binding");
+
+    registry.register_static("bound::after", 0, return_int);
+    let error = match Vm::new_bound(bound) {
+        Ok(_) => panic!("stale bound program must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("stale"));
+}
+
+#[test]
+fn bound_program_survives_a_failed_registry_transaction() {
+    let function =
+        HostFunctionSchema::with_return("bound::transaction", Vec::new(), HostTypeSchema::Int);
+    let (import, schema) = schema_for(&function);
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ret();
+    let program = program_with_imports(vec![import], vec![schema.clone()], bytecode.finish());
+    let mut registry = HostFunctionRegistry::empty();
+    registry
+        .register_catalog_static(schema, return_int)
+        .expect("transaction binding");
+    let bound = registry
+        .bind_program_once(program)
+        .expect("prepare transaction binding");
+
+    let result: vm::VmResult<()> = registry.transactionally(|staged| {
+        staged.register_static("bound::temporary", 0, return_int);
+        Err(vm::VmError::HostError("abort transaction".to_string()))
+    });
+    assert!(result.is_err());
+    Vm::new_bound(bound).expect("failed transaction must preserve the bound program");
+}
+
+#[test]
+fn bound_program_rejects_capability_profile_changes() {
+    let function =
+        HostFunctionSchema::with_return("bound::capability", Vec::new(), HostTypeSchema::Int);
+    let (import, _) = schema_for(&function);
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ret();
+    let program = Arc::new(Program::with_imports_and_debug(
+        Vec::new(),
+        bytecode.finish(),
+        vec![import],
+        None,
+    ));
+    let mut registry = HostFunctionRegistry::empty();
+    registry.register_static("bound::capability", 0, return_int);
+    let bound = registry
+        .bind_program_once(program)
+        .expect("prepare capability binding");
+
+    registry
+        .allow_builtin("bound::capability")
+        .expect("registered host capability should be known");
+    let error = match Vm::new_bound(bound) {
+        Ok(_) => panic!("changed capability profile must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("stale"));
+}
+
+#[test]
+fn bound_program_rejects_catalog_schema_mismatch_during_prepare() {
+    let registered = HostFunctionSchema::with_return(
+        "bound::schema",
+        vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+        HostTypeSchema::Int,
+    );
+    let requested = HostFunctionSchema::with_return(
+        "bound::schema",
+        vec![HostParamSchema::value("value", HostTypeSchema::String)],
+        HostTypeSchema::Int,
+    );
+    let (import, registered_schema) = schema_for(&registered);
+    let (_, requested_schema) = schema_for(&requested);
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ret();
+    let program = program_with_imports(vec![import], vec![requested_schema], bytecode.finish());
+    let mut registry = HostFunctionRegistry::empty();
+    registry
+        .register_catalog_static(registered_schema, return_int)
+        .expect("registered schema");
+
+    let error = match registry.bind_program_once(program) {
+        Ok(_) => panic!("catalog schema mismatch must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("bound::schema"));
+}
 
 fn native_jit_supported() -> bool {
     (cfg!(target_arch = "x86_64")
@@ -335,7 +621,7 @@ fn restricted_capabilities_disable_trace_jit_for_host_imports_and_builtins() {
 #[test]
 fn generated_http_imports_are_unique_typed_and_independently_capability_gated() {
     const IMPORTS: [&str; 2] = ["http::client::request", "http::client::sse"];
-    let callables = default_host_callables();
+    let callables = vm::default_host_callables();
     for name in IMPORTS {
         let discovered = callables
             .iter()
@@ -354,7 +640,7 @@ fn generated_http_imports_are_unique_typed_and_independently_capability_gated() 
                 callable.signature.params[1].ty.display_label(),
                 "fn(map) -> map"
             );
-            assert_eq!(callable.host_execution, HostExecution::MaySuspend);
+            assert_eq!(callable.host_execution, vm::HostExecution::MaySuspend);
         }
     }
 

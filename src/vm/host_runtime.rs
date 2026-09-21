@@ -37,6 +37,49 @@ use crate::vm::{VmError, VmResult};
 /// Embedder-supplied print sink for `print`/`debug` output.
 pub(crate) type RuntimePrintSink = dyn FnMut(String) + Send;
 
+/// Copy-on-write storage for host-function schemas.
+///
+/// A bound program installs an immutable `Arc` slice shared by every VM it
+/// creates. Legacy registration APIs retain append/update semantics by
+/// materializing a private vector only when a VM is subsequently mutated.
+pub(crate) struct HostFunctionSchemas {
+    shared: Arc<[Option<HostImportSchema>]>,
+    owned: Option<Vec<Option<HostImportSchema>>>,
+}
+
+impl HostFunctionSchemas {
+    pub(crate) fn new() -> Self {
+        Self {
+            shared: Arc::from(Vec::new().into_boxed_slice()),
+            owned: None,
+        }
+    }
+
+    fn owned_values(&mut self) -> &mut Vec<Option<HostImportSchema>> {
+        self.owned
+            .get_or_insert_with(|| self.shared.as_ref().to_vec())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.owned.as_ref().map_or(self.shared.len(), Vec::len)
+    }
+
+    pub(crate) fn push(&mut self, schema: Option<HostImportSchema>) {
+        self.owned_values().push(schema);
+    }
+
+    pub(crate) fn set(&mut self, index: usize, schema: Option<HostImportSchema>) {
+        if let Some(slot) = self.owned_values().get_mut(index) {
+            *slot = schema;
+        }
+    }
+
+    pub(crate) fn replace_shared(&mut self, schemas: Arc<[Option<HostImportSchema>]>) {
+        self.shared = schemas;
+        self.owned = None;
+    }
+}
+
 #[derive(Debug)]
 struct BridgeOperationState {
     cancellation_reason: Option<OperationCancelReason>,
@@ -65,10 +108,10 @@ impl BridgeOperationState {
 /// must not be duplicated across VMs.
 pub(crate) struct HostRuntime {
     pub(super) host_functions: Vec<VmHostFunction>,
-    pub(crate) host_function_schemas: Vec<Option<HostImportSchema>>,
+    pub(crate) host_function_schemas: HostFunctionSchemas,
     pub(crate) host_function_symbols: HashMap<String, u16>,
     pub(crate) builtin_overrides: HashMap<u16, u16>,
-    pub(crate) resolved_calls: Vec<u16>,
+    pub(crate) resolved_calls: Arc<[u16]>,
     pub(crate) resolved_calls_dirty: bool,
     pub(crate) async_bridge: Option<Box<dyn HostAsyncBridge>>,
     pub(crate) runtime_print_sink: Option<Box<RuntimePrintSink>>,
@@ -107,12 +150,12 @@ pub(crate) struct HostRuntime {
     pub(crate) allow_default_builtin_capabilities: bool,
     /// Explicitly allowed builtin call indices (from the bound capability
     /// profile), enforced when `allow_default_builtin_capabilities` is off.
-    pub(crate) allowed_builtin_calls: Vec<u16>,
+    pub(crate) allowed_builtin_calls: Arc<[u16]>,
     /// Whether the default host capability set is enabled for this VM.
     pub(crate) allow_default_host_capabilities: bool,
     /// Host-function slots permitted by the bound capability profile,
     /// enforced when `allow_default_host_capabilities` is off.
-    pub(crate) allowed_host_function_slots: Vec<u16>,
+    pub(crate) allowed_host_function_slots: Arc<[u16]>,
     /// Whether unbound host imports fall back to the default host functions.
     pub(crate) allow_default_host_fallback: bool,
     /// The standard-surface composition used to construct this VM's default
@@ -153,10 +196,10 @@ impl HostRuntime {
     pub(crate) fn new() -> Self {
         Self {
             host_functions: Vec::new(),
-            host_function_schemas: Vec::new(),
+            host_function_schemas: HostFunctionSchemas::new(),
             host_function_symbols: HashMap::new(),
             builtin_overrides: HashMap::new(),
-            resolved_calls: Vec::new(),
+            resolved_calls: Arc::from(Vec::new().into_boxed_slice()),
             resolved_calls_dirty: true,
             async_bridge: None,
             runtime_print_sink: None,
@@ -169,9 +212,9 @@ impl HostRuntime {
             replacement_execution_scope: None,
             module_state_store: super::host_state::ModuleStateStore::new(),
             allow_default_builtin_capabilities: true,
-            allowed_builtin_calls: Vec::new(),
+            allowed_builtin_calls: Arc::from(Vec::new().into_boxed_slice()),
             allow_default_host_capabilities: true,
-            allowed_host_function_slots: Vec::new(),
+            allowed_host_function_slots: Arc::from(Vec::new().into_boxed_slice()),
             allow_default_host_fallback: true,
             standard_composition: None,
             named_struct_schemas: Arc::new(HashMap::new()),

@@ -42,9 +42,10 @@ pub use self::epoch::{EpochCheckpoint, EpochHandle};
 use self::execution_scope::ExecutionScopeError;
 pub use self::fuel::FuelCheckpoint;
 pub use self::host::{
-    CallOutcome, CallReturn, HostArgsFunction, HostAsyncBridge, HostAsyncOpTerminal,
-    HostBindingPlan, HostFunction, HostFunctionRegistry, HostOpId, HostStackFunction,
-    RegistrySchemaError, StaticHostArgsFunction, StaticHostFunction, StaticHostStackFunction,
+    BoundHostProgram, CallOutcome, CallReturn, HostArgsFunction, HostAsyncBridge,
+    HostAsyncOpTerminal, HostBindingPlan, HostFunction, HostFunctionRegistry, HostOpId,
+    HostStackFunction, RegistrySchemaError, StaticHostArgsFunction, StaticHostFunction,
+    StaticHostStackFunction,
 };
 use self::host::{HostCallExecOutcome, VmHostFunction};
 pub use self::host_context::{
@@ -1144,6 +1145,26 @@ impl Vm {
 
     pub fn new_shared(program: Arc<Program>) -> Self {
         Self::new_shared_with_jit_config(program, jit::JitConfig::default())
+    }
+
+    /// Constructs a VM from a host binding prepared for the program.
+    ///
+    /// Immutable host dispatch metadata is reused from `program`; dynamic
+    /// host factories still create one mutable instance per VM.
+    pub fn new_bound(program: Arc<BoundHostProgram>) -> VmResult<Self> {
+        Self::new_bound_with_jit_config(program, jit::JitConfig::default())
+    }
+
+    /// `new_bound` with an explicit per-VM JIT configuration.
+    pub fn new_bound_with_jit_config(
+        program: Arc<BoundHostProgram>,
+        jit_config: jit::JitConfig,
+    ) -> VmResult<Self> {
+        let shared_program = program.program_arc();
+        validate_frame_allocation_limits(&shared_program)?;
+        let mut vm = Self::new_shared_with_jit_config(shared_program, jit_config);
+        program.instantiate_into(&mut vm)?;
+        Ok(vm)
     }
 
     pub fn new_shared_with_jit_config(program: Arc<Program>, jit_config: jit::JitConfig) -> Self {
