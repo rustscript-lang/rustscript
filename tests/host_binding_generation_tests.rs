@@ -8,12 +8,14 @@ use build_script::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use syn::parse_quote;
 use vm::{
     BuiltinFunction, BytecodeBuilder, CallOutcome, CallReturn, CapabilityProfile, HostApiBuilder,
-    HostFunction, HostFunctionRegistry, HostFunctionSchema, HostImport, HostImportSchema,
-    HostParamSchema, HostTypeSchema, JitConfig, JitTraceTerminal, Program, Value, Vm, VmStatus,
-    compile_source,
+    HostArgsFunction, HostAsyncBridge, HostAsyncOpTerminal, HostFunction, HostFunctionRegistry,
+    HostFunctionSchema, HostImport, HostImportSchema, HostParamSchema, HostStackFunction,
+    HostTypeSchema, JitConfig, JitTraceTerminal, Program, StandardSurfaceComposition, Value, Vm,
+    VmStatus, compile_source,
 };
 
 fn schema_for(function: &HostFunctionSchema) -> (HostImport, HostImportSchema) {
@@ -57,6 +59,99 @@ fn program_with_imports(
 
 fn return_int(_vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
     Ok(CallOutcome::Return(CallReturn::one(Value::Int(7))))
+}
+
+fn return_int_99(_vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+    Ok(CallOutcome::Return(CallReturn::one(Value::Int(99))))
+}
+
+struct FailingComposition;
+
+impl StandardSurfaceComposition for FailingComposition {
+    fn import_in_standard(&self, _import: &HostImport) -> bool {
+        false
+    }
+
+    fn ensure_surfaces(
+        &self,
+        _imports: &[HostImport],
+        registry: &mut HostFunctionRegistry,
+    ) -> vm::VmResult<bool> {
+        registry.register_static("composition::probe", 0, return_int);
+        Err(vm::VmError::HostError(
+            "intentional composition probe failure".to_string(),
+        ))
+    }
+
+    fn build_default_registry(&self) -> vm::VmResult<HostFunctionRegistry> {
+        Ok(HostFunctionRegistry::empty())
+    }
+
+    fn bind_default_name(&self, _vm: &mut Vm, _name: &str) -> bool {
+        false
+    }
+}
+
+struct MatrixResource;
+
+impl vm::resource::HostResource for MatrixResource {}
+
+struct MatrixModule(u64);
+
+struct MatrixAsyncBridge;
+
+impl HostAsyncBridge for MatrixAsyncBridge {
+    fn poll_op(
+        &mut self,
+        _op_id: vm::HostOpId,
+        _cx: &mut Context<'_>,
+    ) -> Poll<vm::VmResult<vm::CallReturn>> {
+        Poll::Pending
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        _op_id: vm::HostOpId,
+        _cx: &mut Context<'_>,
+    ) -> Poll<vm::VmResult<vm::HostFutureOutput>> {
+        Poll::Pending
+    }
+
+    fn cleanup_op(
+        &mut self,
+        _op_id: vm::HostOpId,
+        _terminal: HostAsyncOpTerminal,
+    ) -> vm::VmResult<()> {
+        Ok(())
+    }
+}
+
+struct MatrixFactoryHost(i64);
+
+impl HostFunction for MatrixFactoryHost {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::one(Value::Int(self.0))))
+    }
+}
+
+impl HostStackFunction for MatrixFactoryHost {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::one(Value::Int(self.0))))
+    }
+}
+
+impl HostArgsFunction for MatrixFactoryHost {
+    fn call(&mut self, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::one(Value::Int(self.0))))
+    }
+}
+
+struct MatrixOwnedHost;
+
+impl vm::HostOwnedFunction for MatrixOwnedHost {
+    fn call(&mut self, _call: &mut vm::OwnedHostCall<'_>) -> vm::VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::one(Value::Int(4))))
+    }
 }
 
 struct IsolatedCounterHost {
@@ -127,6 +222,169 @@ fn bound_program_keeps_mutable_host_state_per_vm() {
     assert_eq!(second.run().expect("second run"), VmStatus::Halted);
     assert_eq!(first.stack(), &[Value::Int(1)]);
     assert_eq!(second.stack(), &[Value::Int(1)]);
+}
+
+#[test]
+fn bound_vm_lifecycle_matrix_isolates_module_resource_and_async_state() {
+    let program = Arc::new(Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]));
+    let bound = HostFunctionRegistry::empty()
+        .bind_program_once(program)
+        .expect("empty bound program");
+    let mut first = Vm::new_bound(Arc::clone(&bound)).expect("first lifecycle VM");
+    let mut second = Vm::new_bound(bound).expect("second lifecycle VM");
+
+    assert_eq!(first.allocate_host_op_id(), 1);
+    assert_eq!(second.allocate_host_op_id(), 1);
+    first
+        .set_async_bridge(Box::new(MatrixAsyncBridge))
+        .expect("first async bridge");
+    second
+        .set_async_bridge(Box::new(MatrixAsyncBridge))
+        .expect("second async bridge");
+    first.clear_async_bridge().expect("first bridge clear");
+    second.clear_async_bridge().expect("second bridge clear");
+
+    first.host_context().set_module_state(MatrixModule(7));
+    assert_eq!(
+        first
+            .host_context()
+            .module_state::<MatrixModule>()
+            .map(|state| state.0),
+        Some(7)
+    );
+    assert!(
+        second
+            .host_context()
+            .module_state::<MatrixModule>()
+            .is_none()
+    );
+
+    let _first_resource = first
+        .host_context()
+        .push_resource(MatrixResource)
+        .expect("first resource");
+    assert_eq!(first.host_context().resource_count(), 1);
+    assert_eq!(second.host_context().resource_count(), 0);
+}
+
+#[test]
+fn bound_program_instantiates_each_dynamic_factory_kind_per_vm() {
+    let imports = vec![
+        HostImport {
+            name: "matrix::dynamic".to_string(),
+            arity: 0,
+            return_type: vm::ValueType::Int,
+        },
+        HostImport {
+            name: "matrix::stack".to_string(),
+            arity: 0,
+            return_type: vm::ValueType::Int,
+        },
+        HostImport {
+            name: "matrix::args".to_string(),
+            arity: 0,
+            return_type: vm::ValueType::Int,
+        },
+    ];
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.call(0, 0);
+    bytecode.call(1, 0);
+    bytecode.call(2, 0);
+    bytecode.ret();
+    let program = Arc::new(Program::with_imports_and_debug(
+        Vec::new(),
+        bytecode.finish(),
+        imports,
+        None,
+    ));
+    let dynamic_count = Arc::new(AtomicUsize::new(0));
+    let stack_count = Arc::new(AtomicUsize::new(0));
+    let args_count = Arc::new(AtomicUsize::new(0));
+    let mut registry = HostFunctionRegistry::empty();
+    registry.register("matrix::dynamic", 0, {
+        let count = Arc::clone(&dynamic_count);
+        move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::new(MatrixFactoryHost(1))
+        }
+    });
+    registry.register_stack("matrix::stack", 0, {
+        let count = Arc::clone(&stack_count);
+        move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::new(MatrixFactoryHost(2))
+        }
+    });
+    registry.register_args("matrix::args", 0, {
+        let count = Arc::clone(&args_count);
+        move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::new(MatrixFactoryHost(3))
+        }
+    });
+    let bound = registry
+        .bind_program_once(Arc::clone(&program))
+        .expect("dynamic factory matrix binding");
+    let mut first = Vm::new_bound(Arc::clone(&bound)).expect("first factory matrix VM");
+    let mut second = Vm::new_bound(bound).expect("second factory matrix VM");
+    assert_eq!(dynamic_count.load(Ordering::SeqCst), 2);
+    assert_eq!(stack_count.load(Ordering::SeqCst), 2);
+    assert_eq!(args_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        first.run().expect("first factory matrix run"),
+        VmStatus::Halted
+    );
+    assert_eq!(
+        second.run().expect("second factory matrix run"),
+        VmStatus::Halted
+    );
+    assert_eq!(
+        first.stack(),
+        &[Value::Int(1), Value::Int(2), Value::Int(3)]
+    );
+    assert_eq!(
+        second.stack(),
+        &[Value::Int(1), Value::Int(2), Value::Int(3)]
+    );
+
+    let owned_schema =
+        HostFunctionSchema::with_return("matrix::owned", Vec::new(), HostTypeSchema::Int);
+    let (owned_import, owned_schema) = schema_for(&owned_schema);
+    let mut owned_code = BytecodeBuilder::new();
+    owned_code.call(0, 0);
+    owned_code.ret();
+    let owned_program = program_with_imports(
+        vec![owned_import],
+        vec![owned_schema.clone()],
+        owned_code.finish(),
+    );
+    let owned_count = Arc::new(AtomicUsize::new(0));
+    let mut owned_registry = HostFunctionRegistry::empty();
+    owned_registry
+        .register_exact_owned("matrix::owned", 0, owned_schema, {
+            let count = Arc::clone(&owned_count);
+            move |_context| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Box::new(MatrixOwnedHost)
+            }
+        })
+        .expect("owned factory registration");
+    let owned_bound = owned_registry
+        .bind_program_once(owned_program)
+        .expect("owned factory binding");
+    let mut owned_first = Vm::new_bound(Arc::clone(&owned_bound)).expect("first owned VM");
+    let mut owned_second = Vm::new_bound(owned_bound).expect("second owned VM");
+    assert_eq!(owned_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        owned_first.run().expect("first owned run"),
+        VmStatus::Halted
+    );
+    assert_eq!(
+        owned_second.run().expect("second owned run"),
+        VmStatus::Halted
+    );
+    assert_eq!(owned_first.stack(), &[Value::Int(4)]);
+    assert_eq!(owned_second.stack(), &[Value::Int(4)]);
 }
 
 #[test]
@@ -238,6 +496,180 @@ fn bound_program_survives_a_failed_registry_transaction() {
     });
     assert!(result.is_err());
     Vm::new_bound(bound).expect("failed transaction must preserve the bound program");
+}
+
+#[test]
+fn committed_registry_transaction_invalidates_existing_bound_programs() {
+    let function =
+        HostFunctionSchema::with_return("bound::commit", Vec::new(), HostTypeSchema::Int);
+    let (import, schema) = schema_for(&function);
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ret();
+    let program = program_with_imports(vec![import], vec![schema.clone()], bytecode.finish());
+    let mut registry = HostFunctionRegistry::empty();
+    registry
+        .register_catalog_static(schema, return_int)
+        .expect("commit binding");
+    let bound = registry
+        .bind_program_once(program)
+        .expect("prepare commit binding");
+
+    registry
+        .transactionally(|staged| {
+            staged.register_static("bound::committed", 0, return_int);
+            Ok(())
+        })
+        .expect("commit transaction");
+    let error = match Vm::new_bound(bound) {
+        Ok(_) => panic!("commit must invalidate old artifact"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("stale"));
+}
+
+#[test]
+fn sibling_registry_mutation_invalidates_old_plans_but_allows_new_untouched_snapshot_plans() {
+    let function =
+        HostFunctionSchema::with_return("bound::sibling", Vec::new(), HostTypeSchema::Int);
+    let (import, schema) = schema_for(&function);
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.call(0, 0);
+    bytecode.ret();
+    let program = program_with_imports(
+        vec![import.clone()],
+        vec![schema.clone()],
+        bytecode.finish(),
+    );
+    let mut registry = HostFunctionRegistry::empty();
+    registry
+        .register_catalog_static(schema.clone(), return_int)
+        .expect("sibling binding");
+    let plan = registry
+        .prepare_plan_with_schemas(&[import.clone()], &[Some(schema.clone())])
+        .expect("prepare sibling plan");
+    let mut sibling = registry.clone();
+    sibling.register_static("bound::sibling_only", 0, return_int);
+
+    let mut stale_vm = Vm::new_shared(Arc::clone(&program));
+    let error = registry
+        .bind_vm_with_plan(&mut stale_vm, &plan)
+        .expect_err("sibling mutation must invalidate the old plan");
+    assert!(error.to_string().contains("stale"));
+
+    let fresh_plan = registry
+        .prepare_plan_with_schemas(&[import], &[Some(schema)])
+        .expect("untouched sibling snapshot should prepare a fresh plan");
+    let mut fresh_vm = Vm::new_shared(program);
+    registry
+        .bind_vm_with_plan(&mut fresh_vm, &fresh_plan)
+        .expect("fresh plan for untouched snapshot should bind");
+    assert_eq!(
+        fresh_vm.run().expect("fresh sibling vm should run"),
+        VmStatus::Halted
+    );
+}
+
+#[test]
+fn failed_composition_probe_does_not_mutate_source_registry_or_plan_witness() {
+    let function = HostFunctionSchema::with_return(
+        "bound::composition_source",
+        Vec::new(),
+        HostTypeSchema::Int,
+    );
+    let (import, _schema) = schema_for(&function);
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.call(0, 0);
+    bytecode.ret();
+    let program = Arc::new(Program::with_imports_and_debug(
+        Vec::new(),
+        bytecode.finish(),
+        vec![import.clone()],
+        None,
+    ));
+    let mut registry = HostFunctionRegistry::empty();
+    registry.register_static("bound::composition_source", 0, return_int);
+    registry.set_standard_composition(Arc::new(FailingComposition));
+    let plan = registry.prepare_plan(&[import]).expect("source plan");
+
+    let error = match registry.bind_program_once(Arc::clone(&program)) {
+        Ok(_) => panic!("composition probe should fail"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("intentional composition probe failure")
+    );
+    assert!(!registry.contains_name("composition::probe"));
+
+    let mut vm = Vm::new_shared(program);
+    registry
+        .bind_vm_with_plan(&mut vm, &plan)
+        .expect("failed probe must not stale the source plan");
+    assert_eq!(vm.run().expect("source plan should run"), VmStatus::Halted);
+}
+
+#[test]
+fn new_bound_preserves_default_composition_for_builtin_and_regex_paths() {
+    let compiled = compile_source(
+        r#"
+            use re;
+            let mut i = 0;
+            while i < 4 {
+                let _ = string_contains("rustscript", "script");
+                let _ = re::match("^rust", "rustscript");
+                i = i + 1;
+            }
+            i;
+        "#,
+    )
+    .expect("builtin and regex program should compile");
+    let bound = HostFunctionRegistry::new()
+        .bind_program_once(Arc::new(compiled.program))
+        .expect("default registry should prepare builtin and regex program");
+    let mut vm = Vm::new_bound(bound).expect("bound VM should retain default composition");
+    assert!(vm.standard_composition().is_some());
+    vm.set_jit_config(JitConfig {
+        enabled: native_jit_supported(),
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    assert_eq!(
+        vm.run().expect("builtin and regex VM should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(4)]);
+    if native_jit_supported() {
+        assert!(vm.jit_native_exec_count() > 0);
+    }
+}
+
+#[test]
+fn bound_vm_rejects_legacy_registration_without_positional_remap() {
+    let function =
+        HostFunctionSchema::with_return("bound::duplicate", Vec::new(), HostTypeSchema::Int);
+    let (import, schema) = schema_for(&function);
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.call(1, 0);
+    bytecode.ret();
+    let program = program_with_imports(
+        vec![import.clone(), import],
+        vec![schema.clone(), schema.clone()],
+        bytecode.finish(),
+    );
+    let mut registry = HostFunctionRegistry::empty();
+    registry
+        .register_catalog_static(schema, return_int)
+        .expect("duplicate import binding");
+    let bound = registry
+        .bind_program_once(program)
+        .expect("duplicate import artifact");
+    let mut vm = Vm::new_bound(bound).expect("duplicate import VM");
+    assert_eq!(vm.register_static_function(return_int_99), u16::MAX);
+    let error = vm
+        .run()
+        .expect_err("post-bind legacy registration must fail closed");
+    assert!(error.to_string().contains("after host binding"));
 }
 
 #[test]

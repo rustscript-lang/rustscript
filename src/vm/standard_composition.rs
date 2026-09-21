@@ -13,6 +13,17 @@ use super::{CallOutcome, HostFunctionRegistry, Vm, VmError, VmResult};
 
 /// Runtime surface operations that the VM may request without knowing their
 /// concrete implementation module.
+///
+/// A composition value is shared by registry snapshots, bound programs, and
+/// every VM instantiated from one bound program. Implementations therefore
+/// must be immutable configuration objects: do not put per-VM counters,
+/// caches, resource tables, async state, or other mutable execution state in
+/// `self`, including through interior mutability. Per-VM state belongs in the
+/// `Vm` host-state/resource/operation APIs or in a host-function factory. The
+/// `&mut Vm` arguments below provide the current VM explicitly for operations
+/// that need execution-local state. Implementations must use those borrows
+/// only for the duration of the call: they must not retain a VM reference,
+/// create an alias to it with `unsafe`, or re-enter execution on that VM.
 pub trait StandardSurfaceComposition: Send + Sync {
     /// Reports whether this composition owns a standard host import.
     fn import_in_standard(&self, import: &HostImport) -> bool;
@@ -31,8 +42,11 @@ pub trait StandardSurfaceComposition: Send + Sync {
     /// Binds one standard host function by source name.
     fn bind_default_name(&self, vm: &mut Vm, name: &str) -> bool;
 
-    /// Dispatches a catalog builtin. The default keeps custom compositions
-    /// source-compatible while reporting that no builtin dispatcher is present.
+    /// Dispatches a catalog builtin using a mutable scratch copy of the call
+    /// arguments. The slice is never an alias of the VM's operand stack, and
+    /// implementations must not retain it after returning. The default keeps
+    /// custom compositions source-compatible while reporting that no builtin
+    /// dispatcher is present.
     fn execute_builtin_call(
         &self,
         _vm: &mut Vm,

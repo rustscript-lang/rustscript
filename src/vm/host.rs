@@ -900,80 +900,53 @@ pub enum RegistrySchemaError {
 type HostPlanCache =
     HashMap<(Vec<HostImport>, Vec<Option<HostImportSchema>>), Arc<HostBindingPlan>>;
 
-/// Live identity shared by registry snapshots and prepared programs.
+/// Live mutation lineage shared by registry clones.
 ///
-/// Registry mutation publishes a new state/token and advances the generation
-/// through this witness. A prepared program can therefore detect mutation even
-/// when the registry was updated transactionally and replaced its ordinary
-/// generation atomics with a copy-on-write snapshot.
+/// The lineage generation is the fail-closed witness for every copy-on-write
+/// registry snapshot. A clone keeps its own immutable state token, so a
+/// sibling mutation invalidates old artifacts without making a newly prepared
+/// plan for the untouched sibling unusable.
+#[derive(Debug)]
 struct RegistryIdentity {
-    state: RwLock<Arc<()>>,
-    generation_token: RwLock<Arc<()>>,
     generation: AtomicU64,
 }
 
 impl RegistryIdentity {
-    fn new(state: Arc<()>, generation_token: Arc<()>, generation: u64) -> Self {
+    fn new(generation: u64) -> Self {
         Self {
-            state: RwLock::new(state),
-            generation_token: RwLock::new(generation_token),
             generation: AtomicU64::new(generation),
         }
     }
 
-    fn current_matches(
-        &self,
-        state: &Arc<()>,
-        generation_token: &Arc<()>,
-        generation: u64,
-    ) -> bool {
-        self.generation.load(Ordering::Relaxed) == generation
-            && Arc::ptr_eq(
-                &self
-                    .state
-                    .read()
-                    .expect("registry identity state lock should not be poisoned"),
-                state,
-            )
-            && Arc::ptr_eq(
-                &self
-                    .generation_token
-                    .read()
-                    .expect("registry identity token lock should not be poisoned"),
-                generation_token,
-            )
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
-    fn publish(&self, state: Arc<()>, generation_token: Arc<()>, generation: u64) {
-        *self
-            .state
-            .write()
-            .expect("registry identity state lock should not be poisoned") = state;
-        *self
-            .generation_token
-            .write()
-            .expect("registry identity token lock should not be poisoned") = generation_token;
-        self.generation.store(generation, Ordering::Relaxed);
+    fn bump(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    fn snapshot(&self) -> Self {
-        Self::new(
-            Arc::clone(
-                &self
-                    .state
-                    .read()
-                    .expect("registry identity state lock should not be poisoned"),
-            ),
-            Arc::clone(
-                &self
-                    .generation_token
-                    .read()
-                    .expect("registry identity token lock should not be poisoned"),
-            ),
-            self.generation.load(Ordering::Relaxed),
-        )
+    fn current_matches(&self, generation: u64) -> bool {
+        self.current_generation() == generation
     }
 }
+
+#[derive(Clone, Debug)]
+struct RegistrySnapshot {
+    identity: Arc<RegistryIdentity>,
+    state: Arc<()>,
+    generation: u64,
+}
+
+impl PartialEq for RegistrySnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+            && Arc::ptr_eq(&self.state, &other.state)
+            && self.generation == other.generation
+    }
+}
+
+impl Eq for RegistrySnapshot {}
 
 impl std::fmt::Display for RegistrySchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1059,16 +1032,42 @@ pub struct HostBindingPlan {
     allow_default_host_capabilities: bool,
     capability_profile: Arc<CapabilityProfile>,
     capability_fingerprint: u64,
-    registry_state: Arc<()>,
-    registry_generation_token: Arc<()>,
-    registry_generation: u64,
+    registry_snapshot: RegistrySnapshot,
+}
+
+impl HostBindingPlan {
+    fn validate_layout(&self, registry_len: usize) -> VmResult<()> {
+        if self.import_signature.len() != self.import_schemas.len()
+            || self.resolved_calls.len() != self.import_signature.len()
+            || self.registry_slots.len() != self.registry_schemas.len()
+        {
+            return Err(VmError::HostError(
+                "host binding plan descriptor lengths are inconsistent".to_string(),
+            ));
+        }
+        for &registry_slot in self.registry_slots.iter() {
+            if usize::from(registry_slot) >= registry_len {
+                return Err(VmError::InvalidCall(registry_slot));
+            }
+        }
+        for &resolved_slot in self.resolved_calls.iter() {
+            if usize::from(resolved_slot) >= self.registry_slots.len() {
+                return Err(VmError::InvalidCall(resolved_slot));
+            }
+        }
+        for &allowed_slot in self.allowed_host_function_slots.iter() {
+            if usize::from(allowed_slot) >= self.registry_slots.len() {
+                return Err(VmError::InvalidCall(allowed_slot));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
 struct HostDispatchTemplate {
     entries: Arc<[RegistryEntryKind]>,
     schemas: Arc<[Option<HostImportSchema>]>,
-    guarded_owned_schemas: Arc<[Option<Arc<HostImportSchema>>]>,
     resolved_calls: Arc<[u16]>,
     allowed_builtin_calls: Arc<[u16]>,
     allowed_host_function_slots: Arc<[u16]>,
@@ -1087,7 +1086,7 @@ pub struct BoundHostProgram {
     plan: Arc<HostBindingPlan>,
     dispatch: Arc<HostDispatchTemplate>,
     registry: Arc<HostFunctionRegistry>,
-    registry_identity: Arc<RegistryIdentity>,
+    source_registry_snapshot: RegistrySnapshot,
 }
 
 #[derive(Clone)]
@@ -1101,8 +1100,6 @@ pub struct HostFunctionRegistry {
     allow_default_host_capabilities: bool,
     capability_profile: Arc<CapabilityProfile>,
     registry_state: Arc<()>,
-    registry_generation_token: Arc<()>,
-    registry_generation: Arc<AtomicU64>,
     registry_identity: Arc<RegistryIdentity>,
     /// Caller-provided standard-surface composition strategy, if installed.
     ///
@@ -1123,12 +1120,7 @@ impl Default for HostFunctionRegistry {
 impl HostFunctionRegistry {
     pub fn empty() -> Self {
         let registry_state = Arc::new(());
-        let registry_generation_token = Arc::new(());
-        let registry_identity = Arc::new(RegistryIdentity::new(
-            Arc::clone(&registry_state),
-            Arc::clone(&registry_generation_token),
-            0,
-        ));
+        let registry_identity = Arc::new(RegistryIdentity::new(0));
         Self {
             entries: Arc::new(Vec::new()),
             by_name: Arc::new(HashMap::new()),
@@ -1139,8 +1131,6 @@ impl HostFunctionRegistry {
             allow_default_host_capabilities: true,
             capability_profile: Arc::new(CapabilityProfile::allow_all()),
             registry_state,
-            registry_generation_token,
-            registry_generation: Arc::new(AtomicU64::new(0)),
             registry_identity,
             standard_composition: None,
             named_struct_schemas: Arc::new(HashMap::new()),
@@ -1160,9 +1150,6 @@ impl HostFunctionRegistry {
         registry.allow_default_builtin_capabilities = false;
         registry.allow_default_host_capabilities = false;
         registry.capability_profile = Arc::new(CapabilityProfile::deny_all());
-        registry.registry_state = Arc::new(());
-        registry.registry_generation_token = Arc::new(());
-        registry.registry_generation = Arc::new(AtomicU64::new(0));
         registry.invalidate_plan_cache();
         registry
     }
@@ -1263,13 +1250,31 @@ impl HostFunctionRegistry {
 
     fn invalidate_plan_cache(&mut self) {
         self.registry_state = Arc::new(());
-        self.registry_generation.fetch_add(1, Ordering::Relaxed);
-        self.registry_identity.publish(
-            Arc::clone(&self.registry_state),
-            Arc::clone(&self.registry_generation_token),
-            self.registry_generation.load(Ordering::Relaxed),
-        );
+        self.registry_identity.bump();
         self.plan_cache = Arc::new(RwLock::new(HashMap::new()));
+    }
+
+    fn registry_snapshot(&self) -> RegistrySnapshot {
+        RegistrySnapshot {
+            identity: Arc::clone(&self.registry_identity),
+            state: Arc::clone(&self.registry_state),
+            generation: self.registry_identity.current_generation(),
+        }
+    }
+
+    fn detached_clone(&self) -> Self {
+        let mut detached = self.clone();
+        detached.registry_identity = Arc::new(RegistryIdentity::new(
+            self.registry_identity.current_generation(),
+        ));
+        detached.plan_cache = Arc::new(RwLock::new(HashMap::new()));
+        detached
+    }
+
+    fn snapshot_is_current(&self, snapshot: &RegistrySnapshot) -> bool {
+        Arc::ptr_eq(&self.registry_identity, &snapshot.identity)
+            && Arc::ptr_eq(&self.registry_state, &snapshot.state)
+            && snapshot.identity.current_matches(snapshot.generation)
     }
 
     pub fn register<F>(&mut self, name: impl Into<String>, arity: u8, factory: F)
@@ -1287,7 +1292,10 @@ impl HostFunctionRegistry {
         }
 
         let entries = Arc::make_mut(&mut self.entries);
-        let slot = entries.len() as u16;
+        let slot = match u16::try_from(entries.len()) {
+            Ok(slot) if slot < u16::MAX => slot,
+            _ => return,
+        };
         entries.push(RegistryEntry {
             arity,
             schema: None,
@@ -1314,7 +1322,10 @@ impl HostFunctionRegistry {
         }
 
         let entries = Arc::make_mut(&mut self.entries);
-        let slot = entries.len() as u16;
+        let slot = match u16::try_from(entries.len()) {
+            Ok(slot) if slot < u16::MAX => slot,
+            _ => return,
+        };
         entries.push(RegistryEntry {
             arity,
             schema: None,
@@ -1339,7 +1350,10 @@ impl HostFunctionRegistry {
         }
 
         let entries = Arc::make_mut(&mut self.entries);
-        let slot = entries.len() as u16;
+        let slot = match u16::try_from(entries.len()) {
+            Ok(slot) if slot < u16::MAX => slot,
+            _ => return,
+        };
         entries.push(RegistryEntry {
             arity,
             schema: None,
@@ -1366,7 +1380,10 @@ impl HostFunctionRegistry {
         }
 
         let entries = Arc::make_mut(&mut self.entries);
-        let slot = entries.len() as u16;
+        let slot = match u16::try_from(entries.len()) {
+            Ok(slot) if slot < u16::MAX => slot,
+            _ => return,
+        };
         entries.push(RegistryEntry {
             arity,
             schema: None,
@@ -1391,7 +1408,10 @@ impl HostFunctionRegistry {
         }
 
         let entries = Arc::make_mut(&mut self.entries);
-        let slot = entries.len() as u16;
+        let slot = match u16::try_from(entries.len()) {
+            Ok(slot) if slot < u16::MAX => slot,
+            _ => return,
+        };
         entries.push(RegistryEntry {
             arity,
             schema: None,
@@ -1418,7 +1438,10 @@ impl HostFunctionRegistry {
         }
 
         let entries = Arc::make_mut(&mut self.entries);
-        let slot = entries.len() as u16;
+        let slot = match u16::try_from(entries.len()) {
+            Ok(slot) if slot < u16::MAX => slot,
+            _ => return,
+        };
         entries.push(RegistryEntry {
             arity,
             schema: None,
@@ -1451,7 +1474,10 @@ impl HostFunctionRegistry {
         }
 
         let entries = Arc::make_mut(&mut self.entries);
-        let slot = entries.len() as u16;
+        let slot = match u16::try_from(entries.len()) {
+            Ok(slot) if slot < u16::MAX => slot,
+            _ => return,
+        };
         entries.push(RegistryEntry {
             arity,
             schema: None,
@@ -1509,10 +1535,13 @@ impl HostFunctionRegistry {
         }
 
         let entries = Arc::make_mut(&mut self.entries);
-        let slot = u16::try_from(entries.len()).map_err(|_| RegistrySchemaError::InvalidArity {
-            name: schema.name.clone(),
-            arity: schema.arity(),
-        })?;
+        let slot = u16::try_from(entries.len())
+            .ok()
+            .filter(|slot| *slot < u16::MAX)
+            .ok_or_else(|| RegistrySchemaError::InvalidSchema {
+                name: schema.name.clone(),
+                detail: "registry slot space exhausted".to_string(),
+            })?;
         entries.push(RegistryEntry {
             arity,
             schema: Some(schema.clone()),
@@ -1549,21 +1578,21 @@ impl HostFunctionRegistry {
     where
         F: FnOnce(&mut Self) -> VmResult<R>,
     {
-        let mut staged = self.clone();
-        // Keep staging isolated so a failed transaction cannot invalidate live
-        // prepared programs. The live identity is published only on commit.
-        staged.registry_generation = Arc::new(AtomicU64::new(
-            self.registry_generation.load(Ordering::Relaxed),
-        ));
-        staged.registry_identity = Arc::new(self.registry_identity.snapshot());
+        let mut staged = self.detached_clone();
         let result = register(&mut staged)?;
+        let changed = !Arc::ptr_eq(&self.registry_state, &staged.registry_state);
         let live_identity = Arc::clone(&self.registry_identity);
-        live_identity.publish(
-            Arc::clone(&staged.registry_state),
-            Arc::clone(&staged.registry_generation_token),
-            staged.registry_generation.load(Ordering::Relaxed),
-        );
-        staged.registry_identity = live_identity;
+        let committed_state = Arc::clone(&staged.registry_state);
+        staged.registry_identity = live_identity.clone();
+        staged.registry_state = committed_state;
+        // Plans prepared against the detached lineage cannot remain in the
+        // live cache after commit. A failed transaction returns before this
+        // publication point and leaves both the state token and generation
+        // untouched.
+        staged.plan_cache = Arc::new(RwLock::new(HashMap::new()));
+        if changed {
+            live_identity.bump();
+        }
         *self = staged;
         Ok(result)
     }
@@ -1747,13 +1776,26 @@ impl HostFunctionRegistry {
     }
 
     pub fn bind_vm_cached(&self, vm: &mut Vm) -> VmResult<()> {
-        if let Some(composition) = self.standard_composition.as_ref() {
-            let mut composed = self.clone();
+        let source_snapshot = self.registry_snapshot();
+        let result = if let Some(composition) = self.standard_composition.as_ref() {
+            let mut composed = self.detached_clone();
             composition.ensure_surfaces(&vm.program.imports, &mut composed)?;
             composed.standard_composition = Some(Arc::clone(composition));
-            return composed.bind_vm_cached_inner(vm);
+            if !self.snapshot_is_current(&source_snapshot) {
+                return Err(VmError::HostError(
+                    "host binding composition probe observed a stale registry".to_string(),
+                ));
+            }
+            composed.bind_vm_cached_inner(vm)
+        } else {
+            self.bind_vm_cached_inner(vm)
+        }?;
+        if !self.snapshot_is_current(&source_snapshot) {
+            return Err(VmError::HostError(
+                "host binding source registry became stale during VM construction".to_string(),
+            ));
         }
-        self.bind_vm_cached_inner(vm)
+        Ok(result)
     }
 
     fn bind_vm_cached_inner(&self, vm: &mut Vm) -> VmResult<()> {
@@ -1776,31 +1818,52 @@ impl HostFunctionRegistry {
     /// in the template and are invoked only when a VM needs its own mutable
     /// host instance.
     pub fn bind_program_once(&self, program: Arc<Program>) -> VmResult<Arc<BoundHostProgram>> {
+        let source_snapshot = self.registry_snapshot();
         if let Some(composition) = self.standard_composition.as_ref() {
-            let mut composed = self.clone();
+            let mut composed = self.detached_clone();
             composition.ensure_surfaces(&program.imports, &mut composed)?;
             composed.standard_composition = Some(Arc::clone(composition));
-            return composed.bind_program_once_inner(program);
+            composed.bind_program_once_inner(program, source_snapshot)
+        } else {
+            self.bind_program_once_inner(program, source_snapshot)
         }
-        self.bind_program_once_inner(program)
     }
 
-    fn bind_program_once_inner(&self, program: Arc<Program>) -> VmResult<Arc<BoundHostProgram>> {
+    fn bind_program_once_inner(
+        &self,
+        program: Arc<Program>,
+        source_registry_snapshot: RegistrySnapshot,
+    ) -> VmResult<Arc<BoundHostProgram>> {
         self.validate_program_capabilities(&program)?;
         let plan =
             self.prepare_shared_plan_with_schemas(&program.imports, &program.host_import_schemas)?;
         let dispatch = self.prepare_dispatch_template(&plan)?;
         let registry = Arc::new(self.clone());
+        if !self.plan_matches_current(&plan)
+            || !source_registry_snapshot
+                .identity
+                .current_matches(source_registry_snapshot.generation)
+        {
+            return Err(VmError::HostError(
+                "bound host program became stale during construction".to_string(),
+            ));
+        }
         Ok(Arc::new(BoundHostProgram {
             program,
             plan,
             dispatch: Arc::new(dispatch),
             registry,
-            registry_identity: Arc::clone(&self.registry_identity),
+            source_registry_snapshot,
         }))
     }
 
     fn prepare_dispatch_template(&self, plan: &HostBindingPlan) -> VmResult<HostDispatchTemplate> {
+        if !self.plan_matches_current(plan) {
+            return Err(VmError::HostError(
+                "host binding plan is stale for this registry".to_string(),
+            ));
+        }
+        plan.validate_layout(self.entries.len())?;
         let mut entries = Vec::with_capacity(plan.registry_slots.len());
         for &registry_slot in plan.registry_slots.iter() {
             let entry = self
@@ -1812,13 +1875,6 @@ impl HostFunctionRegistry {
         Ok(HostDispatchTemplate {
             entries: Arc::from(entries.into_boxed_slice()),
             schemas: Arc::clone(&plan.registry_schemas),
-            guarded_owned_schemas: Arc::from(
-                plan.registry_schemas
-                    .iter()
-                    .map(|schema| schema.as_ref().map(|schema| Arc::new(schema.clone())))
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            ),
             resolved_calls: Arc::clone(&plan.resolved_calls),
             allowed_builtin_calls: Arc::clone(&plan.allowed_builtin_calls),
             allowed_host_function_slots: Arc::clone(&plan.allowed_host_function_slots),
@@ -1858,17 +1914,7 @@ impl HostFunctionRegistry {
     fn plan_matches_current(&self, plan: &HostBindingPlan) -> bool {
         self.capability_profile.fingerprint() == plan.capability_fingerprint
             && self.capability_profile.as_ref() == plan.capability_profile.as_ref()
-            && Arc::ptr_eq(&self.registry_state, &plan.registry_state)
-            && Arc::ptr_eq(
-                &self.registry_generation_token,
-                &plan.registry_generation_token,
-            )
-            && self.registry_generation.load(Ordering::Relaxed) == plan.registry_generation
-            && self.registry_identity.current_matches(
-                &plan.registry_state,
-                &plan.registry_generation_token,
-                plan.registry_generation,
-            )
+            && self.snapshot_is_current(&plan.registry_snapshot)
     }
 
     fn plan_for_imports(
@@ -1954,7 +2000,12 @@ impl HostFunctionRegistry {
             let vm_slot = if let Some(&existing) = registry_slot_to_vm_slot.get(&registry_slot) {
                 existing
             } else {
-                let slot = registry_slots.len() as u16;
+                let slot = u16::try_from(registry_slots.len())
+                    .ok()
+                    .filter(|slot| *slot < u16::MAX)
+                    .ok_or_else(|| {
+                        VmError::HostError("host binding VM slot space exhausted".to_string())
+                    })?;
                 registry_slots.push(registry_slot);
                 registry_slot_to_vm_slot.insert(registry_slot, slot);
                 slot
@@ -1962,7 +2013,7 @@ impl HostFunctionRegistry {
             resolved_calls.push(vm_slot);
         }
 
-        let allowed_host_function_slots = imports
+        let mut allowed_host_function_slots = imports
             .iter()
             .zip(resolved_calls.iter().copied())
             .filter_map(|(import, vm_slot)| {
@@ -1971,6 +2022,8 @@ impl HostFunctionRegistry {
                     .then_some(vm_slot)
             })
             .collect::<Vec<_>>();
+        allowed_host_function_slots.sort_unstable();
+        allowed_host_function_slots.dedup();
         let import_key = imports.to_vec();
         let registry_schemas: Vec<Option<HostImportSchema>> = registry_slots
             .iter()
@@ -1997,14 +2050,23 @@ impl HostFunctionRegistry {
             allow_default_host_capabilities: self.allow_default_host_capabilities,
             capability_profile: Arc::clone(&self.capability_profile),
             capability_fingerprint: self.capability_profile.fingerprint(),
-            registry_state: Arc::clone(&self.registry_state),
-            registry_generation_token: Arc::clone(&self.registry_generation_token),
-            registry_generation: self.registry_generation.load(Ordering::Relaxed),
+            registry_snapshot: self.registry_snapshot(),
         });
+        computed.validate_layout(self.entries.len())?;
+        if !self.plan_matches_current(&computed) {
+            return Err(VmError::HostError(
+                "host binding plan became stale during construction".to_string(),
+            ));
+        }
         let mut cache = self
             .plan_cache
             .write()
             .expect("host binding plan cache write lock should not be poisoned");
+        if !self.plan_matches_current(&computed) {
+            return Err(VmError::HostError(
+                "host binding plan became stale before cache publication".to_string(),
+            ));
+        }
         cache.insert(cache_key, Arc::clone(&computed));
         Ok(computed)
     }
@@ -2031,20 +2093,12 @@ impl HostFunctionRegistry {
                 "host binding plan belongs to a different capability profile".to_string(),
             ));
         }
-        if !Arc::ptr_eq(&self.registry_state, &plan.registry_state) {
-            return Err(VmError::HostError(
-                "host binding plan belongs to a different registry state".to_string(),
-            ));
-        }
-        if !Arc::ptr_eq(
-            &self.registry_generation_token,
-            &plan.registry_generation_token,
-        ) || self.registry_generation.load(Ordering::Relaxed) != plan.registry_generation
-        {
+        if !self.plan_matches_current(plan) {
             return Err(VmError::HostError(
                 "host binding plan is stale for this registry".to_string(),
             ));
         }
+        plan.validate_layout(self.entries.len())?;
         if !vm.host.host_functions.is_empty() || !vm.host.host_function_symbols.is_empty() {
             return Err(VmError::HostError(
                 "host binding cache requires an unbound vm".to_string(),
@@ -2093,13 +2147,16 @@ impl HostFunctionRegistry {
                     vm.register_owned_function(function);
                 }
             }
-            let host_slot = vm.host.host_function_schemas.len() - 1;
-            vm.host.host_function_schemas.set(
-                host_slot,
-                plan.registry_schemas.get(host_slot).cloned().flatten(),
-            );
+        }
+        if vm.host.host_functions.len() != plan.registry_slots.len() {
+            return Err(VmError::HostError(
+                "host binding factory count does not match registry slot descriptors".to_string(),
+            ));
         }
         vm.set_default_host_fallback_enabled(false);
+        vm.host
+            .host_function_schemas
+            .replace_shared(Arc::clone(&plan.registry_schemas));
         vm.host.named_struct_schemas = Arc::clone(&self.named_struct_schemas);
         vm.host.allowed_builtin_calls = Arc::from(
             plan.allowed_builtin_calls
@@ -2118,6 +2175,15 @@ impl HostFunctionRegistry {
         vm.install_shared_resolved_calls(Arc::from(
             plan.resolved_calls.as_ref().to_vec().into_boxed_slice(),
         ))?;
+        if let Some(composition) = self.standard_composition.as_ref() {
+            vm.host.standard_composition = Some(Arc::clone(composition));
+        }
+        if !self.plan_matches_current(plan) {
+            return Err(VmError::HostError(
+                "host binding plan became stale during VM construction".to_string(),
+            ));
+        }
+        vm.host.mark_host_binding_locked();
         Ok(())
     }
 }
@@ -2128,21 +2194,18 @@ impl BoundHostProgram {
     }
 
     fn validate_current(&self) -> VmResult<()> {
-        if !Arc::ptr_eq(
-            &self.registry.capability_profile,
-            &self.plan.capability_profile,
-        ) {
-            return Err(VmError::HostError(
-                "bound host program belongs to a different capability profile".to_string(),
-            ));
-        }
-        if !self.registry_identity.current_matches(
-            &self.plan.registry_state,
-            &self.plan.registry_generation_token,
-            self.plan.registry_generation,
-        ) {
+        if !self.registry.plan_matches_current(&self.plan) {
             return Err(VmError::HostError(
                 "bound host program is stale for this registry".to_string(),
+            ));
+        }
+        if !self
+            .source_registry_snapshot
+            .identity
+            .current_matches(self.source_registry_snapshot.generation)
+        {
+            return Err(VmError::HostError(
+                "bound host program source registry is stale".to_string(),
             ));
         }
         Ok(())
@@ -2160,13 +2223,12 @@ impl BoundHostProgram {
                 "bound host program requires an unbound vm".to_string(),
             ));
         }
-        if self.dispatch.entries.len() != self.dispatch.schemas.len()
-            || self.dispatch.entries.len() != self.dispatch.guarded_owned_schemas.len()
-        {
+        if self.dispatch.entries.len() != self.dispatch.schemas.len() {
             return Err(VmError::HostError(
                 "bound host dispatch template is internally inconsistent".to_string(),
             ));
         }
+        self.plan.validate_layout(self.dispatch.entries.len())?;
 
         vm.host.host_functions.reserve(self.dispatch.entries.len());
         for (host_slot, entry) in self.dispatch.entries.iter().enumerate() {
@@ -2184,16 +2246,20 @@ impl BoundHostProgram {
                     let function = factory(OwnedHostContext {
                         registry: &self.registry,
                     });
-                    let function: Box<dyn HostOwnedFunction> =
-                        match self.dispatch.guarded_owned_schemas[host_slot].as_ref() {
-                            Some(schema) if schema_requires_guard(schema) => {
-                                Box::new(GuardedOwnedHostFunction {
-                                    inner: function,
-                                    schema: Arc::clone(schema),
-                                })
-                            }
-                            _ => function,
-                        };
+                    let function: Box<dyn HostOwnedFunction> = match self
+                        .dispatch
+                        .schemas
+                        .get(host_slot)
+                        .and_then(|schema| schema.as_ref())
+                    {
+                        Some(schema) if schema_requires_guard(schema) => {
+                            Box::new(GuardedOwnedHostFunction {
+                                inner: function,
+                                schema: Arc::new(schema.clone()),
+                            })
+                        }
+                        _ => function,
+                    };
                     VmHostFunction::OwnedDynamic(Some(function))
                 }
             };
@@ -2202,7 +2268,9 @@ impl BoundHostProgram {
         vm.host.resolved_calls_dirty = true;
 
         vm.host.allow_default_host_fallback = false;
-        vm.host.standard_composition = self.dispatch.standard_composition.clone();
+        if let Some(composition) = self.dispatch.standard_composition.as_ref() {
+            vm.host.standard_composition = Some(Arc::clone(composition));
+        }
         vm.host.named_struct_schemas = Arc::clone(&self.dispatch.named_struct_schemas);
         vm.host
             .host_function_schemas
@@ -2213,6 +2281,8 @@ impl BoundHostProgram {
             Arc::clone(&self.dispatch.allowed_host_function_slots);
         vm.host.allow_default_host_capabilities = self.plan.allow_default_host_capabilities;
         vm.install_shared_resolved_calls(Arc::clone(&self.dispatch.resolved_calls))?;
+        self.validate_current()?;
+        vm.host.mark_host_binding_locked();
         Ok(())
     }
 }
@@ -2697,8 +2767,22 @@ fn builtin_for_binding_name(name: &str) -> Option<BuiltinFunction> {
 }
 
 impl Vm {
+    fn next_host_function_slot(&self) -> Option<u16> {
+        u16::try_from(self.host.host_functions.len())
+            .ok()
+            .filter(|slot| *slot < u16::MAX)
+    }
+
     pub fn register_function(&mut self, function: Box<dyn HostFunction>) -> u16 {
-        let index = self.host.host_functions.len() as u16;
+        if self
+            .host
+            .reject_host_registration_mutation("register a host function")
+        {
+            return u16::MAX;
+        }
+        let Some(index) = self.next_host_function_slot() else {
+            return u16::MAX;
+        };
         self.host
             .host_functions
             .push(VmHostFunction::Dynamic(function));
@@ -2708,7 +2792,15 @@ impl Vm {
     }
 
     pub fn register_static_function(&mut self, function: StaticHostFunction) -> u16 {
-        let index = self.host.host_functions.len() as u16;
+        if self
+            .host
+            .reject_host_registration_mutation("register a static host function")
+        {
+            return u16::MAX;
+        }
+        let Some(index) = self.next_host_function_slot() else {
+            return u16::MAX;
+        };
         self.host
             .host_functions
             .push(VmHostFunction::Static(function));
@@ -2718,7 +2810,15 @@ impl Vm {
     }
 
     pub fn register_stack_function(&mut self, function: Box<dyn HostStackFunction>) -> u16 {
-        let index = self.host.host_functions.len() as u16;
+        if self
+            .host
+            .reject_host_registration_mutation("register a stack host function")
+        {
+            return u16::MAX;
+        }
+        let Some(index) = self.next_host_function_slot() else {
+            return u16::MAX;
+        };
         self.host
             .host_functions
             .push(VmHostFunction::StackDynamic(function));
@@ -2728,7 +2828,15 @@ impl Vm {
     }
 
     pub fn register_static_stack_function(&mut self, function: StaticHostStackFunction) -> u16 {
-        let index = self.host.host_functions.len() as u16;
+        if self
+            .host
+            .reject_host_registration_mutation("register a static stack host function")
+        {
+            return u16::MAX;
+        }
+        let Some(index) = self.next_host_function_slot() else {
+            return u16::MAX;
+        };
         self.host
             .host_functions
             .push(VmHostFunction::StackStatic(function));
@@ -2738,7 +2846,15 @@ impl Vm {
     }
 
     pub fn register_args_function(&mut self, function: Box<dyn HostArgsFunction>) -> u16 {
-        let index = self.host.host_functions.len() as u16;
+        if self
+            .host
+            .reject_host_registration_mutation("register an args host function")
+        {
+            return u16::MAX;
+        }
+        let Some(index) = self.next_host_function_slot() else {
+            return u16::MAX;
+        };
         self.host
             .host_functions
             .push(VmHostFunction::ArgsDynamic(function));
@@ -2748,7 +2864,15 @@ impl Vm {
     }
 
     pub fn register_static_args_function(&mut self, function: StaticHostArgsFunction) -> u16 {
-        let index = self.host.host_functions.len() as u16;
+        if self
+            .host
+            .reject_host_registration_mutation("register a static args host function")
+        {
+            return u16::MAX;
+        }
+        let Some(index) = self.next_host_function_slot() else {
+            return u16::MAX;
+        };
         self.host
             .host_functions
             .push(VmHostFunction::ArgsStatic(function));
@@ -2767,7 +2891,15 @@ impl Vm {
         &mut self,
         function: StaticHostArgsFunction,
     ) -> u16 {
-        let index = self.host.host_functions.len() as u16;
+        if self
+            .host
+            .reject_host_registration_mutation("register a non-yielding host function")
+        {
+            return u16::MAX;
+        }
+        let Some(index) = self.next_host_function_slot() else {
+            return u16::MAX;
+        };
         self.host
             .host_functions
             .push(VmHostFunction::ArgsStaticNonYielding(function));
@@ -2783,7 +2915,15 @@ impl Vm {
     /// the registry bind; this entry point exists for the bind path itself and
     /// for embeddings that compose their own slot table.
     pub fn register_owned_function(&mut self, function: Box<dyn HostOwnedFunction>) -> u16 {
-        let index = self.host.host_functions.len() as u16;
+        if self
+            .host
+            .reject_host_registration_mutation("register an owned host function")
+        {
+            return u16::MAX;
+        }
+        let Some(index) = self.next_host_function_slot() else {
+            return u16::MAX;
+        };
         self.host
             .host_functions
             .push(VmHostFunction::OwnedDynamic(Some(function)));
@@ -2793,6 +2933,12 @@ impl Vm {
     }
 
     pub fn bind_function(&mut self, name: impl Into<String>, function: Box<dyn HostFunction>) {
+        if self
+            .host
+            .reject_host_binding_mutation("replace a host function")
+        {
+            return;
+        }
         let name = name.into();
         if let Some(builtin) = builtin_for_binding_name(&name) {
             self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Dynamic(function));
@@ -2807,11 +2953,20 @@ impl Vm {
         }
 
         let index = self.register_function(function);
+        if index == u16::MAX {
+            return;
+        }
         self.host.host_function_symbols.insert(name, index);
         self.host.resolved_calls_dirty = true;
     }
 
     pub fn bind_static_function(&mut self, name: impl Into<String>, function: StaticHostFunction) {
+        if self
+            .host
+            .reject_host_binding_mutation("replace a static host function")
+        {
+            return;
+        }
         let name = name.into();
         if let Some(builtin) = builtin_for_binding_name(&name) {
             self.bind_builtin_overrideslot(builtin.call_index(), VmHostFunction::Static(function));
@@ -2826,6 +2981,9 @@ impl Vm {
         }
 
         let index = self.register_static_function(function);
+        if index == u16::MAX {
+            return;
+        }
         self.host.host_function_symbols.insert(name, index);
         self.host.resolved_calls_dirty = true;
     }
@@ -2835,6 +2993,12 @@ impl Vm {
         name: impl Into<String>,
         function: Box<dyn HostStackFunction>,
     ) {
+        if self
+            .host
+            .reject_host_binding_mutation("replace a stack host function")
+        {
+            return;
+        }
         let name = name.into();
         if let Some(&index) = self.host.host_function_symbols.get(&name)
             && let Some(slot) = self.host.host_functions.get_mut(index as usize)
@@ -2845,6 +3009,9 @@ impl Vm {
         }
 
         let index = self.register_stack_function(function);
+        if index == u16::MAX {
+            return;
+        }
         self.host.host_function_symbols.insert(name, index);
         self.host.resolved_calls_dirty = true;
     }
@@ -2854,6 +3021,12 @@ impl Vm {
         name: impl Into<String>,
         function: StaticHostStackFunction,
     ) {
+        if self
+            .host
+            .reject_host_binding_mutation("replace a static stack host function")
+        {
+            return;
+        }
         let name = name.into();
         if let Some(builtin) = builtin_for_binding_name(&name) {
             self.bind_builtin_overrideslot(
@@ -2871,6 +3044,9 @@ impl Vm {
         }
 
         let index = self.register_static_stack_function(function);
+        if index == u16::MAX {
+            return;
+        }
         self.host.host_function_symbols.insert(name, index);
         self.host.resolved_calls_dirty = true;
     }
@@ -2880,6 +3056,12 @@ impl Vm {
         name: impl Into<String>,
         function: Box<dyn HostArgsFunction>,
     ) {
+        if self
+            .host
+            .reject_host_binding_mutation("replace an args host function")
+        {
+            return;
+        }
         let name = name.into();
         if let Some(builtin) = builtin_for_binding_name(&name) {
             self.bind_builtin_overrideslot(
@@ -2897,6 +3079,9 @@ impl Vm {
         }
 
         let index = self.register_args_function(function);
+        if index == u16::MAX {
+            return;
+        }
         self.host.host_function_symbols.insert(name, index);
         self.host.resolved_calls_dirty = true;
     }
@@ -2906,6 +3091,12 @@ impl Vm {
         name: impl Into<String>,
         function: StaticHostArgsFunction,
     ) {
+        if self
+            .host
+            .reject_host_binding_mutation("replace a static args host function")
+        {
+            return;
+        }
         let name = name.into();
         if let Some(builtin) = builtin_for_binding_name(&name) {
             self.bind_builtin_overrideslot(
@@ -2923,6 +3114,9 @@ impl Vm {
         }
 
         let index = self.register_static_args_function(function);
+        if index == u16::MAX {
+            return;
+        }
         self.host.host_function_symbols.insert(name, index);
         self.host.resolved_calls_dirty = true;
     }
@@ -2938,6 +3132,12 @@ impl Vm {
         name: impl Into<String>,
         function: StaticHostArgsFunction,
     ) {
+        if self
+            .host
+            .reject_host_binding_mutation("replace a non-yielding host function")
+        {
+            return;
+        }
         let name = name.into();
         if let Some(builtin) = builtin_for_binding_name(&name) {
             self.bind_builtin_overrideslot(
@@ -2955,6 +3155,9 @@ impl Vm {
         }
 
         let index = self.register_static_non_yielding_args_function(function);
+        if index == u16::MAX {
+            return;
+        }
         self.host.host_function_symbols.insert(name, index);
         self.host.resolved_calls_dirty = true;
     }
@@ -2964,6 +3167,15 @@ impl Vm {
         name: impl Into<String>,
         function: Box<dyn HostFunction>,
     ) -> VmResult<()> {
+        if self
+            .host
+            .reject_host_binding_mutation("replace a builtin host function")
+        {
+            return Err(VmError::HostError(
+                "cannot replace a builtin host function after host binding; rebind a fresh VM"
+                    .to_string(),
+            ));
+        }
         let name = name.into();
         let builtin = BuiltinFunction::from_namespaced_name(&name).ok_or_else(|| {
             VmError::HostError(format!("unknown namespaced builtin override '{name}'"))
@@ -2977,6 +3189,15 @@ impl Vm {
         name: impl Into<String>,
         function: StaticHostFunction,
     ) -> VmResult<()> {
+        if self
+            .host
+            .reject_host_binding_mutation("replace a static builtin host function")
+        {
+            return Err(VmError::HostError(
+                "cannot replace a builtin host function after host binding; rebind a fresh VM"
+                    .to_string(),
+            ));
+        }
         let name = name.into();
         let builtin = BuiltinFunction::from_namespaced_name(&name).ok_or_else(|| {
             VmError::HostError(format!("unknown namespaced builtin override '{name}'"))
@@ -2986,19 +3207,29 @@ impl Vm {
     }
 
     fn bind_builtin_overrideslot(&mut self, builtin_call_index: u16, function: VmHostFunction) {
+        if self
+            .host
+            .reject_host_binding_mutation("replace a builtin host function")
+        {
+            return;
+        }
         if let Some(&host_slot) = self.host.builtin_overrides.get(&builtin_call_index)
             && let Some(slot) = self.host.host_functions.get_mut(host_slot as usize)
         {
             *slot = function;
+            self.host.resolved_calls_dirty = true;
             return;
         }
 
-        let host_slot = self.host.host_functions.len() as u16;
+        let Some(host_slot) = self.next_host_function_slot() else {
+            return;
+        };
         self.host.host_functions.push(function);
         self.host.host_function_schemas.push(None);
         self.host
             .builtin_overrides
             .insert(builtin_call_index, host_slot);
+        self.host.resolved_calls_dirty = true;
     }
 
     fn ensure_async_bridge_mutation_is_quiescent(&self, action: &str) -> VmResult<()> {
@@ -3070,6 +3301,13 @@ impl Vm {
     /// functions. The default remains enabled for backwards compatibility
     /// until a registry is bound.
     pub fn set_default_host_fallback_enabled(&mut self, enabled: bool) {
+        if self.host.host_binding_locked {
+            if self.host.allow_default_host_fallback != enabled {
+                self.host
+                    .reject_host_binding_mutation("change default host fallback");
+            }
+            return;
+        }
         self.host.allow_default_host_fallback = enabled;
         self.host.resolved_calls_dirty = true;
     }
@@ -3083,6 +3321,12 @@ impl Vm {
         &mut self,
         composition: Arc<dyn super::standard_composition::StandardSurfaceComposition>,
     ) {
+        if self
+            .host
+            .reject_host_binding_mutation("replace the standard surface composition")
+        {
+            return;
+        }
         self.host.standard_composition = Some(composition);
         self.host.resolved_calls_dirty = true;
     }
@@ -3741,15 +3985,12 @@ impl Vm {
         let composition = self.host.standard_composition.clone().ok_or_else(|| {
             VmError::HostError("standard surface composition is not installed".to_string())
         })?;
-        // Standard dispatch reads arguments from the current stack tail while mutating the VM.
-        // The composition must not mutate `self.instance.stack` until this borrowed slice is consumed.
-        let outcome = unsafe {
-            let args = std::slice::from_raw_parts_mut(
-                self.instance.stack.as_mut_ptr().add(arg_start),
-                argc,
-            );
-            composition.execute_builtin_call(self, builtin, args)
-        }?;
+        // Builtin implementations may mutate their argument slice (for example,
+        // by consuming a callable capture). Give them an owned scratch buffer so
+        // the VM stack is never aliased with the mutable `&mut Vm` borrow passed
+        // to the composition.
+        let mut args = self.instance.stack[arg_start..].to_vec();
+        let outcome = composition.execute_builtin_call(self, builtin, &mut args)?;
 
         match outcome {
             CallOutcome::Return(values) => {
@@ -4354,6 +4595,7 @@ impl Vm {
         let mut saved_stack = std::mem::take(&mut self.instance.stack);
         self.instance.call_depth += 1;
         let args = saved_stack.split_off(arg_start);
+        self.host.begin_owned_dispatch_mutation();
         let (call_result, untaken) = {
             let mut call = OwnedHostCall::new(self, args);
             let call_result =
@@ -4368,6 +4610,7 @@ impl Vm {
             let untaken = call.into_untaken_args();
             (call_result, untaken)
         };
+        self.host.end_owned_dispatch_mutation();
 
         // Restore the function after the call has released every borrow of the
         // VM. Appending is the defensive fallback for a host handler that
@@ -4803,6 +5046,7 @@ impl Vm {
     }
 
     pub(super) fn ensure_call_bindings(&mut self) -> VmResult<()> {
+        self.host.validate_host_binding_mutation()?;
         if self.program.imports.is_empty() || !self.host.resolved_calls_dirty {
             return Ok(());
         }
@@ -4834,9 +5078,13 @@ impl Vm {
         for (index, import) in imports.iter().enumerate() {
             if use_legacy_order {
                 if index >= self.host.host_functions.len() {
-                    return Err(VmError::InvalidCall(index as u16));
+                    return Err(VmError::InvalidCall(
+                        u16::try_from(index).unwrap_or(u16::MAX),
+                    ));
                 }
-                resolved.push(index as u16);
+                resolved.push(u16::try_from(index).map_err(|_| {
+                    VmError::HostError("legacy host dispatch slot space exhausted".to_string())
+                })?);
                 continue;
             }
 

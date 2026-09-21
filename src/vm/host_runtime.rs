@@ -60,18 +60,8 @@ impl HostFunctionSchemas {
             .get_or_insert_with(|| self.shared.as_ref().to_vec())
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.owned.as_ref().map_or(self.shared.len(), Vec::len)
-    }
-
     pub(crate) fn push(&mut self, schema: Option<HostImportSchema>) {
         self.owned_values().push(schema);
-    }
-
-    pub(crate) fn set(&mut self, index: usize, schema: Option<HostImportSchema>) {
-        if let Some(slot) = self.owned_values().get_mut(index) {
-            *slot = schema;
-        }
     }
 
     pub(crate) fn replace_shared(&mut self, schemas: Arc<[Option<HostImportSchema>]>) {
@@ -111,6 +101,15 @@ pub(crate) struct HostRuntime {
     pub(crate) host_function_schemas: HostFunctionSchemas,
     pub(crate) host_function_symbols: HashMap<String, u16>,
     pub(crate) builtin_overrides: HashMap<u16, u16>,
+    /// Once a registry plan has been installed, host dispatch slots are
+    /// immutable. Legacy mutation APIs record a permanent error instead of
+    /// changing the positional table behind the plan.
+    pub(crate) host_binding_locked: bool,
+    pub(crate) host_binding_mutation_error: Option<String>,
+    /// A guarded owned handler may append a legacy slot for its own internal
+    /// bookkeeping. Existing bound slots remain immutable and the resolved
+    /// import map is never marked dirty during this narrow scope.
+    pub(crate) owned_dispatch_mutation_depth: usize,
     pub(crate) resolved_calls: Arc<[u16]>,
     pub(crate) resolved_calls_dirty: bool,
     pub(crate) async_bridge: Option<Box<dyn HostAsyncBridge>>,
@@ -199,6 +198,9 @@ impl HostRuntime {
             host_function_schemas: HostFunctionSchemas::new(),
             host_function_symbols: HashMap::new(),
             builtin_overrides: HashMap::new(),
+            host_binding_locked: false,
+            host_binding_mutation_error: None,
+            owned_dispatch_mutation_depth: 0,
             resolved_calls: Arc::from(Vec::new().into_boxed_slice()),
             resolved_calls_dirty: true,
             async_bridge: None,
@@ -237,6 +239,55 @@ impl HostRuntime {
     /// Whether the default builtin capability set is enabled.
     pub(crate) fn default_builtin_capabilities_enabled(&self) -> bool {
         self.allow_default_builtin_capabilities
+    }
+
+    pub(crate) fn reject_host_binding_mutation(&mut self, action: &str) -> bool {
+        if !self.host_binding_locked {
+            return false;
+        }
+        if self.host_binding_mutation_error.is_none() {
+            self.host_binding_mutation_error = Some(format!(
+                "cannot {action} after host binding; rebind a fresh VM"
+            ));
+        }
+        true
+    }
+
+    pub(crate) fn bound_registration_is_allowed(&self) -> bool {
+        !self.host_binding_locked || self.owned_dispatch_mutation_depth > 0
+    }
+
+    pub(crate) fn reject_host_registration_mutation(&mut self, action: &str) -> bool {
+        if self.bound_registration_is_allowed() {
+            false
+        } else {
+            self.reject_host_binding_mutation(action)
+        }
+    }
+
+    pub(crate) fn begin_owned_dispatch_mutation(&mut self) {
+        self.owned_dispatch_mutation_depth = self.owned_dispatch_mutation_depth.saturating_add(1);
+    }
+
+    pub(crate) fn end_owned_dispatch_mutation(&mut self) {
+        self.owned_dispatch_mutation_depth = self.owned_dispatch_mutation_depth.saturating_sub(1);
+        if self.owned_dispatch_mutation_depth == 0 && self.host_binding_locked {
+            // Append-only registrations during an owned call never change the
+            // already-installed import map. Do not let the legacy dirty flag
+            // trigger positional remapping on the next guest call.
+            self.resolved_calls_dirty = false;
+        }
+    }
+
+    pub(crate) fn mark_host_binding_locked(&mut self) {
+        self.host_binding_locked = true;
+    }
+
+    pub(crate) fn validate_host_binding_mutation(&self) -> VmResult<()> {
+        if let Some(error) = self.host_binding_mutation_error.as_ref() {
+            return Err(VmError::HostError(error.clone()));
+        }
+        Ok(())
     }
 
     pub(crate) fn reserve_submitted_host_op(&mut self) -> VmResult<HostOpId> {
