@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use vm::{
     CallOutcome, CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput,
-    HostOpId, HttpConfig, HttpHostExt, Program, Value, Vm, VmError, VmResult, VmStatus,
-    compile_source,
+    HostOpId, HttpConfig, HttpHostExt, HttpWorkerResources, Program, Value, Vm, VmError, VmResult,
+    VmStatus, compile_source,
 };
 
 #[derive(Default)]
@@ -163,6 +163,11 @@ fn local_http_config(port: u16) -> HttpConfig {
     }
 }
 
+fn configure_http(vm: &mut Vm, config: HttpConfig) -> VmResult<()> {
+    let mut resources = HttpWorkerResources::new();
+    let lease = resources.client_for(&config)?;
+    vm.configure_http(config, lease)
+}
 fn spawn_test_server() -> (u16, thread::JoinHandle<()>) {
     let listener = bind_test_listener();
     let port = listener
@@ -508,8 +513,7 @@ async fn run_raw_response(response: Vec<u8>, mut config: HttpConfig) -> Result<V
     config.allowed_ports = vec![port];
     config.allow_private_ips = true;
     let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
-    vm.configure_http(config)
-        .expect("raw-response HTTP configuration should be valid");
+    configure_http(&mut vm, config).expect("raw-response HTTP configuration should be valid");
     install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -523,8 +527,7 @@ async fn run_raw_response(response: Vec<u8>, mut config: HttpConfig) -> Result<V
 async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
     let (port, server) = spawn_test_server();
     let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
-    vm.configure_http(local_http_config(port))
-        .expect("HTTP configuration should be valid");
+    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -546,8 +549,7 @@ async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
 async fn http_client_pool_reuses_a_connection_across_vm_reset() {
     let (port, accepted_connections, server) = spawn_keep_alive_server();
     let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
-    vm.configure_http(local_http_config(port))
-        .expect("HTTP configuration should be valid");
+    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -567,7 +569,7 @@ async fn http_client_pool_reuses_a_connection_across_vm_reset() {
             .recv_timeout(TEST_IO_TIMEOUT)
             .expect("server should report connection count"),
         1,
-        "the per-VM Hyper client must retain and reuse its pooled connection"
+        "the embedding-owned worker Hyper client must retain and reuse its pooled connection"
     );
     server.join().expect("keep-alive server should finish");
 }
@@ -647,8 +649,7 @@ async fn buffered_request_preserves_duplicate_header_order() {
     );
     let compiled = compile_source(&source).expect("duplicate headers should compile");
     let mut vm = Vm::new(compiled.program);
-    vm.configure_http(local_http_config(port))
-        .expect("HTTP configuration should be valid");
+    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -678,7 +679,7 @@ async fn buffered_redirect_rewrites_only_post_for_301_and_302() {
                 &format!("http://127.0.0.1:{port}/start"),
                 method,
             ));
-            vm.configure_http(local_http_config(port))
+            configure_http(&mut vm, local_http_config(port))
                 .expect("HTTP configuration should be valid");
             install_host_driver(&mut vm);
             HostFunctionRegistry::new()
@@ -730,8 +731,7 @@ async fn buffered_cross_origin_redirect_strips_credentials_and_custom_headers() 
             &format!("http://127.0.0.1:{source_port}/start"),
             "POST",
         ));
-        vm.configure_http(http_config)
-            .expect("HTTP configuration should be valid");
+        configure_http(&mut vm, http_config).expect("HTTP configuration should be valid");
         install_host_driver(&mut vm);
         HostFunctionRegistry::new()
             .bind_vm_cached(&mut vm)
@@ -817,7 +817,7 @@ async fn buffered_same_origin_redirect_preserves_caller_header_values() {
             &format!("http://127.0.0.1:{port}/start"),
             "POST",
         ));
-        vm.configure_http(local_http_config(port))
+        configure_http(&mut vm, local_http_config(port))
             .expect("HTTP configuration should be valid");
         install_host_driver(&mut vm);
         HostFunctionRegistry::new()
@@ -941,8 +941,7 @@ async fn buffered_redirect_chain_reaches_final_body() {
     let mut vm = Vm::new(build_request_program(format!(
         "http://127.0.0.1:{port}/start"
     )));
-    vm.configure_http(local_http_config(port))
-        .expect("HTTP configuration should be valid");
+    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -1144,7 +1143,7 @@ async fn tls_handshake_obeys_connect_phase_timeout() {
     config.allowed_schemes = vec!["https".to_string()];
     config.connect_timeout = std::time::Duration::from_millis(25);
     config.request_timeout = std::time::Duration::from_millis(500);
-    vm.configure_http(config).unwrap();
+    configure_http(&mut vm, config).unwrap();
     install_host_driver(&mut vm);
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
 
@@ -1177,7 +1176,7 @@ async fn max_stream_duration_does_not_shorten_buffered_requests() {
     let mut buffered_config = local_http_config(port);
     buffered_config.max_stream_duration = std::time::Duration::from_millis(1);
     buffered_config.request_timeout = std::time::Duration::from_millis(200);
-    vm.configure_http(buffered_config).unwrap();
+    configure_http(&mut vm, buffered_config).unwrap();
     install_host_driver(&mut vm);
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
     drive_vm_to_halt(&mut vm).await.unwrap();
@@ -1188,13 +1187,16 @@ async fn max_stream_duration_does_not_shorten_buffered_requests() {
 #[tokio::test(flavor = "current_thread")]
 async fn explicitly_allowed_http_capability_reaches_http_policy() {
     let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
-    vm.configure_http(HttpConfig {
-        allowed_schemes: vec!["http".to_string()],
-        allowed_hosts: vec!["127.0.0.1".to_string()],
-        allowed_ports: vec![1],
-        allow_private_ips: true,
-        ..HttpConfig::default()
-    })
+    configure_http(
+        &mut vm,
+        HttpConfig {
+            allowed_schemes: vec!["http".to_string()],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            allowed_ports: vec![1],
+            allow_private_ips: true,
+            ..HttpConfig::default()
+        },
+    )
     .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     let mut registry = HostFunctionRegistry::restricted();
@@ -1214,14 +1216,17 @@ async fn explicitly_allowed_http_capability_reaches_http_policy() {
 fn http_in_flight_limit_rejects_before_starting_a_request() {
     let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
     vm.set_http_max_in_flight(0);
-    vm.configure_http(HttpConfig {
-        allowed_schemes: vec!["http".to_string()],
-        allowed_hosts: vec!["127.0.0.1".to_string()],
-        allowed_ports: vec![1],
-        allow_private_ips: true,
+    configure_http(
+        &mut vm,
+        HttpConfig {
+            allowed_schemes: vec!["http".to_string()],
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+            allowed_ports: vec![1],
+            allow_private_ips: true,
 
-        ..HttpConfig::default()
-    })
+            ..HttpConfig::default()
+        },
+    )
     .expect("HTTP configuration should be valid");
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -1281,12 +1286,14 @@ fn http_config_accepts_bounded_stream_defaults_and_rejects_zero_bounds() {
     }
 
     let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
-    let error = vm
-        .configure_http(HttpConfig {
+    let error = configure_http(
+        &mut vm,
+        HttpConfig {
             max_stream_item_bytes: 0,
             ..HttpConfig::default()
-        })
-        .expect_err("configuration must reject a zero stream bound");
+        },
+    )
+    .expect_err("configuration must reject a zero stream bound");
     assert!(error.to_string().contains("max_stream_item_bytes"));
     assert!(!vm.http_is_configured());
 }
@@ -1303,8 +1310,7 @@ fn http_config_rejects_request_timeout_that_cannot_form_a_deadline() {
     assert!(validation_error.to_string().contains("request_timeout"));
 
     let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
-    let configure_error = vm
-        .configure_http(invalid)
+    let configure_error = configure_http(&mut vm, invalid)
         .expect_err("configuration must reject an overflowing request timeout");
     assert!(configure_error.to_string().contains("request_timeout"));
     assert!(!vm.http_is_configured());
@@ -1319,8 +1325,7 @@ fn http_config_rejects_request_timeout_that_cannot_form_a_deadline() {
     assert!(validation_error.to_string().contains("max_stream_duration"));
 
     let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
-    let configure_error = vm
-        .configure_http(invalid)
+    let configure_error = configure_http(&mut vm, invalid)
         .expect_err("configuration must reject an overflowing stream duration");
     assert!(configure_error.to_string().contains("max_stream_duration"));
     assert!(!vm.http_is_configured());
@@ -1435,8 +1440,7 @@ async fn reset_retires_buffered_http_future_and_releases_its_permit() {
     let (port, ready, server) = spawn_pending_then_response_server();
     let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
     vm.set_http_max_in_flight(1);
-    vm.configure_http(local_http_config(port))
-        .expect("HTTP configuration should be valid");
+    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -1469,7 +1473,7 @@ async fn shutdown_and_drop_retire_buffered_http_futures() {
         let (port, ready, server) = spawn_pending_server();
         let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
         vm.set_http_max_in_flight(1);
-        vm.configure_http(local_http_config(port))
+        configure_http(&mut vm, local_http_config(port))
             .expect("HTTP configuration should be valid");
         install_host_driver(&mut vm);
         HostFunctionRegistry::new()
@@ -1496,8 +1500,7 @@ async fn shutdown_and_drop_retire_buffered_http_futures() {
 fn http_config_and_max_policy_are_persistent_while_clear_removes_only_config() {
     let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
     vm.set_http_max_in_flight(2);
-    vm.configure_http(local_http_config(1))
-        .expect("HTTP config should be valid");
+    configure_http(&mut vm, local_http_config(1)).expect("HTTP config should be valid");
     assert_eq!(vm.http_max_in_flight(), 2);
     assert!(vm.http_is_configured());
 
@@ -1543,8 +1546,7 @@ fn set_max_in_flight_updates_policy_without_eagerly_creating_runtime_state() {
     // A lazily created admission reads the current persistent max: with max 0
     // the first request is rejected before any connection is attempted.
     vm.set_http_max_in_flight(0);
-    vm.configure_http(local_http_config(1))
-        .expect("HTTP config should be valid");
+    configure_http(&mut vm, local_http_config(1)).expect("HTTP config should be valid");
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");

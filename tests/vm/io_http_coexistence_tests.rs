@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use vm::{
     CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HostOpId,
-    HttpConfig, HttpHostExt, IoHostExt, IoPolicy, Value, Vm, VmError, VmResult, VmStatus,
-    compile_source, register_http_builtin_module, standard_host_catalog,
+    HttpConfig, HttpHostExt, HttpWorkerResources, IoHostExt, IoPolicy, Value, Vm, VmError,
+    VmResult, VmStatus, compile_source, register_http_builtin_module, standard_host_catalog,
 };
 
 #[derive(Default)]
@@ -91,6 +91,12 @@ fn local_http_config(port: u16) -> HttpConfig {
         request_timeout: Duration::from_secs(5),
         ..HttpConfig::default()
     }
+}
+
+fn configure_http(vm: &mut Vm, config: HttpConfig) -> VmResult<()> {
+    let mut resources = HttpWorkerResources::new();
+    let lease = resources.client_for(&config)?;
+    vm.configure_http(config, lease)
 }
 
 fn spawn_http_server(requests: usize) -> (u16, thread::JoinHandle<()>) {
@@ -174,8 +180,7 @@ async fn io_and_http_both_register_via_shared_vm() {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
     });
-    vm.configure_http(HttpConfig::default())
-        .expect("HTTP configuration should be valid");
+    configure_http(&mut vm, HttpConfig::default()).expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
 
@@ -203,8 +208,7 @@ async fn io_and_http_execute_together() {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
     });
-    vm.configure_http(local_http_config(port))
-        .expect("HTTP configuration should be valid");
+    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
 
@@ -227,8 +231,7 @@ async fn io_policy_persists_independently_of_http_config() {
     .expect("source should compile");
     let mut vm = Vm::new(compiled.program);
     vm.configure_io(IoPolicy::default());
-    vm.configure_http(HttpConfig::default())
-        .expect("HTTP configuration should be valid");
+    configure_http(&mut vm, HttpConfig::default()).expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
 
@@ -254,8 +257,7 @@ async fn http_config_persists_independently_of_io_config() {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
     });
-    vm.configure_http(local_http_config(port))
-        .expect("HTTP configuration should be valid");
+    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
 
@@ -286,8 +288,7 @@ async fn io_and_http_coexist_through_vm_reset_cycle() {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
     });
-    vm.configure_http(HttpConfig::default())
-        .expect("HTTP configuration should be valid");
+    configure_http(&mut vm, HttpConfig::default()).expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
 
@@ -320,8 +321,7 @@ async fn worker_cleanup_reaches_quiescence_after_io_and_http() {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
     });
-    vm.configure_http(local_http_config(port))
-        .expect("HTTP configuration should be valid");
+    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
 
@@ -363,8 +363,7 @@ async fn io_and_http_module_states_are_independent() {
         max_write_bytes: 4096,
         ..IoPolicy::default()
     });
-    vm.configure_http(HttpConfig::default())
-        .expect("HTTP configuration should be valid");
+    configure_http(&mut vm, HttpConfig::default()).expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
     drive_vm_to_halt(&mut vm)
@@ -441,8 +440,7 @@ async fn combined_standard_http_exact_bind_executes_with_io_surface_present() {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
     });
-    vm.configure_http(local_http_config(port))
-        .expect("HTTP configuration should be valid");
+    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     registry
         .bind_vm_cached(&mut vm)

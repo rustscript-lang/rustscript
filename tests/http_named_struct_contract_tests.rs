@@ -17,8 +17,8 @@ use vm::compiler::{
 };
 use vm::{
     CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HostOpId,
-    HostStructSchema, HostTypeSchema, HttpConfig, HttpHostExt, Value, Vm, VmError, VmResult,
-    VmStatus, catalog_import_schemas, compile_source, http_host_catalog,
+    HostStructSchema, HostTypeSchema, HttpConfig, HttpHostExt, HttpWorkerResources, Value, Vm,
+    VmError, VmResult, VmStatus, catalog_import_schemas, compile_source, http_host_catalog,
     register_http_builtin_module, standard_host_catalog,
 };
 
@@ -779,7 +779,10 @@ fn local_http_config(port: u16) -> HttpConfig {
 fn bind_http_vm(source: &str, port: u16) -> Vm {
     let compiled = compile_with_http_catalog(source).expect("source should compile");
     let mut vm = Vm::try_new(compiled.program).expect("vm");
-    vm.configure_http(local_http_config(port)).expect("config");
+    let mut resources = HttpWorkerResources::new();
+    let config = local_http_config(port);
+    let lease = resources.client_for(&config).expect("config");
+    vm.configure_http(config, lease).expect("config");
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
     standard_http_registry()
@@ -928,7 +931,10 @@ fn null_sse_timeout_is_treated_as_omitted() {
     let compiled = compile_with_http_catalog(source).expect("null timeout_ms should compile");
     let mut vm = Vm::try_new(compiled.program).expect("vm");
     vm.set_http_max_in_flight(0);
-    vm.configure_http(local_http_config(1)).expect("config");
+    let mut resources = HttpWorkerResources::new();
+    let config = local_http_config(1);
+    let lease = resources.client_for(&config).expect("config");
+    vm.configure_http(config, lease).expect("config");
     standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("bind");

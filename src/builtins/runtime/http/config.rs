@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::vm::{VmError, VmResult};
 
 /// Bounded network policy for the built-in HTTP client and future streaming adapters.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct HttpConfig {
     pub allowed_schemes: Vec<String>,
     pub allowed_hosts: Vec<String>,

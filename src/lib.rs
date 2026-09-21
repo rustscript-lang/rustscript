@@ -58,7 +58,8 @@ pub(crate) fn install_default_host_functions(registry: &mut vm::HostFunctionRegi
     not(target_family = "wasm")
 ))]
 pub use builtins::runtime::http::{
-    HttpConfig, HttpExtension, HttpHostExt, http_host_catalog, register_http_builtin_module,
+    HttpClientLease, HttpConfig, HttpExtension, HttpHostExt, HttpWorkerResources,
+    HttpWorkerShutdown, http_host_catalog, register_http_builtin_module,
     register_http_builtin_module_from_catalog,
 };
 #[cfg(feature = "runtime")]

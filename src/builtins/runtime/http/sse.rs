@@ -662,7 +662,7 @@ async fn open_sse_response(
             }
         }
         opened = open_stream_response(
-            &context.http.client,
+            context.http.client.client(),
             &context.http.config,
             request,
             context.deadline,

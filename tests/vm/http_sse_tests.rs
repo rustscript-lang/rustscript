@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use vm::operation::OperationCancelReason;
 use vm::{
     CallOutcome, CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput,
-    HostOpId, HostStackFunction, HttpConfig, HttpHostExt, Value, Vm, VmError, VmMap, VmResult,
-    VmStatus, compile_source,
+    HostOpId, HostStackFunction, HttpConfig, HttpHostExt, HttpWorkerResources, Value, Vm, VmError,
+    VmMap, VmResult, VmStatus, compile_source,
 };
 
 #[derive(Default)]
@@ -178,10 +178,15 @@ async fn reset_and_wait(vm: &mut Vm) -> VmResult<()> {
     std::future::poll_fn(|cx| vm.poll_reset_for_reuse(cx)).await
 }
 
+fn configure_http(vm: &mut Vm, config: HttpConfig) -> VmResult<()> {
+    let mut resources = HttpWorkerResources::new();
+    let lease = resources.client_for(&config)?;
+    vm.configure_http(config, lease)
+}
 async fn run_sse_source(source: &str, config: HttpConfig) -> Result<Vm, vm::VmError> {
     let compiled = compile_source(source).expect("SSE source should compile");
     let mut vm = Vm::new(compiled.program);
-    vm.configure_http(config).unwrap();
+    configure_http(&mut vm, config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
@@ -500,7 +505,7 @@ async fn sse_delivers_open_events_end_and_terminal_summary() {
     );
     let compiled = compile_source(&source).expect("SSE source should compile");
     let mut vm = Vm::new(compiled.program);
-    vm.configure_http(config(port)).unwrap();
+    configure_http(&mut vm, config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
@@ -538,7 +543,7 @@ async fn sse_callback_inspects_typed_open_headers() {
     );
     let compiled = compile_source(&source).expect("SSE source should compile");
     let mut vm = Vm::new(compiled.program);
-    vm.configure_http(config(port)).unwrap();
+    configure_http(&mut vm, config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
     let mut registry = HostFunctionRegistry::new();
@@ -568,7 +573,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
     )
     .expect("the structural callback reaches runtime schema validation");
     let mut vm = Vm::new(compiled.program);
-    vm.configure_http(config(1)).unwrap();
+    configure_http(&mut vm, config(1)).unwrap();
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
     let error = vm
         .run()
@@ -594,7 +599,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
         let compiled = compile_source(&source).unwrap();
         let mut vm = Vm::new(compiled.program);
         vm.set_http_max_in_flight(0);
-        vm.configure_http(config(1)).unwrap();
+        configure_http(&mut vm, config(1)).unwrap();
         HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
         let error = vm.run().unwrap_err();
         assert!(error.to_string().contains(expected), "{timeout}: {error}");
@@ -630,7 +635,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
     let compiled = compile_source(source).unwrap();
     let mut vm = Vm::new(compiled.program);
     vm.set_http_max_in_flight(0);
-    vm.configure_http(config(1)).unwrap();
+    configure_http(&mut vm, config(1)).unwrap();
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
     let error = vm.run().unwrap_err();
     assert!(
@@ -648,7 +653,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
     "#;
     let compiled = compile_source(source).unwrap();
     let mut vm = Vm::new(compiled.program);
-    vm.configure_http(config(1)).unwrap();
+    configure_http(&mut vm, config(1)).unwrap();
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
     let error = vm.run().unwrap_err();
     assert!(error.to_string().contains("GET or POST"), "{error}");
@@ -666,7 +671,7 @@ fn sse_admission_does_not_require_a_tokio_reactor() {
     "#;
     let compiled = compile_source(source).unwrap();
     let mut vm = Vm::new(compiled.program);
-    vm.configure_http(config(1)).unwrap();
+    configure_http(&mut vm, config(1)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
@@ -980,7 +985,7 @@ async fn sse_rejected_nested_admission_rolls_back_before_reset_reuse() {
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
     vm.set_http_max_in_flight(2);
-    vm.configure_http(config(port)).unwrap();
+    configure_http(&mut vm, config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
@@ -1033,7 +1038,7 @@ async fn sse_reset_releases_the_connection_permit_before_reuse() {
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
     vm.set_http_max_in_flight(1);
-    vm.configure_http(config(port)).unwrap();
+    configure_http(&mut vm, config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
@@ -1088,7 +1093,7 @@ async fn sse_reset_while_callback_waits_retires_stream_to_quiescence() {
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
     vm.set_http_max_in_flight(1);
-    vm.configure_http(config(port)).unwrap();
+    configure_http(&mut vm, config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
     let wait_calls = Arc::new(AtomicUsize::new(0));
@@ -1278,7 +1283,7 @@ async fn sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout
     );
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
-    vm.configure_http(deadline_config).unwrap();
+    configure_http(&mut vm, deadline_config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
     let mut registry = HostFunctionRegistry::new();
@@ -1336,7 +1341,7 @@ async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
     let mut deadline_config = config(port);
     deadline_config.max_stream_duration = std::time::Duration::from_millis(20);
     deadline_config.stream_idle_timeout = std::time::Duration::from_millis(200);
-    vm.configure_http(deadline_config).unwrap();
+    configure_http(&mut vm, deadline_config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
@@ -1401,7 +1406,7 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
     let mut deadline_config = config(port);
     deadline_config.max_stream_duration = std::time::Duration::from_millis(100);
     deadline_config.stream_idle_timeout = std::time::Duration::from_secs(1);
-    vm.configure_http(deadline_config).unwrap();
+    configure_http(&mut vm, deadline_config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
     let wait_calls = Arc::new(AtomicUsize::new(0));
@@ -1474,7 +1479,7 @@ async fn sse_callback_continue_after_deadline_fails_before_another_network_poll(
     let mut deadline_config = config(port);
     deadline_config.max_stream_duration = std::time::Duration::from_millis(100);
     deadline_config.stream_idle_timeout = std::time::Duration::from_secs(1);
-    vm.configure_http(deadline_config).unwrap();
+    configure_http(&mut vm, deadline_config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
     let wait_calls = Arc::new(AtomicUsize::new(0));

@@ -1,4 +1,8 @@
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use pd_host_function::pd_host_function;
@@ -21,41 +25,174 @@ use policy::{ConnectionAdmission, ConnectionPermit};
 
 const DEFAULT_MAX_HTTP_IN_FLIGHT: usize = 64;
 
-/// Persistent, per-VM HTTP module state.
-///
-/// Lives outside the invocation execution scope: it is installed through the
-/// generic module-state store and deliberately survives
-/// [`Vm::reset_for_reuse`] and scope close. The in-flight admission counter is
-/// shared (via [`Arc`]) with every live connection permit; the last one to
-/// drop decrements it, so it stays authoritative across resets without the
-/// core ever counting connections by class.
-struct HttpHostState {
-    config: Option<HttpConfig>,
-    admission: ConnectionAdmission,
+struct HttpClientEntry {
+    config: HttpConfig,
     client: request::HttpClient,
+    admission: ConnectionAdmission,
 }
 
-impl Default for HttpHostState {
-    fn default() -> Self {
-        let config = HttpConfig::default();
+/// Opaque, cloneable access to one embedding-owned Hyper client.
+///
+/// Cloning this lease shares the client, connector, connection pool, and
+/// admission state. The lease does not expose Hyper types to embedders and can
+/// safely be captured by request-owned futures.
+#[derive(Clone)]
+pub struct HttpClientLease {
+    entry: Arc<HttpClientEntry>,
+}
+
+impl HttpClientLease {
+    fn matches_config(&self, config: &HttpConfig) -> bool {
+        self.entry.config == *config
+    }
+
+    fn acquire(&self) -> VmResult<ConnectionPermit> {
+        self.entry.admission.acquire()
+    }
+
+    fn client(&self) -> &request::HttpClient {
+        &self.entry.client
+    }
+
+    fn set_max_in_flight(&self, max_in_flight: usize) {
+        self.entry.admission.set_max_in_flight(max_in_flight);
+    }
+
+    fn max_in_flight(&self) -> usize {
+        self.entry.admission.max_in_flight()
+    }
+}
+
+/// Embedding-owned HTTP clients and their shared admission state.
+///
+/// One resource owner may be held for a worker lifetime. A client is built once
+/// for each full [`HttpConfig`] identity and is reused by every VM that receives
+/// a lease from this resource. Hyper and hyper-util remain the owners of
+/// connectors, sockets, pools, and connection drivers.
+pub struct HttpWorkerResources {
+    clients: HashMap<HttpConfig, Arc<HttpClientEntry>>,
+    max_in_flight: usize,
+    admission_open: bool,
+}
+
+impl HttpWorkerResources {
+    /// Creates an empty worker resource owner with the default admission cap.
+    pub fn new() -> Self {
+        Self::with_max_in_flight(DEFAULT_MAX_HTTP_IN_FLIGHT)
+    }
+
+    /// Creates an empty worker resource owner with an explicit admission cap.
+    pub fn with_max_in_flight(max_in_flight: usize) -> Self {
         Self {
-            config: None,
-            admission: ConnectionAdmission::new(DEFAULT_MAX_HTTP_IN_FLIGHT),
-            client: request::build_client(&config),
+            clients: HashMap::new(),
+            max_in_flight,
+            admission_open: true,
+        }
+    }
+
+    /// Returns the shared client lease for a complete HTTP policy identity.
+    ///
+    /// Configuration validation runs before client lookup. Once admission is
+    /// closed, no new lease or request permit can be created; existing leases
+    /// remain owned by their callers until they are dropped.
+    pub fn client_for(&mut self, config: &HttpConfig) -> VmResult<HttpClientLease> {
+        config.validate()?;
+        if !self.admission_open {
+            return Err(VmError::HostError(
+                "HTTP worker resource admission is closed".to_string(),
+            ));
+        }
+        if let Some(entry) = self.clients.get(config) {
+            return Ok(HttpClientLease {
+                entry: Arc::clone(entry),
+            });
+        }
+        let entry = Arc::new(HttpClientEntry {
+            config: config.clone(),
+            client: request::build_client(config),
+            admission: ConnectionAdmission::new(self.max_in_flight),
+        });
+        self.clients.insert(config.clone(), Arc::clone(&entry));
+        Ok(HttpClientLease { entry })
+    }
+
+    /// Updates the shared admission cap for existing and future policy keys.
+    pub fn set_max_in_flight(&mut self, max_in_flight: usize) {
+        self.max_in_flight = max_in_flight;
+        for entry in self.clients.values() {
+            entry.admission.set_max_in_flight(max_in_flight);
+        }
+    }
+
+    /// Returns the configured worker-level admission cap.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight
+    }
+
+    /// Stops new leases and request permits while allowing existing permits to
+    /// retire normally.
+    pub fn close_admission(&mut self) {
+        self.admission_open = false;
+        for entry in self.clients.values() {
+            entry.admission.close();
+        }
+    }
+
+    /// Moves the worker-owned clients into an owned, non-blocking shutdown
+    /// future. The future contains no VM, request, or raw-pointer borrow.
+    pub fn into_shutdown(mut self) -> HttpWorkerShutdown {
+        self.close_admission();
+        HttpWorkerShutdown {
+            clients: Some(self.clients),
         }
     }
 }
 
-/// HTTP host configuration owned by the HTTP host implementation.
+impl Default for HttpWorkerResources {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Owned cleanup state for one [`HttpWorkerResources`] instance.
 ///
-/// Configuration is persistent module state, *outside* invocation resources:
-/// [`configure_http`](Self::configure_http) replaces the policy without
-/// touching the execution scope, and the policy survives
-/// [`Vm::reset_for_reuse`]. Requests and streams are closed/cancelled by the
-/// generic execution-scope lifecycle, never by an HTTP-specific owner/type
-/// dispatch.
+/// The current Hyper legacy client has no separate caller task set to await;
+/// polling this future releases the resource owner's client map immediately.
+/// Any outstanding [`HttpClientLease`] keeps its shared client alive until its
+/// own request work retires.
+pub struct HttpWorkerShutdown {
+    clients: Option<HashMap<HttpConfig, Arc<HttpClientEntry>>>,
+}
+
+impl Future for HttpWorkerShutdown {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().clients.take();
+        Poll::Ready(())
+    }
+}
+
+/// Persistent, per-VM HTTP module state.
+///
+/// The VM stores only request policy, an optional admission override, and an
+/// opaque lease injected by its embedding. It never constructs or owns a
+/// Hyper client. The state survives [`Vm::reset_for_reuse`], while clearing
+/// configuration drops only this VM's lease clone.
+#[derive(Default)]
+struct HttpHostState {
+    config: Option<HttpConfig>,
+    client: Option<HttpClientLease>,
+    max_in_flight: Option<usize>,
+}
+
+/// HTTP host configuration and explicit worker-client injection.
+///
+/// The embedding owns [`HttpWorkerResources`], obtains a policy-matched lease,
+/// and passes that lease into [`Self::configure_http`]. There is no implicit
+/// per-VM client fallback.
 pub trait HttpHostExt {
-    fn configure_http(&mut self, config: HttpConfig) -> VmResult<()>;
+    fn configure_http(&mut self, config: HttpConfig, client: HttpClientLease) -> VmResult<()>;
     fn set_http_max_in_flight(&mut self, max_in_flight: usize);
     fn http_max_in_flight(&mut self) -> usize;
     fn clear_http_configuration(&mut self);
@@ -63,18 +200,24 @@ pub trait HttpHostExt {
 }
 
 impl HttpHostExt for Vm {
-    fn configure_http(&mut self, config: HttpConfig) -> VmResult<()> {
+    fn configure_http(&mut self, config: HttpConfig, client: HttpClientLease) -> VmResult<()> {
         config.validate()?;
+        if !client.matches_config(&config) {
+            return Err(VmError::HostError(
+                "HTTP client lease does not match HTTP configuration".to_string(),
+            ));
+        }
         let mut ctx = self.host_context();
-        let admission = ctx
+        let max_in_flight = ctx
             .module_state::<HttpHostState>()
-            .map(|state| state.admission.clone())
-            .unwrap_or_else(|| ConnectionAdmission::new(DEFAULT_MAX_HTTP_IN_FLIGHT));
-        let client = request::build_client(&config);
+            .and_then(|state| state.max_in_flight);
+        if let Some(max_in_flight) = max_in_flight {
+            client.set_max_in_flight(max_in_flight);
+        }
         ctx.set_module_state(HttpHostState {
             config: Some(config),
-            admission,
-            client,
+            client: Some(client),
+            max_in_flight,
         });
         Ok(())
     }
@@ -84,39 +227,45 @@ impl HttpHostExt for Vm {
         if ctx.module_state::<HttpHostState>().is_none() {
             ctx.set_module_state(HttpHostState::default());
         }
-        ctx.module_state_mut::<HttpHostState>()
-            .expect("HTTP host state was inserted")
-            .admission
-            .set_max_in_flight(max_in_flight);
+        let state = ctx
+            .module_state_mut::<HttpHostState>()
+            .expect("HTTP host state was inserted");
+        state.max_in_flight = Some(max_in_flight);
+        if let Some(client) = state.client.as_ref() {
+            client.set_max_in_flight(max_in_flight);
+        }
     }
 
     fn http_max_in_flight(&mut self) -> usize {
         self.host_context()
             .module_state::<HttpHostState>()
-            .map_or(DEFAULT_MAX_HTTP_IN_FLIGHT, |state| {
-                state.admission.max_in_flight()
+            .and_then(|state| {
+                state
+                    .max_in_flight
+                    .or_else(|| state.client.as_ref().map(HttpClientLease::max_in_flight))
             })
+            .unwrap_or(DEFAULT_MAX_HTTP_IN_FLIGHT)
     }
 
     fn clear_http_configuration(&mut self) {
         let mut ctx = self.host_context();
         if let Some(state) = ctx.module_state_mut::<HttpHostState>() {
             state.config = None;
+            state.client = None;
         }
     }
 
     fn http_is_configured(&mut self) -> bool {
         self.host_context()
             .module_state::<HttpHostState>()
-            .and_then(|state| state.config.as_ref())
-            .is_some()
+            .is_some_and(|state| state.config.is_some() && state.client.is_some())
     }
 }
 
-/// Captured HTTP configuration, shared Hyper client, and one in-flight permit.
+/// Captured HTTP configuration, shared Hyper client lease, and one in-flight permit.
 pub(super) struct HttpRequestContext {
     config: HttpConfig,
-    client: request::HttpClient,
+    client: HttpClientLease,
     permit: ConnectionPermit,
     prepared_request: Option<(request::HttpRequest, Instant)>,
 }
@@ -140,6 +289,10 @@ impl HttpRequestContext {
             .config
             .clone()
             .ok_or_else(|| VmError::HostError("HTTP host is not configured".to_string()))?;
+        let client = state
+            .client
+            .clone()
+            .ok_or_else(|| VmError::HostError("HTTP client lease is not configured".to_string()))?;
         let admitted_at = Instant::now();
         if script_timeout.is_some_and(|timeout| admitted_at.checked_add(timeout).is_none()) {
             return Err(VmError::HostError(format!(
@@ -152,11 +305,11 @@ impl HttpRequestContext {
         let deadline = admitted_at.checked_add(duration).ok_or_else(|| {
             VmError::HostError("HTTP max_stream_duration cannot form a deadline".to_string())
         })?;
-        let permit = state.admission.acquire()?;
+        let permit = client.acquire()?;
         Ok((
             Self {
                 config,
-                client: state.client.clone(),
+                client,
                 permit,
                 prepared_request: None,
             },
@@ -469,7 +622,7 @@ pub(super) async fn builtin_http_client_request(
     let (request, deadline) = prepared_request.ok_or_else(|| {
         VmError::HostError("HTTP request capture did not prepare the request".to_string())
     })?;
-    request::perform_buffered_request(&client, &config, &request, deadline).await
+    request::perform_buffered_request(client.client(), &config, &request, deadline).await
 }
 
 #[cfg(test)]
@@ -480,7 +633,7 @@ mod tests {
         SchemeFamily, is_restricted_ip, validate_resolved_addresses, validate_url,
         validate_url_policy,
     };
-    use super::{HttpConfig, HttpHostExt};
+    use super::{HttpConfig, HttpHostExt, HttpWorkerResources};
 
     #[test]
     fn default_http_policy_denies_all_hosts() {
@@ -496,7 +649,12 @@ mod tests {
     fn stream_timeout_validation_precedes_permit_admission() {
         let mut vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
         vm.set_http_max_in_flight(0);
-        vm.configure_http(HttpConfig::default())
+        let mut resources = HttpWorkerResources::new();
+        let config = HttpConfig::default();
+        let lease = resources
+            .client_for(&config)
+            .expect("default config should be valid");
+        vm.configure_http(config, lease)
             .expect("default config should be valid");
 
         let error = super::HttpRequestContext::capture_for(&mut vm, Some(Duration::MAX), "SSE")
@@ -607,8 +765,13 @@ mod tests {
 
     #[test]
     fn http_config_persists_across_scope_reset() {
+        let mut resources = HttpWorkerResources::new();
+        let config = HttpConfig::default();
+        let lease = resources
+            .client_for(&config)
+            .expect("default config should be valid");
         let mut vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
-        vm.configure_http(HttpConfig::default())
+        vm.configure_http(config, lease)
             .expect("default config should be valid");
         assert!(vm.http_is_configured());
 
@@ -622,6 +785,88 @@ mod tests {
         vm.clear_http_configuration();
         assert!(!vm.http_is_configured());
         // A VM that never runs keeps working after config removal.
+    }
+
+    #[test]
+    fn same_worker_policy_reuses_client_across_vms_and_reset() {
+        let mut resources = HttpWorkerResources::new();
+        let config = HttpConfig::default();
+        let first = resources
+            .client_for(&config)
+            .expect("default config should be valid");
+        let second = resources
+            .client_for(&config)
+            .expect("same policy should reuse the worker client");
+        assert!(std::sync::Arc::ptr_eq(&first.entry, &second.entry));
+
+        let mut first_vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
+        first_vm
+            .configure_http(config.clone(), first)
+            .expect("first lease injection should succeed");
+        let mut second_vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
+        second_vm
+            .configure_http(config.clone(), second.clone())
+            .expect("second lease injection should succeed");
+        first_vm
+            .reset_for_reuse()
+            .expect("first VM reset should complete while the worker client remains owned");
+        second_vm
+            .reset_for_reuse()
+            .expect("second VM reset should complete while the worker client remains owned");
+        drop(first_vm);
+        drop(second_vm);
+
+        let third = resources
+            .client_for(&config)
+            .expect("worker client should survive VM reset and drop");
+        assert!(std::sync::Arc::ptr_eq(&second.entry, &third.entry));
+    }
+
+    #[test]
+    fn different_full_http_policy_identity_isolated() {
+        let mut resources = HttpWorkerResources::new();
+        let first_config = HttpConfig::default();
+        let second_config = HttpConfig {
+            allow_private_ips: true,
+            ..first_config.clone()
+        };
+        let first = resources
+            .client_for(&first_config)
+            .expect("first config should be valid");
+        let second = resources
+            .client_for(&second_config)
+            .expect("second config should be valid");
+        assert!(!std::sync::Arc::ptr_eq(&first.entry, &second.entry));
+    }
+
+    #[test]
+    fn closing_worker_admission_rejects_leases_and_new_requests() {
+        let mut resources = HttpWorkerResources::new();
+        let config = HttpConfig::default();
+        let lease = resources
+            .client_for(&config)
+            .expect("default config should be valid");
+        resources.close_admission();
+        assert!(resources.client_for(&config).is_err());
+        assert!(lease.entry.admission.acquire().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_shutdown_is_owned_and_does_not_borrow_a_vm() {
+        let mut resources = HttpWorkerResources::new();
+        let config = HttpConfig::default();
+        let lease = resources
+            .client_for(&config)
+            .expect("default config should be valid");
+        drop(resources);
+        assert!(lease.entry.admission.acquire().is_ok());
+
+        let mut resources = HttpWorkerResources::new();
+        let _ = resources
+            .client_for(&config)
+            .expect("default config should be valid");
+        resources.close_admission();
+        resources.into_shutdown().await;
     }
 }
 

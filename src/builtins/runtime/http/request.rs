@@ -63,7 +63,7 @@ where
 
 type HttpsPolicyConnector = ConnectTimeout<HttpsConnector<HttpConnector<PolicyResolver>>>;
 
-/// Cloneable Hyper client retained in per-VM HTTP module state.
+/// Cloneable Hyper client retained in an embedding-owned worker resource.
 pub(super) type HttpClient = Client<HttpsPolicyConnector, Full<Bytes>>;
 
 pub(super) fn build_client(config: &HttpConfig) -> HttpClient {

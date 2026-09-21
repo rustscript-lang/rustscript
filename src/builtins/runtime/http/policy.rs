@@ -2,7 +2,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -35,33 +35,44 @@ pub(super) struct ResolvedTarget {
 /// Shared admission state for every connection-oriented HTTP adapter.
 #[derive(Clone, Debug)]
 pub(super) struct ConnectionAdmission {
-    max_in_flight: usize,
+    max_in_flight: Arc<AtomicUsize>,
     in_flight: Arc<AtomicUsize>,
+    open: Arc<AtomicBool>,
 }
 
 impl ConnectionAdmission {
     pub(super) fn new(max_in_flight: usize) -> Self {
         Self {
-            max_in_flight,
+            max_in_flight: Arc::new(AtomicUsize::new(max_in_flight)),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            open: Arc::new(AtomicBool::new(true)),
         }
     }
 
-    pub(super) fn set_max_in_flight(&mut self, max_in_flight: usize) {
-        self.max_in_flight = max_in_flight;
+    pub(super) fn set_max_in_flight(&self, max_in_flight: usize) {
+        self.max_in_flight.store(max_in_flight, Ordering::Release);
     }
 
     pub(super) fn max_in_flight(&self) -> usize {
-        self.max_in_flight
+        self.max_in_flight.load(Ordering::Acquire)
+    }
+
+    pub(super) fn close(&self) {
+        self.open.store(false, Ordering::Release);
     }
 
     pub(super) fn acquire(&self) -> VmResult<ConnectionPermit> {
+        if !self.open.load(Ordering::Acquire) {
+            return Err(VmError::HostError(
+                "HTTP worker resource admission is closed".to_string(),
+            ));
+        }
         let mut active = self.in_flight.load(Ordering::Acquire);
         loop {
-            if active >= self.max_in_flight {
+            let max_in_flight = self.max_in_flight.load(Ordering::Acquire);
+            if active >= max_in_flight {
                 return Err(VmError::HostError(format!(
-                    "HTTP in-flight request limit of {} was reached",
-                    self.max_in_flight
+                    "HTTP in-flight request limit of {max_in_flight} was reached"
                 )));
             }
             match self.in_flight.compare_exchange_weak(
@@ -71,9 +82,16 @@ impl ConnectionAdmission {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    return Ok(ConnectionPermit {
+                    let permit = ConnectionPermit {
                         in_flight: Arc::clone(&self.in_flight),
-                    });
+                    };
+                    if self.open.load(Ordering::Acquire) {
+                        return Ok(permit);
+                    }
+                    drop(permit);
+                    return Err(VmError::HostError(
+                        "HTTP worker resource admission is closed".to_string(),
+                    ));
                 }
                 Err(observed) => active = observed,
             }
