@@ -1153,7 +1153,31 @@ mod tests {
             "a future entry must enforce the current worker cap"
         );
         drop(future_permits);
+
+        resources.close_admission();
+        resources.set_max_in_flight(4);
+        assert_eq!(resources.max_in_flight(), 4);
+        assert!(
+            resources.client_for(&first_config).is_err(),
+            "a post-close cap update must not reopen lease admission"
+        );
+        assert!(
+            first.acquire().is_err(),
+            "an existing lease must remain rejected after a post-close cap update"
+        );
+        assert!(
+            second.acquire().is_err(),
+            "every existing policy entry must remain closed after a post-close cap update"
+        );
+        assert!(
+            future.acquire().is_err(),
+            "a future-config lease must remain closed after a post-close cap update"
+        );
         drop(first_active);
+        assert!(
+            first.acquire().is_err(),
+            "retiring an active permit must not reopen the closed worker gate"
+        );
     }
 
     #[test]
