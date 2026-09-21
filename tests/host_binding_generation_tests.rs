@@ -92,6 +92,31 @@ impl StandardSurfaceComposition for FailingComposition {
     }
 }
 
+struct SuccessfulComposition;
+
+impl StandardSurfaceComposition for SuccessfulComposition {
+    fn import_in_standard(&self, import: &HostImport) -> bool {
+        import.name == "composition::staged"
+    }
+
+    fn ensure_surfaces(
+        &self,
+        _imports: &[HostImport],
+        registry: &mut HostFunctionRegistry,
+    ) -> vm::VmResult<bool> {
+        registry.register_static("composition::staged", 0, return_int);
+        Ok(true)
+    }
+
+    fn build_default_registry(&self) -> vm::VmResult<HostFunctionRegistry> {
+        Ok(HostFunctionRegistry::empty())
+    }
+
+    fn bind_default_name(&self, _vm: &mut Vm, _name: &str) -> bool {
+        false
+    }
+}
+
 struct MatrixResource;
 
 impl vm::resource::HostResource for MatrixResource {}
@@ -126,6 +151,78 @@ impl HostAsyncBridge for MatrixAsyncBridge {
     }
 }
 
+struct PendingResetBridge {
+    submitted: Arc<AtomicUsize>,
+    cancellations: Arc<AtomicUsize>,
+    cleanups: Arc<AtomicUsize>,
+    futures: std::collections::HashMap<vm::HostOpId, vm::HostFuture>,
+}
+
+impl HostAsyncBridge for PendingResetBridge {
+    fn submit_op(&mut self, op_id: vm::HostOpId, future: vm::HostFuture) -> vm::VmResult<()> {
+        if self.futures.insert(op_id, future).is_some() {
+            return Err(vm::VmError::HostError(format!(
+                "duplicate pending operation {op_id}"
+            )));
+        }
+        self.submitted.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn poll_op(
+        &mut self,
+        _op_id: vm::HostOpId,
+        _cx: &mut Context<'_>,
+    ) -> Poll<vm::VmResult<vm::CallReturn>> {
+        Poll::Pending
+    }
+
+    fn poll_submitted_op(
+        &mut self,
+        _op_id: vm::HostOpId,
+        _cx: &mut Context<'_>,
+    ) -> Poll<vm::VmResult<vm::HostFutureOutput>> {
+        Poll::Pending
+    }
+
+    fn request_cancel_op(
+        &mut self,
+        _op_id: vm::HostOpId,
+        _reason: vm::operation::OperationCancelReason,
+    ) -> vm::VmResult<()> {
+        self.cancellations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn poll_cancel_op(
+        &mut self,
+        _op_id: vm::HostOpId,
+        _cx: &mut Context<'_>,
+    ) -> Poll<vm::VmResult<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn cleanup_op(
+        &mut self,
+        op_id: vm::HostOpId,
+        _terminal: HostAsyncOpTerminal,
+    ) -> vm::VmResult<()> {
+        self.futures.remove(&op_id);
+        self.cleanups.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct PendingStackHost;
+
+impl HostStackFunction for PendingStackHost {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        vm.submit_host_future(Box::pin(std::future::pending::<
+            vm::VmResult<vm::HostFutureOutput>,
+        >()))
+    }
+}
+
 struct MatrixFactoryHost(i64);
 
 impl HostFunction for MatrixFactoryHost {
@@ -143,6 +240,26 @@ impl HostStackFunction for MatrixFactoryHost {
 impl HostArgsFunction for MatrixFactoryHost {
     fn call(&mut self, _args: &[Value]) -> vm::VmResult<CallOutcome> {
         Ok(CallOutcome::Return(CallReturn::one(Value::Int(self.0))))
+    }
+}
+
+struct ReentrantStackHost {
+    attempted_reentry: bool,
+}
+
+impl HostStackFunction for ReentrantStackHost {
+    fn call(&mut self, vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+        if !self.attempted_reentry {
+            self.attempted_reentry = true;
+            vm.reset_for_reuse()
+                .expect("stack mutation reset should be accepted");
+            let error = vm
+                .run()
+                .expect_err("same stack host slot must reject re-entry safely");
+            assert!(error.to_string().contains("already executing"));
+        }
+        assert_eq!(args, &[Value::Int(41)]);
+        Ok(CallOutcome::Return(CallReturn::one(args[0].clone())))
     }
 }
 
@@ -187,6 +304,67 @@ fn one_bound_program_constructs_ten_thousand_vms() {
         let vm = Vm::new_bound(Arc::clone(&bound)).expect("construct bound vm");
         assert_eq!(vm.bound_function_count(), 1);
     }
+}
+
+#[test]
+fn bound_program_accepts_sparse_registry_slots() {
+    let function =
+        HostFunctionSchema::with_return("bound::sparse", Vec::new(), HostTypeSchema::Int);
+    let (import, schema) = schema_for(&function);
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.call(0, 0);
+    bytecode.ret();
+    let program = program_with_imports(vec![import], vec![schema.clone()], bytecode.finish());
+
+    let mut registry = HostFunctionRegistry::empty();
+    registry.register_static("bound::unused", 0, return_int_99);
+    registry
+        .register_catalog_static(schema, return_int)
+        .expect("sparse catalog binding");
+    let bound = registry
+        .bind_program_once(program)
+        .expect("sparse bound program");
+    let mut vm = Vm::new_bound(bound).expect("sparse bound VM");
+
+    assert_eq!(
+        vm.run().expect("sparse bound VM should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
+}
+
+#[test]
+fn stack_host_reentry_and_reset_preserve_owned_argument_semantics() {
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ldc(0);
+    bytecode.call(0, 1);
+    bytecode.ret();
+    let program = Arc::new(Program::with_imports_and_debug(
+        vec![Value::Int(41)],
+        bytecode.finish(),
+        vec![HostImport {
+            name: "bound::reentrant_stack".to_string(),
+            arity: 1,
+            return_type: vm::ValueType::Int,
+        }],
+        None,
+    ));
+    let mut registry = HostFunctionRegistry::empty();
+    registry.register_stack("bound::reentrant_stack", 1, || {
+        Box::new(ReentrantStackHost {
+            attempted_reentry: false,
+        })
+    });
+    let bound = registry
+        .bind_program_once(program)
+        .expect("reentrant stack binding");
+    let mut vm = Vm::new_bound(bound).expect("reentrant stack VM");
+
+    assert_eq!(
+        vm.run().expect("reentrant stack VM should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(41)]);
 }
 
 #[test]
@@ -265,6 +443,51 @@ fn bound_vm_lifecycle_matrix_isolates_module_resource_and_async_state() {
         .expect("first resource");
     assert_eq!(first.host_context().resource_count(), 1);
     assert_eq!(second.host_context().resource_count(), 0);
+}
+
+#[test]
+fn bound_vm_reset_cancels_active_submitted_async_operation() {
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.call(0, 0);
+    bytecode.ret();
+    let program = Arc::new(Program::with_imports_and_debug(
+        Vec::new(),
+        bytecode.finish(),
+        vec![HostImport {
+            name: "bound::pending_stack".to_string(),
+            arity: 0,
+            return_type: vm::ValueType::Int,
+        }],
+        None,
+    ));
+    let mut registry = HostFunctionRegistry::empty();
+    registry.register_stack("bound::pending_stack", 0, || Box::new(PendingStackHost));
+    let bound = registry
+        .bind_program_once(program)
+        .expect("pending stack binding");
+    let mut vm = Vm::new_bound(bound).expect("pending stack VM");
+    let submitted = Arc::new(AtomicUsize::new(0));
+    let cancellations = Arc::new(AtomicUsize::new(0));
+    let cleanups = Arc::new(AtomicUsize::new(0));
+    vm.set_async_bridge(Box::new(PendingResetBridge {
+        submitted: Arc::clone(&submitted),
+        cancellations: Arc::clone(&cancellations),
+        cleanups: Arc::clone(&cleanups),
+        futures: std::collections::HashMap::new(),
+    }))
+    .expect("pending bridge");
+
+    assert_eq!(
+        vm.run().expect("pending call should run"),
+        VmStatus::Waiting(1)
+    );
+    assert_eq!(submitted.load(Ordering::SeqCst), 1);
+    vm.reset_for_reuse()
+        .expect("reset should cancel pending call");
+    assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+    assert_eq!(cleanups.load(Ordering::SeqCst), 1);
+    assert!(vm.is_reusable());
+    vm.clear_async_bridge().expect("cleared bridge after reset");
 }
 
 #[test]
@@ -545,7 +768,7 @@ fn sibling_registry_mutation_invalidates_old_plans_but_allows_new_untouched_snap
         .register_catalog_static(schema.clone(), return_int)
         .expect("sibling binding");
     let plan = registry
-        .prepare_plan_with_schemas(&[import.clone()], &[Some(schema.clone())])
+        .prepare_plan_with_schemas(std::slice::from_ref(&import), &[Some(schema.clone())])
         .expect("prepare sibling plan");
     let mut sibling = registry.clone();
     sibling.register_static("bound::sibling_only", 0, return_int);
@@ -607,6 +830,37 @@ fn failed_composition_probe_does_not_mutate_source_registry_or_plan_witness() {
         .bind_vm_with_plan(&mut vm, &plan)
         .expect("failed probe must not stale the source plan");
     assert_eq!(vm.run().expect("source plan should run"), VmStatus::Halted);
+}
+
+#[test]
+fn successful_composition_probe_stages_only_bound_registry() {
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.call(0, 0);
+    bytecode.ret();
+    let program = Arc::new(Program::with_imports_and_debug(
+        Vec::new(),
+        bytecode.finish(),
+        vec![HostImport {
+            name: "composition::staged".to_string(),
+            arity: 0,
+            return_type: vm::ValueType::Int,
+        }],
+        None,
+    ));
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_standard_composition(Arc::new(SuccessfulComposition));
+    assert!(!registry.contains_name("composition::staged"));
+
+    let bound = registry
+        .bind_program_once(program)
+        .expect("successful composition probe");
+    assert!(!registry.contains_name("composition::staged"));
+    let mut vm = Vm::new_bound(bound).expect("composed bound VM");
+    assert_eq!(
+        vm.run().expect("composed bound VM should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
 }
 
 #[test]

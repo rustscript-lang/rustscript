@@ -102,10 +102,10 @@ pub trait HostFunction: Send {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome>;
 }
 
-/// VM-aware host functions that opt into borrowed stack-tail dispatch.
+/// VM-aware host functions that receive an owned snapshot of the call arguments.
 ///
-/// Implementations must not re-enter the VM or otherwise structurally mutate
-/// the value stack while `args` is borrowed for the duration of `call`.
+/// The callback may re-enter the VM or mutate its value stack. Re-entry into
+/// the same stack-host slot while it is executing returns a host error.
 pub trait HostStackFunction: Send {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome>;
 }
@@ -1036,7 +1036,7 @@ pub struct HostBindingPlan {
 }
 
 impl HostBindingPlan {
-    fn validate_layout(&self, registry_len: usize) -> VmResult<()> {
+    fn validate_registry_layout(&self, registry_len: usize) -> VmResult<()> {
         if self.import_signature.len() != self.import_schemas.len()
             || self.resolved_calls.len() != self.import_signature.len()
             || self.registry_slots.len() != self.registry_schemas.len()
@@ -1050,13 +1050,22 @@ impl HostBindingPlan {
                 return Err(VmError::InvalidCall(registry_slot));
             }
         }
+        Ok(())
+    }
+
+    fn validate_layout(&self, registry_len: usize) -> VmResult<()> {
+        self.validate_registry_layout(registry_len)?;
+        self.validate_dispatch_slots(self.registry_slots.len())
+    }
+
+    fn validate_dispatch_slots(&self, dispatch_len: usize) -> VmResult<()> {
         for &resolved_slot in self.resolved_calls.iter() {
-            if usize::from(resolved_slot) >= self.registry_slots.len() {
+            if usize::from(resolved_slot) >= dispatch_len {
                 return Err(VmError::InvalidCall(resolved_slot));
             }
         }
         for &allowed_slot in self.allowed_host_function_slots.iter() {
-            if usize::from(allowed_slot) >= self.registry_slots.len() {
+            if usize::from(allowed_slot) >= dispatch_len {
                 return Err(VmError::InvalidCall(allowed_slot));
             }
         }
@@ -1073,6 +1082,34 @@ struct HostDispatchTemplate {
     allowed_host_function_slots: Arc<[u16]>,
     named_struct_schemas: Arc<HashMap<String, crate::compiler::TypeSchema>>,
     standard_composition: Option<Arc<dyn super::standard_composition::StandardSurfaceComposition>>,
+}
+
+impl HostDispatchTemplate {
+    fn validate_layout(&self, plan: &HostBindingPlan) -> VmResult<()> {
+        let dispatch_len = self.entries.len();
+        if self.schemas.len() != dispatch_len
+            || self.schemas.len() != plan.registry_schemas.len()
+            || self.resolved_calls.len() != plan.import_signature.len()
+            || self.resolved_calls.len() != plan.resolved_calls.len()
+            || self.allowed_host_function_slots.len() != plan.allowed_host_function_slots.len()
+            || dispatch_len != plan.registry_slots.len()
+        {
+            return Err(VmError::HostError(
+                "bound host dispatch template lengths are inconsistent".to_string(),
+            ));
+        }
+        for &resolved_slot in self.resolved_calls.iter() {
+            if usize::from(resolved_slot) >= dispatch_len {
+                return Err(VmError::InvalidCall(resolved_slot));
+            }
+        }
+        for &allowed_slot in self.allowed_host_function_slots.iter() {
+            if usize::from(allowed_slot) >= dispatch_len {
+                return Err(VmError::InvalidCall(allowed_slot));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Immutable host binding prepared once for one immutable program.
@@ -1777,7 +1814,7 @@ impl HostFunctionRegistry {
 
     pub fn bind_vm_cached(&self, vm: &mut Vm) -> VmResult<()> {
         let source_snapshot = self.registry_snapshot();
-        let result = if let Some(composition) = self.standard_composition.as_ref() {
+        if let Some(composition) = self.standard_composition.as_ref() {
             let mut composed = self.detached_clone();
             composition.ensure_surfaces(&vm.program.imports, &mut composed)?;
             composed.standard_composition = Some(Arc::clone(composition));
@@ -1795,7 +1832,7 @@ impl HostFunctionRegistry {
                 "host binding source registry became stale during VM construction".to_string(),
             ));
         }
-        Ok(result)
+        Ok(())
     }
 
     fn bind_vm_cached_inner(&self, vm: &mut Vm) -> VmResult<()> {
@@ -1872,7 +1909,7 @@ impl HostFunctionRegistry {
                 .ok_or(VmError::InvalidCall(registry_slot))?;
             entries.push(entry.kind.clone());
         }
-        Ok(HostDispatchTemplate {
+        let dispatch = HostDispatchTemplate {
             entries: Arc::from(entries.into_boxed_slice()),
             schemas: Arc::clone(&plan.registry_schemas),
             resolved_calls: Arc::clone(&plan.resolved_calls),
@@ -1880,7 +1917,9 @@ impl HostFunctionRegistry {
             allowed_host_function_slots: Arc::clone(&plan.allowed_host_function_slots),
             named_struct_schemas: Arc::clone(&self.named_struct_schemas),
             standard_composition: self.standard_composition.clone(),
-        })
+        };
+        dispatch.validate_layout(plan)?;
+        Ok(dispatch)
     }
 
     pub fn prepare_plan(&self, imports: &[HostImport]) -> VmResult<HostBindingPlan> {
@@ -2223,20 +2262,21 @@ impl BoundHostProgram {
                 "bound host program requires an unbound vm".to_string(),
             ));
         }
-        if self.dispatch.entries.len() != self.dispatch.schemas.len() {
-            return Err(VmError::HostError(
-                "bound host dispatch template is internally inconsistent".to_string(),
-            ));
-        }
-        self.plan.validate_layout(self.dispatch.entries.len())?;
+        self.plan
+            .validate_registry_layout(self.registry.entries.len())?;
+        self.dispatch.validate_layout(&self.plan)?;
 
         vm.host.host_functions.reserve(self.dispatch.entries.len());
         for (host_slot, entry) in self.dispatch.entries.iter().enumerate() {
             let function = match entry {
                 RegistryEntryKind::Factory(factory) => VmHostFunction::Dynamic(factory()),
                 RegistryEntryKind::Static(function) => VmHostFunction::Static(*function),
-                RegistryEntryKind::StackFactory(factory) => VmHostFunction::StackDynamic(factory()),
-                RegistryEntryKind::StackStatic(function) => VmHostFunction::StackStatic(*function),
+                RegistryEntryKind::StackFactory(factory) => {
+                    VmHostFunction::StackDynamic(Some(factory()))
+                }
+                RegistryEntryKind::StackStatic(function) => {
+                    VmHostFunction::StackStatic(Some(*function))
+                }
                 RegistryEntryKind::ArgsFactory(factory) => VmHostFunction::ArgsDynamic(factory()),
                 RegistryEntryKind::ArgsStatic(function) => VmHostFunction::ArgsStatic(*function),
                 RegistryEntryKind::ArgsStaticNonYielding(function) => {
@@ -2290,8 +2330,8 @@ impl BoundHostProgram {
 pub(super) enum VmHostFunction {
     Dynamic(Box<dyn HostFunction>),
     Static(StaticHostFunction),
-    StackDynamic(Box<dyn HostStackFunction>),
-    StackStatic(StaticHostStackFunction),
+    StackDynamic(Option<Box<dyn HostStackFunction>>),
+    StackStatic(Option<StaticHostStackFunction>),
     ArgsDynamic(Box<dyn HostArgsFunction>),
     ArgsStatic(StaticHostArgsFunction),
     ArgsStaticNonYielding(StaticHostArgsFunction),
@@ -2300,6 +2340,11 @@ pub(super) enum VmHostFunction {
     /// function. The option is empty only while the function is executing;
     /// this avoids borrowing a registry vector across `HostOwnedFunction::call`.
     OwnedDynamic(Option<Box<dyn HostOwnedFunction>>),
+}
+
+enum ActiveStackHostFunction {
+    Dynamic(Box<dyn HostStackFunction>),
+    Static(StaticHostStackFunction),
 }
 
 pub(super) enum HostCallExecOutcome {
@@ -2821,7 +2866,7 @@ impl Vm {
         };
         self.host
             .host_functions
-            .push(VmHostFunction::StackDynamic(function));
+            .push(VmHostFunction::StackDynamic(Some(function)));
         self.host.host_function_schemas.push(None);
         self.host.resolved_calls_dirty = true;
         index
@@ -2839,7 +2884,7 @@ impl Vm {
         };
         self.host
             .host_functions
-            .push(VmHostFunction::StackStatic(function));
+            .push(VmHostFunction::StackStatic(Some(function)));
         self.host.host_function_schemas.push(None);
         self.host.resolved_calls_dirty = true;
         index
@@ -3003,7 +3048,7 @@ impl Vm {
         if let Some(&index) = self.host.host_function_symbols.get(&name)
             && let Some(slot) = self.host.host_functions.get_mut(index as usize)
         {
-            *slot = VmHostFunction::StackDynamic(function);
+            *slot = VmHostFunction::StackDynamic(Some(function));
             self.host.resolved_calls_dirty = true;
             return;
         }
@@ -3031,14 +3076,14 @@ impl Vm {
         if let Some(builtin) = builtin_for_binding_name(&name) {
             self.bind_builtin_overrideslot(
                 builtin.call_index(),
-                VmHostFunction::StackStatic(function),
+                VmHostFunction::StackStatic(Some(function)),
             );
             return;
         }
         if let Some(&index) = self.host.host_function_symbols.get(&name)
             && let Some(slot) = self.host.host_functions.get_mut(index as usize)
         {
-            *slot = VmHostFunction::StackStatic(function);
+            *slot = VmHostFunction::StackStatic(Some(function));
             self.host.resolved_calls_dirty = true;
             return;
         }
@@ -4522,10 +4567,15 @@ impl Vm {
             .host_functions
             .get(resolved_index as usize)
             .ok_or(VmError::InvalidCall(resolved_index))?;
-        Ok(matches!(
-            function,
-            VmHostFunction::StackDynamic(_) | VmHostFunction::StackStatic(_)
-        ))
+        match function {
+            VmHostFunction::StackDynamic(Some(_)) | VmHostFunction::StackStatic(Some(_)) => {
+                Ok(true)
+            }
+            VmHostFunction::StackDynamic(None) | VmHostFunction::StackStatic(None) => Err(
+                VmError::HostError("stack host function is already executing".to_string()),
+            ),
+            _ => Ok(false),
+        }
     }
 
     /// Whether the resolved slot is an owned-dispatch binding.
@@ -4849,31 +4899,45 @@ impl Vm {
             .len()
             .checked_sub(argc)
             .ok_or(VmError::StackUnderflow)?;
-        self.instance.call_depth += 1;
-        let function_ptr =
-            self.host
+        let mut function = {
+            let slot = self
+                .host
                 .host_functions
                 .get_mut(resolved_index as usize)
-                .ok_or(VmError::InvalidCall(resolved_index))? as *mut VmHostFunction;
-        // Stack-borrowed host functions opt into the same raw stack-tail borrowing model used
-        // by builtin dispatch. They must not re-enter the VM or otherwise mutate `self.instance.stack`
-        // while the borrowed slice is alive.
-        let outcome = unsafe {
-            let args =
-                std::slice::from_raw_parts(self.instance.stack.as_ptr().add(arg_start), argc);
-            match &mut *function_ptr {
-                VmHostFunction::StackDynamic(function) => function.call(self, args),
-                VmHostFunction::StackStatic(function) => function(self, args),
-                VmHostFunction::Dynamic(_)
-                | VmHostFunction::Static(_)
-                | VmHostFunction::ArgsDynamic(_)
-                | VmHostFunction::ArgsStatic(_)
-                | VmHostFunction::ArgsStaticNonYielding(_)
-                | VmHostFunction::OwnedDynamic(_) => unreachable!(),
+                .ok_or(VmError::InvalidCall(resolved_index))?;
+            match slot {
+                VmHostFunction::StackDynamic(function) => function
+                    .take()
+                    .map(ActiveStackHostFunction::Dynamic)
+                    .ok_or_else(|| {
+                        VmError::HostError("stack host function is already executing".to_string())
+                    })?,
+                VmHostFunction::StackStatic(function) => function
+                    .take()
+                    .map(ActiveStackHostFunction::Static)
+                    .ok_or_else(|| {
+                        VmError::HostError("stack host function is already executing".to_string())
+                    })?,
+                _ => unreachable!("stack dispatch requires a stack host function"),
             }
         };
+        let args = self.instance.stack[arg_start..].to_vec();
+        self.instance.call_depth += 1;
+        let call_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &mut function {
+                ActiveStackHostFunction::Dynamic(function) => function.call(self, &args),
+                ActiveStackHostFunction::Static(function) => function(self, &args),
+            }));
         self.instance.call_depth = self.instance.call_depth.saturating_sub(1);
-        let outcome = outcome?;
+        let call_result = match call_result {
+            Ok(result) => result,
+            Err(payload) => {
+                self.restore_stack_host_function(resolved_index, function);
+                std::panic::resume_unwind(payload);
+            }
+        };
+        self.restore_stack_host_function(resolved_index, function);
+        let outcome = call_result?;
 
         match outcome {
             CallOutcome::Return(values) => {
@@ -4908,6 +4972,45 @@ impl Vm {
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
+        }
+    }
+
+    fn restore_stack_host_function(
+        &mut self,
+        resolved_index: u16,
+        function: ActiveStackHostFunction,
+    ) {
+        let function = match (
+            self.host.host_functions.get_mut(resolved_index as usize),
+            Some(function),
+        ) {
+            (
+                Some(VmHostFunction::StackDynamic(slot)),
+                Some(ActiveStackHostFunction::Dynamic(function)),
+            ) if slot.is_none() => {
+                *slot = Some(function);
+                None
+            }
+            (
+                Some(VmHostFunction::StackStatic(slot)),
+                Some(ActiveStackHostFunction::Static(function)),
+            ) if slot.is_none() => {
+                *slot = Some(function);
+                None
+            }
+            (_, function) => function,
+        };
+        if let Some(function) = function {
+            let function = match function {
+                ActiveStackHostFunction::Dynamic(function) => {
+                    VmHostFunction::StackDynamic(Some(function))
+                }
+                ActiveStackHostFunction::Static(function) => {
+                    VmHostFunction::StackStatic(Some(function))
+                }
+            };
+            self.host.host_functions.push(function);
+            self.host.host_function_schemas.push(None);
         }
     }
 
