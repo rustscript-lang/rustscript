@@ -26,12 +26,15 @@ compiled runtime surface and generated metadata synchronized.
 
 ## Native API
 
-On a supported native target, enabling `http-client` preserves the source-level
-HTTP call signatures and embedding entry points:
+On a supported native target, enabling `http-client` leaves the guest HTTP
+call signatures unchanged. Embedding setup uses explicit worker-resource
+injection:
 
 - `HttpConfig` controls request and stream limits, redirects, timeouts, and
   capability policy;
-- `HttpExtension` and `HttpHostExt` install the native HTTP host integration;
+- `HttpExtension` and `HttpHostExt` provide the native HTTP host integration;
+  embedding setup passes a matching `HttpClientLease` to
+  `HttpHostExt::configure_http`;
 - `register_http_builtin_module` and `http_host_catalog` expose the native
   callable metadata;
 - `http::client::request` returns a bounded `HttpResponse`; and
@@ -39,10 +42,11 @@ HTTP call signatures and embedding entry points:
 
 ## Embedding resources and leases
 
-Native embeddings create one [`HttpWorkerResources`] owner for the worker and
-inject a matching [`HttpClientLease`] into each VM. The owner keys clients by
-the complete [`HttpConfig`] value, so changing any policy or limit creates an
-isolated Hyper client and admission state:
+Native embeddings create one embedding-owned [`HttpWorkerResources`] owner for
+the worker. It owns one Hyper client and admission entry for each complete
+[`HttpConfig`] identity. VMs hold matching injected [`HttpClientLease`] values;
+VMs that receive leases for the same config from that owner share that client
+and admission state:
 
 ```rust
 let mut resources = HttpWorkerResources::new();
@@ -52,16 +56,18 @@ vm.configure_http(config, lease)?;
 ```
 
 Keep the owner alive for the normal worker and VM lifetime, across VM reset/reuse,
-and until active work has been quiesced. During shutdown the owner may be
-closed first: a lease is cloneable and is retained by VM module state, buffered
-request futures, and the SSE stream driver. Hyper continues to own the
-connector, sockets, pool, and response body; RustScript does not add a pool,
-Tokio runtime, worker thread, or operation registry.
+across all VMs intended to share a policy client, and until active work has been
+quiesced. During shutdown the owner may be closed first: a lease is cloneable and
+is retained by VM module state, buffered request futures, and the SSE stream
+driver. Hyper continues to own the connector, sockets, pool, and response body;
+RustScript does not add a pool, Tokio runtime, worker thread, or operation
+registry.
 
-There is no implicit client fallback. `HttpExtension` or the catalog registration
-only publishes and installs the host surface; the embedding still must call
-`HttpWorkerResources::client_for` and `HttpHostExt::configure_http`. An HTTP
-call from a VM without an injected matching lease fails as a host error.
+There is no implicit client fallback or per-VM client construction.
+`HttpExtension` or the catalog registration only publishes and installs the host
+surface; the embedding still must call `HttpWorkerResources::client_for` and
+`HttpHostExt::configure_http`. An HTTP call from a VM without an injected
+matching lease fails as a host error.
 
 `Vm::set_http_max_in_flight` is a VM-local override. The effective cap for that
 VM is the lower of its override and the owner cap; changing one VM cannot alter
@@ -93,10 +99,14 @@ then drop the VMs and any remaining lease clones. Dropping the owner first is
 also safe when fail-closed rejection is desired; active operations still retain
 what they need until retirement.
 
-When migrating an embedding from the earlier implicit HTTP setup, keep the
-existing `HttpExtension`/catalog registration, add one worker-owned
-`HttpWorkerResources`, pass `client_for(&config)` to every VM with
-`configure_http`, and remove any per-VM client construction or fallback path.
+When migrating an embedding from the earlier implicit HTTP setup, guest call
+signatures remain unchanged. Keep the existing `HttpExtension`/catalog
+registration, add one worker-owned `HttpWorkerResources`, pass
+`client_for(&config)` to every VM with `configure_http`, and remove any per-VM
+client construction or fallback path. When replacing an HTTP configuration,
+obtain a new matching lease with `HttpWorkerResources::client_for(&new_config)`
+and pass it with `configure_http`.
+
 Preserve the owner across VM reset/reuse and across all VMs that should share a
 policy client; create a distinct config when isolation is required.
 
@@ -349,13 +359,16 @@ prevents a target from reaching a disallowed private address through DNS
 rebinding without claiming that the admission-selected address is the one used
 for the socket.
 
-Buffered HTTP and SSE share one cloneable Hyper client stored in per-VM HTTP
-module state. Hyper owns HTTP/1 transport setup, connection pooling, idle
-connection lifecycle, and pooled-connection retry behavior. VM reset/reuse
-retains this library client and its pool; HTTP configuration replacement builds
-a new client for the new policy snapshot. The host does not maintain a custom
-pool, sender cache, connection worker, private Tokio runtime, or reconnect state
-machine.
+Buffered HTTP and SSE use cloneable Hyper clients from embedding-owned
+`HttpWorkerResources` entries. The owner maintains one client and admission entry
+per complete `HttpConfig`; VMs store matching `HttpClientLease` values and can
+share an entry when they share that config. Hyper owns HTTP/1 transport setup,
+connection pooling, idle connection lifecycle, and pooled-connection retry
+behavior. The owner and injected VM lease span VM reset/reuse; replacing an HTTP
+configuration obtains a new matching lease with
+`HttpWorkerResources::client_for` rather than constructing a client in VM state.
+The host does not maintain a custom pool, sender cache, connection worker,
+private Tokio runtime, or reconnect state machine.
 
 ## Deliberately absent APIs and semantics
 
@@ -367,8 +380,9 @@ Buffered requests and SSE opening run as macro-owned async host futures. HTTP ha
 no private pending map, abort map, operation-ID namespace, token owner route, or
 cancellation state machine. After an SSE response opens, only the generic
 callable-stream driver retains the Hyper response body, parser, deadlines,
-callback continuation, and in-flight permit needed for callback re-entry and
-backpressure.
+callback continuation, in-flight permit, and matching `HttpClientLease` needed
+for callback re-entry and backpressure. The driver retains that lease through
+stream retirement.
 
 The generic `src/builtins/runtime/cancellation.rs` remains for non-HTTP runtime
 callers. Embedding-owned retirement drops a pending HTTP future and rejects late
