@@ -1,8 +1,7 @@
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -32,81 +31,95 @@ pub(super) struct ResolvedTarget {
     pub(super) address: SocketAddr,
 }
 
+#[derive(Debug)]
+struct AdmissionState {
+    max_in_flight: usize,
+    in_flight: usize,
+    open: bool,
+}
+
 /// Shared admission state for every connection-oriented HTTP adapter.
 #[derive(Clone, Debug)]
 pub(super) struct ConnectionAdmission {
-    max_in_flight: Arc<AtomicUsize>,
-    in_flight: Arc<AtomicUsize>,
-    open: Arc<AtomicBool>,
+    state: Arc<Mutex<AdmissionState>>,
 }
 
 impl ConnectionAdmission {
     pub(super) fn new(max_in_flight: usize) -> Self {
         Self {
-            max_in_flight: Arc::new(AtomicUsize::new(max_in_flight)),
-            in_flight: Arc::new(AtomicUsize::new(0)),
-            open: Arc::new(AtomicBool::new(true)),
+            state: Arc::new(Mutex::new(AdmissionState {
+                max_in_flight,
+                in_flight: 0,
+                open: true,
+            })),
         }
     }
 
     pub(super) fn set_max_in_flight(&self, max_in_flight: usize) {
-        self.max_in_flight.store(max_in_flight, Ordering::Release);
+        self.with_state(|state| state.max_in_flight = max_in_flight);
     }
 
     pub(super) fn max_in_flight(&self) -> usize {
-        self.max_in_flight.load(Ordering::Acquire)
+        self.with_state(|state| state.max_in_flight)
     }
 
     pub(super) fn close(&self) {
-        self.open.store(false, Ordering::Release);
+        self.with_state(|state| state.open = false);
     }
 
     pub(super) fn acquire(&self) -> VmResult<ConnectionPermit> {
-        if !self.open.load(Ordering::Acquire) {
+        self.acquire_with_limit(None)
+    }
+
+    pub(super) fn acquire_with_limit(
+        &self,
+        requested_max_in_flight: Option<usize>,
+    ) -> VmResult<ConnectionPermit> {
+        let mut state = self.lock_state();
+        if !state.open {
             return Err(VmError::HostError(
                 "HTTP worker resource admission is closed".to_string(),
             ));
         }
-        let mut active = self.in_flight.load(Ordering::Acquire);
-        loop {
-            let max_in_flight = self.max_in_flight.load(Ordering::Acquire);
-            if active >= max_in_flight {
-                return Err(VmError::HostError(format!(
-                    "HTTP in-flight request limit of {max_in_flight} was reached"
-                )));
-            }
-            match self.in_flight.compare_exchange_weak(
-                active,
-                active + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    let permit = ConnectionPermit {
-                        in_flight: Arc::clone(&self.in_flight),
-                    };
-                    if self.open.load(Ordering::Acquire) {
-                        return Ok(permit);
-                    }
-                    drop(permit);
-                    return Err(VmError::HostError(
-                        "HTTP worker resource admission is closed".to_string(),
-                    ));
-                }
-                Err(observed) => active = observed,
-            }
+        let max_in_flight = requested_max_in_flight.map_or(state.max_in_flight, |requested| {
+            requested.min(state.max_in_flight)
+        });
+        if state.in_flight >= max_in_flight {
+            return Err(VmError::HostError(format!(
+                "HTTP in-flight request limit of {max_in_flight} was reached"
+            )));
         }
+        state.in_flight += 1;
+        drop(state);
+        Ok(ConnectionPermit {
+            state: Arc::clone(&self.state),
+        })
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, AdmissionState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn with_state<T>(&self, operation: impl FnOnce(&mut AdmissionState) -> T) -> T {
+        let mut state = self.lock_state();
+        operation(&mut state)
     }
 }
 
 /// Releases one shared connection slot when its embedding-owned future retires.
 pub(super) struct ConnectionPermit {
-    in_flight: Arc<AtomicUsize>,
+    state: Arc<Mutex<AdmissionState>>,
 }
 
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
-        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight = state.in_flight.saturating_sub(1);
     }
 }
 
@@ -335,9 +348,14 @@ pub(super) fn validate_url(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::phase_deadline_at;
+    use hyper_util::client::legacy::connect::dns::Name;
+    use tower_service::Service;
+
+    use super::{ConnectionAdmission, PolicyResolver, phase_deadline_at};
 
     #[test]
     fn opening_phase_deadline_cannot_reset_absolute_budget_per_hop() {
@@ -367,5 +385,48 @@ mod tests {
             ),
             absolute
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolver_rechecks_disallowed_addresses_before_connect() {
+        let config = crate::builtins::runtime::http::HttpConfig::default();
+        let mut resolver = PolicyResolver::new(&config);
+        let name = "127.0.0.1"
+            .parse::<Name>()
+            .expect("literal resolver name should parse");
+        let error = match resolver.call(name).await {
+            Ok(_) => panic!("private resolver result must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn close_rejects_stale_leases_without_invalidating_active_permits() {
+        let admission = ConnectionAdmission::new(1);
+        let permit = admission
+            .acquire()
+            .expect("first permit should be admitted");
+        admission.close();
+        assert!(admission.acquire().is_err());
+        drop(permit);
+        assert!(admission.acquire().is_err());
+    }
+
+    #[test]
+    fn acquire_after_a_concurrent_close_is_fail_closed() {
+        let admission = Arc::new(ConnectionAdmission::new(2));
+        let gate = Arc::new(Barrier::new(2));
+        let worker_admission = Arc::clone(&admission);
+        let worker_gate = Arc::clone(&gate);
+        let worker = thread::spawn(move || {
+            worker_gate.wait();
+            worker_gate.wait();
+            worker_admission.acquire().is_err()
+        });
+        gate.wait();
+        admission.close();
+        gate.wait();
+        assert!(worker.join().expect("admission worker should finish"));
     }
 }

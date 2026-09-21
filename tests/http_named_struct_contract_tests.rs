@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::ops::{Deref, DerefMut};
 use std::task::{Context, Poll};
 use std::thread;
 
@@ -776,7 +777,26 @@ fn local_http_config(port: u16) -> HttpConfig {
     }
 }
 
-fn bind_http_vm(source: &str, port: u16) -> Vm {
+struct HttpTestVm {
+    vm: Vm,
+    _resources: HttpWorkerResources,
+}
+
+impl Deref for HttpTestVm {
+    type Target = Vm;
+
+    fn deref(&self) -> &Self::Target {
+        &self.vm
+    }
+}
+
+impl DerefMut for HttpTestVm {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.vm
+    }
+}
+
+fn bind_http_vm(source: &str, port: u16) -> HttpTestVm {
     let compiled = compile_with_http_catalog(source).expect("source should compile");
     let mut vm = Vm::try_new(compiled.program).expect("vm");
     let mut resources = HttpWorkerResources::new();
@@ -788,7 +808,10 @@ fn bind_http_vm(source: &str, port: u16) -> Vm {
     standard_http_registry()
         .bind_vm_cached(&mut vm)
         .expect("bind");
-    vm
+    HttpTestVm {
+        vm,
+        _resources: resources,
+    }
 }
 
 fn spawn_ok_server() -> (u16, thread::JoinHandle<()>) {

@@ -93,8 +93,11 @@ fn local_http_config(port: u16) -> HttpConfig {
     }
 }
 
-fn configure_http(vm: &mut Vm, config: HttpConfig) -> VmResult<()> {
-    let mut resources = HttpWorkerResources::new();
+fn configure_http(
+    resources: &mut HttpWorkerResources,
+    vm: &mut Vm,
+    config: HttpConfig,
+) -> VmResult<()> {
     let lease = resources.client_for(&config)?;
     vm.configure_http(config, lease)
 }
@@ -167,6 +170,7 @@ fn http_request_source(port: u16) -> String {
 
 #[tokio::test(flavor = "current_thread")]
 async fn io_and_http_both_register_via_shared_vm() {
+    let mut resources = HttpWorkerResources::new();
     let compiled = compile_source(
         r#"
         use io;
@@ -180,7 +184,8 @@ async fn io_and_http_both_register_via_shared_vm() {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
     });
-    configure_http(&mut vm, HttpConfig::default()).expect("HTTP configuration should be valid");
+    configure_http(&mut resources, &mut vm, HttpConfig::default())
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
 
@@ -192,6 +197,7 @@ async fn io_and_http_both_register_via_shared_vm() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn io_and_http_execute_together() {
+    let mut resources = HttpWorkerResources::new();
     let (port, server) = spawn_http_server(1);
     let source = format!(
         r#"
@@ -208,7 +214,8 @@ async fn io_and_http_execute_together() {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
     });
-    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
+    configure_http(&mut resources, &mut vm, local_http_config(port))
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
 
@@ -221,6 +228,7 @@ async fn io_and_http_execute_together() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn io_policy_persists_independently_of_http_config() {
+    let mut resources = HttpWorkerResources::new();
     let compiled = compile_source(
         r#"
         use io;
@@ -231,7 +239,8 @@ async fn io_policy_persists_independently_of_http_config() {
     .expect("source should compile");
     let mut vm = Vm::new(compiled.program);
     vm.configure_io(IoPolicy::default());
-    configure_http(&mut vm, HttpConfig::default()).expect("HTTP configuration should be valid");
+    configure_http(&mut resources, &mut vm, HttpConfig::default())
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
 
@@ -250,6 +259,7 @@ async fn io_policy_persists_independently_of_http_config() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn http_config_persists_independently_of_io_config() {
+    let mut resources = HttpWorkerResources::new();
     let (port, server) = spawn_http_server(2);
     let compiled = compile_source(&http_request_source(port)).expect("HTTP source should compile");
     let mut vm = Vm::new(compiled.program);
@@ -257,7 +267,8 @@ async fn http_config_persists_independently_of_io_config() {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
     });
-    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
+    configure_http(&mut resources, &mut vm, local_http_config(port))
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
 
@@ -275,6 +286,7 @@ async fn http_config_persists_independently_of_io_config() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn io_and_http_coexist_through_vm_reset_cycle() {
+    let mut resources = HttpWorkerResources::new();
     let compiled = compile_source(
         r#"
         use io;
@@ -288,7 +300,8 @@ async fn io_and_http_coexist_through_vm_reset_cycle() {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
     });
-    configure_http(&mut vm, HttpConfig::default()).expect("HTTP configuration should be valid");
+    configure_http(&mut resources, &mut vm, HttpConfig::default())
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
 
@@ -305,6 +318,7 @@ async fn io_and_http_coexist_through_vm_reset_cycle() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn worker_cleanup_reaches_quiescence_after_io_and_http() {
+    let mut resources = HttpWorkerResources::new();
     let (port, server) = spawn_http_server(1);
     let source = format!(
         r#"
@@ -321,7 +335,8 @@ async fn worker_cleanup_reaches_quiescence_after_io_and_http() {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
     });
-    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
+    configure_http(&mut resources, &mut vm, local_http_config(port))
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
 
@@ -348,6 +363,7 @@ fn http_transport_does_not_publish_guest_resources() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn io_and_http_module_states_are_independent() {
+    let mut resources = HttpWorkerResources::new();
     let compiled = compile_source(
         r#"
         use io;
@@ -363,7 +379,8 @@ async fn io_and_http_module_states_are_independent() {
         max_write_bytes: 4096,
         ..IoPolicy::default()
     });
-    configure_http(&mut vm, HttpConfig::default()).expect("HTTP configuration should be valid");
+    configure_http(&mut resources, &mut vm, HttpConfig::default())
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     bind_default_host_registry(&mut vm);
     drive_vm_to_halt(&mut vm)
@@ -410,6 +427,7 @@ fn explicit_standard_catalog_emits_exact_http_import_schema() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn combined_standard_http_exact_bind_executes_with_io_surface_present() {
+    let mut resources = HttpWorkerResources::new();
     let (port, server) = spawn_http_server(1);
     let catalog = standard_host_catalog();
     let source = format!(
@@ -440,7 +458,8 @@ async fn combined_standard_http_exact_bind_executes_with_io_surface_present() {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
     });
-    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
+    configure_http(&mut resources, &mut vm, local_http_config(port))
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     registry
         .bind_vm_cached(&mut vm)

@@ -37,6 +37,69 @@ HTTP call signatures and embedding entry points:
 - `http::client::request` returns a bounded `HttpResponse`; and
 - `http::client::sse` drives a bounded SSE stream through a script callback.
 
+## Embedding resources and leases
+
+Native embeddings create one [`HttpWorkerResources`] owner for the worker and
+inject a matching [`HttpClientLease`] into each VM. The owner keys clients by
+the complete [`HttpConfig`] value, so changing any policy or limit creates an
+isolated Hyper client and admission state:
+
+```rust
+let mut resources = HttpWorkerResources::new();
+let config = HttpConfig::default();
+let lease = resources.client_for(&config)?;
+vm.configure_http(config, lease)?;
+```
+
+Keep the owner alive for the normal worker and VM lifetime, across VM reset/reuse,
+and until active work has been quiesced. During shutdown the owner may be
+closed first: a lease is cloneable and is retained by VM module state, buffered
+request futures, and the SSE stream driver. Hyper continues to own the
+connector, sockets, pool, and response body; RustScript does not add a pool,
+Tokio runtime, worker thread, or operation registry.
+
+There is no implicit client fallback. `HttpExtension` or the catalog registration
+only publishes and installs the host surface; the embedding still must call
+`HttpWorkerResources::client_for` and `HttpHostExt::configure_http`. An HTTP
+call from a VM without an injected matching lease fails as a host error.
+
+`Vm::set_http_max_in_flight` is a VM-local override. The effective cap for that
+VM is the lower of its override and the owner cap; changing one VM cannot alter
+the enforced cap or getter result of a sibling VM. An embedding-wide change can
+be made deliberately with `HttpWorkerResources::set_max_in_flight`, which
+updates the shared cap for all leases from that owner.
+
+## Owner shutdown and migration
+
+Owner destruction and explicit shutdown are fail-closed for new work. Dropping
+`HttpWorkerResources` or calling `close_admission` rejects new leases and new
+permits through existing leases. Permits and operations already admitted are
+not invalidated; their request or stream future must be allowed to retire, and
+its lease is released on every normal, cancel, reset, shutdown, and drop path.
+A stale lease can remain stored in a VM for cleanup, but it cannot start another
+HTTP operation.
+
+For explicit shutdown, close admission and move the owner state into its
+owned cleanup future:
+
+```rust
+resources.into_shutdown().await;
+```
+
+The shutdown transition closes admission before releasing the owner's client
+map. The recommended ordering is: stop scheduling new VM work, reset or shut
+down VMs so active buffered/SSE futures retire, await `HttpWorkerShutdown`,
+then drop the VMs and any remaining lease clones. Dropping the owner first is
+also safe when fail-closed rejection is desired; active operations still retain
+what they need until retirement.
+
+When migrating an embedding from the earlier implicit HTTP setup, keep the
+existing `HttpExtension`/catalog registration, add one worker-owned
+`HttpWorkerResources`, pass `client_for(&config)` to every VM with
+`configure_http`, and remove any per-VM client construction or fallback path.
+Preserve the owner across VM reset/reuse and across all VMs that should share a
+policy client; create a distinct config when isolation is required.
+
 Both builtins are ordinary `#[pd_host_function] async fn` declarations. Their
 macro-generated wrappers own async-host submission; the HTTP module does not
 publish transient request, response, or stream resources.

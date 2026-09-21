@@ -11,7 +11,9 @@ use super::request::{
     HttpRequest, OwnedResponse, open_stream_response, parse_request, response_header_entries,
     validate_request_header_budget,
 };
-use super::{CaptureAsyncHostContext, HostFutureOutput, HttpRequestContext, policy};
+use super::{
+    CaptureAsyncHostContext, HostFutureOutput, HttpClientLease, HttpRequestContext, policy,
+};
 use crate::builtins::runtime::typed::{VmCallable, VmMap, VmMapHandle};
 use crate::vm::async_host::{HostStreamAction, HostStreamDriver, HostStreamPoll};
 use crate::vm::operation::OperationCancelReason;
@@ -438,6 +440,9 @@ struct SseStreamDriver {
     body_started: bool,
     eof: bool,
     end_emitted: bool,
+    /// Keeps the embedding-owned worker resource alive for the full response
+    /// and every generic stream termination path.
+    _client: HttpClientLease,
     _permit: super::policy::ConnectionPermit,
 }
 
@@ -447,6 +452,7 @@ impl SseStreamDriver {
         url: url::Url,
         config: &super::HttpConfig,
         deadline: Instant,
+        client: HttpClientLease,
         permit: super::policy::ConnectionPermit,
     ) -> VmResult<Self> {
         let status = response.response().status();
@@ -495,6 +501,7 @@ impl SseStreamDriver {
             body_started: false,
             eof: false,
             end_emitted: false,
+            _client: client,
             _permit: permit,
         })
     }
@@ -701,7 +708,14 @@ pub(super) async fn builtin_http_client_sse(
         deadline,
         request: _,
     } = context;
-    let driver = SseStreamDriver::new(response, url, &http.config, deadline, http.permit)?;
+    let driver = SseStreamDriver::new(
+        response,
+        url,
+        &http.config,
+        deadline,
+        http.client.clone(),
+        http.permit,
+    )?;
     Ok(HostFutureOutput::continue_with(move |vm| {
         match vm.submit_callable_stream(callback, driver) {
             Ok(CallOutcome::Pending(op_id)) => Ok(CallOutcome::Pending(op_id)),

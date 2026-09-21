@@ -163,8 +163,11 @@ fn local_http_config(port: u16) -> HttpConfig {
     }
 }
 
-fn configure_http(vm: &mut Vm, config: HttpConfig) -> VmResult<()> {
-    let mut resources = HttpWorkerResources::new();
+fn configure_http(
+    resources: &mut HttpWorkerResources,
+    vm: &mut Vm,
+    config: HttpConfig,
+) -> VmResult<()> {
     let lease = resources.client_for(&config)?;
     vm.configure_http(config, lease)
 }
@@ -513,7 +516,9 @@ async fn run_raw_response(response: Vec<u8>, mut config: HttpConfig) -> Result<V
     config.allowed_ports = vec![port];
     config.allow_private_ips = true;
     let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
-    configure_http(&mut vm, config).expect("raw-response HTTP configuration should be valid");
+    let mut resources = HttpWorkerResources::new();
+    configure_http(&mut resources, &mut vm, config)
+        .expect("raw-response HTTP configuration should be valid");
     install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -527,7 +532,9 @@ async fn run_raw_response(response: Vec<u8>, mut config: HttpConfig) -> Result<V
 async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
     let (port, server) = spawn_test_server();
     let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
-    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
+    let mut resources = HttpWorkerResources::new();
+    configure_http(&mut resources, &mut vm, local_http_config(port))
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -549,7 +556,9 @@ async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
 async fn http_client_pool_reuses_a_connection_across_vm_reset() {
     let (port, accepted_connections, server) = spawn_keep_alive_server();
     let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
-    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
+    let mut resources = HttpWorkerResources::new();
+    configure_http(&mut resources, &mut vm, local_http_config(port))
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -649,7 +658,9 @@ async fn buffered_request_preserves_duplicate_header_order() {
     );
     let compiled = compile_source(&source).expect("duplicate headers should compile");
     let mut vm = Vm::new(compiled.program);
-    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
+    let mut resources = HttpWorkerResources::new();
+    configure_http(&mut resources, &mut vm, local_http_config(port))
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -672,6 +683,7 @@ async fn buffered_request_preserves_duplicate_header_order() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn buffered_redirect_rewrites_only_post_for_301_and_302() {
+    let mut resources = HttpWorkerResources::new();
     for status in [301, 302] {
         for method in ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"] {
             let (port, requests, server) = spawn_redirect_server(status, 1);
@@ -679,7 +691,7 @@ async fn buffered_redirect_rewrites_only_post_for_301_and_302() {
                 &format!("http://127.0.0.1:{port}/start"),
                 method,
             ));
-            configure_http(&mut vm, local_http_config(port))
+            configure_http(&mut resources, &mut vm, local_http_config(port))
                 .expect("HTTP configuration should be valid");
             install_host_driver(&mut vm);
             HostFunctionRegistry::new()
@@ -716,6 +728,7 @@ async fn buffered_redirect_rewrites_only_post_for_301_and_302() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn buffered_cross_origin_redirect_strips_credentials_and_custom_headers() {
+    let mut resources = HttpWorkerResources::new();
     for status in [301, 302, 303, 307, 308] {
         let (
             source_port,
@@ -731,7 +744,8 @@ async fn buffered_cross_origin_redirect_strips_credentials_and_custom_headers() 
             &format!("http://127.0.0.1:{source_port}/start"),
             "POST",
         ));
-        configure_http(&mut vm, http_config).expect("HTTP configuration should be valid");
+        configure_http(&mut resources, &mut vm, http_config)
+            .expect("HTTP configuration should be valid");
         install_host_driver(&mut vm);
         HostFunctionRegistry::new()
             .bind_vm_cached(&mut vm)
@@ -811,13 +825,14 @@ async fn buffered_cross_origin_redirect_strips_credentials_and_custom_headers() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn buffered_same_origin_redirect_preserves_caller_header_values() {
+    let mut resources = HttpWorkerResources::new();
     for status in [301, 302, 303, 307, 308] {
         let (port, requests, server) = spawn_redirect_server(status, 1);
         let mut vm = Vm::new(build_request_program_with_headers(
             &format!("http://127.0.0.1:{port}/start"),
             "POST",
         ));
-        configure_http(&mut vm, local_http_config(port))
+        configure_http(&mut resources, &mut vm, local_http_config(port))
             .expect("HTTP configuration should be valid");
         install_host_driver(&mut vm);
         HostFunctionRegistry::new()
@@ -937,11 +952,13 @@ async fn buffered_response_limits_reject_adversarial_framing_and_exact_head_over
 
 #[tokio::test(flavor = "current_thread")]
 async fn buffered_redirect_chain_reaches_final_body() {
+    let mut resources = HttpWorkerResources::new();
     let (port, requests, server) = spawn_redirect_server(307, 2);
     let mut vm = Vm::new(build_request_program(format!(
         "http://127.0.0.1:{port}/start"
     )));
-    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
+    configure_http(&mut resources, &mut vm, local_http_config(port))
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -1132,6 +1149,7 @@ fn cached_plan_refreshes_after_a_sibling_registry_mutation() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn tls_handshake_obeys_connect_phase_timeout() {
+    let mut resources = HttpWorkerResources::new();
     let listener = bind_test_listener();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
@@ -1143,7 +1161,7 @@ async fn tls_handshake_obeys_connect_phase_timeout() {
     config.allowed_schemes = vec!["https".to_string()];
     config.connect_timeout = std::time::Duration::from_millis(25);
     config.request_timeout = std::time::Duration::from_millis(500);
-    configure_http(&mut vm, config).unwrap();
+    configure_http(&mut resources, &mut vm, config).unwrap();
     install_host_driver(&mut vm);
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
 
@@ -1161,6 +1179,7 @@ async fn tls_handshake_obeys_connect_phase_timeout() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn max_stream_duration_does_not_shorten_buffered_requests() {
+    let mut resources = HttpWorkerResources::new();
     let listener = bind_test_listener();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
@@ -1176,7 +1195,7 @@ async fn max_stream_duration_does_not_shorten_buffered_requests() {
     let mut buffered_config = local_http_config(port);
     buffered_config.max_stream_duration = std::time::Duration::from_millis(1);
     buffered_config.request_timeout = std::time::Duration::from_millis(200);
-    configure_http(&mut vm, buffered_config).unwrap();
+    configure_http(&mut resources, &mut vm, buffered_config).unwrap();
     install_host_driver(&mut vm);
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
     drive_vm_to_halt(&mut vm).await.unwrap();
@@ -1186,8 +1205,10 @@ async fn max_stream_duration_does_not_shorten_buffered_requests() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn explicitly_allowed_http_capability_reaches_http_policy() {
+    let mut resources = HttpWorkerResources::new();
     let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
     configure_http(
+        &mut resources,
         &mut vm,
         HttpConfig {
             allowed_schemes: vec!["http".to_string()],
@@ -1214,9 +1235,11 @@ async fn explicitly_allowed_http_capability_reaches_http_policy() {
 
 #[test]
 fn http_in_flight_limit_rejects_before_starting_a_request() {
+    let mut resources = HttpWorkerResources::new();
     let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
     vm.set_http_max_in_flight(0);
     configure_http(
+        &mut resources,
         &mut vm,
         HttpConfig {
             allowed_schemes: vec!["http".to_string()],
@@ -1239,6 +1262,7 @@ fn http_in_flight_limit_rejects_before_starting_a_request() {
 
 #[test]
 fn http_config_accepts_bounded_stream_defaults_and_rejects_zero_bounds() {
+    let mut resources = HttpWorkerResources::new();
     let defaults = HttpConfig::default();
     defaults
         .validate()
@@ -1287,6 +1311,7 @@ fn http_config_accepts_bounded_stream_defaults_and_rejects_zero_bounds() {
 
     let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
     let error = configure_http(
+        &mut resources,
         &mut vm,
         HttpConfig {
             max_stream_item_bytes: 0,
@@ -1300,6 +1325,7 @@ fn http_config_accepts_bounded_stream_defaults_and_rejects_zero_bounds() {
 
 #[test]
 fn http_config_rejects_request_timeout_that_cannot_form_a_deadline() {
+    let mut resources = HttpWorkerResources::new();
     let invalid = HttpConfig {
         request_timeout: std::time::Duration::MAX,
         ..HttpConfig::default()
@@ -1310,7 +1336,7 @@ fn http_config_rejects_request_timeout_that_cannot_form_a_deadline() {
     assert!(validation_error.to_string().contains("request_timeout"));
 
     let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
-    let configure_error = configure_http(&mut vm, invalid)
+    let configure_error = configure_http(&mut resources, &mut vm, invalid)
         .expect_err("configuration must reject an overflowing request timeout");
     assert!(configure_error.to_string().contains("request_timeout"));
     assert!(!vm.http_is_configured());
@@ -1325,10 +1351,93 @@ fn http_config_rejects_request_timeout_that_cannot_form_a_deadline() {
     assert!(validation_error.to_string().contains("max_stream_duration"));
 
     let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
-    let configure_error = configure_http(&mut vm, invalid)
+    let configure_error = configure_http(&mut resources, &mut vm, invalid)
         .expect_err("configuration must reject an overflowing stream duration");
     assert!(configure_error.to_string().contains("max_stream_duration"));
     assert!(!vm.http_is_configured());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn two_vms_share_one_worker_owner_for_buffered_requests() {
+    let (port, accepted, server) = spawn_keep_alive_server();
+    let config = local_http_config(port);
+    let mut resources = HttpWorkerResources::new();
+    let mut first_vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+    let first_lease = resources
+        .client_for(&config)
+        .expect("first worker lease should be created");
+    first_vm
+        .configure_http(config.clone(), first_lease)
+        .expect("first VM should accept its worker lease");
+    install_host_driver(&mut first_vm);
+
+    let mut second_vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+    let second_lease = resources
+        .client_for(&config)
+        .expect("second worker lease should reuse the policy client");
+    second_vm
+        .configure_http(config, second_lease)
+        .expect("second VM should accept its worker lease");
+    install_host_driver(&mut second_vm);
+
+    drive_vm_to_halt(&mut first_vm)
+        .await
+        .expect("first buffered request should complete");
+    drive_vm_to_halt(&mut second_vm)
+        .await
+        .expect("second buffered request should complete");
+    assert_eq!(
+        accepted
+            .recv_timeout(TEST_IO_TIMEOUT)
+            .expect("server should report connection reuse"),
+        1,
+        "the owner-scoped client should be shared by both VMs"
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn buffered_work_retires_after_owner_drop_or_explicit_shutdown() {
+    for explicit_shutdown in [false, true] {
+        let (port, ready, server) = spawn_pending_server();
+        let config = local_http_config(port);
+        let mut resources = HttpWorkerResources::new();
+        let lease = resources
+            .client_for(&config)
+            .expect("worker lease should be created");
+        let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+        vm.configure_http(config.clone(), lease.clone())
+            .expect("active VM should accept its worker lease");
+        install_host_driver(&mut vm);
+        assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
+        poll_pending_http_transport(&mut vm).await;
+        ready
+            .recv_timeout(TEST_IO_TIMEOUT)
+            .expect("buffered request should reach the server");
+
+        if explicit_shutdown {
+            resources.into_shutdown().await;
+        } else {
+            drop(resources);
+        }
+        reset_and_wait(&mut vm)
+            .await
+            .expect("active buffered work should retire after owner closure");
+
+        let mut stale_vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+        stale_vm
+            .configure_http(config, lease)
+            .expect("an existing lease may remain injectable after owner closure");
+        install_host_driver(&mut stale_vm);
+        let error = stale_vm
+            .run()
+            .expect_err("a stale lease must fail before a new request starts");
+        assert!(
+            error.to_string().contains("admission is closed"),
+            "unexpected stale-lease error: {error}"
+        );
+        server.join().unwrap();
+    }
 }
 
 fn spawn_pending_server() -> (u16, mpsc::Receiver<()>, thread::JoinHandle<()>) {
@@ -1437,10 +1546,12 @@ async fn reset_and_wait(vm: &mut Vm) -> Result<(), vm::VmError> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn reset_retires_buffered_http_future_and_releases_its_permit() {
+    let mut resources = HttpWorkerResources::new();
     let (port, ready, server) = spawn_pending_then_response_server();
     let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
     vm.set_http_max_in_flight(1);
-    configure_http(&mut vm, local_http_config(port)).expect("HTTP configuration should be valid");
+    configure_http(&mut resources, &mut vm, local_http_config(port))
+        .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
@@ -1469,11 +1580,12 @@ async fn reset_retires_buffered_http_future_and_releases_its_permit() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_and_drop_retire_buffered_http_futures() {
+    let mut resources = HttpWorkerResources::new();
     for shutdown in [true, false] {
         let (port, ready, server) = spawn_pending_server();
         let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
         vm.set_http_max_in_flight(1);
-        configure_http(&mut vm, local_http_config(port))
+        configure_http(&mut resources, &mut vm, local_http_config(port))
             .expect("HTTP configuration should be valid");
         install_host_driver(&mut vm);
         HostFunctionRegistry::new()
@@ -1498,9 +1610,11 @@ async fn shutdown_and_drop_retire_buffered_http_futures() {
 /// admission) remains in force.
 #[test]
 fn http_config_and_max_policy_are_persistent_while_clear_removes_only_config() {
+    let mut resources = HttpWorkerResources::new();
     let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
     vm.set_http_max_in_flight(2);
-    configure_http(&mut vm, local_http_config(1)).expect("HTTP config should be valid");
+    configure_http(&mut resources, &mut vm, local_http_config(1))
+        .expect("HTTP config should be valid");
     assert_eq!(vm.http_max_in_flight(), 2);
     assert!(vm.http_is_configured());
 
@@ -1530,6 +1644,7 @@ fn http_config_and_max_policy_are_persistent_while_clear_removes_only_config() {
 /// the *current* persistent max at capture time.
 #[test]
 fn set_max_in_flight_updates_policy_without_eagerly_creating_runtime_state() {
+    let mut resources = HttpWorkerResources::new();
     #[derive(Debug)]
     struct Probe;
 
@@ -1546,7 +1661,8 @@ fn set_max_in_flight_updates_policy_without_eagerly_creating_runtime_state() {
     // A lazily created admission reads the current persistent max: with max 0
     // the first request is rejected before any connection is attempted.
     vm.set_http_max_in_flight(0);
-    configure_http(&mut vm, local_http_config(1)).expect("HTTP config should be valid");
+    configure_http(&mut resources, &mut vm, local_http_config(1))
+        .expect("HTTP config should be valid");
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
