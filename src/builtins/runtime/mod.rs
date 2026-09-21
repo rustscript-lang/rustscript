@@ -1,6 +1,8 @@
 // VM-side builtin execution entrypoints.
 // Builtin metadata and call-index mapping live in crate::builtins.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::builtins::BuiltinFunction;
@@ -14,6 +16,11 @@ use crate::vm::CaptureAsyncHostContext;
 use crate::vm::HostFutureOutput;
 #[allow(unused_imports)]
 use crate::vm::{CallOutcome, CallReturn, HostOpId, Value, Vm, VmError, VmResult};
+
+#[cfg(test)]
+static STANDARD_CATALOG_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static STANDARD_CATALOG_FINGERPRINT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 mod aot;
 mod bytes;
@@ -87,19 +94,41 @@ pub fn sqlite_host_catalog() -> Arc<HostApiCatalog> {
     }))
 }
 
+struct StandardCatalogState {
+    catalog: Arc<HostApiCatalog>,
+    fingerprint: HostApiFingerprint,
+}
+
+fn standard_catalog_state() -> &'static StandardCatalogState {
+    static STATE: OnceLock<StandardCatalogState> = OnceLock::new();
+    STATE.get_or_init(|| {
+        let catalog = Arc::new(host_modules::build_standard_host_catalog());
+        #[cfg(test)]
+        STANDARD_CATALOG_BUILD_COUNT.fetch_add(1, Ordering::SeqCst);
+
+        let fingerprint = catalog.fingerprint();
+        #[cfg(test)]
+        STANDARD_CATALOG_FINGERPRINT_COUNT.fetch_add(1, Ordering::SeqCst);
+
+        StandardCatalogState {
+            catalog,
+            fingerprint,
+        }
+    })
+}
+
 /// Returns the combined catalog used by default source analysis.
 ///
 /// Resources, named structs, and function schemas are the derived catalogs of
 /// every standard host module that publishes a guest surface, merged in the
 /// deterministic aggregation order.
 pub fn standard_host_catalog() -> Arc<HostApiCatalog> {
-    static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
-    Arc::clone(CATALOG.get_or_init(|| Arc::new(host_modules::build_standard_host_catalog())))
+    Arc::clone(&standard_catalog_state().catalog)
 }
 
 /// Returns the cached fingerprint for [`standard_host_catalog`].
 pub fn standard_host_catalog_fingerprint() -> HostApiFingerprint {
-    standard_host_catalog().fingerprint()
+    standard_catalog_state().fingerprint
 }
 
 /// The standard host modules for this build (see [`host_modules`]).
@@ -224,8 +253,69 @@ pub(crate) fn execute_builtin_call(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Barrier};
+
     use super::*;
     use crate::{OpCode, Program};
+
+    #[test]
+    fn standard_catalog_fingerprint_is_cached_after_repeated_access() {
+        let expected = standard_host_catalog().fingerprint();
+        assert_eq!(standard_host_catalog_fingerprint(), expected);
+
+        for _ in 0..10_000 {
+            assert_eq!(standard_host_catalog_fingerprint(), expected);
+        }
+
+        assert_eq!(
+            STANDARD_CATALOG_BUILD_COUNT.load(Ordering::SeqCst),
+            1,
+            "standard catalog should be initialized once"
+        );
+        assert_eq!(
+            STANDARD_CATALOG_FINGERPRINT_COUNT.load(Ordering::SeqCst),
+            1,
+            "standard catalog fingerprint should be computed once"
+        );
+    }
+
+    #[test]
+    fn standard_catalog_access_is_single_initialization_under_concurrency() {
+        const WORKER_COUNT: usize = 16;
+
+        let start = Arc::new(Barrier::new(WORKER_COUNT));
+        let handles = (0..WORKER_COUNT)
+            .map(|_| {
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    let fingerprint = standard_host_catalog_fingerprint();
+                    assert_eq!(fingerprint, standard_host_catalog().fingerprint());
+                    fingerprint
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let fingerprints = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("catalog worker should finish"))
+            .collect::<Vec<_>>();
+        assert!(
+            fingerprints.windows(2).all(|window| window[0] == window[1]),
+            "concurrent callers should observe one fingerprint"
+        );
+        assert_eq!(
+            STANDARD_CATALOG_BUILD_COUNT.load(Ordering::SeqCst),
+            1,
+            "concurrent catalog callers should initialize once"
+        );
+        assert_eq!(
+            STANDARD_CATALOG_FINGERPRINT_COUNT.load(Ordering::SeqCst),
+            1,
+            "concurrent catalog callers should compute the fingerprint once"
+        );
+    }
 
     #[test]
     fn builtin_assert_success_returns_no_stack_value() {
