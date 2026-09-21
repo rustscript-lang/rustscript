@@ -43,10 +43,11 @@ injection:
 ## Embedding resources and leases
 
 Native embeddings create one embedding-owned [`HttpWorkerResources`] owner for
-the worker. It owns one Hyper client and admission entry for each complete
-[`HttpConfig`] identity. VMs hold matching injected [`HttpClientLease`] values;
-VMs that receive leases for the same config from that owner share that client
-and admission state:
+the worker. It owns one Hyper client and one worker admission gate for each
+complete [`HttpConfig`] identity. Each `client_for` call returns a lease with a
+fresh VM-local admission scope; clones of that lease share the local scope for
+that VM or request chain. VMs holding leases for the same config share the
+Hyper client and worker gate while keeping their local scopes independent:
 
 ```rust
 let mut resources = HttpWorkerResources::new();
@@ -69,11 +70,13 @@ surface; the embedding still must call `HttpWorkerResources::client_for` and
 `HttpHostExt::configure_http`. An HTTP call from a VM without an injected
 matching lease fails as a host error.
 
-`Vm::set_http_max_in_flight` is a VM-local override. The effective cap for that
-VM is the lower of its override and the owner cap; changing one VM cannot alter
-the enforced cap or getter result of a sibling VM. An embedding-wide change can
-be made deliberately with `HttpWorkerResources::set_max_in_flight`, which
-updates the shared cap for all leases from that owner.
+`HttpWorkerResources::new` uses an effectively unbounded worker cap. An embedding
+can select an aggregate cap with `HttpWorkerResources::with_max_in_flight` or
+change it with `HttpWorkerResources::set_max_in_flight`; those APIs affect only
+the worker gate shared by leases for each matching config. Every lease starts
+with a VM-local cap of 64. `Vm::set_http_max_in_flight` changes only that lease's
+local scope and its VM getter; changing one VM cannot alter a sibling lease.
+The reported effective cap is the lower of the local and worker caps.
 
 ## Owner shutdown and migration
 
@@ -360,12 +363,14 @@ rebinding without claiming that the admission-selected address is the one used
 for the socket.
 
 Buffered HTTP and SSE use cloneable Hyper clients from embedding-owned
-`HttpWorkerResources` entries. The owner maintains one client and admission entry
-per complete `HttpConfig`; VMs store matching `HttpClientLease` values and can
-share an entry when they share that config. Hyper owns HTTP/1 transport setup,
-connection pooling, idle connection lifecycle, and pooled-connection retry
-behavior. The owner and injected VM lease span VM reset/reuse; replacing an HTTP
-configuration obtains a new matching lease with
+`HttpWorkerResources` entries. The owner maintains one client and one worker
+admission gate per complete `HttpConfig`; every lease also owns a fresh local
+admission scope. Request and SSE capture acquire both permits. If local
+admission fails after worker admission, the worker permit is released. The SSE
+driver retains the composite permit and matching lease through stream retirement.
+Hyper owns HTTP/1 transport setup, connection pooling, idle connection lifecycle,
+and pooled-connection retry behavior. The owner and injected VM lease span VM
+reset/reuse; replacing an HTTP configuration obtains a new matching lease with
 `HttpWorkerResources::client_for` rather than constructing a client in VM state.
 The host does not maintain a custom pool, sender cache, connection worker,
 private Tokio runtime, or reconnect state machine.

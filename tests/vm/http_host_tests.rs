@@ -249,6 +249,34 @@ fn spawn_keep_alive_server() -> (u16, mpsc::Receiver<usize>, thread::JoinHandle<
     (port, receiver, handle)
 }
 
+fn spawn_two_request_server() -> (u16, mpsc::Receiver<usize>, thread::JoinHandle<()>) {
+    let listener = bind_test_listener();
+    let port = listener
+        .local_addr()
+        .expect("two-request listener should have an address")
+        .port();
+    let (sender, receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut streams = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) =
+                accept_test_connection(&listener).expect("concurrent request should arrive");
+            let request = read_recorded_request(&mut stream);
+            assert!(request.starts_with("GET / HTTP/1.1"));
+            streams.push(stream);
+        }
+        for stream in &mut streams {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .expect("concurrent response should be writable");
+        }
+        sender
+            .send(streams.len())
+            .expect("concurrent connection count receiver");
+    });
+    (port, receiver, handle)
+}
+
 fn spawn_response_server(response: Vec<u8>) -> (u16, thread::JoinHandle<()>) {
     let listener = bind_test_listener();
     let port = listener
@@ -1394,6 +1422,59 @@ async fn two_vms_share_one_worker_owner_for_buffered_requests() {
         "the owner-scoped client should be shared by both VMs"
     );
     server.join().unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn separate_vm_leases_admit_concurrent_buffered_requests() {
+    let (port, accepted, server) = spawn_two_request_server();
+    let config = local_http_config(port);
+    let mut resources = HttpWorkerResources::new();
+
+    let mut first_vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+    first_vm.set_http_max_in_flight(1);
+    first_vm
+        .configure_http(
+            config.clone(),
+            resources
+                .client_for(&config)
+                .expect("first worker lease should be created"),
+        )
+        .expect("first VM should accept its worker lease");
+    install_host_driver(&mut first_vm);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut first_vm)
+        .expect("first VM host registry should bind HTTP");
+
+    let mut second_vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+    second_vm.set_http_max_in_flight(1);
+    second_vm
+        .configure_http(
+            config.clone(),
+            resources
+                .client_for(&config)
+                .expect("second worker lease should be created"),
+        )
+        .expect("second VM should accept its worker lease");
+    install_host_driver(&mut second_vm);
+    HostFunctionRegistry::new()
+        .bind_vm_cached(&mut second_vm)
+        .expect("second VM host registry should bind HTTP");
+
+    let (first, second) = tokio::join!(
+        drive_vm_to_halt(&mut first_vm),
+        drive_vm_to_halt(&mut second_vm),
+    );
+    first.expect("first concurrent request should complete");
+    second.expect("second concurrent request should complete");
+    assert_eq!(
+        accepted
+            .recv_timeout(TEST_IO_TIMEOUT)
+            .expect("server should observe both concurrent requests"),
+        2
+    );
+    server
+        .join()
+        .expect("concurrent request server should finish");
 }
 
 #[tokio::test(flavor = "current_thread")]

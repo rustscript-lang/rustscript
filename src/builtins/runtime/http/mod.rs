@@ -21,53 +21,78 @@ pub(super) mod request;
 pub(super) mod sse;
 
 pub use config::HttpConfig;
-use policy::{ConnectionAdmission, ConnectionPermit};
+use policy::{CompositeConnectionPermit, ConnectionAdmission};
 
 const DEFAULT_MAX_HTTP_IN_FLIGHT: usize = 64;
+const DEFAULT_MAX_WORKER_HTTP_IN_FLIGHT: usize = usize::MAX;
 
 struct HttpClientEntry {
     config: HttpConfig,
     client: request::HttpClient,
-    admission: ConnectionAdmission,
+    worker_admission: ConnectionAdmission,
 }
 
 /// Opaque, cloneable access to one embedding-owned Hyper client.
 ///
 /// Cloning this lease shares the client, connector, connection pool, and
-/// admission state. The lease does not expose Hyper types to embedders and can
-/// safely be captured by request-owned futures.
+/// VM-local admission scope. Every lease from the same worker entry retains the
+/// shared worker admission gate, while each `client_for` call gets a distinct
+/// local scope. The lease does not expose Hyper types to embedders and can be
+/// safely captured by request-owned futures.
 #[derive(Clone)]
 pub struct HttpClientLease {
     entry: Arc<HttpClientEntry>,
+    local_admission: ConnectionAdmission,
 }
 
 impl HttpClientLease {
+    fn from_entry(entry: &Arc<HttpClientEntry>) -> Self {
+        Self {
+            entry: Arc::clone(entry),
+            local_admission: ConnectionAdmission::new(DEFAULT_MAX_HTTP_IN_FLIGHT),
+        }
+    }
+
     fn matches_config(&self, config: &HttpConfig) -> bool {
         self.entry.config == *config
     }
 
-    fn acquire(&self, requested_max_in_flight: Option<usize>) -> VmResult<ConnectionPermit> {
-        match requested_max_in_flight {
-            Some(max_in_flight) => self.entry.admission.acquire_with_limit(Some(max_in_flight)),
-            None => self.entry.admission.acquire(),
-        }
+    fn acquire(&self) -> VmResult<CompositeConnectionPermit> {
+        let worker_permit = self.entry.worker_admission.acquire()?;
+        let local_permit = match self.local_admission.acquire() {
+            Ok(permit) => permit,
+            Err(error) => {
+                drop(worker_permit);
+                return Err(error);
+            }
+        };
+        Ok(CompositeConnectionPermit::new(worker_permit, local_permit))
     }
 
     fn client(&self) -> &request::HttpClient {
         &self.entry.client
     }
 
-    fn max_in_flight(&self) -> usize {
-        self.entry.admission.max_in_flight()
+    fn set_local_max_in_flight(&self, max_in_flight: usize) {
+        self.local_admission.set_max_in_flight(max_in_flight);
+    }
+
+    fn local_max_in_flight(&self) -> usize {
+        self.local_admission.max_in_flight()
+    }
+
+    fn worker_max_in_flight(&self) -> usize {
+        self.entry.worker_admission.max_in_flight()
     }
 }
 
-/// Embedding-owned HTTP clients and their shared admission state.
+/// Embedding-owned HTTP clients and their worker-level admission gates.
 ///
 /// One resource owner may be held for a worker lifetime. A client is built once
 /// for each full [`HttpConfig`] identity and is reused by every VM that receives
-/// a lease from this resource. Hyper and hyper-util remain the owners of
-/// connectors, sockets, pools, and connection drivers.
+/// a lease from this resource. Each returned lease has its own VM-local
+/// admission scope. Hyper and hyper-util remain the owners of connectors,
+/// sockets, pools, and connection drivers.
 pub struct HttpWorkerResources {
     clients: HashMap<HttpConfig, Arc<HttpClientEntry>>,
     max_in_flight: usize,
@@ -75,12 +100,12 @@ pub struct HttpWorkerResources {
 }
 
 impl HttpWorkerResources {
-    /// Creates an empty worker resource owner with the default admission cap.
+    /// Creates an empty worker resource owner with no practical aggregate cap.
     pub fn new() -> Self {
-        Self::with_max_in_flight(DEFAULT_MAX_HTTP_IN_FLIGHT)
+        Self::with_max_in_flight(DEFAULT_MAX_WORKER_HTTP_IN_FLIGHT)
     }
 
-    /// Creates an empty worker resource owner with an explicit admission cap.
+    /// Creates an empty worker resource owner with an explicit aggregate cap.
     pub fn with_max_in_flight(max_in_flight: usize) -> Self {
         Self {
             clients: HashMap::new(),
@@ -102,24 +127,22 @@ impl HttpWorkerResources {
             ));
         }
         if let Some(entry) = self.clients.get(config) {
-            return Ok(HttpClientLease {
-                entry: Arc::clone(entry),
-            });
+            return Ok(HttpClientLease::from_entry(entry));
         }
         let entry = Arc::new(HttpClientEntry {
             config: config.clone(),
             client: request::build_client(config),
-            admission: ConnectionAdmission::new(self.max_in_flight),
+            worker_admission: ConnectionAdmission::new(self.max_in_flight),
         });
         self.clients.insert(config.clone(), Arc::clone(&entry));
-        Ok(HttpClientLease { entry })
+        Ok(HttpClientLease::from_entry(&entry))
     }
 
     /// Updates the shared admission cap for existing and future policy keys.
     pub fn set_max_in_flight(&mut self, max_in_flight: usize) {
         self.max_in_flight = max_in_flight;
         for entry in self.clients.values() {
-            entry.admission.set_max_in_flight(max_in_flight);
+            entry.worker_admission.set_max_in_flight(max_in_flight);
         }
     }
 
@@ -133,7 +156,7 @@ impl HttpWorkerResources {
     pub fn close_admission(&mut self) {
         self.admission_open = false;
         for entry in self.clients.values() {
-            entry.admission.close();
+            entry.worker_admission.close();
         }
     }
 
@@ -217,6 +240,9 @@ impl HttpHostExt for Vm {
         let max_in_flight = ctx
             .module_state::<HttpHostState>()
             .and_then(|state| state.max_in_flight);
+        if let Some(max_in_flight) = max_in_flight {
+            client.set_local_max_in_flight(max_in_flight);
+        }
         ctx.set_module_state(HttpHostState {
             config: Some(config),
             client: Some(client),
@@ -234,19 +260,28 @@ impl HttpHostExt for Vm {
             .module_state_mut::<HttpHostState>()
             .expect("HTTP host state was inserted");
         state.max_in_flight = Some(max_in_flight);
+        if let Some(client) = state.client.as_ref() {
+            client.set_local_max_in_flight(max_in_flight);
+        }
     }
 
     fn http_max_in_flight(&mut self) -> usize {
         self.host_context()
             .module_state::<HttpHostState>()
-            .and_then(|state| {
-                let shared = state.client.as_ref().map(HttpClientLease::max_in_flight);
-                match (state.max_in_flight, shared) {
-                    (Some(local), Some(shared)) => Some(local.min(shared)),
-                    (Some(local), None) => Some(local),
-                    (None, Some(shared)) => Some(shared),
-                    (None, None) => None,
-                }
+            .map(|state| {
+                let local = state
+                    .max_in_flight
+                    .or_else(|| {
+                        state
+                            .client
+                            .as_ref()
+                            .map(HttpClientLease::local_max_in_flight)
+                    })
+                    .unwrap_or(DEFAULT_MAX_HTTP_IN_FLIGHT);
+                state
+                    .client
+                    .as_ref()
+                    .map_or(local, |client| local.min(client.worker_max_in_flight()))
             })
             .unwrap_or(DEFAULT_MAX_HTTP_IN_FLIGHT)
     }
@@ -270,7 +305,7 @@ impl HttpHostExt for Vm {
 pub(super) struct HttpRequestContext {
     config: HttpConfig,
     client: HttpClientLease,
-    permit: ConnectionPermit,
+    permit: CompositeConnectionPermit,
     prepared_request: Option<(request::HttpRequest, Instant)>,
 }
 
@@ -297,7 +332,6 @@ impl HttpRequestContext {
             .client
             .clone()
             .ok_or_else(|| VmError::HostError("HTTP client lease is not configured".to_string()))?;
-        let requested_max_in_flight = state.max_in_flight;
         let admitted_at = Instant::now();
         if script_timeout.is_some_and(|timeout| admitted_at.checked_add(timeout).is_none()) {
             return Err(VmError::HostError(format!(
@@ -310,7 +344,7 @@ impl HttpRequestContext {
         let deadline = admitted_at.checked_add(duration).ok_or_else(|| {
             VmError::HostError("HTTP max_stream_duration cannot form a deadline".to_string())
         })?;
-        let permit = client.acquire(requested_max_in_flight)?;
+        let permit = client.acquire()?;
         Ok((
             Self {
                 config,
@@ -638,7 +672,7 @@ mod tests {
         SchemeFamily, is_restricted_ip, validate_resolved_addresses, validate_url,
         validate_url_policy,
     };
-    use super::{HttpConfig, HttpHostExt, HttpWorkerResources};
+    use super::{HttpConfig, HttpHostExt, HttpRequestContext, HttpWorkerResources};
 
     #[test]
     fn default_http_policy_denies_all_hosts() {
@@ -859,6 +893,164 @@ mod tests {
     }
 
     #[test]
+    fn distinct_vm_leases_have_independent_local_admission_scopes() {
+        let mut resources = HttpWorkerResources::with_max_in_flight(usize::MAX);
+        let config = HttpConfig::default();
+        let mut active = Vec::new();
+
+        for _ in 0..65 {
+            let lease = resources
+                .client_for(&config)
+                .expect("default config should be valid");
+            let mut vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
+            vm.set_http_max_in_flight(64);
+            vm.configure_http(config.clone(), lease)
+                .expect("lease injection should succeed");
+            active.push(
+                HttpRequestContext::capture_for(&mut vm, None, "HTTP")
+                    .expect("each VM should admit one request")
+                    .0,
+            );
+        }
+
+        assert_eq!(active.len(), 65);
+    }
+
+    #[test]
+    fn one_vm_local_admission_rejects_its_65th_request() {
+        let mut resources = HttpWorkerResources::with_max_in_flight(usize::MAX);
+        let config = HttpConfig::default();
+        let lease = resources
+            .client_for(&config)
+            .expect("default config should be valid");
+        let mut vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
+        vm.set_http_max_in_flight(64);
+        vm.configure_http(config, lease)
+            .expect("lease injection should succeed");
+        let mut active = Vec::new();
+        for _ in 0..64 {
+            active.push(
+                HttpRequestContext::capture_for(&mut vm, None, "HTTP")
+                    .expect("the VM should admit up to its local limit")
+                    .0,
+            );
+        }
+
+        let error = match HttpRequestContext::capture_for(&mut vm, None, "HTTP") {
+            Ok(_) => panic!("the VM should reject its 65th request"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("in-flight request limit"));
+    }
+
+    #[test]
+    fn sibling_vm_local_limits_do_not_share_in_flight_counts() {
+        let mut resources = HttpWorkerResources::with_max_in_flight(usize::MAX);
+        let config = HttpConfig::default();
+        let first_lease = resources
+            .client_for(&config)
+            .expect("default config should be valid");
+        let second_lease = resources
+            .client_for(&config)
+            .expect("same policy should reuse the worker client");
+        let mut first_vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
+        first_vm.set_http_max_in_flight(1);
+        first_vm
+            .configure_http(config.clone(), first_lease)
+            .expect("first lease injection should succeed");
+        let mut second_vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
+        second_vm.set_http_max_in_flight(2);
+        second_vm
+            .configure_http(config, second_lease)
+            .expect("second lease injection should succeed");
+
+        let _first = HttpRequestContext::capture_for(&mut first_vm, None, "HTTP")
+            .expect("first VM should admit its local request");
+        let _second = HttpRequestContext::capture_for(&mut second_vm, None, "HTTP")
+            .expect("second VM should admit its first local request");
+        let _second_again = HttpRequestContext::capture_for(&mut second_vm, None, "HTTP")
+            .expect("second VM should admit its second local request");
+        let error = match HttpRequestContext::capture_for(&mut second_vm, None, "HTTP") {
+            Ok(_) => panic!("second VM should reject only its own third request"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("in-flight request limit"));
+    }
+
+    #[test]
+    fn composite_permit_holds_worker_and_local_admission() {
+        let mut resources = HttpWorkerResources::with_max_in_flight(1);
+        let config = HttpConfig::default();
+        let lease = resources
+            .client_for(&config)
+            .expect("default config should be valid");
+        lease.set_local_max_in_flight(1);
+
+        let permit = lease
+            .acquire()
+            .expect("the composite permit should admit both scopes");
+        assert!(
+            lease.entry.worker_admission.acquire().is_err(),
+            "the worker permit must remain held"
+        );
+        assert!(
+            lease.local_admission.acquire().is_err(),
+            "the VM-local permit must remain held"
+        );
+        drop(permit);
+
+        let worker_permit = lease
+            .entry
+            .worker_admission
+            .acquire()
+            .expect("dropping the composite permit should release worker admission");
+        let local_permit = lease
+            .local_admission
+            .acquire()
+            .expect("dropping the composite permit should release local admission");
+        drop(local_permit);
+        drop(worker_permit);
+    }
+
+    #[test]
+    fn local_admission_failure_releases_the_worker_permit() {
+        let mut resources = HttpWorkerResources::with_max_in_flight(1);
+        let config = HttpConfig::default();
+        let lease = resources
+            .client_for(&config)
+            .expect("default config should be valid");
+        lease.set_local_max_in_flight(0);
+
+        assert!(lease.acquire().is_err(), "zero local capacity must reject");
+        let worker_permit = lease
+            .entry
+            .worker_admission
+            .acquire()
+            .expect("a failed local admission must release worker capacity");
+        drop(worker_permit);
+    }
+
+    #[test]
+    fn cloned_lease_shares_its_vm_local_admission_scope() {
+        let mut resources = HttpWorkerResources::with_max_in_flight(usize::MAX);
+        let config = HttpConfig::default();
+        let lease = resources
+            .client_for(&config)
+            .expect("default config should be valid");
+        let clone = lease.clone();
+        clone.set_local_max_in_flight(1);
+
+        let permit = lease
+            .acquire()
+            .expect("the cloned lease should share local capacity");
+        assert!(
+            clone.acquire().is_err(),
+            "a clone must observe the same VM-local in-flight count"
+        );
+        drop(permit);
+    }
+
+    #[test]
     fn vm_admission_override_does_not_change_a_sibling_vm() {
         let mut resources = HttpWorkerResources::with_max_in_flight(3);
         let config = HttpConfig::default();
@@ -884,18 +1076,17 @@ mod tests {
             3,
             "a VM-local override must not report the sibling's shared admission cap"
         );
-        let first_permit = first_lease
-            .entry
-            .admission
-            .acquire_with_limit(Some(1))
+        let _first = HttpRequestContext::capture_for(&mut first_vm, None, "HTTP")
             .expect("the first VM should admit its local cap");
-        let second_permit = second_lease
-            .entry
-            .admission
-            .acquire_with_limit(Some(3))
-            .expect("the sibling VM should retain its own enforced cap");
-        drop(second_permit);
-        drop(first_permit);
+        let _second = HttpRequestContext::capture_for(&mut second_vm, None, "HTTP")
+            .expect("the sibling VM should retain its own local cap");
+        let _second_again = HttpRequestContext::capture_for(&mut second_vm, None, "HTTP")
+            .expect("the sibling VM should admit another request");
+        let error = match HttpRequestContext::capture_for(&mut second_vm, None, "HTTP") {
+            Ok(_) => panic!("the worker aggregate cap should reject the fourth request"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("in-flight request limit"));
     }
 
     #[test]
@@ -906,13 +1097,11 @@ mod tests {
             .client_for(&config)
             .expect("default config should be valid");
         let permit = lease
-            .entry
-            .admission
             .acquire()
             .expect("an active permit should be admitted before owner drop");
         drop(resources);
         assert!(
-            lease.entry.admission.acquire().is_err(),
+            lease.acquire().is_err(),
             "stale leases must fail closed after their owner is dropped"
         );
         drop(permit);
@@ -927,7 +1116,7 @@ mod tests {
             .expect("default config should be valid");
         resources.close_admission();
         assert!(resources.client_for(&config).is_err());
-        assert!(lease.entry.admission.acquire().is_err());
+        assert!(lease.acquire().is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -938,12 +1127,10 @@ mod tests {
             .client_for(&config)
             .expect("default config should be valid");
         let permit = lease
-            .entry
-            .admission
             .acquire()
             .expect("active permit should be admitted before owner drop");
         drop(resources);
-        assert!(lease.entry.admission.acquire().is_err());
+        assert!(lease.acquire().is_err());
         drop(permit);
 
         let mut resources = HttpWorkerResources::new();
@@ -951,12 +1138,10 @@ mod tests {
             .client_for(&config)
             .expect("default config should be valid");
         let permit = lease
-            .entry
-            .admission
             .acquire()
             .expect("active permit should be admitted before explicit shutdown");
         resources.into_shutdown().await;
-        assert!(lease.entry.admission.acquire().is_err());
+        assert!(lease.acquire().is_err());
         drop(permit);
     }
 }

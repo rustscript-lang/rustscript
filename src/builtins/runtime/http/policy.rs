@@ -68,25 +68,16 @@ impl ConnectionAdmission {
     }
 
     pub(super) fn acquire(&self) -> VmResult<ConnectionPermit> {
-        self.acquire_with_limit(None)
-    }
-
-    pub(super) fn acquire_with_limit(
-        &self,
-        requested_max_in_flight: Option<usize>,
-    ) -> VmResult<ConnectionPermit> {
         let mut state = self.lock_state();
         if !state.open {
             return Err(VmError::HostError(
                 "HTTP worker resource admission is closed".to_string(),
             ));
         }
-        let max_in_flight = requested_max_in_flight.map_or(state.max_in_flight, |requested| {
-            requested.min(state.max_in_flight)
-        });
-        if state.in_flight >= max_in_flight {
+        if state.in_flight >= state.max_in_flight {
             return Err(VmError::HostError(format!(
-                "HTTP in-flight request limit of {max_in_flight} was reached"
+                "HTTP in-flight request limit of {} was reached",
+                state.max_in_flight
             )));
         }
         state.in_flight += 1;
@@ -120,6 +111,21 @@ impl Drop for ConnectionPermit {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.in_flight = state.in_flight.saturating_sub(1);
+    }
+}
+
+/// Holds one worker admission permit and one VM-local admission permit.
+pub(super) struct CompositeConnectionPermit {
+    _worker: ConnectionPermit,
+    _local: ConnectionPermit,
+}
+
+impl CompositeConnectionPermit {
+    pub(super) fn new(worker: ConnectionPermit, local: ConnectionPermit) -> Self {
+        Self {
+            _worker: worker,
+            _local: local,
+        }
     }
 }
 

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use hyper::body::Bytes;
 use pd_host_function::pd_host_function;
 
+use super::policy::CompositeConnectionPermit;
 use super::request::{
     HttpRequest, OwnedResponse, open_stream_response, parse_request, response_header_entries,
     validate_request_header_budget,
@@ -443,7 +444,7 @@ struct SseStreamDriver {
     /// Keeps the embedding-owned worker resource alive for the full response
     /// and every generic stream termination path.
     _client: HttpClientLease,
-    _permit: super::policy::ConnectionPermit,
+    _permit: CompositeConnectionPermit,
 }
 
 impl SseStreamDriver {
@@ -453,7 +454,7 @@ impl SseStreamDriver {
         config: &super::HttpConfig,
         deadline: Instant,
         client: HttpClientLease,
-        permit: super::policy::ConnectionPermit,
+        permit: CompositeConnectionPermit,
     ) -> VmResult<Self> {
         let status = response.response().status();
         if !status.is_success() {
