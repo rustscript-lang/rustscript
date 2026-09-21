@@ -15,7 +15,7 @@ use vm::{
     HostArgsFunction, HostAsyncBridge, HostAsyncOpTerminal, HostFunction, HostFunctionRegistry,
     HostFunctionSchema, HostImport, HostImportSchema, HostParamSchema, HostStackFunction,
     HostTypeSchema, JitConfig, JitTraceTerminal, Program, StandardSurfaceComposition, Value, Vm,
-    VmStatus, compile_source,
+    VmError, VmStatus, compile_source,
 };
 
 fn schema_for(function: &HostFunctionSchema) -> (HostImport, HostImportSchema) {
@@ -263,6 +263,65 @@ impl HostStackFunction for ReentrantStackHost {
     }
 }
 
+struct ErrorThenSuccessStackHost {
+    calls: Arc<AtomicUsize>,
+}
+
+impl HostStackFunction for ErrorThenSuccessStackHost {
+    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(VmError::HostError("stack callback error".to_string()));
+        }
+        Ok(CallOutcome::Return(CallReturn::one(
+            args.first().cloned().unwrap_or(Value::Null),
+        )))
+    }
+}
+
+struct PanicThenSuccessStackHost {
+    calls: Arc<AtomicUsize>,
+}
+
+impl HostStackFunction for PanicThenSuccessStackHost {
+    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("stack callback panic");
+        }
+        Ok(CallOutcome::Return(CallReturn::one(
+            args.first().cloned().unwrap_or(Value::Null),
+        )))
+    }
+}
+
+struct CountingStackHost {
+    calls: Arc<AtomicUsize>,
+}
+
+impl HostStackFunction for CountingStackHost {
+    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> vm::VmResult<CallOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(CallOutcome::Return(CallReturn::one(
+            args.first().cloned().unwrap_or(Value::Null),
+        )))
+    }
+}
+
+struct DifferentSlotRecursingStackHost {
+    nested_runs: Arc<AtomicUsize>,
+}
+
+impl HostStackFunction for DifferentSlotRecursingStackHost {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> vm::VmResult<CallOutcome> {
+        self.nested_runs.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            vm.run()
+                .expect("different stack-host slot should be reentrant"),
+            VmStatus::Halted
+        );
+        Ok(CallOutcome::Halt)
+    }
+}
+
 struct MatrixOwnedHost;
 
 impl vm::HostOwnedFunction for MatrixOwnedHost {
@@ -282,6 +341,23 @@ impl HostFunction for IsolatedCounterHost {
             self.calls as i64,
         ))))
     }
+}
+
+fn unary_stack_program(name: &str) -> Arc<Program> {
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ldc(0);
+    bytecode.call(0, 1);
+    bytecode.ret();
+    Arc::new(Program::with_imports_and_debug(
+        vec![Value::Int(41)],
+        bytecode.finish(),
+        vec![HostImport {
+            name: name.to_string(),
+            arity: 1,
+            return_type: vm::ValueType::Int,
+        }],
+        None,
+    ))
 }
 
 #[test]
@@ -365,6 +441,138 @@ fn stack_host_reentry_and_reset_preserve_owned_argument_semantics() {
         VmStatus::Halted
     );
     assert_eq!(vm.stack(), &[Value::Int(41)]);
+    vm.reset_for_reuse()
+        .expect("same-slot host must remain resettable");
+    assert_eq!(
+        vm.run()
+            .expect("same-slot host must remain callable after reset"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(41)]);
+}
+
+#[test]
+fn stack_host_error_restores_slot_after_reset_and_reuse() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factory_calls = Arc::clone(&calls);
+    let mut registry = HostFunctionRegistry::empty();
+    registry.register_stack("bound::error_stack", 1, move || {
+        Box::new(ErrorThenSuccessStackHost {
+            calls: Arc::clone(&factory_calls),
+        })
+    });
+    let mut vm = Vm::new_bound(
+        registry
+            .bind_program_once(unary_stack_program("bound::error_stack"))
+            .expect("error stack binding"),
+    )
+    .expect("error stack VM");
+
+    let error = vm
+        .run()
+        .expect_err("first stack callback must return an error");
+    assert!(error.to_string().contains("stack callback error"));
+    assert_eq!(vm.stack(), &[Value::Int(41)]);
+    vm.reset_for_reuse()
+        .expect("error callback VM must reset for reuse");
+    assert_eq!(
+        vm.run().expect("restored error slot must run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(41)]);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn stack_host_panic_restores_slot_after_catch_reset_and_reuse() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factory_calls = Arc::clone(&calls);
+    let mut registry = HostFunctionRegistry::empty();
+    registry.register_stack("bound::panic_stack", 1, move || {
+        Box::new(PanicThenSuccessStackHost {
+            calls: Arc::clone(&factory_calls),
+        })
+    });
+    let mut vm = Vm::new_bound(
+        registry
+            .bind_program_once(unary_stack_program("bound::panic_stack"))
+            .expect("panic stack binding"),
+    )
+    .expect("panic stack VM");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.run()));
+    assert!(result.is_err(), "first stack callback must panic");
+    assert_eq!(vm.stack(), &[Value::Int(41)]);
+    vm.reset_for_reuse()
+        .expect("panic callback VM must reset for reuse");
+    assert_eq!(
+        vm.run().expect("restored panic slot must run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(41)]);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn stack_host_allows_recursion_through_a_different_slot_and_restores_both_slots() {
+    let outer_runs = Arc::new(AtomicUsize::new(0));
+    let inner_runs = Arc::new(AtomicUsize::new(0));
+    let outer_counter = Arc::clone(&outer_runs);
+    let inner_counter = Arc::clone(&inner_runs);
+    let mut bytecode = BytecodeBuilder::new();
+    bytecode.ldc(0);
+    bytecode.call(0, 1);
+    bytecode.ldc(1);
+    bytecode.call(1, 1);
+    bytecode.ret();
+    let program = Arc::new(Program::with_imports_and_debug(
+        vec![Value::Int(41), Value::Int(42)],
+        bytecode.finish(),
+        vec![
+            HostImport {
+                name: "bound::outer_stack".to_string(),
+                arity: 1,
+                return_type: vm::ValueType::Int,
+            },
+            HostImport {
+                name: "bound::inner_stack".to_string(),
+                arity: 1,
+                return_type: vm::ValueType::Int,
+            },
+        ],
+        None,
+    ));
+    let mut registry = HostFunctionRegistry::empty();
+    registry.register_stack("bound::outer_stack", 1, move || {
+        Box::new(DifferentSlotRecursingStackHost {
+            nested_runs: Arc::clone(&outer_counter),
+        })
+    });
+    registry.register_stack("bound::inner_stack", 1, move || {
+        Box::new(CountingStackHost {
+            calls: Arc::clone(&inner_counter),
+        })
+    });
+    let bound = registry
+        .bind_program_once(program)
+        .expect("different-slot stack binding");
+    let mut vm = Vm::new_bound(bound).expect("different-slot stack VM");
+
+    assert_eq!(
+        vm.run().expect("different-slot recursion must run"),
+        VmStatus::Halted
+    );
+    assert_eq!(outer_runs.load(Ordering::SeqCst), 1);
+    assert_eq!(inner_runs.load(Ordering::SeqCst), 1);
+    vm.reset_for_reuse()
+        .expect("different-slot stack VM must reset for reuse");
+    assert_eq!(
+        vm.run()
+            .expect("both stack slots must remain callable after reset"),
+        VmStatus::Halted
+    );
+    assert_eq!(outer_runs.load(Ordering::SeqCst), 2);
+    assert_eq!(inner_runs.load(Ordering::SeqCst), 2);
 }
 
 #[test]

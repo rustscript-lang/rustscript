@@ -4588,6 +4588,25 @@ impl Vm {
         Ok(matches!(function, VmHostFunction::OwnedDynamic(_)))
     }
 
+    /// Restores the guest-visible state of a failed owned dispatch.
+    ///
+    /// The drained values that the host did not take are appended after the
+    /// caller's preserved stack prefix, followed by values the handler pushed.
+    /// The waiting slot is restored to the state observed before dispatch so a
+    /// failed pending setup cannot leave a partial continuation behind.
+    fn rollback_owned_dispatch(
+        &mut self,
+        mut saved_stack: Vec<Value>,
+        mut untaken: Vec<Value>,
+        mut host_stack: Vec<Value>,
+        waiting_host_op: Option<WaitingHostOp>,
+    ) {
+        saved_stack.append(&mut untaken);
+        saved_stack.append(&mut host_stack);
+        self.instance.stack = saved_stack;
+        self.instance.waiting_host_op = waiting_host_op;
+    }
+
     /// Executes an owned host function: the call operands are drained from the
     /// operand stack into an [`OwnedHostCall`] and ownership of the arguments
     /// the function takes transfers to it.
@@ -4645,6 +4664,7 @@ impl Vm {
         let mut saved_stack = std::mem::take(&mut self.instance.stack);
         self.instance.call_depth += 1;
         let args = saved_stack.split_off(arg_start);
+        let waiting_host_op = self.instance.waiting_host_op.clone();
         self.host.begin_owned_dispatch_mutation();
         let (call_result, untaken) = {
             let mut call = OwnedHostCall::new(self, args);
@@ -4686,17 +4706,21 @@ impl Vm {
         let outcome = match call_result {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(err)) => {
-                let mut untaken = untaken;
-                saved_stack.append(&mut untaken);
-                saved_stack.append(&mut host_stack);
-                self.instance.stack = saved_stack;
+                self.rollback_owned_dispatch(
+                    saved_stack,
+                    untaken,
+                    host_stack,
+                    waiting_host_op.clone(),
+                );
                 return Err(err);
             }
             Err(payload) => {
-                let mut untaken = untaken;
-                saved_stack.append(&mut untaken);
-                saved_stack.append(&mut host_stack);
-                self.instance.stack = saved_stack;
+                self.rollback_owned_dispatch(
+                    saved_stack,
+                    untaken,
+                    host_stack,
+                    waiting_host_op.clone(),
+                );
                 std::panic::resume_unwind(payload);
             }
         };
@@ -4716,10 +4740,12 @@ impl Vm {
                     &self.program,
                     self.host.execution_scope.resources(),
                 ) {
-                    let mut untaken = untaken;
-                    saved_stack.append(&mut untaken);
-                    saved_stack.append(&mut host_stack);
-                    self.instance.stack = saved_stack;
+                    self.rollback_owned_dispatch(
+                        saved_stack,
+                        untaken,
+                        host_stack,
+                        waiting_host_op.clone(),
+                    );
                     return Err(error);
                 }
                 saved_stack.append(&mut host_stack);
@@ -4740,25 +4766,41 @@ impl Vm {
                 // the ordinary failure path; values the handler already took
                 // remain owned by the handler. The instruction pointer stays
                 // past the call instruction — it is never rewound for a retry.
-                let mut untaken = untaken;
-                saved_stack.append(&mut untaken);
-                saved_stack.append(&mut host_stack);
-                self.instance.stack = saved_stack;
+                self.rollback_owned_dispatch(
+                    saved_stack,
+                    untaken,
+                    host_stack,
+                    waiting_host_op.clone(),
+                );
                 Err(VmError::HostError(
                     "owned host function returned yield, which owned dispatch does not support"
                         .to_string(),
                 ))
             }
             CallOutcome::Pending(op_id) => {
-                saved_stack.append(&mut host_stack);
-                self.instance.stack = saved_stack;
-                let resume_ip = self.call_resume_ip(call_ip)?;
-                self.set_waiting_host_op_with_return(
+                let resume_ip = match self.call_resume_ip(call_ip) {
+                    Ok(resume_ip) => resume_ip,
+                    Err(error) => {
+                        self.rollback_owned_dispatch(
+                            saved_stack,
+                            untaken,
+                            host_stack,
+                            waiting_host_op.clone(),
+                        );
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = self.set_waiting_host_op_with_return(
                     op_id,
                     self.host_call_pending_source(op_id),
                     expected_return_type,
                     expected_return_schema,
-                )?;
+                ) {
+                    self.rollback_owned_dispatch(saved_stack, untaken, host_stack, waiting_host_op);
+                    return Err(error);
+                }
+                saved_stack.append(&mut host_stack);
+                self.instance.stack = saved_stack;
                 self.instance.ip = resume_ip;
                 Ok(HostCallExecOutcome::Pending(op_id))
             }
@@ -6326,6 +6368,20 @@ mod owned_dispatch_tests {
         }
     }
 
+    struct PendingOwned {
+        calls: Arc<AtomicUsize>,
+        pending_op: HostOpId,
+        marker: i64,
+    }
+
+    impl HostOwnedFunction for PendingOwned {
+        fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            call.vm().instance.stack.push(Value::Int(self.marker));
+            Ok(CallOutcome::Pending(self.pending_op))
+        }
+    }
+
     fn callable_take_schema() -> HostImportSchema {
         owned_schema(
             vec![
@@ -6338,6 +6394,130 @@ mod owned_dispatch_tests {
             ],
             HostTypeSchema::Bool,
         )
+    }
+
+    fn pending_value_schema() -> HostImportSchema {
+        named_schema(
+            "test::pending",
+            vec![
+                HostImportParam {
+                    name: "first".to_string(),
+                    schema: HostTypeSchema::Int,
+                    passing: HostParamPassing::Value,
+                },
+                HostImportParam {
+                    name: "second".to_string(),
+                    schema: HostTypeSchema::Int,
+                    passing: HostParamPassing::Value,
+                },
+            ],
+            HostTypeSchema::Bool,
+        )
+    }
+
+    fn pending_value_program(schema: &HostImportSchema) -> Program {
+        let mut code = crate::BytecodeBuilder::new();
+        code.ldc(0);
+        code.ldc(1);
+        code.call(0, 2);
+        code.ret();
+        Program::with_imports_and_debug(
+            vec![Value::Int(11), Value::Int(22)],
+            code.finish(),
+            vec![HostImport {
+                name: schema.name.clone(),
+                arity: schema.arity() as u8,
+                return_type: ValueType::Bool,
+            }],
+            None,
+        )
+        .with_host_import_schemas(vec![schema.clone()])
+        .expect("pending host import schemas")
+    }
+
+    #[test]
+    fn owned_pending_setup_failures_restore_stack_waiting_state_and_allow_reuse() {
+        for force_waiting_setup_failure in [false, true] {
+            let schema = pending_value_schema();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let factory_calls = Arc::clone(&calls);
+            let mut registry = HostFunctionRegistry::empty();
+            registry
+                .register_exact_owned("test::pending", 2, schema.clone(), move |_context| {
+                    Box::new(PendingOwned {
+                        calls: Arc::clone(&factory_calls),
+                        pending_op: 7,
+                        marker: 99,
+                    })
+                })
+                .expect("register pending owned host");
+            let mut vm = bound_vm(pending_value_program(&schema), &registry);
+            let previous_waiting = force_waiting_setup_failure.then_some(WaitingHostOp {
+                op_id: 99,
+                source: WaitingHostOpSource::Manual,
+                expected_return_type: None,
+                expected_return_schema: None,
+            });
+            vm.instance.stack = vec![Value::Int(11), Value::Int(22)];
+            vm.instance.waiting_host_op = previous_waiting.clone();
+
+            let call_ip = if force_waiting_setup_failure {
+                vm.program
+                    .code
+                    .iter()
+                    .position(|opcode| *opcode == OpCode::Call as u8)
+                    .expect("pending program call opcode")
+            } else {
+                usize::MAX
+            };
+            let error = match vm.execute_bound_owned_host_function(
+                0,
+                2,
+                call_ip,
+                Some(ValueType::Bool),
+                Some(&schema),
+            ) {
+                Ok(_) => panic!("forced pending setup failure must be reported"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains(if force_waiting_setup_failure {
+                    "already waiting"
+                } else {
+                    "bytecode"
+                }),
+                "unexpected forced pending setup error: {error}"
+            );
+            assert_eq!(
+                vm.instance.stack,
+                vec![Value::Int(11), Value::Int(22), Value::Int(99)],
+                "pending setup failure must restore untaken operands and host-pushed values"
+            );
+            assert_eq!(
+                vm.instance.waiting_host_op, previous_waiting,
+                "pending setup failure must preserve the prior waiting state"
+            );
+            assert!(matches!(
+                vm.host.host_functions.first(),
+                Some(VmHostFunction::OwnedDynamic(Some(_)))
+            ));
+
+            vm.reset_for_reuse()
+                .expect("VM must reset after pending setup rollback");
+            assert!(vm.is_reusable());
+            assert_eq!(
+                vm.run().expect("reused VM should enter pending state"),
+                VmStatus::Waiting(7)
+            );
+            vm.complete_host_op(7, CallReturn::one(Value::Bool(true)))
+                .expect("manual pending operation should complete");
+            assert_eq!(
+                vm.resume().expect("reused VM should resume"),
+                VmStatus::Halted
+            );
+            assert_eq!(vm.stack(), &[Value::Int(99), Value::Bool(true)]);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
     }
 
     #[test]
