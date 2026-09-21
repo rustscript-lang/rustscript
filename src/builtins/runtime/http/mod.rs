@@ -269,15 +269,10 @@ impl HttpHostExt for Vm {
         self.host_context()
             .module_state::<HttpHostState>()
             .map(|state| {
-                let local = state
-                    .max_in_flight
-                    .or_else(|| {
-                        state
-                            .client
-                            .as_ref()
-                            .map(HttpClientLease::local_max_in_flight)
-                    })
-                    .unwrap_or(DEFAULT_MAX_HTTP_IN_FLIGHT);
+                let local = match state.client.as_ref() {
+                    Some(client) => client.local_max_in_flight(),
+                    None => state.max_in_flight.unwrap_or(DEFAULT_MAX_HTTP_IN_FLIGHT),
+                };
                 state
                     .client
                     .as_ref()
@@ -1048,6 +1043,117 @@ mod tests {
             "a clone must observe the same VM-local in-flight count"
         );
         drop(permit);
+    }
+
+    #[test]
+    fn cloned_vm_leases_report_and_enforce_shared_local_cap() {
+        let mut resources = HttpWorkerResources::with_max_in_flight(3);
+        let config = HttpConfig::default();
+        let lease = resources
+            .client_for(&config)
+            .expect("default config should be valid");
+        let first_lease = lease.clone();
+        let second_lease = lease;
+        let mut first_vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
+        first_vm
+            .configure_http(config.clone(), first_lease)
+            .expect("first lease injection should succeed");
+        let mut second_vm = crate::vm::Vm::new(crate::vm::Program::new(Vec::new(), Vec::new()));
+        second_vm
+            .configure_http(config, second_lease)
+            .expect("second lease injection should succeed");
+
+        first_vm.set_http_max_in_flight(8);
+        assert_eq!(
+            first_vm.http_max_in_flight(),
+            3,
+            "the worker cap must limit the shared local cap"
+        );
+        assert_eq!(
+            second_vm.http_max_in_flight(),
+            3,
+            "cloned VMs must report the same effective cap"
+        );
+
+        second_vm.set_http_max_in_flight(1);
+        assert_eq!(first_vm.http_max_in_flight(), 1);
+        assert_eq!(second_vm.http_max_in_flight(), 1);
+
+        let first_permit = HttpRequestContext::capture_for(&mut first_vm, None, "HTTP")
+            .expect("the shared local cap should admit one request")
+            .0;
+        assert!(
+            HttpRequestContext::capture_for(&mut second_vm, None, "HTTP").is_err(),
+            "the cloned VM must enforce the updated shared local cap"
+        );
+        drop(first_permit);
+        let second_permit = HttpRequestContext::capture_for(&mut second_vm, None, "HTTP")
+            .expect("releasing the shared permit should restore capacity")
+            .0;
+        drop(second_permit);
+    }
+
+    #[test]
+    fn set_max_in_flight_updates_existing_and_future_entries_without_cross_config_corruption() {
+        let mut resources = HttpWorkerResources::with_max_in_flight(2);
+        let first_config = HttpConfig::default();
+        let second_config = HttpConfig {
+            max_redirects: 4,
+            ..HttpConfig::default()
+        };
+        let first = resources
+            .client_for(&first_config)
+            .expect("first config should be valid");
+        let second = resources
+            .client_for(&second_config)
+            .expect("second config should be valid");
+        assert!(!std::sync::Arc::ptr_eq(&first.entry, &second.entry));
+        assert_eq!(first.worker_max_in_flight(), 2);
+        assert_eq!(second.worker_max_in_flight(), 2);
+
+        let first_active = first
+            .acquire()
+            .expect("the first config should admit an active request");
+        resources.set_max_in_flight(1);
+        assert_eq!(resources.max_in_flight(), 1);
+        assert_eq!(first.worker_max_in_flight(), 1);
+        assert_eq!(second.worker_max_in_flight(), 1);
+        assert!(
+            first.acquire().is_err(),
+            "a cap reduction must account for an existing active permit"
+        );
+        let second_permit = second
+            .acquire()
+            .expect("a distinct config must retain an independent active count");
+        drop(second_permit);
+
+        resources.set_max_in_flight(3);
+        assert_eq!(first.worker_max_in_flight(), 3);
+        assert_eq!(second.worker_max_in_flight(), 3);
+        let first_after_raise = first
+            .acquire()
+            .expect("raising the cap must allow a new permit beside the active one");
+        drop(first_after_raise);
+
+        let future_config = HttpConfig {
+            max_redirects: 3,
+            ..HttpConfig::default()
+        };
+        let future = resources
+            .client_for(&future_config)
+            .expect("future config should use the current worker cap");
+        assert_eq!(future.worker_max_in_flight(), 3);
+        let future_permits = [
+            future.acquire().expect("future entry permit 1"),
+            future.acquire().expect("future entry permit 2"),
+            future.acquire().expect("future entry permit 3"),
+        ];
+        assert!(
+            future.acquire().is_err(),
+            "a future entry must enforce the current worker cap"
+        );
+        drop(future_permits);
+        drop(first_active);
     }
 
     #[test]
