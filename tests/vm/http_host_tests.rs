@@ -1151,7 +1151,11 @@ fn registry_state_rejects_structural_sibling_mutations() {
     let error = destination
         .bind_vm_with_plan(&mut vm, &plan)
         .expect_err("structural sibling mutation must reject the plan");
-    assert!(error.to_string().contains("different registry state"));
+    let message = error.to_string();
+    assert!(
+        message.contains("host binding plan is stale for this registry"),
+        "divergent registries must reject the plan, got {message}"
+    );
 }
 
 #[test]

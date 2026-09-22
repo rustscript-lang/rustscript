@@ -252,7 +252,7 @@ mod tests {
             BindModeTestScope::try_enter(),
             Err(BindModeScopeError::AlreadyActiveOnCurrentThread)
         ));
-        let panic = std::panic::catch_unwind(|| BindModeTestScope::enter());
+        let panic = std::panic::catch_unwind(BindModeTestScope::enter);
         assert!(panic.is_err(), "nested enter must fail without waiting");
         drop(scope);
 
