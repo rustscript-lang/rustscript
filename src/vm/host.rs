@@ -1953,13 +1953,16 @@ impl HostFunctionRegistry {
                 "bound host program became stale during construction".to_string(),
             ));
         }
-        Ok(Arc::new(BoundHostProgram {
+        let bound_program = Arc::new(BoundHostProgram {
             program,
             plan,
             dispatch: Arc::new(dispatch),
             registry,
             source_registry_snapshot,
-        }))
+        });
+        #[cfg(feature = "bind-mode-test-hooks")]
+        super::bind_mode_test_hooks::record_bound_program_preparation();
+        Ok(bound_program)
     }
 
     fn prepare_dispatch_template(&self, plan: &HostBindingPlan) -> VmResult<HostDispatchTemplate> {

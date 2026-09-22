@@ -1,6 +1,5 @@
 #![cfg(all(feature = "runtime", feature = "bind-mode-test-hooks"))]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use vm::{
@@ -8,7 +7,8 @@ use vm::{
     CompileSourceFileOptions, HostApiBuilder, HostApiCatalog, HostFunction, HostFunctionRegistry,
     HostFunctionSchema, HostOwnedFunction, HostParamPassing, HostParamSchema, HostStructField,
     HostStructSchema, HostTypeSchema, OwnedHostCall, Program, SourceFlavor, TimerBackend,
-    TimerConfig, TimerHostExt, TimerRegistration, Value, Vm, VmError, VmResult, VmStatus,
+    TimerConfig, TimerHostExt, TimerRegistration, TimerRegistrationMetadata,
+    TimerRegistrationTransaction, Value, Vm, VmError, VmResult, VmStatus,
     compile_source_with_flavor_and_options, register_timer_builtin_module,
     register_timer_builtin_module_from_catalog, standard_host_catalog,
 };
@@ -19,12 +19,20 @@ struct RecordingBackend {
 }
 
 impl TimerBackend for RecordingBackend {
-    fn register(&self, registration: TimerRegistration) -> VmResult<()> {
-        self.registrations
-            .lock()
-            .expect("timer registrations")
-            .push(registration);
-        Ok(())
+    fn prepare_registration<'a>(
+        &'a self,
+        _metadata: TimerRegistrationMetadata,
+    ) -> VmResult<TimerRegistrationTransaction<'a>> {
+        Ok(TimerRegistrationTransaction::new(
+            move |registration| {
+                self.registrations
+                    .lock()
+                    .expect("timer registrations")
+                    .push(registration);
+                Ok(())
+            },
+            || {},
+        ))
     }
 
     fn pending_count(&self) -> usize {
@@ -154,6 +162,10 @@ fn ten_thousand_bound_timer_callback_constructions_reuse_one_preparation() {
     assert_eq!(snapshot.full_bind_installs, 0);
     assert_eq!(snapshot.bound_vm_instantiations, 10001);
     assert_eq!(
+        snapshot.bound_program_preparations, 1,
+        "one bound artifact preparation must serve the source and all callbacks"
+    );
+    assert_eq!(
         backend
             .registrations
             .lock()
@@ -163,14 +175,57 @@ fn ten_thousand_bound_timer_callback_constructions_reuse_one_preparation() {
     );
 }
 
-struct CountingHost {
-    calls: Arc<AtomicUsize>,
+#[derive(Clone, Copy)]
+enum DispatchKind {
+    IntegerOverload,
+    StringOverload,
+    NamedRecord,
 }
 
-impl HostFunction for CountingHost {
-    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
+struct DispatchHost {
+    kind: DispatchKind,
+}
+
+impl HostFunction for DispatchHost {
+    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+        let result = match self.kind {
+            DispatchKind::IntegerOverload => {
+                if args != [Value::Int(7)] {
+                    return Err(VmError::HostError(format!(
+                        "integer overload received unexpected args: {args:?}"
+                    )));
+                }
+                11
+            }
+            DispatchKind::StringOverload => {
+                let [Value::String(value)] = args else {
+                    return Err(VmError::HostError(format!(
+                        "string overload received unexpected args: {args:?}"
+                    )));
+                };
+                if value.as_ref() != "text" {
+                    return Err(VmError::HostError(format!(
+                        "string overload received unexpected value: {value}"
+                    )));
+                }
+                22
+            }
+            DispatchKind::NamedRecord => {
+                let [Value::Map(record)] = args else {
+                    return Err(VmError::HostError(format!(
+                        "named handler received unexpected args: {args:?}"
+                    )));
+                };
+                if record.len() != 1 || record.get(&Value::string("value")) != Some(&Value::Int(7))
+                {
+                    return Err(VmError::HostError(format!(
+                        "named handler received unexpected record: {record:?}"
+                    )));
+                }
+                33
+            }
+        };
+        Ok(CallOutcome::Return(CallReturn::one(Value::Int(result))))
     }
 }
 
@@ -183,17 +238,17 @@ fn timer_catalog_with_overloads_and_named_record() -> Arc<HostApiCatalog> {
     let overloaded_int = HostFunctionSchema::with_return(
         "test::overloaded",
         vec![HostParamSchema::value("value", HostTypeSchema::Int)],
-        HostTypeSchema::Bool,
+        HostTypeSchema::Int,
     );
     let overloaded_string = HostFunctionSchema::with_return(
         "test::overloaded",
         vec![HostParamSchema::value("value", HostTypeSchema::String)],
-        HostTypeSchema::Bool,
+        HostTypeSchema::Int,
     );
     let named = HostFunctionSchema::with_return(
         "test::named",
         vec![HostParamSchema::value("record", record.as_type())],
-        HostTypeSchema::Bool,
+        HostTypeSchema::Int,
     );
     let mut builder = HostApiBuilder::new();
     for resource in standard.resources() {
@@ -215,7 +270,7 @@ fn timer_catalog_with_overloads_and_named_record() -> Arc<HostApiCatalog> {
 #[test]
 fn bound_timer_callback_executes_overloads_and_named_struct_schema() {
     let catalog = timer_catalog_with_overloads_and_named_record();
-    let source = "use timer; use test; timer::at(1, |premature| if true => { test::overloaded(7); test::overloaded(\"text\"); test::named({ value: 7 }); } else => { null });";
+    let source = "use timer; use test; timer::at(1, |premature| if true => { assert(test::overloaded(7) == 11); assert(test::overloaded(\"text\") == 22); assert(test::named({ value: 7 }) == 33); null } else => { null });";
     let compiled = compile_source_with_flavor_and_options(
         source,
         SourceFlavor::RustScript,
@@ -233,7 +288,6 @@ fn bound_timer_callback_executes_overloads_and_named_struct_schema() {
         })
     }));
 
-    let calls = Arc::new(AtomicUsize::new(0));
     let mut registry = HostFunctionRegistry::empty();
     registry
         .install_named_struct_schemas(vm::catalog_named_struct_schemas(catalog.as_ref()))
@@ -242,26 +296,30 @@ fn bound_timer_callback_executes_overloads_and_named_struct_schema() {
         .expect("timer registration");
     for name in ["test::overloaded", "test::named"] {
         for schema in vm::catalog_import_schemas(catalog.as_ref(), name) {
-            let calls = Arc::clone(&calls);
+            let kind = match schema.params.first().map(|param| &param.schema) {
+                Some(HostTypeSchema::Int) => DispatchKind::IntegerOverload,
+                Some(HostTypeSchema::String) => DispatchKind::StringOverload,
+                Some(HostTypeSchema::Named { name, .. }) if name == "TimerRecord" => {
+                    DispatchKind::NamedRecord
+                }
+                other => panic!("unexpected test schema: {other:?}"),
+            };
             registry
-                .register_catalog(schema, move || {
-                    Box::new(CountingHost {
-                        calls: Arc::clone(&calls),
-                    })
-                })
+                .register_catalog(schema, move || Box::new(DispatchHost { kind }))
                 .expect("custom catalog registration");
         }
     }
+    let setup_scope = BindModeTestScope::enter();
     let bound = registry
         .bind_program_once(Arc::clone(&program))
         .expect("combined bound program");
+    drop(setup_scope);
     let backend = Arc::new(RecordingBackend::default());
     let scope = BindModeTestScope::enter();
     let mut vm = Vm::new_bound(bound).expect("combined bound VM");
     let backend_trait: Arc<dyn TimerBackend> = backend.clone();
     vm.install_timer_runtime(backend_trait, TimerConfig::default());
     assert_eq!(vm.run().expect("combined timer root run"), VmStatus::Halted);
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
 
     let mut registrations =
         std::mem::take(&mut *backend.registrations.lock().expect("timer registrations"));
@@ -273,7 +331,6 @@ fn bound_timer_callback_executes_overloads_and_named_struct_schema() {
             .expect("combined callback"),
         vm::TimerCallbackStatus::Complete
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 3);
     let snapshot = scope.snapshot();
     assert_eq!(snapshot.full_bind_installs, 0);
     assert_eq!(snapshot.bound_vm_instantiations, 2);
@@ -286,9 +343,11 @@ fn standalone_owned_timer_uses_registry_fallback_and_counts_full_bind() {
     let mut registry = HostFunctionRegistry::new();
     register_timer_builtin_module(&mut registry).expect("timer registration");
     let mut vm = Vm::new_shared(Arc::clone(&program));
+    let setup_scope = BindModeTestScope::enter();
     registry
         .bind_vm_cached(&mut vm)
         .expect("registry-only root binding");
+    drop(setup_scope);
     let backend_trait: Arc<dyn TimerBackend> = backend.clone();
     vm.install_timer_runtime(backend_trait, TimerConfig::default());
 
@@ -341,12 +400,14 @@ fn stale_bound_artifact_fails_closed_without_counting_an_instantiation() {
     bytecode.ret();
     let program = Arc::new(Program::new(Vec::new(), bytecode.finish()));
     let mut registry = HostFunctionRegistry::empty();
+    let setup_scope = BindModeTestScope::enter();
     let bound = registry
         .bind_program_once(Arc::clone(&program))
         .expect("bound artifact");
     registry.register_static("stale::mutation", 0, |_vm, _args| {
         Ok(CallOutcome::Return(CallReturn::none()))
     });
+    drop(setup_scope);
 
     let scope = BindModeTestScope::enter();
     let error = match Vm::new_bound(bound) {
@@ -435,6 +496,7 @@ fn supplied_bound_artifact_mismatch_is_rejected_without_registry_fallback() {
             Box::new(AlwaysSuccessOwned)
         })
         .expect("wrong registry owned entry");
+    let setup_scope = BindModeTestScope::enter();
     let wrong_bound = wrong_registry
         .bind_program_once(Arc::clone(&program))
         .expect("wrong bound artifact");
@@ -451,6 +513,7 @@ fn supplied_bound_artifact_mismatch_is_rejected_without_registry_fallback() {
     let root_bound = root_registry
         .bind_program_once(Arc::clone(&program))
         .expect("root bound artifact");
+    drop(setup_scope);
 
     let scope = BindModeTestScope::enter();
     let mut vm = Vm::new_bound(root_bound).expect("root VM");

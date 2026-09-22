@@ -52,8 +52,9 @@ pub use timer::{
     DEFAULT_MAX_PENDING_TIMERS, DEFAULT_MAX_RUNNING_TIMERS, OwnedTimerCallback, TIMER_CALLBACK_ARG,
     TimerBackend, TimerCallbackError, TimerCallbackState, TimerCallbackStatus, TimerConfig,
     TimerCounts, TimerExtension, TimerHostExt, TimerHostState, TimerRegistration,
-    installed_timer_counts, register_owned_timer, register_owned_timer_with_bound_program,
-    register_timer_builtin_module, register_timer_builtin_module_from_catalog, timer_host_catalog,
+    TimerRegistrationMetadata, TimerRegistrationTransaction, installed_timer_counts,
+    register_owned_timer, register_owned_timer_with_bound_program, register_timer_builtin_module,
+    register_timer_builtin_module_from_catalog, timer_host_catalog,
 };
 
 /// Returns the editor/compiler catalog for the built-in host extensions.

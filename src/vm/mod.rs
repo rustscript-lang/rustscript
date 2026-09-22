@@ -39,7 +39,7 @@ pub use self::aot::AotArtifactError;
 use self::async_host::preserve_stream_cleanup;
 pub use self::async_host::{CaptureAsyncHostContext, HostFuture, HostFutureOutput};
 #[cfg(feature = "bind-mode-test-hooks")]
-pub use self::bind_mode_test_hooks::{BindModeSnapshot, BindModeTestScope};
+pub use self::bind_mode_test_hooks::{BindModeScopeError, BindModeSnapshot, BindModeTestScope};
 pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder};
 use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};

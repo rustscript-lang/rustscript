@@ -46,6 +46,83 @@ impl Default for TimerConfig {
     }
 }
 
+/// Immutable registration metadata supplied during transaction preparation.
+///
+/// `prepare_registration` receives this value before the callback is handed to
+/// the backend. Preparation may validate metadata or reserve capacity, but it
+/// must not publish the callback. Publication is allowed only from
+/// [`TimerRegistrationTransaction::commit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerRegistrationMetadata {
+    pub delay: Duration,
+    pub interval: Option<Duration>,
+    pub max_pending: usize,
+    pub max_running: usize,
+}
+
+/// Two-phase backend registration guard.
+///
+/// The backend supplies the commit and rollback closures from
+/// [`TimerBackend::prepare_registration`]. The guard owns the rollback closure
+/// until commit succeeds; dropping it invokes rollback. Rollback must only
+/// cancel the reservation/remove a published registration, must be idempotent,
+/// and must not drive callback bytecode, enter a VM/runtime, block on worker
+/// progress, or spawn a thread.
+pub struct TimerRegistrationTransaction<'a> {
+    commit: Option<Box<dyn FnOnce(TimerRegistration) -> VmResult<()> + Send + 'a>>,
+    rollback: Option<Box<dyn FnOnce() + Send + 'a>>,
+}
+
+impl<'a> TimerRegistrationTransaction<'a> {
+    /// Creates a transaction guard for one prepared backend reservation.
+    pub fn new(
+        commit: impl FnOnce(TimerRegistration) -> VmResult<()> + Send + 'a,
+        rollback: impl FnOnce() + Send + 'a,
+    ) -> Self {
+        Self {
+            commit: Some(Box::new(commit)),
+            rollback: Some(Box::new(rollback)),
+        }
+    }
+
+    /// Publishes the registration. A returned error leaves the transaction
+    /// rolled back. A panic leaves the rollback closure armed for the caller's
+    /// panic boundary or this guard's `Drop` implementation.
+    pub fn commit(&mut self, registration: TimerRegistration) -> VmResult<()> {
+        let Some(commit) = self.commit.take() else {
+            return Err(VmError::HostError(
+                "timer registration transaction is no longer active".to_string(),
+            ));
+        };
+        match commit(registration) {
+            Ok(()) => {
+                self.rollback.take();
+                Ok(())
+            }
+            Err(error) => {
+                self.rollback();
+                Err(error)
+            }
+        }
+    }
+
+    /// Rolls back a prepared or partially published registration.
+    pub fn rollback(&mut self) {
+        self.commit.take();
+        if let Some(rollback) = self.rollback.take() {
+            rollback();
+        }
+    }
+}
+
+impl Drop for TimerRegistrationTransaction<'_> {
+    fn drop(&mut self) {
+        if let Some(rollback) = self.rollback.take() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
+        }
+    }
+}
+
 /// Backend contract for deadline scheduling and lifecycle accounting.
 ///
 /// A backend owns every accepted registration. Deadline waits may happen on a
@@ -61,9 +138,16 @@ impl Default for TimerConfig {
 /// each [`TimerRegistration`] are MUST-enforce obligations, checked atomically
 /// with the backend's own insertion/scheduling so they behave as hard caps.
 pub trait TimerBackend: Send + Sync + 'static {
-    /// Accepts one complete registration. Returning success transfers the task
-    /// to the backend and lets the script call return immediately.
-    fn register(&self, registration: TimerRegistration) -> VmResult<()>;
+    /// Prepares one registration transaction without publishing its callback.
+    ///
+    /// The returned guard must perform all rollback through its nonblocking
+    /// cancellation closure. `commit` is the only operation that may publish
+    /// the callback, and a backend must make rollback remove a registration even
+    /// when commit returns an error or panics after insertion.
+    fn prepare_registration<'a>(
+        &'a self,
+        metadata: TimerRegistrationMetadata,
+    ) -> VmResult<TimerRegistrationTransaction<'a>>;
     /// Registered callbacks waiting to begin (or waiting for a running slot).
     fn pending_count(&self) -> usize;
     /// Live callback executions, including callbacks paused on async host work.
@@ -91,6 +175,18 @@ pub struct TimerRegistration {
     /// the backend's counters with an estimate.
     pub max_running: usize,
     pub callback: OwnedTimerCallback,
+}
+
+impl TimerRegistration {
+    /// Returns the metadata supplied to backend transaction preparation.
+    pub fn metadata(&self) -> TimerRegistrationMetadata {
+        TimerRegistrationMetadata {
+            delay: self.delay,
+            interval: self.interval,
+            max_pending: self.max_pending,
+            max_running: self.max_running,
+        }
+    }
 }
 
 impl std::fmt::Debug for TimerRegistration {
@@ -742,6 +838,13 @@ fn register_owned_timer_inner(
         (state.backend()?, state.config)
     };
     let callback_state = TimerHostState::callback(&backend, config);
+    let metadata = TimerRegistrationMetadata {
+        delay,
+        interval,
+        max_pending: config.max_pending,
+        max_running: config.max_running,
+    };
+    let mut transaction = backend.prepare_registration(metadata)?;
     let rollback_callback = call
         .arg(callback_arg)
         .cloned()
@@ -787,15 +890,17 @@ fn register_owned_timer_inner(
         callback: OwnedTimerCallback::new(vm, callback),
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        backend.register(registration)
+        transaction.commit(registration)
     }));
     match result {
         Ok(Ok(())) => Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true)))),
         Ok(Err(error)) => {
+            transaction.rollback();
             call.restore_arg(callback_arg, rollback_callback)?;
             Err(error)
         }
         Err(payload) => {
+            transaction.rollback();
             call.restore_arg(callback_arg, rollback_callback)?;
             std::panic::resume_unwind(payload)
         }
@@ -875,9 +980,17 @@ mod tests {
     }
 
     impl TimerBackend for RecordingBackend {
-        fn register(&self, _registration: TimerRegistration) -> VmResult<()> {
-            *self.registrations.lock().expect("registrations") += 1;
-            Ok(())
+        fn prepare_registration<'a>(
+            &'a self,
+            _metadata: TimerRegistrationMetadata,
+        ) -> VmResult<TimerRegistrationTransaction<'a>> {
+            Ok(TimerRegistrationTransaction::new(
+                move |_registration| {
+                    *self.registrations.lock().expect("registrations") += 1;
+                    Ok(())
+                },
+                || {},
+            ))
         }
 
         fn pending_count(&self) -> usize {

@@ -58,11 +58,16 @@ after the owning backend is dropped an existing callback reports
 
 ## Generic backend boundary
 
-`TimerBackend::register` receives a complete `TimerRegistration`. A successful
-return transfers ownership of the registration and its `OwnedTimerCallback` to
-the backend. A returned error means the backend retained nothing. The backend
-must enforce admission and running limits under its own synchronization, and
-must provide idempotent shutdown.
+`TimerBackend::prepare_registration` receives immutable
+`TimerRegistrationMetadata` and returns a `TimerRegistrationTransaction`. The
+prepare phase may validate metadata or reserve capacity, but it cannot publish
+the callback. The transaction's `commit` receives the complete
+`TimerRegistration`; only a successful commit transfers ownership to the
+backend. A returned error or panic leaves the transaction's rollback guard
+armed, and rollback must remove any partial publication without entering a
+VM/runtime, blocking on worker progress, or spawning a thread. The backend must
+enforce admission and running limits under its own synchronization and provide
+idempotent shutdown.
 
 The generic module has no request, connection, worker-phase, or `ngx.timer`
 semantics. It does not create request objects, inherit request-local state, or
@@ -76,23 +81,28 @@ The callback parameter is declared `TakeOwned`. Registration follows this
 transactional order:
 
 1. Validate the duration, before taking any argument.
-2. Clone the callback value for rollback, then take the original callback from
+2. Prepare the backend transaction from the registration metadata; preparation
+   publishes no callback.
+3. Clone the callback value for rollback, then take the original callback from
    the owned host call.
-3. Validate the callable's complete program-local graph. Cycles are visited once;
+4. Validate the callable's complete program-local graph. Cycles are visited once;
    nested foreign callables and resource-bearing captures are rejected. Resource
    captures remain unsupported because this boundary has no resource-table
    transfer operation.
-4. Create a fresh private callback VM, bind the host registry, install the
+5. Create a fresh private callback VM, bind the host registry, install the
    timer module state, and adopt the validated callable graph.
-5. Build the registration and call the backend.
-6. Only a successful backend return commits the transfer.
+6. Build the registration and commit the backend transaction.
+7. Only a successful backend commit disarms rollback and transfers the callback.
 
 A preflight, VM-spawn, or backend error restores the cloned callback into its
-original host-call slot and marks that slot untaken. The ordinary owned-dispatch
-failure path then restores all untaken arguments to the guest stack exactly
-once. A backend panic follows the same restoration step and then resumes the
-original panic. Consequently a rejected registration does not consume the
-source callback, and a backend rejection must not retain the callback VM.
+original host-call slot and marks that slot untaken. The transaction rollback
+runs before that restoration for a backend error or panic, so an attempted
+backend insertion cannot retain a registration while the source owns the
+callback again. The ordinary owned-dispatch failure path then restores all
+untaken arguments to the guest stack exactly once. A backend panic resumes the
+original panic after rollback and source restoration. Consequently a rejected
+registration does not consume the source callback, and a backend rejection
+must not retain the callback VM.
 
 The fresh callback VM starts halted with no execution frames, stack, or host
 return. Its callable graph remains owned by that VM for the lifetime of the
@@ -151,8 +161,10 @@ Callback start, waiting poll, and resume each have a panic boundary. A callback
 panic is converted to a structured `VmError::HostError`, reported through the
 reporting helper when used, and followed by the same graph-preserving reset.
 The callback becomes `Complete`, so a repeating registration can attempt its
-next round. Backend registration panics are separate: the source argument is
-restored and the backend panic is preserved for the embedding to handle.
+next round. Backend registration failures use the registration transaction's
+rollback guard: the backend must remove any publication before the source
+argument is restored, and the backend panic is preserved for the embedding to
+handle.
 
 For `at`, the backend should remove the registration after the callback reaches
 `Complete` or `Cancelled`. For `every`, a callback error is reported for that
@@ -172,20 +184,38 @@ re-implement the callback handoff. Three public items cover it:
 - `HostOwnedFunction`, `OwnedHostCall`, `OwnedHostContext` (re-exported at the
   crate root) — the adapter implements `HostOwnedFunction` and receives the
   drained call;
-- `timer::register_owned_timer(call, registry, callback_arg, delay, interval)` —
-  takes the owned call, the index of the callable argument, and a **checked**
-  `Duration` plus an optional repeating `Duration`, and performs exactly the
-  steps `timer::at` / `timer::every` perform: runtime lookup, callback type and
-  program-provenance validation, fresh isolated callback VM, admission limits
-  carried from the installed `TimerConfig`, backend registration, and the
-  transactional rollback of the callback argument on a returned error or a
-  panic. It rejects a zero repeating interval and never inspects the host name,
-  so it is name-independent and unit-independent;
+- `OwnedHostContext::bound_program()` — the factory must retain this exact
+  `Arc<BoundHostProgram>` for a production VM created with `Vm::new_bound`;
+- `timer::register_owned_timer_with_bound_program(call, bound_program,
+  callback_arg, delay, interval)` — takes the exact bound artifact and never
+  prepares or performs a full registry bind. If `bound_program()` is `None`, a
+  production bound adapter must fail closed with a host error. This prevents a
+  missing binding artifact from silently changing the callback path;
+- `timer::register_owned_timer(call, registry, callback_arg, delay, interval)`
+  remains the explicitly labeled **registry-only fallback** for generic
+  embeddings that intentionally use `bind_vm_cached`. It takes a checked
+  `Duration` plus an optional repeating `Duration`, performs the same callback
+  provenance and isolation checks, and restores the callback on every returned
+  error or panic;
 - `timer::installed_timer_counts(vm)` — returns `TimerCounts { pending, running }`
   read synchronously from the installed backend, so count functions never need
   `TimerBackend` or `TimerHostState`.
 
 ```rust
+struct MySecondsTimer {
+    registry: HostFunctionRegistry,
+    bound_program: Option<Arc<BoundHostProgram>>,
+}
+
+impl HostOwnedAdapterFactory for MySecondsTimerFactory {
+    fn create(&self, context: OwnedHostContext<'_>) -> Box<dyn HostOwnedFunction> {
+        Box::new(MySecondsTimer {
+            registry: context.registry().clone(),
+            bound_program: context.bound_program(),
+        })
+    }
+}
+
 impl HostOwnedFunction for MySecondsTimer {
     fn call(&mut self, call: &mut OwnedHostCall<'_>) -> VmResult<CallOutcome> {
         let seconds = match call.arg(0) {
@@ -195,9 +225,14 @@ impl HostOwnedFunction for MySecondsTimer {
         if seconds < 0 {
             return Err(VmError::HostError("timer seconds must be non-negative".into()));
         }
-        register_owned_timer(
+        let Some(bound_program) = self.bound_program.clone() else {
+            return Err(VmError::HostError(
+                "production timer adapter requires a bound host program".into(),
+            ));
+        };
+        register_owned_timer_with_bound_program(
             call,
-            &self.registry,
+            bound_program,
             TIMER_CALLBACK_ARG,
             Duration::from_secs(seconds as u64),
             None,
@@ -206,9 +241,22 @@ impl HostOwnedFunction for MySecondsTimer {
 }
 ```
 
-`OwnedTimerCallback` values are only ever created inside `register_owned_timer`
-and the two millisecond adapters, so a downstream adapter can never construct
-one directly and bypass callback provenance or VM isolation.
+A generic embedding that deliberately has no bound artifact may use the
+registry-only fallback explicitly:
+
+```rust
+register_owned_timer(
+    call,
+    &self.registry,
+    TIMER_CALLBACK_ARG,
+    Duration::from_secs(seconds as u64),
+    None,
+)
+```
+
+`OwnedTimerCallback` values are only ever created inside the two registration
+helpers and the standard millisecond adapters, so a downstream adapter can
+never construct one directly and bypass callback provenance or VM isolation.
 
 ## Running-limit policy
 
@@ -230,6 +278,12 @@ The generic module performs **no admission and keeps no counters**. Each
   rather than post-hoc observations;
 - a rejected registration returns an error and retains nothing, and the generic
   module restores the callback to the caller (see the rollback contract above);
+- `TimerBackend::prepare_registration(metadata)` must return a
+  `TimerRegistrationTransaction`. Preparation may reserve capacity without
+  publishing a callback. The transaction's `commit` performs the only
+  publication step; its rollback guard must remove a publication after either a
+  returned error or a panic. The guard's rollback/`Drop` path is nonblocking,
+  does not enter a VM/runtime, and does not spawn a thread;
 - `timer::pending_count()`, `timer::running_count()`, and
   `installed_timer_counts` are pure backend queries: they return exactly
   `TimerBackend::pending_count()` / `TimerBackend::running_count()` for the
@@ -239,8 +293,8 @@ The generic module performs **no admission and keeps no counters**. Each
 Embeddings therefore select their own capacity by installing a `TimerConfig`
 (with the documented defaults `DEFAULT_MAX_PENDING_TIMERS` = 1024 and
 `DEFAULT_MAX_RUNNING_TIMERS` = 256); a backend that needs a stricter or
-dynamically shared budget enforces it inside its own `register` /
-scheduling path.
+dynamically shared budget enforces it inside its own
+`prepare_registration` / transaction scheduling path.
 
 ## VM-core boundary
 

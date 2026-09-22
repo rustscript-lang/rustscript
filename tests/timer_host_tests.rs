@@ -1,7 +1,7 @@
 //! Standard timer host-module integration tests.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -11,9 +11,10 @@ use vm::{
     HostAsyncBridge, HostFunctionRegistry, HostFunctionSchema, HostImportParam, HostImportSchema,
     HostOpId, HostOwnedFunction, HostParamPassing, HostParamSchema, HostTypeSchema, OwnedHostCall,
     OwnedHostContext, SourceError, SourceFlavor, SourcePathError, TIMER_CALLBACK_ARG, TimerBackend,
-    TimerConfig, TimerCounts, TimerExtension, TimerHostExt, TimerRegistration, Value, Vm, VmError,
-    VmResult, VmStatus, compile_source_with_flavor_and_options, installed_timer_counts,
-    register_owned_timer, standard_host_catalog,
+    TimerConfig, TimerCounts, TimerExtension, TimerHostExt, TimerRegistration,
+    TimerRegistrationMetadata, TimerRegistrationTransaction, Value, Vm, VmError, VmResult,
+    VmStatus, compile_source_with_flavor_and_options, installed_timer_counts, register_owned_timer,
+    standard_host_catalog,
 };
 
 #[derive(Default)]
@@ -30,16 +31,24 @@ impl ManualBackend {
 }
 
 impl TimerBackend for ManualBackend {
-    fn register(&self, registration: TimerRegistration) -> VmResult<()> {
-        let mut registrations = self.registrations.lock().expect("registrations");
-        if registrations.len() >= registration.max_pending {
-            return Err(vm::VmError::HostError(format!(
-                "timer pending limit {} reached",
-                registration.max_pending
-            )));
-        }
-        registrations.push(registration);
-        Ok(())
+    fn prepare_registration<'a>(
+        &'a self,
+        _metadata: TimerRegistrationMetadata,
+    ) -> VmResult<TimerRegistrationTransaction<'a>> {
+        Ok(TimerRegistrationTransaction::new(
+            move |registration| {
+                let mut registrations = self.registrations.lock().expect("registrations");
+                if registrations.len() >= registration.max_pending {
+                    return Err(vm::VmError::HostError(format!(
+                        "timer pending limit {} reached",
+                        registration.max_pending
+                    )));
+                }
+                registrations.push(registration);
+                Ok(())
+            },
+            || {},
+        ))
     }
 
     fn pending_count(&self) -> usize {
@@ -68,10 +77,18 @@ struct RejectingBackend {
 }
 
 impl TimerBackend for RejectingBackend {
-    fn register(&self, _registration: TimerRegistration) -> VmResult<()> {
-        self.attempts.fetch_add(1, Ordering::SeqCst);
-        Err(vm::VmError::HostError(
-            "backend rejected registration".to_string(),
+    fn prepare_registration<'a>(
+        &'a self,
+        _metadata: TimerRegistrationMetadata,
+    ) -> VmResult<TimerRegistrationTransaction<'a>> {
+        Ok(TimerRegistrationTransaction::new(
+            move |_registration| {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                Err(vm::VmError::HostError(
+                    "backend rejected registration".to_string(),
+                ))
+            },
+            || {},
         ))
     }
 
@@ -96,9 +113,17 @@ struct PanickingBackend {
 }
 
 impl TimerBackend for PanickingBackend {
-    fn register(&self, _registration: TimerRegistration) -> VmResult<()> {
-        self.attempts.fetch_add(1, Ordering::SeqCst);
-        panic!("backend registration panic");
+    fn prepare_registration<'a>(
+        &'a self,
+        _metadata: TimerRegistrationMetadata,
+    ) -> VmResult<TimerRegistrationTransaction<'a>> {
+        Ok(TimerRegistrationTransaction::new(
+            move |_registration| {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                panic!("backend registration panic");
+            },
+            || {},
+        ))
     }
 
     fn pending_count(&self) -> usize {
@@ -112,6 +137,84 @@ impl TimerBackend for PanickingBackend {
     fn report_callback_error(&self, _error: vm::TimerCallbackError) {}
 
     fn shutdown(&self) -> VmResult<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PublishingFailure {
+    ReturnError,
+    Panic,
+}
+
+struct PublishingFailureBackend {
+    mode: PublishingFailure,
+    next_id: AtomicU64,
+    attempts: AtomicUsize,
+    registrations: Mutex<HashMap<u64, TimerRegistration>>,
+}
+
+impl PublishingFailureBackend {
+    fn new(mode: PublishingFailure) -> Self {
+        Self {
+            mode,
+            next_id: AtomicU64::new(1),
+            attempts: AtomicUsize::new(0),
+            registrations: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl TimerBackend for PublishingFailureBackend {
+    fn prepare_registration<'a>(
+        &'a self,
+        _metadata: TimerRegistrationMetadata,
+    ) -> VmResult<TimerRegistrationTransaction<'a>> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mode = self.mode;
+        Ok(TimerRegistrationTransaction::new(
+            move |registration| {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                self.registrations
+                    .lock()
+                    .expect("publishing registrations")
+                    .insert(id, registration);
+                match mode {
+                    PublishingFailure::ReturnError => Err(VmError::HostError(
+                        "backend failed after publishing registration".to_string(),
+                    )),
+                    PublishingFailure::Panic => {
+                        panic!("backend panicked after publishing registration")
+                    }
+                }
+            },
+            move || {
+                self.registrations
+                    .lock()
+                    .expect("publishing registrations")
+                    .remove(&id);
+            },
+        ))
+    }
+
+    fn pending_count(&self) -> usize {
+        self.registrations
+            .lock()
+            .expect("publishing registrations")
+            .len()
+    }
+
+    fn running_count(&self) -> usize {
+        0
+    }
+
+    fn report_callback_error(&self, _error: vm::TimerCallbackError) {}
+
+    fn shutdown(&self) -> VmResult<()> {
+        self.registrations
+            .lock()
+            .expect("publishing registrations")
+            .clear();
         Ok(())
     }
 }
@@ -215,20 +318,28 @@ impl LimitedSchedulerBackend {
 }
 
 impl TimerBackend for LimitedSchedulerBackend {
-    fn register(&self, registration: TimerRegistration) -> VmResult<()> {
-        let mut state = self.state.lock().expect("scheduler state");
-        if state.pending.len() + state.active.len() >= registration.max_pending {
-            return Err(vm::VmError::HostError(
-                "timer pending limit reached".to_string(),
-            ));
-        }
-        if registration.max_running != self.max_running {
-            return Err(vm::VmError::HostError(
-                "scheduler max_running mismatch".to_string(),
-            ));
-        }
-        state.pending.push_back(registration);
-        Ok(())
+    fn prepare_registration<'a>(
+        &'a self,
+        _metadata: TimerRegistrationMetadata,
+    ) -> VmResult<TimerRegistrationTransaction<'a>> {
+        Ok(TimerRegistrationTransaction::new(
+            move |registration| {
+                let mut state = self.state.lock().expect("scheduler state");
+                if state.pending.len() + state.active.len() >= registration.max_pending {
+                    return Err(vm::VmError::HostError(
+                        "timer pending limit reached".to_string(),
+                    ));
+                }
+                if registration.max_running != self.max_running {
+                    return Err(vm::VmError::HostError(
+                        "scheduler max_running mismatch".to_string(),
+                    ));
+                }
+                state.pending.push_back(registration);
+                Ok(())
+            },
+            || {},
+        ))
     }
 
     fn pending_count(&self) -> usize {
@@ -340,16 +451,24 @@ impl AdmissionBackend {
 }
 
 impl TimerBackend for AdmissionBackend {
-    fn register(&self, registration: TimerRegistration) -> VmResult<()> {
-        self.barrier.wait();
-        let mut registrations = self.registrations.lock().expect("registrations");
-        if registrations.len() >= registration.max_pending {
-            return Err(vm::VmError::HostError(
-                "timer pending limit reached".to_string(),
-            ));
-        }
-        registrations.push(registration);
-        Ok(())
+    fn prepare_registration<'a>(
+        &'a self,
+        _metadata: TimerRegistrationMetadata,
+    ) -> VmResult<TimerRegistrationTransaction<'a>> {
+        Ok(TimerRegistrationTransaction::new(
+            move |registration| {
+                self.barrier.wait();
+                let mut registrations = self.registrations.lock().expect("registrations");
+                if registrations.len() >= registration.max_pending {
+                    return Err(vm::VmError::HostError(
+                        "timer pending limit reached".to_string(),
+                    ));
+                }
+                registrations.push(registration);
+                Ok(())
+            },
+            || {},
+        ))
     }
 
     fn pending_count(&self) -> usize {
@@ -379,16 +498,24 @@ struct ShutdownBackend {
 }
 
 impl TimerBackend for ShutdownBackend {
-    fn register(&self, registration: TimerRegistration) -> VmResult<()> {
-        let mut registrations = self.registrations.lock().expect("registrations");
-        if registrations.len() >= registration.max_pending {
-            return Err(vm::VmError::HostError(format!(
-                "timer pending limit {} reached",
-                registration.max_pending
-            )));
-        }
-        registrations.push(registration);
-        Ok(())
+    fn prepare_registration<'a>(
+        &'a self,
+        _metadata: TimerRegistrationMetadata,
+    ) -> VmResult<TimerRegistrationTransaction<'a>> {
+        Ok(TimerRegistrationTransaction::new(
+            move |registration| {
+                let mut registrations = self.registrations.lock().expect("registrations");
+                if registrations.len() >= registration.max_pending {
+                    return Err(vm::VmError::HostError(format!(
+                        "timer pending limit {} reached",
+                        registration.max_pending
+                    )));
+                }
+                registrations.push(registration);
+                Ok(())
+            },
+            || {},
+        ))
     }
 
     fn pending_count(&self) -> usize {
@@ -999,6 +1126,49 @@ fn backend_panic_restores_callback_argument_before_unwinding() {
         "the panic path must restore the callback value before unwinding"
     );
     backend.shutdown().expect("shutdown after backend panic");
+}
+
+#[test]
+fn backend_publishing_failure_rolls_back_before_restoring_callback() {
+    for mode in [PublishingFailure::ReturnError, PublishingFailure::Panic] {
+        let backend = Arc::new(PublishingFailureBackend::new(mode));
+        let mut vm = build_vm_with_backend(
+            "use timer; timer::at(1, |premature| null);",
+            &backend,
+            TimerConfig::default(),
+        )
+        .expect("vm setup succeeds before publishing failure");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.run()));
+        match mode {
+            PublishingFailure::ReturnError => {
+                assert!(
+                    matches!(result, Ok(Err(_))),
+                    "returned backend error must propagate"
+                );
+            }
+            PublishingFailure::Panic => {
+                assert!(result.is_err(), "backend panic must unwind");
+            }
+        }
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backend.pending_count(),
+            0,
+            "a published registration must be removed before failure handling restores the source"
+        );
+        assert_eq!(
+            vm.stack()
+                .iter()
+                .filter(|value| matches!(value, Value::Callable(_)))
+                .count(),
+            1,
+            "the source callback must be restored exactly once"
+        );
+        backend
+            .shutdown()
+            .expect("shutdown after publishing failure");
+        assert_eq!(backend.pending_count(), 0);
+    }
 }
 
 #[test]
