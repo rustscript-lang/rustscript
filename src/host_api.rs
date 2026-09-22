@@ -59,11 +59,13 @@
 
 use std::any::{Any, TypeId};
 use std::fmt;
+#[cfg(feature = "runtime")]
+use std::sync::Arc;
 
 #[cfg(feature = "runtime")]
 use crate::bytecode::Value;
 #[cfg(feature = "runtime")]
-use crate::vm::{CallOutcome, HostFunctionRegistry, Vm, VmError, VmResult};
+use crate::vm::{BoundHostProgram, CallOutcome, HostFunctionRegistry, Vm, VmError, VmResult};
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, VariantAccess, Visitor};
 use serde::ser::{SerializeStruct, SerializeStructVariant};
@@ -4362,11 +4364,15 @@ pub trait HostOwnedFunction: Send {
 /// The context is handed to the registration factory when a registry binds a
 /// VM, so an owned host function can retain the immutable registry/binding
 /// configuration it needs to spawn an isolated owned-value execution VM
-/// later. It deliberately carries nothing else: no host state, no execution
-/// frames, no request-local data.
+/// later. A VM created from [`BoundHostProgram`] also supplies the exact
+/// immutable bound artifact that was used for that VM; a registry-only binding
+/// supplies `None` and must use the explicit registry fallback. It deliberately
+/// carries nothing else: no host state, no execution frames, no request-local
+/// data.
 #[cfg(feature = "runtime")]
 pub struct OwnedHostContext<'a> {
     pub(crate) registry: &'a HostFunctionRegistry,
+    pub(crate) bound_program: Option<Arc<BoundHostProgram>>,
 }
 
 #[cfg(feature = "runtime")]
@@ -4377,6 +4383,15 @@ impl<'a> OwnedHostContext<'a> {
     /// table, capability profile, and composition with its source.
     pub fn registry(&self) -> &'a HostFunctionRegistry {
         self.registry
+    }
+
+    /// Returns the exact immutable artifact used to bind the current VM.
+    ///
+    /// `Some` is present only for a VM constructed through [`Vm::new_bound`].
+    /// The returned `Arc` is immutable shared metadata; it does not share any
+    /// mutable VM, module, execution-scope, async, or host-private state.
+    pub fn bound_program(&self) -> Option<Arc<BoundHostProgram>> {
+        self.bound_program.clone()
     }
 }
 

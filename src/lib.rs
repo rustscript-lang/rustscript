@@ -31,8 +31,8 @@ pub use builtins::runtime::{
     DEFAULT_MAX_PENDING_TIMERS, DEFAULT_MAX_RUNNING_TIMERS, OwnedTimerCallback, TIMER_CALLBACK_ARG,
     TimerBackend, TimerCallbackError, TimerCallbackState, TimerCallbackStatus, TimerConfig,
     TimerCounts, TimerExtension, TimerHostExt, TimerHostState, TimerRegistration,
-    installed_timer_counts, register_owned_timer, register_timer_builtin_module,
-    register_timer_builtin_module_from_catalog, timer_host_catalog,
+    installed_timer_counts, register_owned_timer, register_owned_timer_with_bound_program,
+    register_timer_builtin_module, register_timer_builtin_module_from_catalog, timer_host_catalog,
 };
 #[cfg(all(feature = "runtime", feature = "sqlite", not(target_family = "wasm")))]
 pub use builtins::runtime::{
@@ -178,6 +178,8 @@ pub use vm::{
     register_host_extension, resource, validate_catalog_import_schemas,
     validate_catalog_import_schemas_with_fingerprints,
 };
+#[cfg(feature = "bind-mode-test-hooks")]
+pub use vm::{BindModeSnapshot, BindModeTestScope};
 #[cfg(feature = "runtime")]
 pub use vmbc::{
     DisassembleOptions, ValidationError, WireError, decode_program, disassemble_program,

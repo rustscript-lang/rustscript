@@ -28,6 +28,11 @@ pd-vm = { git = "https://github.com/rustscript-lang/rustscript", package = "pd-v
 pd-host-function = { git = "https://github.com/rustscript-lang/rustscript", package = "pd-host-function" }
 ```
 
+For integration-only bind-mode measurements, enable the non-default
+`pd-vm` feature `bind-mode-test-hooks`. It exposes the scoped
+`BindModeTestScope`/`BindModeSnapshot` API and is omitted from ordinary release
+feature sets.
+
 ## Build and test
 
 ```bash

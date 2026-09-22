@@ -28,7 +28,8 @@ use crate::vm::async_host::{
 };
 use crate::vm::execution_scope::{ExecutionScope, ExecutionScopeError, ScopeCloseOutcome};
 use crate::vm::host::{
-    HostAsyncBridge, HostAsyncOpTerminal, HostOpId, ScopedOperationCompletion, VmHostFunction,
+    BoundHostProgram, HostAsyncBridge, HostAsyncOpTerminal, HostOpId, ScopedOperationCompletion,
+    VmHostFunction,
 };
 use crate::vm::operation::{OperationCancelReason, OperationId};
 use crate::vm::standard_composition::StandardSurfaceComposition;
@@ -174,6 +175,12 @@ pub(crate) struct HostRuntime {
     /// Compiler identity stays `TypeSchema::Named`; this table supplies Object
     /// bodies for runtime validation and nested-resource classification.
     pub(crate) named_struct_schemas: Arc<HashMap<String, crate::compiler::TypeSchema>>,
+    /// Exact immutable artifact that installed this VM's bound dispatch.
+    ///
+    /// Registry-only bindings leave this unset. Owned adapters use the marker
+    /// to prove that a supplied bound artifact belongs to the currently
+    /// executing VM before constructing a callback VM.
+    pub(crate) bound_host_program: Option<Arc<BoundHostProgram>>,
     /// Host-owned callable stream drivers. The VM stores only this generic
     /// driver contract; HTTP/SSE state remains in the adapter module.
     pub(crate) stream_drivers: HashMap<HostOpId, Box<dyn HostStreamDriver>>,
@@ -213,6 +220,7 @@ impl HostRuntime {
             reset_error: None,
             replacement_execution_scope: None,
             module_state_store: super::host_state::ModuleStateStore::new(),
+            bound_host_program: None,
             allow_default_builtin_capabilities: true,
             allowed_builtin_calls: Arc::from(Vec::new().into_boxed_slice()),
             allow_default_host_capabilities: true,

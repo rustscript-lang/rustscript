@@ -58,6 +58,7 @@ cranelift-jit = [
     "dep:cranelift-module",
     "dep:cranelift-native",
 ]
+bind-mode-test-hooks = ["runtime"]
 
 [[bin]]
 name = "pd-vm-run"
@@ -128,6 +129,11 @@ tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
 name = "host_binding_generation_tests"
 path = "tests/host_binding_generation_tests.rs"
 required-features = ["cranelift-jit"]
+
+[[test]]
+name = "bound_owned_callback_tests"
+path = "tests/bound_owned_callback_tests.rs"
+required-features = ["runtime", "bind-mode-test-hooks"]
 
 [[test]]
 name = "host_sdk_tests"

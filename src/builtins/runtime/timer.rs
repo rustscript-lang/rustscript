@@ -13,8 +13,8 @@ use crate::host_api::{
     HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema,
 };
 use crate::{
-    CallOutcome, CallReturn, HostFunctionRegistry, HostOwnedFunction, OwnedHostCall,
-    OwnedHostContext, Value, Vm, VmError, VmResult, VmStatus,
+    BoundHostProgram, CallOutcome, CallReturn, HostFunctionRegistry, HostOwnedFunction,
+    OwnedHostCall, OwnedHostContext, Value, Vm, VmError, VmResult, VmStatus,
 };
 
 /// Default maximum number of registered callbacks waiting to begin.
@@ -481,6 +481,7 @@ impl crate::host_extension::HostOwnedAdapterFactory for RegisterTimerFactory {
     fn create(&self, context: OwnedHostContext<'_>) -> Box<dyn HostOwnedFunction> {
         Box::new(RegisterTimer {
             registry: context.registry().clone(),
+            bound_program: context.bound_program(),
             repeating: self.repeating,
         })
     }
@@ -571,6 +572,7 @@ pub fn timer_host_catalog() -> Arc<HostApiCatalog> {
 
 struct RegisterTimer {
     registry: HostFunctionRegistry,
+    bound_program: Option<Arc<BoundHostProgram>>,
     repeating: bool,
 }
 
@@ -596,13 +598,22 @@ impl HostOwnedFunction for RegisterTimer {
             )));
         }
         let delay = Duration::from_millis(delay_ms as u64);
-        register_owned_timer(
-            call,
-            &self.registry,
-            TIMER_CALLBACK_ARG,
-            delay,
-            self.repeating.then_some(delay),
-        )
+        match self.bound_program.as_ref() {
+            Some(bound_program) => register_owned_timer_with_bound_program(
+                call,
+                Arc::clone(bound_program),
+                TIMER_CALLBACK_ARG,
+                delay,
+                self.repeating.then_some(delay),
+            ),
+            None => register_owned_timer(
+                call,
+                &self.registry,
+                TIMER_CALLBACK_ARG,
+                delay,
+                self.repeating.then_some(delay),
+            ),
+        }
     }
 }
 
@@ -684,6 +695,40 @@ pub fn register_owned_timer(
     delay: Duration,
     interval: Option<Duration>,
 ) -> VmResult<CallOutcome> {
+    register_owned_timer_inner(call, Some(registry), None, callback_arg, delay, interval)
+}
+
+/// Registers one owned timer callback through an existing bound artifact.
+///
+/// This is the bound-aware counterpart to [`register_owned_timer`]. The
+/// callback VM is instantiated from `bound_program` and never performs a
+/// registry plan lookup or full bind. The artifact must be the exact one that
+/// installed the currently executing source VM; mismatches fail closed.
+pub fn register_owned_timer_with_bound_program(
+    call: &mut OwnedHostCall<'_>,
+    bound_program: Arc<BoundHostProgram>,
+    callback_arg: usize,
+    delay: Duration,
+    interval: Option<Duration>,
+) -> VmResult<CallOutcome> {
+    register_owned_timer_inner(
+        call,
+        None,
+        Some(bound_program),
+        callback_arg,
+        delay,
+        interval,
+    )
+}
+
+fn register_owned_timer_inner(
+    call: &mut OwnedHostCall<'_>,
+    registry: Option<&HostFunctionRegistry>,
+    bound_program: Option<Arc<BoundHostProgram>>,
+    callback_arg: usize,
+    delay: Duration,
+    interval: Option<Duration>,
+) -> VmResult<CallOutcome> {
     if interval.is_some_and(|interval| interval.is_zero()) {
         return Err(VmError::HostError(
             "timer interval must be positive".to_string(),
@@ -706,11 +751,22 @@ pub fn register_owned_timer(
         call.restore_arg(callback_arg, rollback_callback)?;
         return Err(VmError::TypeMismatch("callable"));
     }
-    let spawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        call.spawn_owned_callable_vm(registry, &callback, move |vm| {
-            vm.host_context().set_module_state(callback_state);
-            Ok(())
-        })
+    let spawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match bound_program {
+        Some(bound_program) => {
+            call.spawn_owned_callable_vm_with_bound_program(bound_program, &callback, move |vm| {
+                vm.host_context().set_module_state(callback_state);
+                Ok(())
+            })
+        }
+        None => {
+            let registry = registry.ok_or_else(|| {
+                VmError::HostError("owned timer registry fallback is missing".to_string())
+            })?;
+            call.spawn_owned_callable_vm(registry, &callback, move |vm| {
+                vm.host_context().set_module_state(callback_state);
+                Ok(())
+            })
+        }
     }));
     let vm = match spawn {
         Ok(Ok(vm)) => vm,
@@ -1054,6 +1110,7 @@ mod tests {
             .register_exact_owned("timer::at", 2, schema, |_context| {
                 Box::new(RegisterTimer {
                     registry: HostFunctionRegistry::empty(),
+                    bound_program: None,
                     repeating: false,
                 })
             })

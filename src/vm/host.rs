@@ -123,6 +123,11 @@ pub use crate::host_api::{HostOwnedFunction, OwnedHostCall, OwnedHostContext};
 
 type OwnedHostFactory = dyn Fn(OwnedHostContext<'_>) -> Box<dyn HostOwnedFunction> + Send + Sync;
 
+enum OwnedCallableVmBinding<'a> {
+    Registry(&'a HostFunctionRegistry),
+    Bound(Arc<BoundHostProgram>),
+}
+
 impl<'vm> OwnedHostCall<'vm> {
     /// Creates a fresh, isolated VM that owns `callable` and its captured
     /// callable graph.
@@ -147,16 +152,79 @@ impl<'vm> OwnedHostCall<'vm> {
         callable: &Value,
         configure: impl FnOnce(&mut Vm) -> VmResult<()>,
     ) -> VmResult<Vm> {
-        let program = Arc::clone(&self.vm.program);
-        let composition = self.vm.host.standard_composition.clone();
+        self.spawn_owned_callable_vm_inner(
+            OwnedCallableVmBinding::Registry(registry),
+            callable,
+            configure,
+        )
+    }
+
+    /// Creates an isolated callback VM from the exact bound artifact of the
+    /// currently executing VM.
+    ///
+    /// The supplied artifact must be the same `Arc` that installed the source
+    /// VM. Its program identity, registry witness/generation, full schemas,
+    /// capability profile, catalog layout, and dispatch layout are validated
+    /// before construction. The callback VM uses [`Vm::new_bound`] directly;
+    /// this path never invokes registry plan preparation or full VM binding.
+    /// Only the callback-owned callable graph is transferred. The new VM owns
+    /// a fresh execution scope, module-state store, async bridge slot, and
+    /// mutable host-function instances.
+    pub fn spawn_owned_callable_vm_with_bound_program(
+        &mut self,
+        bound_program: Arc<BoundHostProgram>,
+        callable: &Value,
+        configure: impl FnOnce(&mut Vm) -> VmResult<()>,
+    ) -> VmResult<Vm> {
+        self.spawn_owned_callable_vm_inner(
+            OwnedCallableVmBinding::Bound(bound_program),
+            callable,
+            configure,
+        )
+    }
+
+    fn spawn_owned_callable_vm_inner(
+        &mut self,
+        binding: OwnedCallableVmBinding<'_>,
+        callable: &Value,
+        configure: impl FnOnce(&mut Vm) -> VmResult<()>,
+    ) -> VmResult<Vm> {
+        if let OwnedCallableVmBinding::Bound(bound_program) = &binding {
+            let source_bound = self.vm.host.bound_host_program.as_ref().ok_or_else(|| {
+                VmError::HostError(
+                    "bound owned callback requires a source vm constructed with new_bound"
+                        .to_string(),
+                )
+            })?;
+            if !Arc::ptr_eq(source_bound, bound_program) {
+                return Err(VmError::HostError(
+                    "bound host program does not match source vm".to_string(),
+                ));
+            }
+            if !Arc::ptr_eq(&self.vm.program, &bound_program.program) {
+                return Err(VmError::HostError(
+                    "bound host program does not match source vm program".to_string(),
+                ));
+            }
+            bound_program.validate_current()?;
+        }
+
         let mut owned = Vec::new();
         let mut visited = Vec::new();
         collect_owned_callable_graph(self.vm, callable, 0, &mut visited, &mut owned)?;
-        let mut vm = Vm::new_shared(Arc::clone(&program));
-        if let Some(composition) = composition {
-            vm.set_standard_composition(composition);
-        }
-        registry.bind_vm_cached(&mut vm)?;
+        let mut vm = match binding {
+            OwnedCallableVmBinding::Registry(registry) => {
+                let program = Arc::clone(&self.vm.program);
+                let composition = self.vm.host.standard_composition.clone();
+                let mut vm = Vm::new_shared(program);
+                if let Some(composition) = composition {
+                    vm.set_standard_composition(composition);
+                }
+                registry.bind_vm_cached(&mut vm)?;
+                vm
+            }
+            OwnedCallableVmBinding::Bound(bound_program) => Vm::new_bound(bound_program)?,
+        };
         configure(&mut vm)?;
         vm.instance.owned_callables.extend(owned);
         clear_owned_callable_vm_state(&mut vm);
@@ -2173,7 +2241,10 @@ impl HostFunctionRegistry {
                     vm.register_static_non_yielding_args_function(*function);
                 }
                 RegistryEntryKind::OwnedFactory(factory) => {
-                    let function = factory(OwnedHostContext { registry: self });
+                    let function = factory(OwnedHostContext {
+                        registry: self,
+                        bound_program: None,
+                    });
                     let function: Box<dyn HostOwnedFunction> = match entry.schema.as_ref() {
                         Some(schema) if schema_requires_guard(schema) => {
                             Box::new(GuardedOwnedHostFunction {
@@ -2223,6 +2294,8 @@ impl HostFunctionRegistry {
             ));
         }
         vm.host.mark_host_binding_locked();
+        #[cfg(feature = "bind-mode-test-hooks")]
+        super::bind_mode_test_hooks::record_full_bind_installation();
         Ok(())
     }
 }
@@ -2250,7 +2323,7 @@ impl BoundHostProgram {
         Ok(())
     }
 
-    pub(crate) fn instantiate_into(&self, vm: &mut Vm) -> VmResult<()> {
+    pub(crate) fn instantiate_into(self: &Arc<Self>, vm: &mut Vm) -> VmResult<()> {
         self.validate_current()?;
         if !Arc::ptr_eq(&vm.program, &self.program) {
             return Err(VmError::HostError(
@@ -2265,6 +2338,7 @@ impl BoundHostProgram {
         self.plan
             .validate_registry_layout(self.registry.entries.len())?;
         self.dispatch.validate_layout(&self.plan)?;
+        vm.host.bound_host_program = Some(Arc::clone(self));
 
         vm.host.host_functions.reserve(self.dispatch.entries.len());
         for (host_slot, entry) in self.dispatch.entries.iter().enumerate() {
@@ -2285,6 +2359,7 @@ impl BoundHostProgram {
                 RegistryEntryKind::OwnedFactory(factory) => {
                     let function = factory(OwnedHostContext {
                         registry: &self.registry,
+                        bound_program: Some(Arc::clone(self)),
                     });
                     let function: Box<dyn HostOwnedFunction> = match self
                         .dispatch
