@@ -58,16 +58,29 @@ after the owning backend is dropped an existing callback reports
 
 ## Generic backend boundary
 
-`TimerBackend::prepare_registration` receives immutable
-`TimerRegistrationMetadata` and returns a `TimerRegistrationTransaction`. The
-prepare phase may validate metadata or reserve capacity, but it cannot publish
+`TimerBackend::register(&self, TimerRegistration)` remains the legacy
+all-or-nothing entry point, so an existing backend can implement the trait
+without a source change. The default `prepare_registration` creates a small
+transaction that calls `register` only during commit. Backends that need strong
+rollback override `prepare_registration` and return their own
+`TimerRegistrationTransaction`.
+
+Preparation may validate metadata or reserve capacity, but it cannot publish
 the callback. The transaction's `commit` receives the complete
 `TimerRegistration`; only a successful commit transfers ownership to the
-backend. A returned error or panic leaves the transaction's rollback guard
-armed, and rollback must remove any partial publication without entering a
-VM/runtime, blocking on worker progress, or spawning a thread. The backend must
-enforce admission and running limits under its own synchronization and provide
-idempotent shutdown.
+backend. A returned commit error invokes rollback once. A commit panic leaves
+the guard armed so the caller invokes rollback once. The rollback operation
+must be **nonblocking and non-panicking**: it may cancel a reservation or remove
+a partial publication, but it must not enter a VM/runtime, wait for worker
+progress, poll callback work, or spawn a thread. If it removes a registration,
+it must return that registration after releasing backend locks; the generic
+guard then drops the callback VM after rollback returns.
+
+The legacy path retains its existing limitation: a backend that panics after
+publishing through `register` cannot be generically reclaimed because it did
+not provide a transactional rollback operation. The helper restores the source
+callback and rethrows that panic. Strong transactional backends provide the
+rollback contract above.
 
 The generic module has no request, connection, worker-phase, or `ngx.timer`
 semantics. It does not create request objects, inherit request-local state, or
@@ -82,7 +95,8 @@ transactional order:
 
 1. Validate the duration, before taking any argument.
 2. Prepare the backend transaction from the registration metadata; preparation
-   publishes no callback.
+   publishes no callback. The compatibility default defers legacy `register`
+   until commit.
 3. Clone the callback value for rollback, then take the original callback from
    the owned host call.
 4. Validate the callable's complete program-local graph. Cycles are visited once;
@@ -95,14 +109,13 @@ transactional order:
 7. Only a successful backend commit disarms rollback and transfers the callback.
 
 A preflight, VM-spawn, or backend error restores the cloned callback into its
-original host-call slot and marks that slot untaken. The transaction rollback
-runs before that restoration for a backend error or panic, so an attempted
-backend insertion cannot retain a registration while the source owns the
-callback again. The ordinary owned-dispatch failure path then restores all
-untaken arguments to the guest stack exactly once. A backend panic resumes the
-original panic after rollback and source restoration. Consequently a rejected
-registration does not consume the source callback, and a backend rejection
-must not retain the callback VM.
+original host-call slot and marks that slot untaken. A returned commit error
+has already run rollback once; a commit panic runs rollback once at the panic
+boundary. Any registration returned by rollback is dropped only after rollback
+returns and backend locks are released. The ordinary owned-dispatch failure path
+then restores all untaken arguments to the guest stack exactly once. A backend
+panic resumes the original panic after rollback and source restoration. A
+legacy backend panic keeps the legacy limitation described above.
 
 The fresh callback VM starts halted with no execution frames, stack, or host
 return. Its callable graph remains owned by that VM for the lifetime of the
@@ -278,12 +291,14 @@ The generic module performs **no admission and keeps no counters**. Each
   rather than post-hoc observations;
 - a rejected registration returns an error and retains nothing, and the generic
   module restores the callback to the caller (see the rollback contract above);
-- `TimerBackend::prepare_registration(metadata)` must return a
-  `TimerRegistrationTransaction`. Preparation may reserve capacity without
-  publishing a callback. The transaction's `commit` performs the only
-  publication step; its rollback guard must remove a publication after either a
-  returned error or a panic. The guard's rollback/`Drop` path is nonblocking,
-  does not enter a VM/runtime, and does not spawn a thread;
+- `TimerBackend::prepare_registration(metadata)` may reserve capacity without
+  publishing a callback. The default guard defers legacy `register` to commit;
+  a strong transactional backend supplies a rollback operation that removes a
+  publication after either a returned error or a panic. That rollback/cancel
+  path is **NONBLOCKING and NON-PANICKING**, does not enter a VM/runtime, wait
+  for worker progress, poll callback work, or spawn a thread. Any registration
+  it returns is released after rollback returns and backend locks are gone;
+  `Drop` invokes the same rollback once when a guard remains prepared;
 - `timer::pending_count()`, `timer::running_count()`, and
   `installed_timer_counts` are pure backend queries: they return exactly
   `TimerBackend::pending_count()` / `TimerBackend::running_count()` for the

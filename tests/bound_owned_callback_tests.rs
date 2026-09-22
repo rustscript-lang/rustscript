@@ -31,7 +31,7 @@ impl TimerBackend for RecordingBackend {
                     .push(registration);
                 Ok(())
             },
-            || {},
+            || None,
         ))
     }
 

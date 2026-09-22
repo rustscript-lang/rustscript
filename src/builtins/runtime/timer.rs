@@ -62,22 +62,25 @@ pub struct TimerRegistrationMetadata {
 
 /// Two-phase backend registration guard.
 ///
-/// The backend supplies the commit and rollback closures from
-/// [`TimerBackend::prepare_registration`]. The guard owns the rollback closure
-/// until commit succeeds; dropping it invokes rollback. Rollback must only
-/// cancel the reservation/remove a published registration, must be idempotent,
-/// and must not drive callback bytecode, enter a VM/runtime, block on worker
-/// progress, or spawn a thread.
+/// A backend supplies the commit and rollback operations from
+/// [`TimerBackend::prepare_registration`]. The guard owns rollback until a
+/// successful commit; dropping a still-prepared guard invokes it once. The
+/// rollback operation may cancel a reservation or remove a published
+/// registration, but it must not drive callback bytecode, enter a VM/runtime,
+/// wait for worker progress, or spawn a thread. It must also be non-panicking.
+/// If it removes a registration, it returns that registration so this guard can
+/// release the callback VM only after rollback has returned and backend locks
+/// have been released.
 pub struct TimerRegistrationTransaction<'a> {
     commit: Option<Box<dyn FnOnce(TimerRegistration) -> VmResult<()> + Send + 'a>>,
-    rollback: Option<Box<dyn FnOnce() + Send + 'a>>,
+    rollback: Option<Box<dyn FnOnce() -> Option<TimerRegistration> + Send + 'a>>,
 }
 
 impl<'a> TimerRegistrationTransaction<'a> {
     /// Creates a transaction guard for one prepared backend reservation.
     pub fn new(
         commit: impl FnOnce(TimerRegistration) -> VmResult<()> + Send + 'a,
-        rollback: impl FnOnce() + Send + 'a,
+        rollback: impl FnOnce() -> Option<TimerRegistration> + Send + 'a,
     ) -> Self {
         Self {
             commit: Some(Box::new(commit)),
@@ -85,9 +88,11 @@ impl<'a> TimerRegistrationTransaction<'a> {
         }
     }
 
-    /// Publishes the registration. A returned error leaves the transaction
-    /// rolled back. A panic leaves the rollback closure armed for the caller's
-    /// panic boundary or this guard's `Drop` implementation.
+    /// Publishes the registration.
+    ///
+    /// A returned error invokes rollback exactly once. A panic leaves rollback
+    /// armed for the caller's panic boundary or this guard's `Drop`
+    /// implementation.
     pub fn commit(&mut self, registration: TimerRegistration) -> VmResult<()> {
         let Some(commit) = self.commit.take() else {
             return Err(VmError::HostError(
@@ -106,19 +111,25 @@ impl<'a> TimerRegistrationTransaction<'a> {
         }
     }
 
-    /// Rolls back a prepared or partially published registration.
+    /// Rolls back a prepared or partially published registration once.
+    ///
+    /// Any registration returned by the backend is dropped after the rollback
+    /// operation returns, so callback VM destruction cannot occur under a
+    /// backend lock. The backend rollback itself is required to be
+    /// nonblocking and non-panicking; this method deliberately does not add a
+    /// panic boundary around it.
     pub fn rollback(&mut self) {
         self.commit.take();
         if let Some(rollback) = self.rollback.take() {
-            rollback();
+            drop(rollback());
         }
     }
 }
 
 impl Drop for TimerRegistrationTransaction<'_> {
     fn drop(&mut self) {
-        if let Some(rollback) = self.rollback.take() {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(rollback));
+        if self.rollback.is_some() {
+            self.rollback();
         }
     }
 }
@@ -138,16 +149,36 @@ impl Drop for TimerRegistrationTransaction<'_> {
 /// each [`TimerRegistration`] are MUST-enforce obligations, checked atomically
 /// with the backend's own insertion/scheduling so they behave as hard caps.
 pub trait TimerBackend: Send + Sync + 'static {
+    /// Legacy all-or-nothing registration entry point.
+    ///
+    /// Existing backends may implement this method without changing source.
+    /// The default preparation path below calls it only from transaction commit,
+    /// so a legacy backend does not publish during preparation. A backend that
+    /// overrides [`Self::prepare_registration`] may leave this default unused.
+    fn register(&self, _registration: TimerRegistration) -> VmResult<()> {
+        Err(VmError::HostError(
+            "timer backend does not implement registration".to_string(),
+        ))
+    }
+
     /// Prepares one registration transaction without publishing its callback.
     ///
-    /// The returned guard must perform all rollback through its nonblocking
-    /// cancellation closure. `commit` is the only operation that may publish
-    /// the callback, and a backend must make rollback remove a registration even
-    /// when commit returns an error or panics after insertion.
+    /// The default implementation preserves the legacy [`Self::register`]
+    /// contract. Strong transactional backends override it and return a guard
+    /// whose rollback operation cancels the reservation or removes any partial
+    /// publication. That rollback operation is required to be NONBLOCKING and
+    /// NON-PANICKING. `commit` is the only operation that may publish the
+    /// callback, and rollback must remove a registration even when commit
+    /// returns an error or panics after insertion.
     fn prepare_registration<'a>(
         &'a self,
-        metadata: TimerRegistrationMetadata,
-    ) -> VmResult<TimerRegistrationTransaction<'a>>;
+        _metadata: TimerRegistrationMetadata,
+    ) -> VmResult<TimerRegistrationTransaction<'a>> {
+        Ok(TimerRegistrationTransaction::new(
+            move |registration| self.register(registration),
+            || None,
+        ))
+    }
     /// Registered callbacks waiting to begin (or waiting for a running slot).
     fn pending_count(&self) -> usize;
     /// Live callback executions, including callbacks paused on async host work.
@@ -851,6 +882,7 @@ fn register_owned_timer_inner(
         .ok_or_else(|| VmError::HostError("timer callback argument is missing".to_string()))?;
     let callback = call.take_arg(callback_arg)?;
     if !matches!(callback, Value::Callable(_)) {
+        transaction.rollback();
         call.restore_arg(callback_arg, rollback_callback)?;
         return Err(VmError::TypeMismatch("callable"));
     }
@@ -874,10 +906,12 @@ fn register_owned_timer_inner(
     let vm = match spawn {
         Ok(Ok(vm)) => vm,
         Ok(Err(error)) => {
+            transaction.rollback();
             call.restore_arg(callback_arg, rollback_callback)?;
             return Err(error);
         }
         Err(payload) => {
+            transaction.rollback();
             call.restore_arg(callback_arg, rollback_callback)?;
             std::panic::resume_unwind(payload)
         }
@@ -895,7 +929,7 @@ fn register_owned_timer_inner(
     match result {
         Ok(Ok(())) => Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true)))),
         Ok(Err(error)) => {
-            transaction.rollback();
+            // `commit` already rolled back this returned error exactly once.
             call.restore_arg(callback_arg, rollback_callback)?;
             Err(error)
         }
@@ -989,7 +1023,7 @@ mod tests {
                     *self.registrations.lock().expect("registrations") += 1;
                     Ok(())
                 },
-                || {},
+                || None,
             ))
         }
 

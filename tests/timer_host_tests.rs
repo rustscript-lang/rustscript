@@ -1,7 +1,7 @@
 //! Standard timer host-module integration tests.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -16,6 +16,42 @@ use vm::{
     VmStatus, compile_source_with_flavor_and_options, installed_timer_counts, register_owned_timer,
     standard_host_catalog,
 };
+
+#[derive(Default)]
+struct LegacyRegisterBackend {
+    registrations: Mutex<Vec<TimerRegistration>>,
+}
+
+impl TimerBackend for LegacyRegisterBackend {
+    fn register(&self, registration: TimerRegistration) -> VmResult<()> {
+        self.registrations
+            .lock()
+            .expect("legacy registrations")
+            .push(registration);
+        Ok(())
+    }
+
+    fn pending_count(&self) -> usize {
+        self.registrations
+            .lock()
+            .expect("legacy registrations")
+            .len()
+    }
+
+    fn running_count(&self) -> usize {
+        0
+    }
+
+    fn report_callback_error(&self, _error: vm::TimerCallbackError) {}
+
+    fn shutdown(&self) -> VmResult<()> {
+        self.registrations
+            .lock()
+            .expect("legacy registrations")
+            .clear();
+        Ok(())
+    }
+}
 
 #[derive(Default)]
 struct ManualBackend {
@@ -47,7 +83,7 @@ impl TimerBackend for ManualBackend {
                 registrations.push(registration);
                 Ok(())
             },
-            || {},
+            || None,
         ))
     }
 
@@ -88,7 +124,7 @@ impl TimerBackend for RejectingBackend {
                     "backend rejected registration".to_string(),
                 ))
             },
-            || {},
+            || None,
         ))
     }
 
@@ -122,7 +158,7 @@ impl TimerBackend for PanickingBackend {
                 self.attempts.fetch_add(1, Ordering::SeqCst);
                 panic!("backend registration panic");
             },
-            || {},
+            || None,
         ))
     }
 
@@ -151,6 +187,8 @@ struct PublishingFailureBackend {
     mode: PublishingFailure,
     next_id: AtomicU64,
     attempts: AtomicUsize,
+    rollbacks: AtomicUsize,
+    rollback_active: Arc<AtomicBool>,
     registrations: Mutex<HashMap<u64, TimerRegistration>>,
 }
 
@@ -160,6 +198,8 @@ impl PublishingFailureBackend {
             mode,
             next_id: AtomicU64::new(1),
             attempts: AtomicUsize::new(0),
+            rollbacks: AtomicUsize::new(0),
+            rollback_active: Arc::new(AtomicBool::new(false)),
             registrations: Mutex::new(HashMap::new()),
         }
     }
@@ -189,10 +229,16 @@ impl TimerBackend for PublishingFailureBackend {
                 }
             },
             move || {
-                self.registrations
-                    .lock()
-                    .expect("publishing registrations")
-                    .remove(&id);
+                self.rollbacks.fetch_add(1, Ordering::SeqCst);
+                self.rollback_active.store(true, Ordering::SeqCst);
+                let registration = {
+                    self.registrations
+                        .lock()
+                        .expect("publishing registrations")
+                        .remove(&id)
+                };
+                self.rollback_active.store(false, Ordering::SeqCst);
+                registration
             },
         ))
     }
@@ -338,7 +384,7 @@ impl TimerBackend for LimitedSchedulerBackend {
                 state.pending.push_back(registration);
                 Ok(())
             },
-            || {},
+            || None,
         ))
     }
 
@@ -467,7 +513,7 @@ impl TimerBackend for AdmissionBackend {
                 registrations.push(registration);
                 Ok(())
             },
-            || {},
+            || None,
         ))
     }
 
@@ -514,7 +560,7 @@ impl TimerBackend for ShutdownBackend {
                 registrations.push(registration);
                 Ok(())
             },
-            || {},
+            || None,
         ))
     }
 
@@ -585,6 +631,8 @@ struct TimerTestExtension {
 struct ProbeCounters {
     drops: AtomicUsize,
     calls: AtomicUsize,
+    drop_during_rollback: AtomicBool,
+    rollback_active: Option<Arc<AtomicBool>>,
 }
 
 /// A host-function instance that counts its own release. Every bound VM owns
@@ -597,6 +645,16 @@ struct ProbeHost {
 
 impl Drop for ProbeHost {
     fn drop(&mut self) {
+        if self
+            .counters
+            .rollback_active
+            .as_ref()
+            .is_some_and(|active| active.load(Ordering::SeqCst))
+        {
+            self.counters
+                .drop_during_rollback
+                .store(true, Ordering::SeqCst);
+        }
         self.counters.drops.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -812,6 +870,18 @@ fn run_with_probe<B: TimerBackend>(
     let mut vm = build_vm_with_probe(source, &backend, config, probe)?;
     assert_eq!(vm.run()?, VmStatus::Halted);
     Ok(vm)
+}
+
+#[test]
+fn legacy_register_implementation_remains_source_compatible() {
+    let backend = Arc::new(LegacyRegisterBackend::default());
+    run_with_backend(
+        "use timer; timer::at(1, |premature| null);",
+        Arc::clone(&backend),
+        TimerConfig::default(),
+    )
+    .expect("legacy register backend succeeds");
+    assert_eq!(backend.pending_count(), 1);
 }
 
 #[test]
@@ -1152,6 +1222,11 @@ fn backend_publishing_failure_rolls_back_before_restoring_callback() {
         }
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
         assert_eq!(
+            backend.rollbacks.load(Ordering::SeqCst),
+            1,
+            "a returned commit failure or panic rolls back exactly once"
+        );
+        assert_eq!(
             backend.pending_count(),
             0,
             "a published registration must be removed before failure handling restores the source"
@@ -1169,6 +1244,53 @@ fn backend_publishing_failure_rolls_back_before_restoring_callback() {
             .expect("shutdown after publishing failure");
         assert_eq!(backend.pending_count(), 0);
     }
+}
+
+#[test]
+fn prepared_transaction_drop_rolls_back_once() {
+    let backend = Arc::new(PublishingFailureBackend::new(
+        PublishingFailure::ReturnError,
+    ));
+    let transaction = backend
+        .prepare_registration(TimerRegistrationMetadata {
+            delay: Duration::from_millis(1),
+            interval: None,
+            max_pending: 1,
+            max_running: 1,
+        })
+        .expect("transaction preparation");
+    drop(transaction);
+    assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.pending_count(), 0);
+}
+
+#[test]
+fn callback_vm_drop_happens_after_transaction_rollback_returns() {
+    let backend = Arc::new(PublishingFailureBackend::new(
+        PublishingFailure::ReturnError,
+    ));
+    let counters = Arc::new(ProbeCounters {
+        rollback_active: Some(Arc::clone(&backend.rollback_active)),
+        ..ProbeCounters::default()
+    });
+    let mut vm = build_vm_with_probe(
+        "use test;\nuse timer;\ntimer::at(1, |premature| if true => { test::probe(); null } else => { null });\n",
+        &backend,
+        TimerConfig::default(),
+        Arc::clone(&counters),
+    )
+    .expect("vm setup succeeds before transactional failure");
+    let result = vm.run();
+    assert!(result.is_err(), "returned commit failure propagates");
+    assert_eq!(backend.rollbacks.load(Ordering::SeqCst), 1);
+    assert!(!counters.drop_during_rollback.load(Ordering::SeqCst));
+    assert_eq!(
+        counters.drops.load(Ordering::SeqCst),
+        1,
+        "the callback VM is released before the source VM"
+    );
+    drop(vm);
+    assert_eq!(counters.drops.load(Ordering::SeqCst), 2);
 }
 
 #[test]
