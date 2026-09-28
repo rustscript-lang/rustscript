@@ -3,8 +3,7 @@ use std::time::{Duration, Instant};
 
 use pd_host_function::pd_host_function;
 
-use super::typed::{VmMap, VmMapHandle};
-use super::{borrow_arg, take_arg};
+use super::{arg, borrow_arg, take_arg};
 use crate::HostCallResult;
 use crate::host_api::{
     HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema, HostStructField,
@@ -15,6 +14,7 @@ use crate::vm::{HostFunctionRegistry, Vm, VmError, VmResult};
 mod config;
 pub(super) mod policy;
 pub(super) mod request;
+mod resources;
 pub(super) mod sse;
 
 pub use config::HttpConfig;
@@ -22,13 +22,13 @@ use policy::{ConnectionAdmission, ConnectionPermit};
 pub use request::{HttpRequestResource, HttpResponseResource};
 
 impl crate::host_extension::HostResourceType for HttpRequestResource {
-    const KEY: &'static str = "http.request";
+    const KEY: &'static str = "http.internal.request_worker";
     const DESCRIPTION: &'static str =
         "An in-flight HTTP request under the configured network policy";
 }
 
 impl crate::host_extension::HostResourceType for HttpResponseResource {
-    const KEY: &'static str = "http.response";
+    const KEY: &'static str = "http.internal.response_stream";
     const DESCRIPTION: &'static str = "An open HTTP response body stream";
 }
 
@@ -187,6 +187,9 @@ pub fn http_host_catalog() -> Arc<HostApiCatalog> {
                 http_request_resource,
                 http_response_resource,
                 sse_stream_resource,
+                request_builder_resource,
+                buffered_response_resource,
+                http_headers_resource,
             ],
             HTTP_NAMED_STRUCTS,
         )
@@ -195,20 +198,19 @@ pub fn http_host_catalog() -> Arc<HostApiCatalog> {
 
 static HTTP_HOST_CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
 
-/// Guest contract for `http::client::request`.
-///
-/// The runtime drives a pending operation under the configured network policy;
-/// the guest contract is the typed `http.request` resource it opens and the
-/// typed `HttpResponse` it resolves to.
-fn http_request_contract() -> HostFunctionSchema {
+fn buffered_request_contract() -> HostFunctionSchema {
     HostFunctionSchema::with_return(
         "http::client::request",
-        vec![HostParamSchema::value(
+        vec![HostParamSchema::with_passing(
             "request",
-            http_request_struct(&http_request_header_struct(), &http_request_body_struct())
-                .as_type(),
+            HostTypeSchema::Resource(
+                crate::host_api::ResourceTypeKey::new("http.request").expect("static key"),
+            ),
+            HostParamPassing::TakeOwned,
         )],
-        http_response_struct(&http_response_header_struct(&http_header_value_struct())).as_type(),
+        HostTypeSchema::Resource(
+            crate::host_api::ResourceTypeKey::new("http.response").expect("static key"),
+        ),
     )
 }
 
@@ -248,14 +250,24 @@ const HTTP_NAMED_STRUCTS: &[(&str, &str)] = &[
     ("SseEvent", ""),
     ("HttpRequest", ""),
     ("SseRequest", ""),
-    ("HttpResponse", ""),
     ("SseCallbackAction", ""),
     ("SseSummary", ""),
 ];
 
 /// The HTTP host catalog surface: one descriptor per `http::client::*` member.
 const HTTP_CATALOG_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+    resources::new_descriptor,
+    resources::set_header_descriptor,
+    resources::set_body_text_descriptor,
+    resources::set_body_bytes_descriptor,
     builtin_http_client_request_descriptor,
+    resources::status_descriptor,
+    resources::url_descriptor,
+    resources::response_header_values_descriptor,
+    resources::response_header_names_descriptor,
+    resources::body_descriptor,
+    resources::headers_values_descriptor,
+    resources::headers_names_descriptor,
     sse::builtin_http_client_sse_descriptor,
 ];
 
@@ -267,6 +279,9 @@ fn http_catalog_module() -> crate::host_extension::HostModuleDescriptor {
             http_request_resource,
             http_response_resource,
             sse_stream_resource,
+            request_builder_resource,
+            buffered_response_resource,
+            http_headers_resource,
         ],
     )
 }
@@ -373,18 +388,6 @@ pub(super) fn sse_request_struct(
     HostStructSchema::new("SseRequest", fields)
 }
 
-pub(super) fn http_response_struct(response_header: &HostStructSchema) -> HostStructSchema {
-    HostStructSchema::new(
-        "HttpResponse",
-        vec![
-            HostStructField::new("status", HostTypeSchema::Int),
-            HostStructField::new("headers", array(response_header.as_type())),
-            HostStructField::new("body", HostTypeSchema::Bytes),
-            HostStructField::new("url", HostTypeSchema::String),
-        ],
-    )
-}
-
 pub(super) fn sse_callback_action_struct() -> HostStructSchema {
     HostStructSchema::new(
         "SseCallbackAction",
@@ -418,6 +421,18 @@ pub(super) fn http_response_resource() -> crate::host_extension::HostResourceTyp
 
 pub(super) fn sse_stream_resource() -> crate::host_extension::HostResourceTypeMeta {
     crate::host_extension::HostResourceTypeMeta::of::<SseStreamResource>()
+}
+
+fn request_builder_resource() -> crate::host_extension::HostResourceTypeMeta {
+    crate::host_extension::HostResourceTypeMeta::of::<resources::HttpRequest>()
+}
+
+fn buffered_response_resource() -> crate::host_extension::HostResourceTypeMeta {
+    crate::host_extension::HostResourceTypeMeta::of::<resources::HttpResponse>()
+}
+
+fn http_headers_resource() -> crate::host_extension::HostResourceTypeMeta {
+    crate::host_extension::HostResourceTypeMeta::of::<resources::HttpHeaders>()
 }
 
 /// Registers every HTTP host function into `registry` using the exact
@@ -473,24 +488,16 @@ impl crate::vm::HostExtension for HttpExtension {
     }
 }
 
-/// Starts an HTTP request under the VM's configured network policy.
-///
-/// The request is a named `HttpRequest` record with `method`, `url`, optional
-/// `headers` as an array of typed `HttpRequestHeader` wrappers, and optional
-/// `body` as a typed `HttpRequestBody` wrapper. `HttpRequestBody` discriminates
-/// between `{ kind: "text", text: string }` and `{ kind: "bytes", bytes: bytes }`;
-/// the unused payload field is null. The response is a named `HttpResponse`
-/// record with `status`, typed `HttpResponseHeader` entries in `headers`, raw
-/// response `body` bytes, and the final validated `url`.
+/// Starts a buffered request, consuming the request builder.
 #[pd_host_function(
     name = "http::client::request",
-    contract = http_request_contract,
+    contract = buffered_request_contract,
     runtime_owned_pending
 )]
 pub(super) fn builtin_http_client_request(
     vm: &mut Vm,
-    request: VmMapHandle,
-) -> VmResult<HostCallResult<VmMap>> {
+    request: crate::vm::resource::ResourceOwned<resources::HttpRequest>,
+) -> VmResult<HostCallResult<i64>> {
     request::perform_buffered_request(vm, request)
 }
 
@@ -683,7 +690,14 @@ mod contract_tests {
                 .map(|schema| HostImport {
                     name: schema.name.clone(),
                     arity: schema.arity() as u8,
-                    return_type: ValueType::Map,
+                    return_type: match &schema.return_type {
+                        HostTypeSchema::Null => ValueType::Null,
+                        HostTypeSchema::Int | HostTypeSchema::Resource(_) => ValueType::Int,
+                        HostTypeSchema::String => ValueType::String,
+                        HostTypeSchema::Bytes => ValueType::Bytes,
+                        HostTypeSchema::Array(_) => ValueType::Array,
+                        _ => ValueType::Map,
+                    },
                 })
                 .collect::<Vec<_>>();
             let schema_slots = schemas.into_iter().map(Some).collect::<Vec<_>>();

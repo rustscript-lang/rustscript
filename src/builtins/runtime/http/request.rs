@@ -13,8 +13,9 @@ use tokio::sync::Notify;
 use super::HttpRequestContext;
 use super::config::HttpConfig;
 use super::policy::{ConnectionPermit, SchemeFamily, request_deadline, resolve_url, with_deadline};
+use super::resources::{HttpHeaders, HttpRequest as RequestBuilder, HttpResponse};
 use crate::HostCallResult;
-use crate::builtins::runtime::typed::{VmMap, VmMapHandle};
+use crate::builtins::runtime::typed::VmMap;
 use crate::host_api::ResourceTypeKey;
 use crate::vm::operation::{
     HostOperation, OperationCancelReason, OperationError, OperationErrorCode, OperationId,
@@ -22,7 +23,7 @@ use crate::vm::operation::{
 };
 use crate::vm::resource::{
     CloseProgress, HostResource, ResourceCloseReason, ResourceError, ResourceErrorCode,
-    ResourceResult,
+    ResourceOwned, ResourceResult,
 };
 use crate::vm::{CallReturn, Value, Vm, VmError, VmResult};
 
@@ -593,7 +594,7 @@ struct BufferedRequestShared {
     /// starts waiting, the next notified() completes immediately.
     cancel: Notify,
     /// One-shot result from the worker thread.
-    result: std::sync::Mutex<Option<VmResult<CallReturn>>>,
+    result: std::sync::Mutex<Option<VmResult<HttpResponse>>>,
     /// Set by the worker after publishing `result`.
     done: std::sync::atomic::AtomicBool,
     /// Set by the spawned closure after the worker entry returns.
@@ -639,7 +640,7 @@ impl BufferedRequestShared {
     /// Publishes a terminal rollback result for a resource that never had a
     /// worker. The compare-exchange prevents this path from claiming a worker
     /// which successfully started between admission and rollback.
-    fn terminalize_workerless(&self, result: VmResult<CallReturn>) -> bool {
+    fn terminalize_workerless(&self, result: VmResult<HttpResponse>) -> bool {
         if self
             .worker_lifecycle
             .compare_exchange(
@@ -667,7 +668,7 @@ impl BufferedRequestShared {
         self.quiescence_waker.wake();
     }
 
-    fn publish(&self, result: VmResult<CallReturn>) {
+    fn publish(&self, result: VmResult<HttpResponse>) {
         *self
             .result
             .lock()
@@ -798,7 +799,7 @@ impl HttpRequestResource {
 
 impl HostResource for HttpRequestResource {
     fn resource_type_key() -> Option<ResourceTypeKey> {
-        ResourceTypeKey::new("http.request").ok()
+        ResourceTypeKey::new("http.internal.request_worker").ok()
     }
 
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
@@ -846,7 +847,7 @@ pub struct HttpResponseResource;
 
 impl HostResource for HttpResponseResource {
     fn resource_type_key() -> Option<ResourceTypeKey> {
-        ResourceTypeKey::new("http.response").ok()
+        ResourceTypeKey::new("http.internal.response_stream").ok()
     }
 
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
@@ -1025,12 +1026,18 @@ fn rollback_buffered_request(
 /// Performs one buffered HTTP request as a generic execution-scope operation.
 pub(super) fn perform_buffered_request(
     vm: &mut Vm,
-    request: VmMapHandle,
-) -> VmResult<HostCallResult<VmMap>> {
+    request: ResourceOwned<RequestBuilder>,
+) -> VmResult<HostCallResult<i64>> {
     let (context, _) = HttpRequestContext::capture(vm, None, "HTTP")?;
     let config = context.config.clone();
     let permit = context.into_permit();
-    let request = parse_request(&request, &config)?;
+    validate_request_header_budget(&request.headers, &config)?;
+    if request.body.len() > config.max_request_body_bytes {
+        return Err(VmError::HostError(
+            "HTTP request body exceeds limit".to_string(),
+        ));
+    }
+    super::policy::validate_url_policy(&config, SchemeFamily::Http, &request.url)?;
     let deadline = request_deadline(config.request_timeout)?;
 
     // Shared state that coordinates the worker thread, operation poll, and
@@ -1078,7 +1085,7 @@ pub(super) fn perform_buffered_request(
     };
 
     let pending_result = Arc::clone(&shared);
-    if let Err(error) = vm.register_scoped_operation_completion(op_id, move |_vm, outcome| {
+    if let Err(error) = vm.register_scoped_operation_completion(op_id, move |vm, outcome| {
         let result = match outcome {
             OperationOutcome::Completed => pending_result
                 .result
@@ -1093,12 +1100,46 @@ pub(super) fn perform_buffered_request(
             // Cancellation is an internal teardown path. Resource cleanup is
             // still performed below, while callers that explicitly poll a
             // cancelled operation receive no guest value.
-            OperationOutcome::Cancelled(_) => Ok(CallReturn::none()),
+            OperationOutcome::Cancelled(_) => {
+                return close_buffered_request_resource(vm, resource_handle)
+                    .map(|()| CallReturn::none());
+            }
             OperationOutcome::Failed(error) => Err(VmError::HostError(error.to_string())),
         };
-        let cleanup = close_buffered_request_resource(_vm, resource_handle);
+        let cleanup = close_buffered_request_resource(vm, resource_handle);
         match (result, cleanup) {
-            (Ok(values), Ok(())) => Ok(values),
+            (Ok(response), Ok(())) => {
+                let token = vm
+                    .host_context()
+                    .push_resource(response)
+                    .map_err(host_boundary_error)?;
+                let handle = token.handle();
+                let key = ResourceTypeKey::new("http.response").expect("static key");
+                if let Err(error) = vm
+                    .host_context()
+                    .typed_resource_with_key::<HttpResponse>(handle, &key)
+                {
+                    let primary = host_boundary_error(error);
+                    return Err(
+                        match vm
+                            .host_context()
+                            .close_resource::<HttpResponse>(handle, ResourceCloseReason::Requested)
+                        {
+                            Ok(CloseProgress::Ready) => primary,
+                            Ok(CloseProgress::Pending) => preserve_cleanup_context(
+                                primary,
+                                vec![VmError::HostError(
+                                    "HTTP response close remained pending".to_string(),
+                                )],
+                            ),
+                            Err(error) => {
+                                preserve_cleanup_context(primary, vec![host_boundary_error(error)])
+                            }
+                        },
+                    );
+                }
+                Ok(CallReturn::one(Value::Int(handle.raw() as i64)))
+            }
             (Err(primary), Ok(())) => Err(primary),
             (Ok(_), Err(cleanup)) => Err(cleanup),
             (Err(primary), Err(cleanup)) => Err(preserve_cleanup_context(primary, vec![cleanup])),
@@ -1117,7 +1158,13 @@ pub(super) fn perform_buffered_request(
     // shared completion cell. The worker uses tokio::select! to respond
     // promptly to cancellation even while blocked on network I/O.
     let worker_config = config.clone();
-    let worker_request = request.clone();
+    let request = request.into_inner();
+    let worker_request = HttpRequest {
+        method: request.method,
+        url: request.url,
+        headers: request.headers,
+        body: request.body.into_bytes(),
+    };
     let join_handle = match spawn_worker("rustscript-http-request", {
         let worker_shared = Arc::clone(&shared);
         move || {
@@ -1140,7 +1187,7 @@ pub(super) fn perform_buffered_request(
                                 None,
                             ),
                         ) => {
-                            result.map(|map| CallReturn::one(Value::Map(Arc::new(map))))
+                            result
                         }
                     }
                 }) {
@@ -1200,7 +1247,7 @@ async fn execute_request_until(
     observer: ResponseReadObserver,
     request_deadline: Instant,
     tls_config: Option<Arc<rustls::ClientConfig>>,
-) -> VmResult<VmMap> {
+) -> VmResult<HttpResponse> {
     let mut method = request.method.clone();
     let mut url = request.url.clone();
     let mut body = request.body.clone();
@@ -1269,9 +1316,14 @@ async fn execute_request_until(
         if has_body {
             reject_declared_oversize(response.response(), config.max_response_body_bytes)?;
         }
-        let response_headers = response_header_entries(response.response().headers());
+        let response_headers = HttpHeaders::from_map(response.response().headers());
         if !has_body {
-            return Ok(response_map(status, response_headers, Vec::new(), &url));
+            return Ok(HttpResponse {
+                status: i64::from(status.as_u16()),
+                headers: response_headers,
+                body: Vec::new(),
+                url: url.to_string(),
+            });
         }
         observer.admit_body(config.max_response_body_bytes);
         let mut bytes = Vec::with_capacity(
@@ -1294,7 +1346,12 @@ async fn execute_request_until(
             }
             bytes.extend_from_slice(&chunk);
         }
-        return Ok(response_map(status, response_headers, bytes, &url));
+        return Ok(HttpResponse {
+            status: i64::from(status.as_u16()),
+            headers: response_headers,
+            body: bytes,
+            url: url.to_string(),
+        });
     }
 
     Err(VmError::HostError(
@@ -1533,23 +1590,6 @@ pub(super) async fn open_stream_response(
     Err(VmError::HostError(
         "HTTP redirect processing failed".to_string(),
     ))
-}
-
-fn response_map(
-    status: hyper::StatusCode,
-    headers: Vec<Value>,
-    body: Vec<u8>,
-    url: &url::Url,
-) -> VmMap {
-    VmMap::from_entries(vec![
-        (
-            Value::string("status"),
-            Value::Int(i64::from(status.as_u16())),
-        ),
-        (Value::string("headers"), Value::array(headers)),
-        (Value::string("body"), Value::bytes(body)),
-        (Value::string("url"), Value::string(url.as_str())),
-    ])
 }
 
 fn validate_response_framing(response: &hyper::Response<hyper::body::Incoming>) -> VmResult<()> {
