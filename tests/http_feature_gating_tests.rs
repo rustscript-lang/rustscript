@@ -1,6 +1,20 @@
 #[test]
 fn http_callables_follow_the_http_client_feature_gate() {
-    for name in ["http::client::request", "http::client::sse"] {
+    for name in [
+        "http::request::new",
+        "http::request::set_header",
+        "http::request::set_body_text",
+        "http::request::set_body_bytes",
+        "http::client::request",
+        "http::response::status",
+        "http::response::url",
+        "http::response::header_values",
+        "http::response::header_names",
+        "http::response::body",
+        "http::headers::values",
+        "http::headers::names",
+        "http::client::sse",
+    ] {
         let published = vm::default_host_callables()
             .iter()
             .any(|callable| callable.name == name);
@@ -15,7 +29,21 @@ fn http_callables_follow_the_http_client_feature_gate() {
 #[test]
 fn http_standard_catalog_entries_follow_the_native_transport_gate() {
     let catalog = vm::standard_host_catalog();
-    for name in ["http::client::request", "http::client::sse"] {
+    for name in [
+        "http::request::new",
+        "http::request::set_header",
+        "http::request::set_body_text",
+        "http::request::set_body_bytes",
+        "http::client::request",
+        "http::response::status",
+        "http::response::url",
+        "http::response::header_values",
+        "http::response::header_names",
+        "http::response::body",
+        "http::headers::values",
+        "http::headers::names",
+        "http::client::sse",
+    ] {
         let published = catalog
             .functions()
             .iter()

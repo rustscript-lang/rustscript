@@ -65,6 +65,50 @@ fn preserves_typed_callable_host_parameter_schema() {
     );
 }
 
+#[cfg(all(feature = "http-client", not(target_family = "wasm")))]
+#[test]
+fn http_resource_source_is_scanned_as_default_host() {
+    let sources = build_script::http_host_source_specs(true, "unix");
+    let resource = sources
+        .iter()
+        .find(|source| source.path == "src/builtins/runtime/http/resources.rs")
+        .expect("resource host source must be scanned");
+    assert_eq!(resource.module, "http::resources");
+    assert_eq!(resource.category, build_script::SourceCategory::DefaultHost);
+    assert!(build_script::http_host_source_specs(false, "unix").is_empty());
+    assert!(build_script::http_host_source_specs(true, "wasm").is_empty());
+}
+
+#[test]
+fn borrowed_and_owned_resource_parameters_use_vm_aware_adapters() {
+    for function in [
+        parse_quote!(
+            fn host(value: ResourceRef<'_, Thing>) -> i64 {}
+        ),
+        parse_quote!(
+            fn host(value: ResourceMut<'_, Thing>) -> VmResult<()> {}
+        ),
+        parse_quote!(
+            fn host(value: ResourceOwned<Thing>) -> VmResult<i64> {}
+        ),
+        parse_quote!(
+            fn host(#[pd_host_resource(passing = "take_owned")] value: Thing) -> i64 {}
+        ),
+    ] {
+        assert_eq!(
+            classify_host_binding(&function),
+            HostBindingKind::StaticStack
+        );
+    }
+    let ordinary: syn::ItemFn = parse_quote!(
+        fn host(value: i64) -> i64 {}
+    );
+    assert_eq!(
+        classify_host_binding(&ordinary),
+        HostBindingKind::StaticNonYieldingArgs
+    );
+}
+
 #[test]
 fn classifies_best_effort_host_bindings_from_signatures() {
     for function in [
@@ -336,18 +380,41 @@ fn restricted_capabilities_disable_trace_jit_for_host_imports_and_builtins() {
 fn generated_http_imports_are_unique_typed_and_independently_capability_gated() {
     const IMPORTS: [&str; 2] = ["http::client::request", "http::client::sse"];
     let callables = default_host_callables();
+    for name in [
+        "http::request::new",
+        "http::request::set_header",
+        "http::request::set_body_text",
+        "http::request::set_body_bytes",
+        "http::client::request",
+        "http::response::status",
+        "http::response::url",
+        "http::response::header_values",
+        "http::response::header_names",
+        "http::response::body",
+        "http::headers::values",
+        "http::headers::names",
+        "http::client::sse",
+    ] {
+        assert_eq!(
+            callables
+                .iter()
+                .filter(|callable| callable.name == name)
+                .count(),
+            1,
+            "{name} discovery count"
+        );
+    }
     for name in IMPORTS {
-        let discovered = callables
+        let callable = callables
             .iter()
-            .filter(|callable| callable.name == name)
-            .collect::<Vec<_>>();
-        assert_eq!(discovered.len(), 1, "{name} discovery count");
-        let callable = discovered[0];
-        assert_eq!(callable.signature.return_type, "map");
+            .find(|callable| callable.name == name)
+            .unwrap();
         if name == "http::client::request" {
+            assert_eq!(callable.signature.return_type, "int");
             assert_eq!(callable.signature.params.len(), 1);
-            assert_eq!(callable.signature.params[0].ty.display_label(), "map");
+            assert_eq!(callable.signature.params[0].ty.display_label(), "resource");
         } else {
+            assert_eq!(callable.signature.return_type, "map");
             assert_eq!(callable.signature.params.len(), 2);
             assert_eq!(callable.signature.params[0].ty.display_label(), "map");
             assert_eq!(

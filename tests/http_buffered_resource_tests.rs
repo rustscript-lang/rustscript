@@ -121,6 +121,51 @@ async fn buffered_resource_reset_cancels_pending_worker_and_closes_transport() {
 }
 
 #[test]
+fn buffered_resource_default_direct_binding_returns_live_builder() {
+    let program = compile_source(
+        r#"use http;
+        let mut req = http::request::new("POST", "http://127.0.0.1:1/");
+        http::request::set_header(&mut req, "x-test", "value");
+        http::request::set_body_bytes(&mut req, b"payload");
+        42;"#,
+    )
+    .unwrap()
+    .program;
+    let mut vm = Vm::new(program);
+    assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+    assert_eq!(vm.stack().last(), Some(&Value::Int(42)));
+    assert_eq!(vm.host_context().resource_count(), 1);
+    vm.reset_for_reuse().unwrap();
+    assert_eq!(vm.host_context().resource_count(), 0);
+}
+
+#[test]
+fn buffered_resource_permissions_preflight_each_import() {
+    use vm::CapabilityProfile;
+
+    let program = compile_source(
+        r#"use http;
+        let mut req = http::request::new("GET", "http://127.0.0.1:1/");
+        http::request::set_header(&mut req, "x-test", "value");"#,
+    )
+    .unwrap()
+    .program;
+    let mut vm = Vm::new(program);
+    let mut registry = HostFunctionRegistry::restricted();
+    registry.set_capability_profile(
+        CapabilityProfile::builder()
+            .allow_host_import("http::request::new")
+            .build(),
+    );
+    let error = registry.bind_vm_cached(&mut vm).unwrap_err();
+    assert!(
+        error.to_string().contains("http::request::set_header"),
+        "{error}"
+    );
+    assert_eq!(vm.host_context().resource_count(), 0);
+}
+
+#[test]
 fn buffered_resource_signatures_reject_maps_wrong_keys_and_reuse() {
     for source in [
         "use http; http::client::request({method: \"GET\", url: \"http://example.com\"});",

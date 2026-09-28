@@ -14,7 +14,7 @@ use crate::vm::{HostFunctionRegistry, Vm, VmError, VmResult};
 mod config;
 pub(super) mod policy;
 pub(super) mod request;
-mod resources;
+pub(super) mod resources;
 pub(super) mod sse;
 
 pub use config::HttpConfig;

@@ -8,17 +8,17 @@ use std::process::Command;
 use syn::{Attribute, FnArg, Item, ItemFn, Meta, Pat, ReturnType, Type};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SourceCategory {
+pub(crate) enum SourceCategory {
     DefaultHost,
     NamespacedBuiltin,
     MetadataOnlyBuiltin,
 }
 
 #[derive(Clone, Debug)]
-struct SourceSpec {
-    path: String,
-    module: String,
-    category: SourceCategory,
+pub(crate) struct SourceSpec {
+    pub(crate) path: String,
+    pub(crate) module: String,
+    pub(crate) category: SourceCategory,
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +140,27 @@ pub(crate) fn http_transport_enabled(http_client_feature: bool, target_family: &
             .any(|family| family.trim() == "wasm")
 }
 
+pub(crate) fn http_host_source_specs(
+    http_client_feature: bool,
+    target_family: &str,
+) -> Vec<SourceSpec> {
+    if !http_transport_enabled(http_client_feature, target_family) {
+        return Vec::new();
+    }
+    [
+        ("src/builtins/runtime/http/mod.rs", "http"),
+        ("src/builtins/runtime/http/resources.rs", "http::resources"),
+        ("src/builtins/runtime/http/sse.rs", "http::sse"),
+    ]
+    .into_iter()
+    .map(|(path, module)| SourceSpec {
+        path: path.to_string(),
+        module: module.to_string(),
+        category: SourceCategory::DefaultHost,
+    })
+    .collect()
+}
+
 #[derive(Clone, Debug)]
 struct Group<'a> {
     key: String,
@@ -190,21 +211,10 @@ fn main() {
             category: SourceCategory::DefaultHost,
         },
     ];
-    if http_transport_enabled(
+    host_sources.extend(http_host_source_specs(
         env::var_os("CARGO_FEATURE_HTTP_CLIENT").is_some(),
         &target_family,
-    ) {
-        host_sources.push(SourceSpec {
-            path: "src/builtins/runtime/http/mod.rs".to_string(),
-            module: "http".to_string(),
-            category: SourceCategory::DefaultHost,
-        });
-        host_sources.push(SourceSpec {
-            path: "src/builtins/runtime/http/sse.rs".to_string(),
-            module: "http::sse".to_string(),
-            category: SourceCategory::DefaultHost,
-        });
-    }
+    ));
     let async_enabled = env::var_os("CARGO_FEATURE_ASYNC").is_some();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("missing target architecture");
     let builtin_sources = builtin_source_specs(&namespaces, async_enabled, &target_arch);
@@ -338,11 +348,18 @@ pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
         return HostBindingKind::StaticStack;
     }
     if function.sig.inputs.iter().any(|input| match input {
-        FnArg::Typed(pat_type) => pd_host_schema::state_spec(&pat_type.ty).is_some(),
+        FnArg::Typed(pat_type) => {
+            pd_host_schema::state_spec(&pat_type.ty).is_some()
+                || pd_host_schema::resource_spec(&pat_type.ty, &pat_type.attrs)
+                    .unwrap_or_else(|message| {
+                        panic!("unsupported callable resource parameter: {message}")
+                    })
+                    .is_some()
+        }
         _ => false,
     }) {
-        // A hidden state parameter resolves through the VM's generic
-        // host-state table, which requires the vm-aware stack adapter.
+        // Hidden state and resource parameters both resolve through the VM.
+        // The generated wrapper takes a VM even if the Rust signature does not.
         return HostBindingKind::StaticStack;
     }
     let return_type = normalized_return_type(&function.sig.output);
