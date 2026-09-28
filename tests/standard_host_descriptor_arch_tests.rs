@@ -30,7 +30,11 @@ const HTTP_SURFACE_ENABLED: bool = cfg!(all(feature = "http-client", not(target_
 /// catalog is the merge of the composed module surfaces, so the golden depends
 /// on the composed set — the default build (no `http-client`) composes one
 /// module fewer and must reproduce [`STANDARD_CATALOG_FINGERPRINT_NO_HTTP`].
-const STANDARD_CATALOG_FINGERPRINT: &str = "6607e4fcb3187e73";
+///
+/// The HTTP surface moved from named-struct request/response/event types to
+/// resources, so its guest contract intentionally changed: the composed
+/// goldens below are the resource-API values.
+const STANDARD_CATALOG_FINGERPRINT: &str = "df4072aba04d62fa";
 /// Fingerprint of the published standard host catalog **without** the HTTP
 /// surface: the `--workspace` default build and every wasm build.
 const STANDARD_CATALOG_FINGERPRINT_NO_HTTP: &str = "a6b4b2dcadc5df14";
@@ -39,7 +43,7 @@ const SQLITE_CATALOG_FINGERPRINT: &str = "b6d4c278145edacf";
 const JIT_CATALOG_FINGERPRINT: &str = "d0a3efbca2d0923c";
 const TIMER_CATALOG_FINGERPRINT: &str = "4af2dfa2aee1f42e";
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
-const HTTP_CATALOG_FINGERPRINT: &str = "18a4033f5857c033";
+const HTTP_CATALOG_FINGERPRINT: &str = "2fe866ea86b2d79e";
 
 /// The standard catalog fingerprint this build must reproduce exactly.
 fn standard_catalog_fingerprint() -> &'static str {
@@ -54,7 +58,18 @@ fn standard_catalog_fingerprint() -> &'static str {
 const STANDARD_RESOURCE_KEYS: &[&str] = &["io.file", "sqlite.connection"];
 
 /// Resource keys the HTTP module publishes when it is composed.
-const HTTP_RESOURCE_KEYS: &[&str] = &["http.request", "http.response", "http.sse"];
+///
+/// The HTTP module is fully resource-based: its guest surface is built from
+/// these keys, and it declares **no** named structs.
+const HTTP_RESOURCE_KEYS: &[&str] = &[
+    "http.request",
+    "http.response",
+    "http.headers",
+    "http.sse_summary",
+    "http.sse",
+    "http.internal.request_worker",
+    "http.internal.response_stream",
+];
 
 /// Named structs the standard catalog always declares.
 const STANDARD_NAMED_STRUCTS: &[&str] = &[
@@ -64,19 +79,42 @@ const STANDARD_NAMED_STRUCTS: &[&str] = &[
     "SqliteTransactionResult",
 ];
 
-/// Named structs the HTTP module declares when it is composed.
-const HTTP_NAMED_STRUCTS: &[&str] = &[
+/// Former HTTP named-struct names that must no longer be catalog names.
+const REMOVED_HTTP_NAMED_STRUCTS: &[&str] = &[
     "HttpRequest",
+    "HttpRequestHeader",
+    "HttpHeaderValue",
     "HttpResponse",
+    "HttpResponseHeader",
+    "HttpRequestBody",
     "SseEvent",
-    "SseSummary",
+    "SseRequest",
     "SseCallbackAction",
+    "SseSummary",
+];
+
+/// HTTP resource keys that stay internal to the module and must not appear in
+/// any guest-visible signature.
+const HTTP_INTERNAL_RESOURCE_KEYS: &[&str] = &[
+    "http.internal.request_worker",
+    "http.internal.response_stream",
+    "http.sse",
+];
+
+/// The public HTTP resource surface: the only keys an HTTP guest signature may
+/// name.
+const HTTP_PUBLIC_RESOURCE_KEYS: &[&str] = &[
+    "http.request",
+    "http.response",
+    "http.headers",
+    "http.sse_summary",
 ];
 
 /// Source files that must contain no hand-written catalog or registry glue for
 /// their migrated host module.
 const MIGRATED_MODULE_FILES: &[&str] = &[
     "src/builtins/runtime/http/mod.rs",
+    "src/builtins/runtime/http/resources.rs",
     "src/builtins/runtime/http/sse.rs",
     "src/builtins/runtime/io/mod.rs",
     "src/builtins/runtime/io/async_io.rs",
@@ -1190,6 +1228,54 @@ fn every_catalog_resource_key_has_a_declaration() {
     }
 }
 
+/// The resource HTTP surface is only meaningful if only the public request /
+/// response / headers / summary keys appear in guest-visible signatures: the
+/// worker, response-stream, and stream handles stay module-internal, and every
+/// named key must actually be declared by the module.
+#[test]
+fn http_guest_signatures_reference_only_public_resource_keys() {
+    let catalog = vm::standard_host_catalog();
+    let declared: BTreeSet<String> = HTTP_RESOURCE_KEYS
+        .iter()
+        .map(|key| key.to_string())
+        .collect();
+    let public: BTreeSet<&str> = HTTP_PUBLIC_RESOURCE_KEYS.iter().copied().collect();
+    let internal: BTreeSet<&str> = HTTP_INTERNAL_RESOURCE_KEYS.iter().copied().collect();
+    assert_eq!(
+        public.len() + internal.len(),
+        declared.len(),
+        "every declared HTTP key must be classified public or internal: {declared:?}"
+    );
+
+    let mut offenders = Vec::new();
+    for function in catalog.functions() {
+        if !function.name.starts_with("http::") {
+            continue;
+        }
+        let mut keys = Vec::new();
+        for param in &function.params {
+            param.ty.collect_resource_keys(&mut keys);
+        }
+        function.return_type.collect_resource_keys(&mut keys);
+        for key in keys {
+            let key = key.to_string();
+            if internal.contains(key.as_str()) {
+                offenders.push(format!("{} references internal key `{key}`", function.name));
+            } else if !public.contains(key.as_str()) {
+                offenders.push(format!(
+                    "{} references `{key}`, which the HTTP module does not declare",
+                    function.name
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "HTTP guest signatures must use public resource keys only:\n{}",
+        offenders.join("\n")
+    );
+}
+
 #[test]
 fn typed_named_struct_contract_is_preserved() {
     let catalog = vm::standard_host_catalog();
@@ -1201,13 +1287,20 @@ fn typed_named_struct_contract_is_preserved() {
     for name in STANDARD_NAMED_STRUCTS {
         assert!(declared.contains(name), "named struct `{name}` is missing");
     }
-    for name in HTTP_NAMED_STRUCTS {
-        assert_eq!(
-            declared.contains(name),
-            HTTP_SURFACE_ENABLED,
-            "named struct `{name}` must follow the HTTP module's composition gate"
+    // The HTTP surface is resource-based now: every name its removed struct
+    // surface published must be gone from the catalog in both build shapes.
+    for name in REMOVED_HTTP_NAMED_STRUCTS {
+        assert!(
+            !declared.contains(name),
+            "named struct `{name}` must not be published by the resource HTTP surface"
         );
     }
+    assert!(
+        declared
+            .iter()
+            .all(|name| !name.starts_with("Http") && !name.starts_with("Sse")),
+        "the standard catalog must publish no HTTP/Sse named structs, got {declared:?}"
+    );
 
     // The typed shapes themselves are unchanged, not just the names.
     let query = catalog

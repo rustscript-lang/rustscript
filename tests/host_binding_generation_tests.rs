@@ -393,6 +393,13 @@ fn generated_http_imports_are_unique_typed_and_independently_capability_gated() 
         "http::response::body",
         "http::headers::values",
         "http::headers::names",
+        "http::sse_summary::outcome",
+        "http::sse_summary::status",
+        "http::sse_summary::headers",
+        "http::sse_summary::url",
+        "http::sse_summary::items",
+        "http::sse_summary::bytes_received",
+        "http::sse_summary::bytes_sent",
         "http::client::sse",
     ] {
         assert_eq!(
@@ -410,16 +417,29 @@ fn generated_http_imports_are_unique_typed_and_independently_capability_gated() 
             .find(|callable| callable.name == name)
             .unwrap();
         if name == "http::client::request" {
-            assert_eq!(callable.signature.return_type, "int");
+            assert_eq!(
+                callable.signature.return_type, "int",
+                "the buffered request returns an opaque response resource handle"
+            );
             assert_eq!(callable.signature.params.len(), 1);
             assert_eq!(callable.signature.params[0].ty.display_label(), "resource");
         } else {
-            assert_eq!(callable.signature.return_type, "map");
+            // The SSE surface is resource-based: one owned request resource and
+            // one positional bool callback. No map carrier remains.
+            assert_eq!(
+                callable.signature.return_type, "resource",
+                "the SSE call returns a summary resource"
+            );
             assert_eq!(callable.signature.params.len(), 2);
-            assert_eq!(callable.signature.params[0].ty.display_label(), "map");
+            assert_eq!(
+                callable.signature.params[0].ty.display_label(),
+                "resource",
+                "the SSE request parameter is an owned resource"
+            );
             assert_eq!(
                 callable.signature.params[1].ty.display_label(),
-                "fn(map) -> map"
+                "fn(string, string, string, string) -> bool",
+                "the SSE event callback is positional, not a map"
             );
             assert_eq!(callable.host_execution, HostExecution::MaySuspend);
         }
