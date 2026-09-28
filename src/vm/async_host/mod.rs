@@ -27,7 +27,7 @@ mod stream;
 
 #[allow(unused_imports)]
 pub(crate) use stream::{
-    HostStreamAction, HostStreamAdmissionError, HostStreamAdmissionRollback,
+    HostStreamAction, HostStreamAdmissionError, HostStreamAdmissionRollback, HostStreamCallback,
     HostStreamContinuation, HostStreamDriver, HostStreamPoll, HostStreamTermination,
     PendingHostStreamTermination, preserve_stream_cleanup,
 };
