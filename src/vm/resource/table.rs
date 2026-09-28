@@ -13,7 +13,7 @@
 
 use std::any::{Any, TypeId};
 use std::cell::{Cell, Ref, RefCell, RefMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
@@ -229,6 +229,69 @@ impl ResourceTable {
 
     pub fn len(&self) -> usize {
         self.active_entries.get()
+    }
+
+    /// Captures identities, including generations, of the current occupants.
+    /// A later occupant of a recycled slot is never mistaken for this one.
+    pub(crate) fn live_handles(&mut self) -> ResourceResult<HashSet<ResourceHandle>> {
+        self.live_indices()?
+            .into_iter()
+            .map(|index| {
+                ResourceHandle::encode(
+                    self.arena_id,
+                    index,
+                    u64::from(self.slots[index].generation.get()),
+                )
+                .ok_or_else(|| {
+                    ResourceError::new(
+                        ResourceErrorCode::ResourceIdExhausted,
+                        "resource::snapshot",
+                        "live resource handle cannot be encoded",
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Closes only occupants absent from a pre-completion snapshot. A Pending
+    /// close keeps the slot occupied and is driven on subsequent polls.
+    pub(crate) fn poll_close_added(
+        &mut self,
+        before: &HashSet<ResourceHandle>,
+        cleanup_error: &mut Option<ResourceError>,
+        cx: &mut Context<'_>,
+    ) -> Poll<ResourceResult<()>> {
+        let indices = self.live_indices()?;
+        let mut closed = 0;
+        let mut failed = 0;
+        let mut first_error = None;
+        for index in indices {
+            let handle = ResourceHandle::encode(
+                self.arena_id,
+                index,
+                u64::from(self.slots[index].generation.get()),
+            )
+            .expect("live slot has a valid handle");
+            if before.contains(&handle) {
+                continue;
+            }
+            self.try_begin_close(
+                index,
+                ResourceCloseReason::Requested,
+                &mut closed,
+                &mut failed,
+                &mut first_error,
+            );
+            self.try_poll_close(index, cx, &mut closed, &mut failed, &mut first_error);
+        }
+        if let Some(error) = first_error {
+            cleanup_error.get_or_insert(error);
+        }
+        if self.live_handles()?.is_subset(before) {
+            Poll::Ready(cleanup_error.clone().map_or(Ok(()), Err))
+        } else {
+            Poll::Pending
+        }
     }
 
     /// Whether the table currently holds no live resources.

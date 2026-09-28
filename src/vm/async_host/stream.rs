@@ -163,6 +163,7 @@ pub(crate) enum HostStreamPhase {
     AwaitItem,
     RunCallback,
     AwaitTermination,
+    RollbackCompletion,
 }
 
 pub(crate) struct HostStreamContinuation {
@@ -172,6 +173,11 @@ pub(crate) struct HostStreamContinuation {
     pub(crate) item: Option<Vec<Value>>,
     pub(crate) item_callback: HostStreamCallback,
     summary: Option<HostStreamSummary>,
+    rollback: Option<(
+        std::collections::HashSet<crate::vm::resource::ResourceHandle>,
+        VmError,
+        Option<crate::vm::resource::ResourceError>,
+    )>,
     pub(crate) phase: HostStreamPhase,
     pub(crate) parent_stack_base: usize,
     pub(crate) parent_frame_count: usize,
@@ -289,6 +295,7 @@ impl Vm {
             item: None,
             item_callback: HostStreamCallback::Event,
             summary: None,
+            rollback: None,
             phase: HostStreamPhase::AwaitItem,
             parent_stack_base: self.instance.stack.len(),
             parent_frame_count: self.instance.execution_frames.len(),
@@ -469,6 +476,15 @@ impl Vm {
         op_id: HostOpId,
         cx: &mut Context<'_>,
     ) -> Poll<VmResult<()>> {
+        if self
+            .instance
+            .host_stream
+            .as_ref()
+            .map(|stream| stream.phase)
+            == Some(HostStreamPhase::RollbackCompletion)
+        {
+            return self.poll_failed_stream_completion(cx);
+        }
         if self
             .instance
             .host_stream
@@ -736,12 +752,74 @@ impl Vm {
                 Poll::Ready(Err(preserve_stream_cleanup(error, cleanup)))
             }
             Poll::Ready(Ok(())) => {
-                let mut stream = self
+                let before = match self.host.execution_scope.resources_mut().live_handles() {
+                    Ok(handles) => handles,
+                    Err(error) => {
+                        let error = VmError::ExecutionScope(
+                            crate::vm::execution_scope::ExecutionScopeError::Resource(error),
+                        );
+                        self.host.mark_reset_failed(&error);
+                        return Poll::Ready(Err(error));
+                    }
+                };
+                let result = match self
                     .instance
                     .host_stream
+                    .as_mut()
+                    .expect("stream exists")
+                    .summary
                     .take()
-                    .expect("termination requires an active stream");
+                    .expect("terminal summary exists")
+                {
+                    HostStreamSummary::Value(value) => Ok(value),
+                    HostStreamSummary::WithVm(completion) => completion(self),
+                };
+                match result {
+                    Ok(summary) => {
+                        let stream = self.instance.host_stream.take().expect("stream exists");
+                        self.instance.waiting_host_op = None;
+                        self.instance.stack.push(summary);
+                        self.drop_value_with_contract(stream.callback);
+                        if let Some(open) = stream.open_callback {
+                            self.drop_value_with_contract(open);
+                        }
+                        if let Some(items) = stream.item {
+                            for item in items {
+                                self.drop_value_with_contract(item);
+                            }
+                        }
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(error) => {
+                        let stream = self.instance.host_stream.as_mut().expect("stream exists");
+                        stream.rollback = Some((before, error, None));
+                        stream.phase = HostStreamPhase::RollbackCompletion;
+                        self.poll_failed_stream_completion(cx)
+                    }
+                }
+            }
+        }
+    }
+
+    fn poll_failed_stream_completion(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        let (before, _, cleanup_error) = self
+            .instance
+            .host_stream
+            .as_mut()
+            .and_then(|stream| stream.rollback.as_mut())
+            .expect("rollback phase has snapshot and error");
+        let result =
+            self.host
+                .execution_scope
+                .resources_mut()
+                .poll_close_added(before, cleanup_error, cx);
+        match result {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(cleanup) => {
+                let mut stream = self.instance.host_stream.take().expect("stream exists");
+                let (_, error, _) = stream.rollback.take().expect("rollback error exists");
                 self.instance.waiting_host_op = None;
+                self.abort_host_invocation(stream.parent_stack_base, stream.parent_frame_count);
                 self.drop_value_with_contract(stream.callback);
                 if let Some(open) = stream.open_callback {
                     self.drop_value_with_contract(open);
@@ -751,23 +829,15 @@ impl Vm {
                         self.drop_value_with_contract(item);
                     }
                 }
-                let result = match stream.summary.take().expect("terminal summary exists") {
-                    HostStreamSummary::Value(value) => Ok(value),
-                    HostStreamSummary::WithVm(completion) => completion(self),
-                };
-                match result {
-                    Ok(summary) => {
-                        self.instance.stack.push(summary);
-                        Poll::Ready(Ok(()))
-                    }
-                    Err(error) => {
-                        self.abort_host_invocation(
-                            stream.parent_stack_base,
-                            stream.parent_frame_count,
-                        );
-                        Poll::Ready(Err(error))
-                    }
+                let cleanup = cleanup.map_err(|error| {
+                    VmError::ExecutionScope(
+                        crate::vm::execution_scope::ExecutionScopeError::Resource(error),
+                    )
+                });
+                if cleanup.is_err() {
+                    self.host.mark_reset_failed(cleanup.as_ref().unwrap_err());
                 }
+                Poll::Ready(Err(preserve_stream_cleanup(error, cleanup)))
             }
         }
     }
@@ -1107,6 +1177,76 @@ mod tests {
     }
 
     #[test]
+    fn reset_waits_for_unscoped_stream_driver_and_fails_closed_on_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for fails in [false, true] {
+            let mut vm = Vm::new(compile_source("").unwrap().program);
+            let ready = Arc::new(AtomicBool::new(false));
+            let id = vm.allocate_host_op_id();
+            vm.host.stream_drivers.insert(
+                id,
+                Box::new(TerminationGateDriver {
+                    ready: Arc::clone(&ready),
+                    fails,
+                }),
+            );
+            // This driver has no execution-scope registration. Its own termination
+            // acknowledgement is the only quiescence barrier.
+            vm.reset_for_reuse().unwrap();
+            assert!(vm.scope_reset_pending());
+            assert!(!vm.is_reusable());
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(vm.poll_reset_for_reuse(&mut cx), Poll::Pending));
+            ready.store(true, Ordering::SeqCst);
+            if fails {
+                assert!(matches!(
+                    vm.poll_reset_for_reuse(&mut cx),
+                    Poll::Ready(Err(_))
+                ));
+                assert!(!vm.is_reusable());
+                assert!(matches!(
+                    vm.poll_reset_for_reuse(&mut cx),
+                    Poll::Ready(Err(_))
+                ));
+            } else {
+                assert!(matches!(
+                    vm.poll_reset_for_reuse(&mut cx),
+                    Poll::Ready(Ok(()))
+                ));
+                assert!(vm.is_reusable());
+            }
+        }
+    }
+
+    struct TerminationGateDriver {
+        ready: Arc<std::sync::atomic::AtomicBool>,
+        fails: bool,
+    }
+    impl HostStreamDriver for TerminationGateDriver {
+        fn poll_next(&mut self, _: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
+            Poll::Pending
+        }
+        fn apply_action(&mut self, _: Value) -> VmResult<HostStreamAction> {
+            unreachable!()
+        }
+        fn poll_termination(
+            &mut self,
+            _: &mut ExecutionScope,
+            _: HostStreamTermination,
+            _: &mut Context<'_>,
+        ) -> Poll<VmResult<()>> {
+            use std::sync::atomic::Ordering;
+            if !self.ready.load(Ordering::SeqCst) {
+                Poll::Pending
+            } else if self.fails {
+                Poll::Ready(Err(VmError::HostError("driver termination failed".into())))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    #[test]
     fn missing_open_callback_aborts_without_routing_into_event() {
         let mut vm = Vm::new(
             compile_source("pub fn event(x: int) -> bool { true }")
@@ -1177,6 +1317,120 @@ mod tests {
         assert!(vm.instance.host_stream.is_none());
         assert!(vm.stack().is_empty());
         assert_eq!(vm.host_context().resource_count(), 0);
+    }
+
+    struct RollbackResource {
+        ready: Arc<std::sync::atomic::AtomicBool>,
+        closes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::vm::resource::HostResource for RollbackResource {
+        fn begin_close(
+            &mut self,
+            _: crate::vm::resource::ResourceCloseReason,
+        ) -> crate::vm::resource::ResourceResult<crate::vm::resource::CloseProgress> {
+            self.closes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::vm::resource::CloseProgress::Pending)
+        }
+        fn poll_close(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<crate::vm::resource::ResourceResult<()>> {
+            if self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    #[test]
+    fn failed_vm_completion_rolls_back_new_resource_after_pending_close() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        for cancel in [false, true] {
+            let mut vm = Vm::new(
+                compile_source("pub fn event(x: int) -> bool { true }")
+                    .unwrap()
+                    .program,
+            );
+            assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+            let existing = vm.host_context().push_resource(SummaryResource).unwrap();
+            let ready = Arc::new(AtomicBool::new(false));
+            let closes = Arc::new(AtomicUsize::new(0));
+            let make_completion = || {
+                let ready = Arc::clone(&ready);
+                let closes = Arc::clone(&closes);
+                Box::new(move |vm: &mut Vm| {
+                    vm.host_context()
+                        .push_resource(RollbackResource { ready, closes })
+                        .unwrap();
+                    Err(VmError::HostError("after push".into()))
+                }) as HostVmCompletion<Value>
+            };
+            let item = if cancel {
+                HostStreamPoll::Call(HostStreamCallback::Event, vec![Value::Int(1)])
+            } else {
+                HostStreamPoll::CompleteWithVm(make_completion())
+            };
+            let driver = DelayedDriver {
+                item: Some(item),
+                ready: Arc::new(AtomicBool::new(true)),
+                cancel_on_action: cancel,
+            };
+            let event = vm.resolve_exported_callable("event").unwrap();
+            let id = match vm
+                .submit_callable_stream_callbacks(event, None, &[TypeSchema::Int], &[], driver)
+                .unwrap_or_else(|err| panic!("admission: {}", err.primary))
+            {
+                CallOutcome::Pending(id) => id,
+                _ => panic!("pending expected"),
+            };
+            // For cancellation the scripted action supplies the failing hook.
+            if cancel {
+                let inner = vm.host.stream_drivers.remove(&id).unwrap();
+                vm.host.stream_drivers.insert(
+                    id,
+                    Box::new(FailingCompletionDriver {
+                        inner,
+                        completion: Some(make_completion()),
+                    }),
+                );
+            }
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(matches!(
+                vm.poll_callable_stream(id, &mut cx),
+                Poll::Pending
+            ));
+            assert_eq!(vm.host_context().resource_count(), 2);
+            assert_eq!(closes.load(Ordering::SeqCst), 1);
+            assert!(matches!(
+                vm.poll_callable_stream(id, &mut cx),
+                Poll::Pending
+            ));
+            ready.store(true, Ordering::SeqCst);
+            assert!(
+                matches!(vm.poll_callable_stream(id, &mut cx), Poll::Ready(Err(VmError::HostError(message))) if message == "after push")
+            );
+            assert_eq!(vm.host_context().resource_count(), 1);
+            assert!(vm.host_context().resource(&existing).is_ok());
+            assert_eq!(closes.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    struct FailingCompletionDriver {
+        inner: Box<dyn HostStreamDriver>,
+        completion: Option<HostVmCompletion<Value>>,
+    }
+    impl HostStreamDriver for FailingCompletionDriver {
+        fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
+            self.inner.poll_next(cx)
+        }
+        fn apply_action(&mut self, _: Value) -> VmResult<HostStreamAction> {
+            Ok(HostStreamAction::CancelWithVm(
+                self.completion.take().unwrap(),
+                OperationCancelReason::Requested,
+            ))
+        }
     }
 
     #[test]

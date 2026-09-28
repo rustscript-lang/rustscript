@@ -487,6 +487,18 @@ impl HostRuntime {
         }
 
         if !self.scope_reset_pending {
+            // A stream driver need not have a scoped operation. Begin every
+            // outstanding driver before the scope can publish its replacement.
+            let ids: Vec<_> = self.stream_drivers.keys().copied().collect();
+            for id in ids {
+                if let Err(error) = self.begin_stream_termination(
+                    id,
+                    HostStreamTermination::Cancelled(OperationCancelReason::VmReset),
+                ) {
+                    self.mark_reset_failed(&error);
+                    return Err(error);
+                }
+            }
             if let Err(error) =
                 self.request_cancel_submitted_host_ops(OperationCancelReason::VmReset)
             {
@@ -541,7 +553,6 @@ impl HostRuntime {
                 .begin_close(crate::vm::resource::ResourceCloseReason::VmReset);
         }
         self.scoped_operation_completions.clear();
-        self.stream_drivers.clear();
         self.replacement_execution_scope = None;
         self.scope_reset_pending = false;
         self.scope_reset_error = Some(error);
@@ -573,6 +584,13 @@ impl HostRuntime {
             return Poll::Ready(Ok(()));
         }
 
+        // Poll both barriers even when the scope has already quiesced. A
+        // driver can own worker state outside the scope's registries.
+        let stream_result = self.poll_stream_terminations(cx);
+        if let Poll::Ready(Err(error)) = stream_result {
+            self.mark_reset_failed(&error);
+            return Poll::Ready(Err(error));
+        }
         let result = self.execution_scope.poll_close(cx);
         match result {
             Poll::Pending => Poll::Pending,
@@ -580,14 +598,15 @@ impl HostRuntime {
                 self.scope_reset_error = Some(error.clone());
                 Poll::Ready(Err(VmError::ExecutionScope(error)))
             }
+            Poll::Ready(Ok(ScopeCloseOutcome::Success)) if stream_result.is_pending() => {
+                Poll::Pending
+            }
             Poll::Ready(Ok(ScopeCloseOutcome::Success)) => {
                 let replacement = self
                     .replacement_execution_scope
                     .take()
                     .expect("pending scope reset must retain one replacement scope");
                 self.execution_scope = replacement;
-                self.stream_drivers.clear();
-                self.pending_stream_terminations.clear();
                 self.scope_reset_pending = false;
                 Poll::Ready(Ok(()))
             }
