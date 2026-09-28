@@ -644,6 +644,14 @@ impl Vm {
                                 stream.rollback =
                                     Some((before, preserve_stream_cleanup(error, cleanup), None));
                                 stream.phase = HostStreamPhase::RollbackCompletion;
+                                self.instance.waiting_host_op =
+                                    Some(crate::vm::host::WaitingHostOp {
+                                        op_id,
+                                        source:
+                                            crate::vm::host::WaitingHostOpSource::CallableStream,
+                                        expected_return_type: None,
+                                        expected_return_schema: None,
+                                    });
                                 self.poll_failed_stream_completion(cx)
                             } else {
                                 let cleanup = self.abort_callable_stream();
@@ -1255,6 +1263,66 @@ mod tests {
         assert!(vm.instance.host_stream.is_none());
         assert_eq!(vm.host_context().resource_count(), 1);
         assert!(vm.host_context().resource(&existing).is_ok());
+    }
+
+    #[test]
+    fn callback_entry_rejection_keeps_pending_rollback_on_waiting_host_op() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let mut vm = Vm::new(
+            compile_source("pub fn event(x: int) -> bool { true }")
+                .unwrap()
+                .program,
+        );
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+        let callback = vm.resolve_exported_callable("event").unwrap();
+        let existing = vm.host_context().push_resource(SummaryResource).unwrap();
+        let ready = Arc::new(AtomicBool::new(false));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let driver = ScriptedDriver {
+            items: VecDeque::from([HostStreamPoll::CallWithVm(
+                HostStreamCallback::Event,
+                Box::new({
+                    let ready = Arc::clone(&ready);
+                    let closes = Arc::clone(&closes);
+                    move |vm| {
+                        vm.host_context()
+                            .push_resource(RollbackResource { ready, closes })
+                            .unwrap();
+                        Ok(vec![Value::string("wrong type")])
+                    }
+                }),
+            )]),
+            actions: Arc::new(Mutex::new(vec![])),
+        };
+        let CallOutcome::Pending(id) = vm
+            .submit_callable_stream_callbacks(callback, None, &[TypeSchema::Int], &[], driver)
+            .unwrap_or_else(|error| panic!("{}", error.primary))
+        else {
+            panic!("pending expected")
+        };
+        vm.set_waiting_host_op_with_return(
+            id,
+            crate::vm::host::WaitingHostOpSource::CallableStream,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(vm.poll_waiting_host_op(&mut cx), Poll::Pending));
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(vm.host_context().resource_count(), 2);
+        assert_eq!(vm.waiting_host_op_id(), Some(id));
+        assert!(matches!(vm.poll_waiting_host_op(&mut cx), Poll::Pending));
+        ready.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            vm.poll_waiting_host_op(&mut cx),
+            Poll::Ready(Err(VmError::TypeMismatch(_)))
+        ));
+        assert!(vm.instance.host_stream.is_none());
+        assert!(vm.waiting_host_op_id().is_none());
+        assert_eq!(vm.host_context().resource_count(), 1);
+        assert!(vm.host_context().resource(&existing).is_ok());
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
     }
 
     #[test]
