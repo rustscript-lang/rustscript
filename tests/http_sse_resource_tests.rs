@@ -231,6 +231,56 @@ async fn resource_sse_reset_closes_pending_connection_and_scope() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn resource_sse_post_redirect_counts_each_transmitted_body() {
+    for status in [307, 308] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            for hop in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert!(count > 0, "request ended before body");
+                    request.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        if request.len() >= end + 4 + 7 {
+                            assert_eq!(&request[end + 4..end + 11], b"payload");
+                            break;
+                        }
+                    }
+                }
+                assert!(request.starts_with(if hop == 0 {
+                    b"POST /start "
+                } else {
+                    b"POST /final "
+                }));
+                if hop == 0 {
+                    stream.write_all(format!("HTTP/1.1 {status} Redirect\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n").as_bytes()).unwrap();
+                } else {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n").unwrap();
+                }
+            }
+        });
+        let source = format!(
+            r#"use http;
+            fn event(a: string, b: string, c: string, d: string) -> bool {{ true }}
+            let mut req = http::request::new("POST", "http://127.0.0.1:{port}/start");
+            http::request::set_body_text(&mut req, "payload");
+            let summary = http::client::sse(req, event);
+            http::sse_summary::bytes_sent(&summary);"#
+        );
+        let vm = run(&source, port).await;
+        server.join().unwrap();
+        assert_eq!(vm.stack().last(), Some(&Value::Int(14)), "status {status}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn resource_sse_without_open_callback_still_returns_headers() {
     let (port, server) = server(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Marker: yes\r\nContent-Length: 0\r\n\r\n");
     let source = format!(

@@ -169,6 +169,7 @@ fn sse_callable_metadata_has_exact_stream_schema() {
         .collect::<Vec<_>>();
     assert_eq!(callables.len(), 1);
     assert_eq!(callables[0].host_execution, vm::HostExecution::MaySuspend);
+    assert_eq!(callables[0].signature.return_type, "resource");
     let catalog = vm::http_host_catalog();
     let schemas = catalog
         .functions()

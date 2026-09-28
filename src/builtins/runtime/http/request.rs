@@ -1499,6 +1499,7 @@ pub(super) async fn open_stream_response(
     observer: ResponseReadObserver,
     opening_deadline: Instant,
     opening_response_deadline: Instant,
+    bytes_sent: &std::sync::atomic::AtomicUsize,
 ) -> VmResult<(OwnedResponse, url::Url)> {
     let mut method = request.method.clone();
     let mut url = request.url.clone();
@@ -1528,6 +1529,15 @@ pub(super) async fn open_stream_response(
             },
         )
         .await?;
+        // A completed response confirms this hop sent its request body. Redirects
+        // preserving POST contribute another copy; rewritten GET hops contribute 0.
+        bytes_sent
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |total| Some(total.saturating_add(body.as_ref().map_or(0, Vec::len))),
+            )
+            .expect("the update always succeeds");
         validate_response_framing(response.response())?;
         if follows_location(response.response().status()) {
             if redirect_index == config.max_redirects {

@@ -398,6 +398,12 @@ impl IntoVmValue for i64 {
     }
 }
 
+impl<T> IntoVmValue for crate::vm::resource::Resource<T> {
+    fn into_vm_value(self) -> Value {
+        Value::Int(self.handle().raw() as i64)
+    }
+}
+
 impl IntoVmValue for u32 {
     fn into_vm_value(self) -> Value {
         Value::Int(i64::from(self))

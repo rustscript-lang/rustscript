@@ -559,6 +559,7 @@ impl Vm {
                 | HostStreamPoll::Call(_, _)
                 | HostStreamPoll::CallWithVm(_, _)),
             )) => {
+                let mut materialized_before = None;
                 let (kind, args) = match item {
                     HostStreamPoll::Item(value) => (HostStreamCallback::Event, vec![value]),
                     HostStreamPoll::Call(kind, args) => (kind, args),
@@ -583,7 +584,10 @@ impl Vm {
                             stream.phase = HostStreamPhase::AwaitItem;
                         }
                         match result {
-                            Ok(args) => (kind, args),
+                            Ok(args) => {
+                                materialized_before = Some(before);
+                                (kind, args)
+                            }
                             Err(error) => {
                                 let cleanup = self
                                     .host
@@ -611,7 +615,8 @@ impl Vm {
                     stream.item_callback = kind;
                     stream.item = Some(args);
                 }
-                match self.start_callable_stream_callback() {
+                let mut callback_entered = false;
+                match self.start_callable_stream_callback(&mut callback_entered) {
                     Ok(VmStatus::Halted) => match self.finish_callable_stream_callback() {
                         Ok(VmStatus::Halted) => Poll::Ready(Ok(())),
                         Ok(VmStatus::Waiting(_)) => {
@@ -623,15 +628,38 @@ impl Vm {
                     },
                     Ok(VmStatus::Yielded | VmStatus::Waiting(_)) => Poll::Ready(Ok(())),
                     Err(error) => {
-                        let cleanup = self.abort_callable_stream();
-                        Poll::Ready(Err(preserve_stream_cleanup(error, cleanup)))
+                        if !callback_entered {
+                            if let Some(before) = materialized_before {
+                                let cleanup = self
+                                    .host
+                                    .begin_stream_termination(
+                                        op_id,
+                                        HostStreamTermination::Cancelled(
+                                            OperationCancelReason::Requested,
+                                        ),
+                                    )
+                                    .and_then(|()| self.poll_stream_termination_once());
+                                let stream =
+                                    self.instance.host_stream.as_mut().expect("stream exists");
+                                stream.rollback =
+                                    Some((before, preserve_stream_cleanup(error, cleanup), None));
+                                stream.phase = HostStreamPhase::RollbackCompletion;
+                                self.poll_failed_stream_completion(cx)
+                            } else {
+                                let cleanup = self.abort_callable_stream();
+                                Poll::Ready(Err(preserve_stream_cleanup(error, cleanup)))
+                            }
+                        } else {
+                            let cleanup = self.abort_callable_stream();
+                            Poll::Ready(Err(preserve_stream_cleanup(error, cleanup)))
+                        }
                     }
                 }
             }
         }
     }
 
-    fn start_callable_stream_callback(&mut self) -> VmResult<VmStatus> {
+    fn start_callable_stream_callback(&mut self, entered: &mut bool) -> VmResult<VmStatus> {
         let (callback, item) = {
             let stream = self
                 .instance
@@ -666,6 +694,7 @@ impl Vm {
             None,
             crate::vm::instance::FrameContinuation::ReturnToHost,
         )?;
+        *entered = true;
         match outcome {
             crate::vm::ExecOutcome::Continue => self.run_internal(None, false),
             crate::vm::ExecOutcome::Halted => Ok(VmStatus::Halted),
@@ -1189,6 +1218,76 @@ mod tests {
         assert!(vm.instance.host_stream.is_none());
         assert_eq!(vm.host_context().resource_count(), 1);
         assert!(vm.host_context().resource(&existing).is_ok());
+    }
+
+    #[test]
+    fn failed_callback_entry_after_vm_materialization_rolls_back_new_resources() {
+        let mut vm = Vm::new(
+            compile_source("pub fn event(x: int) -> bool { true }")
+                .unwrap()
+                .program,
+        );
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+        let callback = vm.resolve_exported_callable("event").unwrap();
+        let existing = vm.host_context().push_resource(SummaryResource).unwrap();
+        let driver = ScriptedDriver {
+            items: VecDeque::from([HostStreamPoll::CallWithVm(
+                HostStreamCallback::Event,
+                Box::new(|vm| {
+                    vm.host_context().push_resource(SummaryResource).unwrap();
+                    // Callback entry rejects the wrong argument type after materialization.
+                    Ok(vec![Value::string("wrong type")])
+                }),
+            )]),
+            actions: Arc::new(Mutex::new(vec![])),
+        };
+        let CallOutcome::Pending(id) = vm
+            .submit_callable_stream_callbacks(callback, None, &[TypeSchema::Int], &[], driver)
+            .unwrap_or_else(|error| panic!("{}", error.primary))
+        else {
+            panic!("pending expected")
+        };
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            vm.poll_callable_stream(id, &mut cx),
+            Poll::Ready(Err(VmError::TypeMismatch(_)))
+        ));
+        assert!(vm.instance.host_stream.is_none());
+        assert_eq!(vm.host_context().resource_count(), 1);
+        assert!(vm.host_context().resource(&existing).is_ok());
+    }
+
+    #[test]
+    fn callback_failure_after_entry_leaves_materialized_resources_script_owned() {
+        let mut vm = Vm::new(
+            compile_source("pub fn event(x: int) -> bool { let zero = 0; x / zero > 0 }")
+                .unwrap()
+                .program,
+        );
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+        let callback = vm.resolve_exported_callable("event").unwrap();
+        let driver = ScriptedDriver {
+            items: VecDeque::from([HostStreamPoll::CallWithVm(
+                HostStreamCallback::Event,
+                Box::new(|vm| {
+                    vm.host_context().push_resource(SummaryResource).unwrap();
+                    Ok(vec![Value::Int(1)])
+                }),
+            )]),
+            actions: Arc::new(Mutex::new(vec![])),
+        };
+        let CallOutcome::Pending(id) = vm
+            .submit_callable_stream_callbacks(callback, None, &[TypeSchema::Int], &[], driver)
+            .unwrap_or_else(|error| panic!("{}", error.primary))
+        else {
+            panic!("pending expected")
+        };
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            vm.poll_callable_stream(id, &mut cx),
+            Poll::Ready(Err(_))
+        ));
+        assert_eq!(vm.host_context().resource_count(), 1);
     }
 
     #[test]

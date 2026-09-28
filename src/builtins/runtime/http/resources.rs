@@ -125,7 +125,7 @@ memory_resource!(
 );
 memory_resource!(HttpResponse, "http.response", "A buffered HTTP response");
 
-pub(super) struct SseSummary {
+pub(crate) struct SseSummary {
     pub(super) outcome: String,
     pub(super) status: i64,
     pub(super) headers: HttpHeaders,

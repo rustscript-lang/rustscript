@@ -28,7 +28,7 @@ use crate::vm::operation::{
     OperationResult, OperationSpec,
 };
 use crate::vm::resource::{
-    CloseProgress, HostResource, ResourceCloseReason, ResourceError, ResourceErrorCode,
+    CloseProgress, HostResource, Resource, ResourceCloseReason, ResourceError, ResourceErrorCode,
     ResourceHandle, ResourceResult,
 };
 use crate::vm::{
@@ -608,6 +608,7 @@ struct SseWorker {
     shared: Arc<SseShared>,
     items: Arc<AtomicUsize>,
     bytes_received: Arc<AtomicUsize>,
+    bytes_sent: Arc<AtomicUsize>,
     status: std::sync::Mutex<Option<u16>>,
     headers: std::sync::Mutex<Option<HttpHeaders>>,
     url: std::sync::Mutex<Option<String>>,
@@ -772,6 +773,7 @@ impl SseWorker {
                 observer,
                 self.deadline,
                 opening_idle_deadline,
+                &self.bytes_sent,
             ) => {
                 opened.map_err(|error| {
                     if error.to_string().contains("HTTP request deadline exceeded") {
@@ -880,7 +882,7 @@ struct SseStreamDriver {
     url: String,
     items: usize,
     bytes_received: Arc<AtomicUsize>,
-    bytes_sent: usize,
+    bytes_sent: Arc<AtomicUsize>,
     has_open_callback: bool,
     /// The absolute total deadline; the driver enforces it in
     /// [`apply_action`](Self::apply_action) so a slow callback cannot extend
@@ -906,7 +908,7 @@ impl SseStreamDriver {
             url: self.url.clone(),
             items: self.items as i64,
             bytes_received: self.bytes_received.load(Ordering::Acquire) as i64,
-            bytes_sent: self.bytes_sent as i64,
+            bytes_sent: i64::try_from(self.bytes_sent.load(Ordering::Acquire)).unwrap_or(i64::MAX),
         };
         Box::new(move |vm| {
             let token = vm
@@ -1350,7 +1352,7 @@ fn builtin_sse_start(
     callback: Value,
     on_open: Option<Value>,
     timeout_ms: Option<i64>,
-) -> VmResult<HostCallResult<i64>> {
+) -> VmResult<HostCallResult<Resource<SseSummary>>> {
     vm.validate_stream_positional_callback(
         &callback,
         &[
@@ -1393,7 +1395,6 @@ fn builtin_sse_start(
             "HTTP request body exceeds limit".to_string(),
         ));
     }
-    let bytes_sent = request.body.as_ref().map_or(0, Vec::len);
     if !request
         .headers
         .iter()
@@ -1461,11 +1462,13 @@ fn builtin_sse_start(
         shared: Arc::clone(&shared),
         items: Arc::new(AtomicUsize::new(0)),
         bytes_received: Arc::new(AtomicUsize::new(0)),
+        bytes_sent: Arc::new(AtomicUsize::new(0)),
         status: std::sync::Mutex::new(None),
         headers: std::sync::Mutex::new(None),
         url: std::sync::Mutex::new(None),
     });
     let bytes_received = worker.bytes_received.clone();
+    let bytes_sent = worker.bytes_sent.clone();
 
     let join_handle = match spawn_worker("rustscript-sse-worker", {
         let worker_shared = Arc::clone(&shared);
@@ -1551,7 +1554,7 @@ pub(super) fn builtin_http_client_sse(
     vm: &mut Vm,
     request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
     on_event: VmCallable<fn(String, String, String, String) -> bool>,
-) -> VmResult<HostCallResult<i64>> {
+) -> VmResult<HostCallResult<Resource<SseSummary>>> {
     builtin_sse_start(vm, request, on_event.into_value(), None, None)
 }
 
@@ -1562,7 +1565,7 @@ pub(super) fn builtin_http_client_sse_open(
     request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
     on_event: VmCallable<fn(String, String, String, String) -> bool>,
     on_open: VmCallable<fn(i64, i64, String) -> bool>,
-) -> VmResult<HostCallResult<i64>> {
+) -> VmResult<HostCallResult<Resource<SseSummary>>> {
     builtin_sse_start(
         vm,
         request,
@@ -1579,7 +1582,7 @@ pub(super) fn builtin_http_client_sse_only_timeout(
     request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
     on_event: VmCallable<fn(String, String, String, String) -> bool>,
     timeout_ms: i64,
-) -> VmResult<HostCallResult<i64>> {
+) -> VmResult<HostCallResult<Resource<SseSummary>>> {
     builtin_sse_start(vm, request, on_event.into_value(), None, Some(timeout_ms))
 }
 
@@ -1591,7 +1594,7 @@ pub(super) fn builtin_http_client_sse_timeout(
     on_event: VmCallable<fn(String, String, String, String) -> bool>,
     on_open: VmCallable<fn(i64, i64, String) -> bool>,
     timeout_ms: i64,
-) -> VmResult<HostCallResult<i64>> {
+) -> VmResult<HostCallResult<Resource<SseSummary>>> {
     builtin_sse_start(
         vm,
         request,

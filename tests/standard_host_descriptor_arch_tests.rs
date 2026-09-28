@@ -726,23 +726,33 @@ fn sse_stream_declaration_is_scanned_and_owned_exactly_once() {
         .iter()
         .filter(|function| function.name == "http::client::sse")
         .collect();
+    let descriptors: Vec<_> = sse
+        .iter()
+        .map(|function| function.descriptor.as_str())
+        .collect();
     assert_eq!(
-        sse.len(),
-        1,
-        "the SSE stream host function must be discovered exactly once: {sse:?}"
+        descriptors,
+        [
+            "builtin_http_client_sse_descriptor",
+            "builtin_http_client_sse_open_descriptor",
+            "builtin_http_client_sse_only_timeout_descriptor",
+            "builtin_http_client_sse_timeout_descriptor",
+        ],
+        "all four SSE overloads must be discovered exactly once"
     );
-    assert_eq!(sse[0].file, file);
-    assert_eq!(sse[0].descriptor, "builtin_http_client_sse_descriptor");
+    assert!(sse.iter().all(|function| function.file == file));
 
     let owners = declared_ownership();
-    let claimants = owners
-        .get("builtin_http_client_sse_descriptor")
-        .expect("the SSE stream descriptor must have an ownership list");
-    assert_eq!(
-        claimants,
-        &vec!["src/builtins/runtime/http/mod.rs".to_string()],
-        "SSE ownership must be declared exactly once"
-    );
+    for descriptor in descriptors {
+        let claimants = owners
+            .get(descriptor)
+            .expect("every SSE overload descriptor must have an ownership list");
+        assert_eq!(
+            claimants,
+            &vec!["src/builtins/runtime/http/mod.rs".to_string()],
+            "each SSE overload must have exactly one owner"
+        );
+    }
 }
 
 /// Every file that declares an ownership list, with the modules it declares
