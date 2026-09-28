@@ -1268,6 +1268,11 @@ impl Vm {
     /// `poll_reset_for_reuse` to obtain the deterministic completion result
     /// before observing an empty scope or reusing the VM.
     pub fn reset_for_reuse(&mut self) -> VmResult<()> {
+        if self.stream_completion_running() {
+            return Err(VmError::InvalidFrameState(
+                "callable stream completion is running",
+            ));
+        }
         if let Err(error) = validate_frame_allocation_limits(&self.program) {
             self.host.mark_reset_failed(&error);
             return Err(error);
@@ -3696,6 +3701,11 @@ impl Vm {
     }
 
     pub fn shutdown(&mut self) {
+        // Shutdown has no error return; leave the active stream intact until
+        // its completion hook returns and the caller can shut down externally.
+        if self.stream_completion_running() {
+            return;
+        }
         self.invalidate_callback_registries();
         let _ = self.cancel_waiting_host_op_with_reason(
             crate::vm::operation::OperationCancelReason::VmDrop,

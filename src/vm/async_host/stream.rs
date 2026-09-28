@@ -163,6 +163,7 @@ pub(crate) enum HostStreamPhase {
     AwaitItem,
     RunCallback,
     AwaitTermination,
+    ExecutingCompletion,
     RollbackCompletion,
 }
 
@@ -417,6 +418,11 @@ impl Vm {
         &mut self,
         reason: OperationCancelReason,
     ) -> VmResult<()> {
+        if self.stream_completion_running() {
+            return Err(VmError::InvalidFrameState(
+                "callable stream completion is running",
+            ));
+        }
         let Some(stream) = self.instance.host_stream.take() else {
             return Ok(());
         };
@@ -436,6 +442,13 @@ impl Vm {
             self.drop_value_with_contract(open);
         }
         cleanup
+    }
+
+    pub(crate) fn stream_completion_running(&self) -> bool {
+        self.instance
+            .host_stream
+            .as_ref()
+            .is_some_and(|stream| stream.phase == HostStreamPhase::ExecutingCompletion)
     }
 
     pub(crate) fn terminate_all_callable_streams_with_reason(
@@ -762,17 +775,24 @@ impl Vm {
                         return Poll::Ready(Err(error));
                     }
                 };
-                let result = match self
-                    .instance
-                    .host_stream
-                    .as_mut()
-                    .expect("stream exists")
-                    .summary
-                    .take()
-                    .expect("terminal summary exists")
-                {
+                let stream = self.instance.host_stream.as_mut().expect("stream exists");
+                let summary = stream.summary.take().expect("terminal summary exists");
+                let result = match summary {
                     HostStreamSummary::Value(value) => Ok(value),
-                    HostStreamSummary::WithVm(completion) => completion(self),
+                    HostStreamSummary::WithVm(completion) => {
+                        self.instance
+                            .host_stream
+                            .as_mut()
+                            .expect("stream exists")
+                            .phase = HostStreamPhase::ExecutingCompletion;
+                        let result = completion(self);
+                        self.instance
+                            .host_stream
+                            .as_mut()
+                            .expect("stream exists")
+                            .phase = HostStreamPhase::AwaitTermination;
+                        result
+                    }
                 };
                 match result {
                     Ok(summary) => {
@@ -1174,6 +1194,113 @@ mod tests {
                     .is_ok()
             );
         }
+    }
+
+    #[test]
+    fn reset_inside_vm_completion_is_rejected_without_disturbing_success() {
+        use std::sync::atomic::AtomicBool;
+        let mut vm = Vm::new(
+            compile_source("pub fn event(x: int) -> bool { true }")
+                .unwrap()
+                .program,
+        );
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+        let callback = vm.resolve_exported_callable("event").unwrap();
+        let driver = DelayedDriver {
+            item: Some(HostStreamPoll::CompleteWithVm(Box::new(|vm| {
+                assert!(matches!(
+                    vm.reset_for_reuse(),
+                    Err(VmError::InvalidFrameState(
+                        "callable stream completion is running"
+                    ))
+                ));
+                assert!(matches!(
+                    vm.cancel_callable_stream_with_reason(OperationCancelReason::Requested),
+                    Err(VmError::InvalidFrameState(
+                        "callable stream completion is running"
+                    ))
+                ));
+                vm.shutdown();
+                assert!(vm.instance.host_stream.is_some());
+                assert!(vm.waiting_host_op_id().is_some());
+                assert!(!vm.scope_reset_pending());
+                let resource = vm.host_context().push_resource(SummaryResource).unwrap();
+                Ok(Value::Int(resource.handle().raw() as i64))
+            }))),
+            ready: Arc::new(AtomicBool::new(true)),
+            cancel_on_action: false,
+        };
+        let CallOutcome::Pending(id) = vm
+            .submit_callable_stream_callbacks(callback, None, &[TypeSchema::Int], &[], driver)
+            .unwrap_or_else(|err| panic!("admission: {}", err.primary))
+        else {
+            panic!("pending expected")
+        };
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            vm.poll_callable_stream(id, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(vm.instance.host_stream.is_none());
+        assert!(vm.host.stream_drivers.is_empty());
+        assert_eq!(vm.host_context().resource_count(), 1);
+        assert!(matches!(vm.stack().last(), Some(Value::Int(_))));
+        vm.reset_for_reuse().unwrap();
+        assert!(matches!(
+            vm.poll_reset_for_reuse(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(vm.host_context().resource_count(), 0);
+    }
+
+    #[test]
+    fn reset_inside_vm_completion_is_rejected_without_disturbing_error_rollback() {
+        use std::sync::atomic::AtomicBool;
+        let mut vm = Vm::new(
+            compile_source("pub fn event(x: int) -> bool { true }")
+                .unwrap()
+                .program,
+        );
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+        let existing = vm.host_context().push_resource(SummaryResource).unwrap();
+        let callback = vm.resolve_exported_callable("event").unwrap();
+        let driver = DelayedDriver {
+            item: Some(HostStreamPoll::CompleteWithVm(Box::new(|vm| {
+                assert!(matches!(
+                    vm.reset_for_reuse(),
+                    Err(VmError::InvalidFrameState(
+                        "callable stream completion is running"
+                    ))
+                ));
+                assert!(vm.instance.host_stream.is_some());
+                vm.host_context().push_resource(SummaryResource).unwrap();
+                Err(VmError::HostError("summary failed".into()))
+            }))),
+            ready: Arc::new(AtomicBool::new(true)),
+            cancel_on_action: false,
+        };
+        let CallOutcome::Pending(id) = vm
+            .submit_callable_stream_callbacks(callback, None, &[TypeSchema::Int], &[], driver)
+            .unwrap_or_else(|err| panic!("admission: {}", err.primary))
+        else {
+            panic!("pending expected")
+        };
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            vm.poll_callable_stream(id, &mut cx),
+            Poll::Ready(Err(VmError::HostError(message))) if message == "summary failed"
+        ));
+        assert!(vm.instance.host_stream.is_none());
+        assert!(vm.host.stream_drivers.is_empty());
+        assert!(vm.stack().is_empty());
+        assert_eq!(vm.host_context().resource_count(), 1);
+        assert!(vm.host_context().resource(&existing).is_ok());
+        vm.reset_for_reuse().unwrap();
+        assert!(matches!(
+            vm.poll_reset_for_reuse(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(vm.host_context().resource_count(), 0);
     }
 
     #[test]
