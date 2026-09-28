@@ -163,22 +163,49 @@ fn buffered_http_catalog_is_keyed_and_map_free() {
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
 #[test]
 fn sse_callable_metadata_has_exact_stream_schema() {
-    let callable = vm::default_host_callables()
+    let callables = vm::default_host_callables()
         .iter()
-        .find(|callable| callable.name == "http::client::sse")
-        .expect("SSE callable should be published");
-    assert_eq!(
-        callable
-            .signature
-            .params
-            .iter()
-            .map(|param| (param.name, param.ty.display_label(), param.optional))
-            .collect::<Vec<_>>(),
-        [
-            ("request", "map".to_string(), false),
-            ("on_event", "fn(map) -> map".to_string(), false),
-        ]
+        .filter(|callable| callable.name == "http::client::sse")
+        .collect::<Vec<_>>();
+    assert_eq!(callables.len(), 1);
+    assert_eq!(callables[0].host_execution, vm::HostExecution::MaySuspend);
+    let catalog = vm::http_host_catalog();
+    let schemas = catalog
+        .functions()
+        .iter()
+        .filter(|function| function.name == "http::client::sse")
+        .collect::<Vec<_>>();
+    use vm::{HostParamPassing, HostParamSchema, HostTypeSchema, ResourceTypeKey};
+    let resource = |name| HostTypeSchema::Resource(ResourceTypeKey::new(name).unwrap());
+    let callback = |params| HostTypeSchema::Callable {
+        params,
+        result: Box::new(HostTypeSchema::Bool),
+    };
+    let request = HostParamSchema::with_passing(
+        "request",
+        resource("http.request"),
+        HostParamPassing::TakeOwned,
     );
-    assert_eq!(callable.signature.return_type, "map");
-    assert_eq!(callable.host_execution, vm::HostExecution::MaySuspend);
+    let event = HostParamSchema::value("on_event", callback(vec![HostTypeSchema::String; 4]));
+    let open = HostParamSchema::with_passing(
+        "on_open",
+        callback(vec![
+            HostTypeSchema::Int,
+            resource("http.headers"),
+            HostTypeSchema::String,
+        ]),
+        HostParamPassing::TakeOwned,
+    );
+    let timeout = HostParamSchema::value("timeout_ms", HostTypeSchema::Int);
+    let expected = [
+        vec![request.clone(), event.clone()],
+        vec![request.clone(), event.clone(), open.clone()],
+        vec![request.clone(), event.clone(), timeout.clone()],
+        vec![request, event, open, timeout],
+    ];
+    assert_eq!(schemas.len(), expected.len());
+    for (schema, params) in schemas.iter().zip(expected) {
+        assert_eq!(schema.params, params);
+        assert_eq!(schema.return_type, resource("http.sse_summary"));
+    }
 }

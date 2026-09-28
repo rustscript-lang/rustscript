@@ -47,6 +47,18 @@ impl<Signature> FromVmValue<'_> for VmCallable<Signature> {
     }
 }
 
+impl<Signature> TakeVmValue for VmCallable<Signature> {
+    fn take_vm_value(slot: &mut Value, _label: &str) -> VmResult<Self> {
+        if !matches!(slot, Value::Callable(_)) {
+            return Err(VmError::TypeMismatch("callable"));
+        }
+        Ok(Self {
+            value: std::mem::replace(slot, Value::Null),
+            marker: PhantomData,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum NumberValue {
     Int(i64),

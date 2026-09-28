@@ -15,6 +15,7 @@ use super::config::HttpConfig;
 use super::policy::{ConnectionPermit, SchemeFamily, request_deadline, resolve_url, with_deadline};
 use super::resources::{HttpHeaders, HttpRequest as RequestBuilder, HttpResponse};
 use crate::HostCallResult;
+#[cfg(test)]
 use crate::builtins::runtime::typed::VmMap;
 use crate::host_api::ResourceTypeKey;
 use crate::vm::operation::{
@@ -426,6 +427,7 @@ pub(super) fn validate_request_header_budget(
     budget.finish()
 }
 
+#[cfg(test)]
 pub(super) fn parse_request(map: &VmMap, config: &HttpConfig) -> VmResult<HttpRequest> {
     let method = map_string(map, "method")?.to_ascii_uppercase();
     if !matches!(
@@ -487,6 +489,7 @@ pub(super) fn parse_request(map: &VmMap, config: &HttpConfig) -> VmResult<HttpRe
     })
 }
 
+#[cfg(test)]
 fn parse_request_body(value: Option<&Value>, config: &HttpConfig) -> VmResult<Option<Vec<u8>>> {
     let Some(value) = value else {
         return Ok(None);
@@ -542,6 +545,7 @@ fn parse_request_body(value: Option<&Value>, config: &HttpConfig) -> VmResult<Op
     Ok(Some(payload.to_vec()))
 }
 
+#[cfg(test)]
 fn reject_unexpected_fields(map: &VmMap, allowed: &[&str], context: &'static str) -> VmResult<()> {
     for (key, _) in map {
         let Value::String(key) = key else {
@@ -556,6 +560,7 @@ fn reject_unexpected_fields(map: &VmMap, allowed: &[&str], context: &'static str
     Ok(())
 }
 
+#[cfg(test)]
 fn required_string_field(map: &VmMap, key: &str, context: &'static str) -> VmResult<String> {
     match map.get(&Value::string(key)) {
         Some(Value::String(value)) => Ok(value.as_ref().clone()),
@@ -564,6 +569,7 @@ fn required_string_field(map: &VmMap, key: &str, context: &'static str) -> VmRes
     }
 }
 
+#[cfg(test)]
 fn map_string(map: &VmMap, key: &str) -> VmResult<String> {
     match map.get(&Value::string(key)) {
         Some(Value::String(value)) => Ok(value.as_ref().clone()),
@@ -1485,39 +1491,6 @@ fn prepare_redirect(
         *body = None;
         headers.retain(|(name, _)| !is_body_header(name));
     }
-}
-
-pub(super) fn response_header_entries(headers: &hyper::HeaderMap) -> Vec<Value> {
-    // HeaderMap iteration does not promise original cross-name wire order.
-    // HeaderName::as_str() is normalized, and the stable sort retains the
-    // HeaderMap-provided order among repeated values of the same name.
-    let mut entries = headers.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-    entries
-        .into_iter()
-        .map(|(name, value)| {
-            let value = if let Ok(text) = value.to_str() {
-                Value::Map(Arc::new(VmMap::from_entries(vec![
-                    (Value::string("kind"), Value::string("text")),
-                    (Value::string("text"), Value::string(text)),
-                    (Value::string("bytes"), Value::Null),
-                ])))
-            } else {
-                Value::Map(Arc::new(VmMap::from_entries(vec![
-                    (Value::string("kind"), Value::string("bytes")),
-                    (Value::string("text"), Value::Null),
-                    (
-                        Value::string("bytes"),
-                        Value::bytes(value.as_bytes().to_vec()),
-                    ),
-                ])))
-            };
-            Value::Map(Arc::new(VmMap::from_entries(vec![
-                (Value::string("name"), Value::string(name.as_str())),
-                (Value::string("value"), value),
-            ])))
-        })
-        .collect()
 }
 
 pub(super) async fn open_stream_response(

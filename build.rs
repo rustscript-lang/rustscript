@@ -1207,7 +1207,13 @@ fn render_builtin_runtime_dispatch(
     )
     .unwrap();
     writeln!(&mut out, "    match name {{").unwrap();
+    let mut bound_names = std::collections::HashSet::new();
     for callable in host_callables {
+        // A direct name binding is installed once; exact catalog imports carry
+        // their own overload-specific adapters through the registry.
+        if !bound_names.insert(&callable.name) {
+            continue;
+        }
         let bind_call = callable
             .host_binding_kind
             .render_bind_static_call(&callable.name, &host_wrapper_adapter_name(callable));

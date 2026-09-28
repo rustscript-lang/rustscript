@@ -124,6 +124,22 @@ memory_resource!(
     "An unsent HTTP request builder"
 );
 memory_resource!(HttpResponse, "http.response", "A buffered HTTP response");
+
+pub(super) struct SseSummary {
+    pub(super) outcome: String,
+    pub(super) status: i64,
+    pub(super) headers: HttpHeaders,
+    pub(super) url: String,
+    pub(super) items: i64,
+    pub(super) bytes_received: i64,
+    pub(super) bytes_sent: i64,
+}
+
+memory_resource!(
+    SseSummary,
+    "http.sse_summary",
+    "An immutable SSE stream summary"
+);
 memory_resource!(
     HttpHeaders,
     "http.headers",
@@ -358,9 +374,111 @@ pub(super) fn headers_names(headers: ResourceRef<'_, HttpHeaders>) -> Vec<Value>
     headers.names()
 }
 
+/// Read the stream termination outcome.
+#[pd_host_function(name = "http::sse_summary::outcome")]
+pub(super) fn sse_outcome(summary: ResourceRef<'_, SseSummary>) -> String {
+    summary.outcome.clone()
+}
+
+/// Read the final HTTP status.
+#[pd_host_function(name = "http::sse_summary::status")]
+pub(super) fn sse_status(summary: ResourceRef<'_, SseSummary>) -> i64 {
+    summary.status
+}
+
+/// Read the final response URL.
+#[pd_host_function(name = "http::sse_summary::url")]
+pub(super) fn sse_url(summary: ResourceRef<'_, SseSummary>) -> String {
+    summary.url.clone()
+}
+
+/// Read the count of dispatched events.
+#[pd_host_function(name = "http::sse_summary::items")]
+pub(super) fn sse_items(summary: ResourceRef<'_, SseSummary>) -> i64 {
+    summary.items
+}
+
+/// Read the body octet count.
+#[pd_host_function(name = "http::sse_summary::bytes_received")]
+pub(super) fn sse_bytes_received(summary: ResourceRef<'_, SseSummary>) -> i64 {
+    summary.bytes_received
+}
+
+/// Read the request body octet count.
+#[pd_host_function(name = "http::sse_summary::bytes_sent")]
+pub(super) fn sse_bytes_sent(summary: ResourceRef<'_, SseSummary>) -> i64 {
+    summary.bytes_sent
+}
+
+fn sse_headers_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        "http::sse_summary::headers",
+        vec![HostParamSchema::with_passing(
+            "summary",
+            HostTypeSchema::Resource(ResourceTypeKey::new("http.sse_summary").expect("static key")),
+            HostParamPassing::Borrow,
+        )],
+        HostTypeSchema::Resource(ResourceTypeKey::new("http.headers").expect("static key")),
+    )
+}
+
+/// Copy response headers into an independent immutable resource.
+#[pd_host_function(name = "http::sse_summary::headers", contract = sse_headers_contract)]
+pub(super) fn sse_headers(vm: &mut Vm, summary: i64) -> VmResult<i64> {
+    let handle = crate::vm::resource::ResourceHandle::from_raw(summary as u64)
+        .map_err(|error| VmError::HostError(error.to_string()))?;
+    let headers = vm
+        .host_context()
+        .borrow_resource_with_key::<SseSummary>(
+            handle,
+            &ResourceTypeKey::new("http.sse_summary").expect("static key"),
+        )
+        .map_err(super::request::host_boundary_error)?
+        .headers
+        .clone();
+    let token = vm
+        .host_context()
+        .push_resource(headers)
+        .map_err(super::request::host_boundary_error)?;
+    Ok(token.handle().raw() as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_accessors_reject_wrong_kind_and_stale_handles() {
+        let mut vm = Vm::new(crate::vm::Program::new(
+            Vec::new(),
+            vec![crate::vm::OpCode::Ret as u8],
+        ));
+        let summary = vm
+            .host_context()
+            .push_resource(SseSummary {
+                outcome: "eof".into(),
+                status: 200,
+                headers: HttpHeaders(Vec::new()),
+                url: "http://example.test/".into(),
+                items: 0,
+                bytes_received: 0,
+                bytes_sent: 0,
+            })
+            .unwrap();
+        let wrong = vm
+            .host_context()
+            .push_resource(HttpHeaders(Vec::new()))
+            .unwrap();
+        let raw = Value::Int(summary.handle().raw() as i64);
+        assert_eq!(sse_outcome(&mut vm, &[raw.clone()]).unwrap(), "eof");
+        assert!(sse_outcome(&mut vm, &[Value::Int(wrong.handle().raw() as i64)]).is_err());
+        assert!(sse_headers(&mut vm, &[Value::Int(wrong.handle().raw() as i64)]).is_err());
+        vm.host_context()
+            .close_resource::<SseSummary>(summary.handle(), ResourceCloseReason::Requested)
+            .unwrap();
+        assert!(sse_outcome(&mut vm, &[raw.clone()]).is_err());
+        assert!(sse_headers(&mut vm, &[raw]).is_err());
+    }
 
     #[test]
     fn independent_headers_resource_preserves_duplicate_values_and_closes() {

@@ -3,11 +3,10 @@ use std::time::{Duration, Instant};
 
 use pd_host_function::pd_host_function;
 
-use super::{arg, borrow_arg, take_arg};
+use super::{arg, borrow_arg};
 use crate::HostCallResult;
 use crate::host_api::{
-    HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema, HostStructField,
-    HostStructSchema, HostTypeSchema,
+    HostApiCatalog, HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema,
 };
 use crate::vm::{HostFunctionRegistry, Vm, VmError, VmResult};
 
@@ -190,6 +189,7 @@ pub fn http_host_catalog() -> Arc<HostApiCatalog> {
                 request_builder_resource,
                 buffered_response_resource,
                 http_headers_resource,
+                sse_summary_resource,
             ],
             HTTP_NAMED_STRUCTS,
         )
@@ -216,43 +216,26 @@ fn buffered_request_contract() -> HostFunctionSchema {
 
 /// Guest contract for `http::client::sse`.
 ///
-/// The callback observes one typed `SseEvent` and returns a typed
-/// `SseCallbackAction`; the stream resolves to a typed `SseSummary`.
+/// SSE streams return an immutable summary resource and invoke positional callbacks.
 fn http_sse_contract() -> HostFunctionSchema {
-    let response_header = http_response_header_struct(&http_header_value_struct());
-    let callback = HostTypeSchema::Callable {
-        params: vec![sse_event_struct(&response_header).as_type()],
-        result: Box::new(sse_callback_action_struct().as_type()),
-    };
-    HostFunctionSchema::with_return(
-        "http::client::sse",
-        vec![
-            HostParamSchema::value(
-                "request",
-                sse_request_struct(&http_request_header_struct(), &http_request_body_struct())
-                    .as_type(),
-            ),
-            HostParamSchema::with_passing("on_event", callback, HostParamPassing::Value),
-        ],
-        sse_summary_struct(&response_header).as_type(),
-    )
+    sse::sse_contract(false, false)
 }
 
-/// The HTTP named structs, in the published declaration order.
-///
-/// The bodies come from the descriptors; this list is the published order and
-/// documentation, so a descriptor-derived catalog renders identically.
-const HTTP_NAMED_STRUCTS: &[(&str, &str)] = &[
-    ("HttpRequestHeader", ""),
-    ("HttpHeaderValue", ""),
-    ("HttpResponseHeader", ""),
-    ("HttpRequestBody", ""),
-    ("SseEvent", ""),
-    ("HttpRequest", ""),
-    ("SseRequest", ""),
-    ("SseCallbackAction", ""),
-    ("SseSummary", ""),
-];
+fn http_sse_open_contract() -> HostFunctionSchema {
+    sse::sse_contract(true, false)
+}
+
+fn http_sse_only_timeout_contract() -> HostFunctionSchema {
+    sse::sse_contract(false, true)
+}
+
+fn http_sse_timeout_contract() -> HostFunctionSchema {
+    sse::sse_contract(true, true)
+}
+
+/// The SSE surface uses resource types and positional callbacks; it declares
+/// no host named structs.
+const HTTP_NAMED_STRUCTS: &[(&str, &str)] = &[];
 
 /// The HTTP host catalog surface: one descriptor per `http::client::*` member.
 const HTTP_CATALOG_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
@@ -268,7 +251,17 @@ const HTTP_CATALOG_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescr
     resources::body_descriptor,
     resources::headers_values_descriptor,
     resources::headers_names_descriptor,
+    resources::sse_outcome_descriptor,
+    resources::sse_status_descriptor,
+    resources::sse_headers_descriptor,
+    resources::sse_url_descriptor,
+    resources::sse_items_descriptor,
+    resources::sse_bytes_received_descriptor,
+    resources::sse_bytes_sent_descriptor,
     sse::builtin_http_client_sse_descriptor,
+    sse::builtin_http_client_sse_open_descriptor,
+    sse::builtin_http_client_sse_only_timeout_descriptor,
+    sse::builtin_http_client_sse_timeout_descriptor,
 ];
 
 fn http_catalog_module() -> crate::host_extension::HostModuleDescriptor {
@@ -282,6 +275,7 @@ fn http_catalog_module() -> crate::host_extension::HostModuleDescriptor {
             request_builder_resource,
             buffered_response_resource,
             http_headers_resource,
+            sse_summary_resource,
         ],
     )
 }
@@ -296,118 +290,6 @@ pub(super) fn http_host_module() -> super::host_modules::StandardHostModule {
         owned: HTTP_CATALOG_FUNCTIONS,
         named_structs: HTTP_NAMED_STRUCTS,
     }
-}
-
-fn opt(inner: HostTypeSchema) -> HostTypeSchema {
-    HostTypeSchema::Optional(Box::new(inner))
-}
-
-pub(super) fn array(inner: HostTypeSchema) -> HostTypeSchema {
-    HostTypeSchema::Array(Box::new(inner))
-}
-
-pub(super) fn http_request_header_struct() -> HostStructSchema {
-    HostStructSchema::new(
-        "HttpRequestHeader",
-        vec![
-            HostStructField::new("name", HostTypeSchema::String),
-            HostStructField::new("value", HostTypeSchema::String),
-        ],
-    )
-}
-
-pub(super) fn http_header_value_struct() -> HostStructSchema {
-    HostStructSchema::new(
-        "HttpHeaderValue",
-        vec![
-            HostStructField::new("kind", HostTypeSchema::String),
-            HostStructField::new("text", opt(HostTypeSchema::String)),
-            HostStructField::new("bytes", opt(HostTypeSchema::Bytes)),
-        ],
-    )
-}
-
-pub(super) fn http_response_header_struct(header_value: &HostStructSchema) -> HostStructSchema {
-    HostStructSchema::new(
-        "HttpResponseHeader",
-        vec![
-            HostStructField::new("name", HostTypeSchema::String),
-            HostStructField::new("value", header_value.as_type()),
-        ],
-    )
-}
-
-pub(super) fn http_request_body_struct() -> HostStructSchema {
-    HostStructSchema::new(
-        "HttpRequestBody",
-        vec![
-            HostStructField::new("kind", HostTypeSchema::String),
-            HostStructField::new("text", opt(HostTypeSchema::String)),
-            HostStructField::new("bytes", opt(HostTypeSchema::Bytes)),
-        ],
-    )
-}
-
-pub(super) fn sse_event_struct(response_header: &HostStructSchema) -> HostStructSchema {
-    HostStructSchema::new(
-        "SseEvent",
-        vec![
-            HostStructField::new("kind", HostTypeSchema::String),
-            HostStructField::new("status", opt(HostTypeSchema::Int)),
-            HostStructField::new("headers", opt(array(response_header.as_type()))),
-            HostStructField::new("url", opt(HostTypeSchema::String)),
-            HostStructField::new("event", opt(HostTypeSchema::String)),
-            HostStructField::new("data", opt(HostTypeSchema::String)),
-            HostStructField::new("id", opt(HostTypeSchema::String)),
-            HostStructField::new("retry_ms", opt(HostTypeSchema::Int)),
-        ],
-    )
-}
-
-pub(super) fn http_request_struct(
-    request_header: &HostStructSchema,
-    request_body: &HostStructSchema,
-) -> HostStructSchema {
-    HostStructSchema::new(
-        "HttpRequest",
-        vec![
-            HostStructField::new("method", HostTypeSchema::String),
-            HostStructField::new("url", HostTypeSchema::String),
-            HostStructField::new("headers", opt(array(request_header.as_type()))),
-            HostStructField::new("body", opt(request_body.as_type())),
-        ],
-    )
-}
-
-pub(super) fn sse_request_struct(
-    request_header: &HostStructSchema,
-    request_body: &HostStructSchema,
-) -> HostStructSchema {
-    let mut fields = http_request_struct(request_header, request_body).fields;
-    fields.push(HostStructField::new("timeout_ms", opt(HostTypeSchema::Int)));
-    HostStructSchema::new("SseRequest", fields)
-}
-
-pub(super) fn sse_callback_action_struct() -> HostStructSchema {
-    HostStructSchema::new(
-        "SseCallbackAction",
-        vec![HostStructField::new("action", HostTypeSchema::String)],
-    )
-}
-
-pub(super) fn sse_summary_struct(response_header: &HostStructSchema) -> HostStructSchema {
-    HostStructSchema::new(
-        "SseSummary",
-        vec![
-            HostStructField::new("outcome", HostTypeSchema::String),
-            HostStructField::new("status", HostTypeSchema::Int),
-            HostStructField::new("headers", array(response_header.as_type())),
-            HostStructField::new("url", HostTypeSchema::String),
-            HostStructField::new("items", HostTypeSchema::Int),
-            HostStructField::new("bytes_received", HostTypeSchema::Int),
-            HostStructField::new("bytes_sent", HostTypeSchema::Int),
-        ],
-    )
 }
 
 /// The canonical declarations for the HTTP resource types.
@@ -433,6 +315,10 @@ fn buffered_response_resource() -> crate::host_extension::HostResourceTypeMeta {
 
 fn http_headers_resource() -> crate::host_extension::HostResourceTypeMeta {
     crate::host_extension::HostResourceTypeMeta::of::<resources::HttpHeaders>()
+}
+
+fn sse_summary_resource() -> crate::host_extension::HostResourceTypeMeta {
+    crate::host_extension::HostResourceTypeMeta::of::<resources::SseSummary>()
 }
 
 /// Registers every HTTP host function into `registry` using the exact
