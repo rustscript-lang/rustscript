@@ -854,8 +854,8 @@ impl Vm {
                         crate::vm::execution_scope::ExecutionScopeError::Resource(error),
                     )
                 });
-                if cleanup.is_err() {
-                    self.host.mark_reset_failed(cleanup.as_ref().unwrap_err());
+                if let Err(cleanup_error) = &cleanup {
+                    self.host.mark_reset_failed(cleanup_error);
                 }
                 Poll::Ready(Err(preserve_stream_cleanup(error, cleanup)))
             }
