@@ -60,47 +60,79 @@ fn install_host_driver(vm: &mut Vm) {
         .expect("test async bridge should install");
 }
 
+/// Guest program that builds an unsent request, sends it, and evaluates the
+/// status/body probe tail.
 fn build_request_program(url: String) -> Program {
-    compile_source(&format!(
-        r#"
-        use http;
-        http::client::request({{"method": "GET", "url": "{url}"}});
-        "#
-    ))
-    .expect("HTTP request source should compile")
-    .program
+    build_request_program_with(&url, "GET", None, &[], PROBE_STATUS_AND_BODY)
 }
 
-fn build_request_program_with_method(url: &str, method: &str) -> Program {
-    compile_source(&format!(
-        r#"
-        use http;
-        http::client::request({{"method": "{method}", "url": "{url}", "body": {{ kind: "text", text: "payload" }}}});
-        "#
-    ))
-    .expect("HTTP request source with method should compile")
-    .program
+/// Builds a program that creates a request (`method`, optional text `body`,
+/// optional `headers`), executes it through `http::client::request`, and then
+/// evaluates `tail` with the response resource bound as `response`.
+fn build_request_program_with(
+    url: &str,
+    method: &str,
+    body: Option<&str>,
+    headers: &[(&str, &str)],
+    tail: &str,
+) -> Program {
+    let mut source =
+        format!("use http;\nlet mut req = http::request::new(\"{method}\", \"{url}\");\n");
+    for (name, value) in headers {
+        source.push_str(&format!(
+            "http::request::set_header(&mut req, \"{name}\", \"{value}\");\n"
+        ));
+    }
+    if let Some(body) = body {
+        source.push_str(&format!(
+            "http::request::set_body_text(&mut req, \"{body}\");\n"
+        ));
+    }
+    source.push_str(&format!(
+        "let response = http::client::request(req);\n{tail}\n"
+    ));
+    compile_source(&source)
+        .expect("HTTP request source should compile")
+        .program
 }
 
-fn build_request_program_with_headers(url: &str, method: &str) -> Program {
-    compile_source(&format!(
-        r#"
-        use http;
-        http::client::request({{"method": "{method}", "url": "{url}", "body": {{ kind: "text", text: "payload" }}, "headers": [
-            {{ name: "Authorization", value: "Bearer secret" }},
-            {{ name: "Proxy-Authorization", value: "Basic proxy-secret" }},
-            {{ name: "Cookie", value: "a=b" }},
-            {{ name: "X-Api-Key", value: "api-secret" }},
-            {{ name: "X-Arbitrary", value: "custom-secret" }},
-            {{ name: "Content-Type", value: "application/body" }},
-            {{ name: "Accept", value: "application/json" }},
-            {{ name: "Accept-Language", value: "en-US" }},
-            {{ name: "Accept-Encoding", value: "identity" }}
-        ]}});
-        "#
-    ))
-    .expect("HTTP request source with headers should compile")
-    .program
+/// Probe tail: status and buffered body read through the response resource
+/// accessors.
+const PROBE_STATUS_AND_BODY: &str =
+    "[http::response::status(&response), http::response::body(&response)];";
+
+/// Probe tail: status, ordered header names, and the repeated `X-Raw` /
+/// `X-Repeat` header values read through the response resource accessors.
+const PROBE_STATUS_AND_HEADERS: &str = "[
+    http::response::status(&response),
+    http::response::header_names(&response),
+    http::response::header_values(&response, \"X-Raw\"),
+    http::response::header_values(&response, \"X-Repeat\")
+];";
+
+/// The cross-origin redirect fixture's caller headers: credentials, custom
+/// keys, a body header, and the safe headers that survive a redirect.
+const REDIRECT_FIXTURE_HEADERS: &[(&str, &str)] = &[
+    ("Authorization", "Bearer secret"),
+    ("Proxy-Authorization", "Basic proxy-secret"),
+    ("Cookie", "a=b"),
+    ("X-Api-Key", "api-secret"),
+    ("X-Arbitrary", "custom-secret"),
+    ("Content-Type", "application/body"),
+    ("Accept", "application/json"),
+    ("Accept-Language", "en-US"),
+    ("Accept-Encoding", "identity"),
+];
+
+/// Builds a `POST` request carrying `payload` and `REDIRECT_FIXTURE_HEADERS`.
+fn build_redirect_fixture_program(url: &str) -> Program {
+    build_request_program_with(
+        url,
+        "POST",
+        Some("payload"),
+        REDIRECT_FIXTURE_HEADERS,
+        PROBE_STATUS_AND_BODY,
+    )
 }
 
 const TEST_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -418,12 +450,36 @@ fn spawn_cross_origin_redirect_servers(
     )
 }
 
-fn response_field<'a>(value: &'a Value, key: &str) -> &'a Value {
-    let Value::Map(map) = value else {
-        panic!("expected response map, got {value:?}");
+/// Indexes one probe value out of the response-accessor array produced by the
+/// `PROBE_*` tails.
+fn probe_field(value: &Value, index: usize) -> &Value {
+    let Value::Array(items) = value else {
+        panic!("expected probe array, got {value:?}");
     };
-    map.get(&Value::string(key))
-        .unwrap_or_else(|| panic!("response missing field {key}"))
+    &items[index]
+}
+
+/// Returns the probe array a guest program leaves as its final stack value.
+fn probe_value(vm: &Vm) -> Value {
+    vm.stack()
+        .last()
+        .cloned()
+        .unwrap_or_else(|| panic!("expected probe value on stack: {:?}", vm.stack()))
+}
+
+/// Recovers the original octets of a header value that the accessor encoded as
+/// one Unicode scalar U+0000..U+00FF per raw byte.
+fn raw_octets(value: &Value) -> Vec<u8> {
+    let Value::String(text) = value else {
+        panic!("expected string header value, got {value:?}");
+    };
+    assert!(
+        !text.contains('\u{fffd}'),
+        "raw header value must not contain replacement characters"
+    );
+    text.chars()
+        .map(|scalar| u8::try_from(u32::from(scalar)).expect("one scalar per raw byte"))
+        .collect()
 }
 
 async fn drive_vm_to_halt(vm: &mut Vm) -> Result<(), vm::VmError> {
@@ -446,7 +502,13 @@ async fn run_raw_response(response: Vec<u8>, mut config: HttpConfig) -> Result<V
     config.allowed_hosts = vec!["127.0.0.1".to_string()];
     config.allowed_ports = vec![port];
     config.allow_private_ips = true;
-    let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+    let mut vm = Vm::new(build_request_program_with(
+        &format!("http://127.0.0.1:{port}/"),
+        "GET",
+        None,
+        &[],
+        PROBE_STATUS_AND_HEADERS,
+    ));
     vm.configure_http(config)
         .expect("raw-response HTTP configuration should be valid");
     install_host_driver(&mut vm);
@@ -455,13 +517,19 @@ async fn run_raw_response(response: Vec<u8>, mut config: HttpConfig) -> Result<V
         .expect("default host registry should bind HTTP");
     let outcome = drive_vm_to_halt(&mut vm).await;
     server.join().expect("raw response server should finish");
-    outcome.map(|()| vm.stack()[0].clone())
+    outcome.map(|()| probe_value(&vm))
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
     let (port, server) = spawn_test_server();
-    let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+    let mut vm = Vm::new(build_request_program_with(
+        &format!("http://127.0.0.1:{port}/"),
+        "GET",
+        None,
+        &[],
+        PROBE_STATUS_AND_BODY,
+    ));
     vm.configure_http(local_http_config(port))
         .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
@@ -474,65 +542,45 @@ async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
         .expect("http request should complete");
     server.join().expect("test server should finish");
 
-    assert_eq!(response_field(&vm.stack()[0], "status"), &Value::Int(200));
-    assert_eq!(
-        response_field(&vm.stack()[0], "body"),
-        &Value::bytes(b"ok".to_vec())
-    );
+    let probe = probe_value(&vm);
+    assert_eq!(probe_field(&probe, 0), &Value::Int(200));
+    assert_eq!(probe_field(&probe, 1), &Value::bytes(b"ok".to_vec()));
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn buffered_response_headers_use_canonical_order_duplicates_and_raw_bytes() {
-    let response = run_raw_response(
+    let probe = run_raw_response(
         b"HTTP/1.1 200 OK\r\nX-Repeat: first\r\nX-Repeat: second\r\nX-Raw: \x80\r\nContent-Length: 0\r\n\r\n".to_vec(),
         HttpConfig::default(),
     )
     .await
     .expect("typed response headers should decode");
-    let Value::Array(headers) = response_field(&response, "headers") else {
-        panic!("expected typed response header array");
+    // Probe layout: [status, names, Values(X-Raw), Values(X-Repeat)].
+    assert_eq!(probe_field(&probe, 0), &Value::Int(200));
+    let Value::Array(names) = probe_field(&probe, 1) else {
+        panic!("expected ordered response header names");
     };
-    assert_eq!(headers.len(), 4);
+    // Canonical (lowercase, sorted) order with duplicates preserved.
     assert_eq!(
-        response_field(&headers[0], "name"),
-        &Value::string("content-length")
+        names.as_slice(),
+        [
+            Value::string("content-length"),
+            Value::string("x-raw"),
+            Value::string("x-repeat"),
+            Value::string("x-repeat"),
+        ]
     );
-    assert_eq!(response_field(&headers[1], "name"), &Value::string("x-raw"));
+    let Value::Array(raw_values) = probe_field(&probe, 2) else {
+        panic!("expected X-Raw header values");
+    };
+    assert_eq!(raw_values.len(), 1);
+    assert_eq!(raw_octets(&raw_values[0]), [0x80]);
+    let Value::Array(repeat_values) = probe_field(&probe, 3) else {
+        panic!("expected X-Repeat header values");
+    };
     assert_eq!(
-        response_field(response_field(&headers[1], "value"), "kind"),
-        &Value::string("bytes")
-    );
-    assert_eq!(
-        response_field(response_field(&headers[1], "value"), "text"),
-        &Value::Null
-    );
-    assert_eq!(
-        response_field(response_field(&headers[1], "value"), "bytes"),
-        &Value::bytes(vec![0x80])
-    );
-    assert_eq!(
-        response_field(&headers[2], "name"),
-        &Value::string("x-repeat")
-    );
-    assert_eq!(
-        response_field(response_field(&headers[2], "value"), "kind"),
-        &Value::string("text")
-    );
-    assert_eq!(
-        response_field(response_field(&headers[2], "value"), "text"),
-        &Value::string("first")
-    );
-    assert_eq!(
-        response_field(response_field(&headers[2], "value"), "bytes"),
-        &Value::Null
-    );
-    assert_eq!(
-        response_field(&headers[3], "name"),
-        &Value::string("x-repeat")
-    );
-    assert_eq!(
-        response_field(response_field(&headers[3], "value"), "text"),
-        &Value::string("second")
+        repeat_values.as_slice(),
+        [Value::string("first"), Value::string("second")]
     );
 }
 
@@ -540,22 +588,18 @@ async fn buffered_response_headers_use_canonical_order_duplicates_and_raw_bytes(
 async fn buffered_request_preserves_duplicate_header_order() {
     let (port, requests, server) =
         spawn_recording_response_server(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec());
-    let source = format!(
-        r#"
-        use http;
-        http::client::request({{
-            method: "GET",
-            url: "http://127.0.0.1:{port}/",
-            headers: [
-                {{ name: "x-order", value: "first" }},
-                {{ name: "x-order", value: "second" }},
-                {{ name: "x-order", value: "third" }}
-            ]
-        }});
-        "#
+    let program = build_request_program_with(
+        &format!("http://127.0.0.1:{port}/"),
+        "GET",
+        None,
+        &[
+            ("x-order", "first"),
+            ("x-order", "second"),
+            ("x-order", "third"),
+        ],
+        PROBE_STATUS_AND_BODY,
     );
-    let compiled = compile_source(&source).expect("duplicate headers should compile");
-    let mut vm = Vm::new(compiled.program);
+    let mut vm = Vm::new(program);
     vm.configure_http(local_http_config(port))
         .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
@@ -571,10 +615,9 @@ async fn buffered_request_preserves_duplicate_header_order() {
         header_values(&request, "x-order"),
         ["first", "second", "third"]
     );
-    assert_eq!(
-        response_field(&vm.stack()[0], "body"),
-        &Value::bytes(b"ok".to_vec())
-    );
+    let probe = probe_value(&vm);
+    assert_eq!(probe_field(&probe, 0), &Value::Int(200));
+    assert_eq!(probe_field(&probe, 1), &Value::bytes(b"ok".to_vec()));
     server.join().expect("recording server should finish");
 }
 
@@ -583,9 +626,12 @@ async fn buffered_redirect_rewrites_only_post_for_301_and_302() {
     for status in [301, 302] {
         for method in ["POST", "PUT", "PATCH", "DELETE", "OPTIONS"] {
             let (port, requests, server) = spawn_redirect_server(status, 1);
-            let mut vm = Vm::new(build_request_program_with_method(
+            let mut vm = Vm::new(build_request_program_with(
                 &format!("http://127.0.0.1:{port}/start"),
                 method,
+                Some("payload"),
+                &[],
+                PROBE_STATUS_AND_BODY,
             ));
             vm.configure_http(local_http_config(port))
                 .expect("HTTP configuration should be valid");
@@ -597,7 +643,7 @@ async fn buffered_redirect_rewrites_only_post_for_301_and_302() {
             drive_vm_to_halt(&mut vm)
                 .await
                 .expect("redirected request should complete");
-            assert_eq!(response_field(&vm.stack()[0], "status"), &Value::Int(200));
+            assert_eq!(probe_field(&probe_value(&vm), 0), &Value::Int(200));
 
             let first = requests.recv().expect("initial request should be recorded");
             let second = requests
@@ -635,10 +681,9 @@ async fn buffered_cross_origin_redirect_strips_credentials_and_custom_headers() 
         ) = spawn_cross_origin_redirect_servers(status);
         let mut http_config = local_http_config(source_port);
         http_config.allowed_ports.push(target_port);
-        let mut vm = Vm::new(build_request_program_with_headers(
-            &format!("http://127.0.0.1:{source_port}/start"),
-            "POST",
-        ));
+        let mut vm = Vm::new(build_redirect_fixture_program(&format!(
+            "http://127.0.0.1:{source_port}/start"
+        )));
         vm.configure_http(http_config)
             .expect("HTTP configuration should be valid");
         install_host_driver(&mut vm);
@@ -649,7 +694,7 @@ async fn buffered_cross_origin_redirect_strips_credentials_and_custom_headers() 
         drive_vm_to_halt(&mut vm)
             .await
             .expect("cross-origin redirect should complete");
-        assert_eq!(response_field(&vm.stack()[0], "status"), &Value::Int(200));
+        assert_eq!(probe_field(&probe_value(&vm), 0), &Value::Int(200));
 
         let first = source_requests
             .recv()
@@ -722,10 +767,9 @@ async fn buffered_cross_origin_redirect_strips_credentials_and_custom_headers() 
 async fn buffered_same_origin_redirect_preserves_caller_header_values() {
     for status in [301, 302, 303, 307, 308] {
         let (port, requests, server) = spawn_redirect_server(status, 1);
-        let mut vm = Vm::new(build_request_program_with_headers(
-            &format!("http://127.0.0.1:{port}/start"),
-            "POST",
-        ));
+        let mut vm = Vm::new(build_redirect_fixture_program(&format!(
+            "http://127.0.0.1:{port}/start"
+        )));
         vm.configure_http(local_http_config(port))
             .expect("HTTP configuration should be valid");
         install_host_driver(&mut vm);
@@ -830,7 +874,7 @@ async fn buffered_response_limits_reject_adversarial_framing_and_exact_head_over
     let exact = run_raw_response(response_head_with_size(64 * 1024), HttpConfig::default())
         .await
         .expect("a response head at the exact limit should be accepted");
-    assert_eq!(response_field(&exact, "status"), &Value::Int(204));
+    assert_eq!(probe_field(&exact, 0), &Value::Int(204));
 
     let error = run_raw_response(
         response_head_with_size(64 * 1024 + 1),
@@ -860,11 +904,9 @@ async fn buffered_redirect_chain_reaches_final_body() {
     drive_vm_to_halt(&mut vm)
         .await
         .expect("redirect chain should complete");
-    assert_eq!(response_field(&vm.stack()[0], "status"), &Value::Int(200));
-    assert_eq!(
-        response_field(&vm.stack()[0], "body"),
-        &Value::bytes(b"ok".to_vec())
-    );
+    let probe = probe_value(&vm);
+    assert_eq!(probe_field(&probe, 0), &Value::Int(200));
+    assert_eq!(probe_field(&probe, 1), &Value::bytes(b"ok".to_vec()));
     for _ in 0..3 {
         requests
             .recv()
@@ -875,7 +917,7 @@ async fn buffered_redirect_chain_reaches_final_body() {
 
 #[test]
 fn http_host_rejects_targets_until_an_explicit_policy_allows_them() {
-    let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
+    let mut vm = Vm::new(build_capability_program("http://127.0.0.1:1/"));
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
@@ -889,6 +931,23 @@ fn http_host_rejects_targets_until_an_explicit_policy_allows_them() {
                 .contains("HTTP target host is not allowed"),
         "unexpected error: {error}"
     );
+}
+
+/// Builds a program whose only host imports are the request-builder pair
+/// `http::request::new` + `http::client::request`: used by the capability and
+/// binding-plan provenance tests, which reason about the import surface.
+fn build_capability_program(url: &str) -> Program {
+    build_request_program_with(url, "GET", None, &[], "response;")
+}
+
+/// Grants every host import a program uses, mirroring what an embedder must
+/// authorize before binding a restricted registry to that program.
+fn allow_program_imports(registry: &mut HostFunctionRegistry, program: &Program) {
+    for import in &program.imports {
+        registry
+            .allow_builtin(&import.name)
+            .unwrap_or_else(|error| panic!("import {} should be known: {error}", import.name));
+    }
 }
 
 #[test]
@@ -906,11 +965,17 @@ fn empty_registry_keeps_language_builtins_but_rejects_http_capability() {
         VmStatus::Halted
     );
 
-    let mut http_vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
+    let mut http_vm = Vm::new(build_capability_program("http://127.0.0.1:1/"));
     let error = HostFunctionRegistry::restricted()
         .bind_vm_cached(&mut http_vm)
         .expect_err("unapproved HTTP capability must fail during preflight");
-    assert!(error.to_string().contains("http::client::request"));
+    assert!(
+        error
+            .to_string()
+            .contains("capability profile does not allow host import")
+            && error.to_string().contains("http::"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -929,7 +994,7 @@ io::open("/tmp/rustscript-capability-test", "r");"#,
 
 #[test]
 fn capability_binding_plan_cannot_cross_registry_profiles() {
-    let program = build_request_program("http://127.0.0.1:1/".to_string());
+    let program = build_capability_program("http://127.0.0.1:1/");
     let unrestricted = HostFunctionRegistry::new();
     let plan = unrestricted
         .prepare_plan_with_schemas(&program.imports, program.host_import_schemas())
@@ -943,7 +1008,7 @@ fn capability_binding_plan_cannot_cross_registry_profiles() {
 
 #[test]
 fn capability_binding_plan_cannot_outlive_registry_mutation() {
-    let program = build_request_program("http://127.0.0.1:1/".to_string());
+    let program = build_capability_program("http://127.0.0.1:1/");
     let mut registry = HostFunctionRegistry::new();
     let plan = registry
         .prepare_plan_with_schemas(&program.imports, program.host_import_schemas())
@@ -960,11 +1025,9 @@ fn capability_binding_plan_cannot_outlive_registry_mutation() {
 
 #[test]
 fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
-    let unchanged_program = build_request_program("http://127.0.0.1:1/".to_string());
+    let unchanged_program = build_capability_program("http://127.0.0.1:1/");
     let mut unchanged_registry = HostFunctionRegistry::restricted();
-    unchanged_registry
-        .allow_builtin("http::client::request")
-        .expect("HTTP capability should be known");
+    allow_program_imports(&mut unchanged_registry, &unchanged_program);
     let unchanged_plan = unchanged_registry
         .prepare_plan_with_schemas(
             &unchanged_program.imports,
@@ -977,13 +1040,11 @@ fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
         .bind_vm_with_plan(&mut unchanged_vm, &unchanged_plan)
         .expect("an unchanged registry clone should reuse the plan");
 
-    let branch_program = build_request_program("http://127.0.0.1:1/".to_string());
+    let branch_program = build_capability_program("http://127.0.0.1:1/");
     let branch_registry = HostFunctionRegistry::restricted();
     let mut first_mutation = branch_registry.clone();
     let mut second_mutation = branch_registry;
-    first_mutation
-        .allow_builtin("http::client::request")
-        .expect("HTTP capability should be known");
+    allow_program_imports(&mut first_mutation, &branch_program);
     second_mutation
         .allow_builtin("io::open")
         .expect("io capability should be known");
@@ -1002,7 +1063,7 @@ fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
 
 #[test]
 fn registry_state_rejects_structural_sibling_mutations() {
-    let program = build_request_program("http://127.0.0.1:1/".to_string());
+    let program = build_capability_program("http://127.0.0.1:1/");
     let registry = HostFunctionRegistry::new();
     let mut source = registry.clone();
     let destination = registry;
@@ -1021,12 +1082,12 @@ fn registry_state_rejects_structural_sibling_mutations() {
 
 #[test]
 fn cached_plan_refreshes_after_a_sibling_registry_mutation() {
-    let program = build_request_program("http://127.0.0.1:1/".to_string());
+    let program = build_capability_program("http://127.0.0.1:1/");
     let registry = HostFunctionRegistry::new();
     let mut mutating_sibling = registry.clone();
     let destination = registry;
 
-    let mut priming_vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
+    let mut priming_vm = Vm::new(build_capability_program("http://127.0.0.1:1/"));
     destination
         .bind_vm_cached(&mut priming_vm)
         .expect("destination should prime its plan cache");
@@ -1061,7 +1122,7 @@ async fn max_stream_duration_does_not_shorten_buffered_requests() {
     install_host_driver(&mut vm);
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
     drive_vm_to_halt(&mut vm).await.unwrap();
-    assert_eq!(response_field(&vm.stack()[0], "status"), &Value::Int(200));
+    assert_eq!(probe_field(&probe_value(&vm), 0), &Value::Int(200));
     server.join().unwrap();
 }
 
@@ -1078,9 +1139,7 @@ async fn explicitly_allowed_http_capability_reaches_http_policy() {
     .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
     let mut registry = HostFunctionRegistry::restricted();
-    registry
-        .allow_builtin("http::client::request")
-        .expect("HTTP builtin should be explicitly allowlisted");
+    allow_program_imports(&mut registry, vm.program());
     registry
         .bind_vm_cached(&mut vm)
         .expect("explicit capability plan should bind");
@@ -1326,7 +1385,7 @@ async fn reset_retires_buffered_http_future_and_releases_its_permit() {
     drive_vm_to_halt(&mut vm)
         .await
         .expect("replacement request should acquire the released permit");
-    assert_eq!(response_field(&vm.stack()[0], "status"), &Value::Int(200));
+    assert_eq!(probe_field(&probe_value(&vm), 0), &Value::Int(200));
     server.join().expect("pending server should finish");
 }
 

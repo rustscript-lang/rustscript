@@ -131,17 +131,14 @@ async fn finish_reset(vm: &mut Vm) -> VmResult<()> {
     Ok(())
 }
 
-fn response_field<'a>(value: &'a Value, key: &str) -> &'a Value {
-    let Value::Map(map) = value else {
-        panic!("expected response map, got {value:?}");
-    };
-    map.get(&Value::string(key))
-        .unwrap_or_else(|| panic!("response missing field {key}"))
-}
-
+/// Guest source that issues one HTTP GET through the resource request API and
+/// leaves the response status as the final stack value.
 fn http_request_source(port: u16) -> String {
     format!(
-        "use http; http::client::request({{\"method\": \"GET\", \"url\": \"http://127.0.0.1:{port}/\"}});"
+        "use http; \
+         let req = http::request::new(\"GET\", \"http://127.0.0.1:{port}/\"); \
+         let response = http::client::request(req); \
+         http::response::status(&response);"
     )
 }
 
@@ -179,8 +176,9 @@ async fn io_and_http_execute_together() {
         use io;
         use http;
         let exists = io::exists("/");
-        let response = http::client::request({{"method": "GET", "url": "http://127.0.0.1:{port}/"}});
-        response.status;
+        let req = http::request::new("GET", "http://127.0.0.1:{port}/");
+        let response = http::client::request(req);
+        http::response::status(&response);
         "#
     );
     let compiled = compile_source(&source).expect("combined source should compile");
@@ -295,9 +293,10 @@ async fn worker_cleanup_reaches_quiescence_after_io_and_http() {
         r#"
         use io;
         use http;
-        let response = http::client::request({{"method": "GET", "url": "http://127.0.0.1:{port}/"}});
+        let req = http::request::new("GET", "http://127.0.0.1:{port}/");
+        let response = http::client::request(req);
         let exists = io::exists("/");
-        response.status;
+        http::response::status(&response);
         "#
     );
     let compiled = compile_source(&source).expect("combined source should compile");
@@ -380,7 +379,8 @@ fn explicit_standard_catalog_emits_exact_http_import_schema() {
     let compiled = vm::compile_source_with_flavor_and_options(
         r#"
         use http;
-        http::client::request({"method": "GET", "url": "http://127.0.0.1:1/"});
+        let req = http::request::new("GET", "http://127.0.0.1:1/");
+        http::client::request(req);
         "#,
         vm::SourceFlavor::RustScript,
         vm::CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog)),
@@ -416,8 +416,9 @@ async fn combined_standard_http_exact_bind_executes_with_io_surface_present() {
         r#"
         use io;
         use http;
-        let response = http::client::request({{"method": "GET", "url": "http://127.0.0.1:{port}/"}});
-        response;
+        let req = http::request::new("GET", "http://127.0.0.1:{port}/");
+        let response = http::client::request(req);
+        http::response::status(&response);
         "#
     );
     let compiled = vm::compile_source_with_flavor_and_options(
@@ -450,7 +451,7 @@ async fn combined_standard_http_exact_bind_executes_with_io_surface_present() {
         .await
         .expect("combined exact HTTP request should complete");
     server.join().expect("HTTP server should finish");
-    assert_eq!(response_field(&vm.stack()[0], "status"), &Value::Int(200));
+    assert_eq!(vm.stack().last(), Some(&Value::Int(200)));
 }
 
 #[test]
