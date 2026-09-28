@@ -68,7 +68,18 @@ impl HttpHeaders {
             .0
             .iter()
             .filter(|(entry, _)| entry == name)
-            .map(|(_, value)| Value::string(String::from_utf8_lossy(value.as_bytes()).into_owned()))
+            // One Unicode scalar U+0000..U+00FF per raw byte; scalar <= 255
+            // re-encoding recovers the original octet, even for valid UTF-8 bytes.
+            .map(|(_, value)| {
+                Value::string(
+                    value
+                        .as_bytes()
+                        .iter()
+                        .copied()
+                        .map(char::from)
+                        .collect::<String>(),
+                )
+            })
             .collect())
     }
 
@@ -308,6 +319,8 @@ pub(super) fn url(response: ResourceRef<'_, HttpResponse>) -> String {
 }
 
 /// Read repeated header values from the buffered response.
+/// Each raw byte becomes one Unicode scalar U+0000..U+00FF; converting each
+/// scalar <= 255 back to an octet recovers the original header value.
 #[pd_host_function(name = "http::response::header_values", contract = response_values_contract)]
 pub(super) fn response_header_values(
     response: ResourceRef<'_, HttpResponse>,
@@ -329,6 +342,8 @@ pub(super) fn body(response: ResourceRef<'_, HttpResponse>) -> VmBytes {
 }
 
 /// Read repeated values from an independent headers resource.
+/// Each raw byte becomes one Unicode scalar U+0000..U+00FF; converting each
+/// scalar <= 255 back to an octet recovers the original header value.
 #[pd_host_function(name = "http::headers::values", contract = header_values_contract)]
 pub(super) fn headers_values(
     headers: ResourceRef<'_, HttpHeaders>,
@@ -382,5 +397,31 @@ mod tests {
             CloseProgress::Ready
         ));
         assert!(headers_names(&mut vm, &[handle]).is_err());
+    }
+
+    #[test]
+    fn independent_headers_resource_maps_each_octet_to_one_scalar() {
+        let mut vm = Vm::new(crate::vm::Program::new(
+            Vec::new(),
+            vec![crate::vm::OpCode::Ret as u8],
+        ));
+        let token = vm
+            .host_context()
+            .push_resource(HttpHeaders(vec![
+                (
+                    hyper::header::HeaderName::from_static("x-raw"),
+                    hyper::header::HeaderValue::from_bytes(&[0x80]).unwrap(),
+                ),
+                (
+                    hyper::header::HeaderName::from_static("x-raw"),
+                    hyper::header::HeaderValue::from_bytes(&[0xc3, 0xa9]).unwrap(),
+                ),
+            ]))
+            .unwrap();
+        let handle = Value::Int(token.handle().raw() as i64);
+        assert_eq!(
+            headers_values(&mut vm, &[handle, Value::string("X-Raw")]).unwrap(),
+            vec![Value::string("\u{80}"), Value::string("\u{c3}\u{a9}")],
+        );
     }
 }

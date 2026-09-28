@@ -258,3 +258,76 @@ fn buffered_resource_request_reads_status_body_and_repeated_headers() {
     vm.reset_for_reuse().unwrap();
     assert_eq!(vm.host_context().resource_count(), 0);
 }
+
+#[test]
+fn buffered_resource_header_values_recover_raw_response_octets() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nX-Raw: \x80\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+    });
+    let source = format!(
+        r#"use http;
+        let req = http::request::new("GET", "http://127.0.0.1:{port}/");
+        let response = http::client::request(req);
+        http::response::header_values(&response, "X-Raw");"#
+    );
+    let mut vm = Vm::new(compile_source(&source).unwrap().program);
+    vm.configure_http(HttpConfig {
+        allowed_schemes: vec!["http".to_string()],
+        allowed_hosts: vec!["127.0.0.1".to_string()],
+        allowed_ports: vec![port],
+        allow_private_ips: true,
+        ..Default::default()
+    })
+    .unwrap();
+    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
+    let mut state = vm.run().expect("run request");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    loop {
+        state = match state {
+            VmStatus::Halted => break,
+            VmStatus::Yielded => vm.resume().unwrap(),
+            VmStatus::Waiting(_) => {
+                runtime
+                    .block_on(vm.await_waiting_host_op())
+                    .expect("await worker");
+                vm.resume().expect("resume worker")
+            }
+        };
+    }
+    server.join().unwrap();
+    let Some(Value::Array(values)) = vm.stack().last() else {
+        panic!("expected header values: {:?}", vm.stack());
+    };
+    let [Value::String(value)] = values.as_slice() else {
+        panic!("expected one string header value: {values:?}");
+    };
+    assert!(!value.contains('\u{fffd}'));
+    let octets: Vec<u8> = value
+        .chars()
+        .map(|scalar| u8::try_from(u32::from(scalar)).expect("one scalar per raw byte"))
+        .collect();
+    assert_eq!(octets, [0x80]);
+}
