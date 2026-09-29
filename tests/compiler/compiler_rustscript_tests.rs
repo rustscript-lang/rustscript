@@ -3886,6 +3886,73 @@ fn rustscript_optional_chain_rejects_statistically_mismatched_declared_schemas()
 }
 
 #[test]
+fn rustscript_typed_captured_closure_prototype_keeps_declared_callable_schema() {
+    let compiled = vm::compile_source_with_flavor(
+        r#"
+            fn run() -> bool {
+                let url: string = "http://127.0.0.1/";
+                let body: string = "body";
+                let mut text: string = "";
+                let mut reason: string = "";
+                let mut received: int = 0;
+                let mut emitted: int = 0;
+                let mut total: int = 0;
+                let mut tools: array = [];
+                let mut done: bool = false;
+                let callback: fn(string, string, string, string) -> bool = |kind, data, id, retry| if data == "done" => {
+                    done = true;
+                    false
+                } else => {
+                    text = text + data;
+                    reason = kind + id + retry;
+                    received += 1;
+                    emitted += 1;
+                    total += 1;
+                    tools = [data];
+                    true
+                };
+                callback("message", "body", "url", "")
+            }
+            run();
+            fn later(seed: string) -> string {
+                let a0: string = seed;
+                let a1: string = a0 + seed;
+                let a2: string = a1 + seed;
+                let a3: string = a2 + seed;
+                let a4: string = a3 + seed;
+                let a5: string = a4 + seed;
+                let a6: string = a5 + seed;
+                let a7: string = a6 + seed;
+                let a8: string = a7 + seed;
+                let a9: string = a8 + seed;
+                let a10: string = a9 + seed;
+                let a11: string = a10 + seed;
+                let a12: string = a11 + seed;
+                let a13: string = a12 + seed;
+                let a14: string = a13 + seed;
+                a14
+            }
+        "#,
+        SourceFlavor::RustScript,
+    )
+    .expect("typed closure with captured locals should compile");
+    let prototype = compiled
+        .program
+        .callable_prototypes
+        .iter()
+        .find(|prototype| prototype.kind == vm::CallableKind::Closure)
+        .expect("closure prototype");
+    assert_eq!(
+        prototype.schema,
+        Some(vm::TypeSchema::Callable {
+            params: vec![vm::TypeSchema::String; 4],
+            result: Box::new(vm::TypeSchema::Bool),
+        }),
+        "the declared callable schema must survive local-slot reuse"
+    );
+}
+
+#[test]
 fn rustscript_explicit_optional_type_annotations_work() {
     let runtime_cases = vec![
         rustscript_runtime_case(

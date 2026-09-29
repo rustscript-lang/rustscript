@@ -1230,6 +1230,12 @@ impl Compiler {
             }
             if let Expr::Closure(closure) = expr {
                 let prototype_id = self.emit_closure_callable_with_self(closure, Some(slot))?;
+                if let Some(schema @ TypeSchema::Callable { .. }) = declared_schema {
+                    // A reused local slot may carry the schema of an earlier
+                    // value in the whole-program type map. The checked local
+                    // declaration is authoritative for this closure binding.
+                    self.callable_prototypes[prototype_id as usize].schema = Some(schema.clone());
+                }
                 self.callable_prototype_bindings.insert(slot, prototype_id);
             } else {
                 if let Expr::Var(source) | Expr::MoveVar(source) = expr
