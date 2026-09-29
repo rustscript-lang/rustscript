@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use vm::operation::OperationCancelReason;
 use vm::{
     CallOutcome, CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput,
-    HostOpId, HostStackFunction, HttpConfig, HttpHostExt, Value, Vm, VmError, VmMap, VmResult,
-    VmStatus, compile_source,
+    HostOpId, HostStackFunction, HttpConfig, HttpHostExt, Value, Vm, VmError, VmResult, VmStatus,
+    compile_source,
 };
 
 #[derive(Default)]
@@ -84,48 +84,6 @@ impl HostStackFunction for CountCalls {
     }
 }
 
-struct InspectOpenHeaders;
-
-impl HostStackFunction for InspectOpenHeaders {
-    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
-        let [event] = args else {
-            return Err(VmError::HostError(
-                "open-header inspector expected one event".to_string(),
-            ));
-        };
-        let valid = if field(event, "kind") == &Value::string("open")
-            && field(event, "status") == &Value::Int(200)
-            && field(event, "url") != &Value::Null
-            && field(event, "event") == &Value::Null
-            && field(event, "data") == &Value::Null
-            && field(event, "id") == &Value::Null
-            && field(event, "retry_ms") == &Value::Null
-        {
-            match field(event, "headers") {
-                Value::Array(headers) if headers.len() == 5 => {
-                    field(&headers[0], "name") == &Value::string("content-length")
-                        && field(&headers[1], "name") == &Value::string("content-type")
-                        && field(&headers[2], "name") == &Value::string("x-duplicate")
-                        && field(&headers[3], "name") == &Value::string("x-duplicate")
-                        && field(&headers[4], "name") == &Value::string("x-raw")
-                        && field(field(&headers[2], "value"), "kind") == &Value::string("text")
-                        && field(field(&headers[2], "value"), "text") == &Value::string("first")
-                        && field(field(&headers[2], "value"), "bytes") == &Value::Null
-                        && field(field(&headers[3], "value"), "text") == &Value::string("second")
-                        && field(field(&headers[3], "value"), "bytes") == &Value::Null
-                        && field(field(&headers[4], "value"), "kind") == &Value::string("bytes")
-                        && field(field(&headers[4], "value"), "text") == &Value::Null
-                        && field(field(&headers[4], "value"), "bytes") == &Value::bytes(vec![0x80])
-                }
-                _ => false,
-            }
-        } else {
-            false
-        };
-        Ok(CallOutcome::Return(CallReturn::one(Value::Bool(valid))))
-    }
-}
-
 impl HostStackFunction for AsyncWaitOnce {
     fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -139,23 +97,6 @@ impl HostStackFunction for AsyncWaitOnce {
             Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true))))
         }
     }
-}
-
-fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
-    let Value::Map(map) = value else {
-        panic!("expected map, got {value:?}");
-    };
-    map.get(&Value::string(key))
-        .unwrap_or_else(|| panic!("missing field {key}"))
-}
-
-fn map(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
-    Value::Map(Arc::new(VmMap::from_entries(
-        entries
-            .into_iter()
-            .map(|(key, value)| (Value::string(key), value))
-            .collect(),
-    )))
 }
 
 async fn drive(vm: &mut Vm) -> VmResult<()> {
@@ -483,35 +424,32 @@ async fn sse_delivers_open_events_end_and_terminal_summary() {
     let source = format!(
         r#"
         use http;
-        fn record(item: SseEvent) -> SseCallbackAction {{
-            if item.kind == "open" && item.status != 200 {{ let _ = 1 / 0; }}
-            if item.kind == "event" && item.data == "one" && item.event != null {{ let _ = 1 / 0; }}
-            if item.kind == "event" && item.data == "two" && item.event != "named" {{ let _ = 1 / 0; }}
-            if item.kind == "end" && item.status != null {{ let _ = 1 / 0; }}
-            {{action: "continue"}}
+        fn opened(status: int, headers: resource<http.headers>, url: string) -> bool {{
+            status == 200 && url == "http://127.0.0.1:{port}/events"
         }}
-        let result = http::client::sse(
-            {{"method": "GET", "url": "http://127.0.0.1:{port}/events"}},
-            record
-        );
-        result;
+        fn record(kind: string, data: string, id: string, retry: string) -> bool {{
+            let mut valid = false;
+            if data == "one" && kind == "" && id == "" && retry == "" {{ valid = true; }}
+            if data == "two" && kind == "named" {{ valid = true; }}
+            valid
+        }}
+        let req = http::request::new("GET", "http://127.0.0.1:{port}/events");
+        let summary = http::client::sse(req, record, opened);
+        [http::sse_summary::outcome(&summary), http::sse_summary::status(&summary), http::sse_summary::items(&summary), http::sse_summary::bytes_sent(&summary)];
         "#
     );
-    let compiled = compile_source(&source).expect("SSE source should compile");
-    let mut vm = Vm::new(compiled.program);
-    vm.configure_http(config(port)).unwrap();
-    vm.set_async_bridge(Box::<TokioHostDriver>::default())
-        .expect("test async bridge should install");
-    HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
-
-    drive(&mut vm).await.unwrap();
+    let vm = run_sse_source(&source, config(port)).await.unwrap();
     server.join().unwrap();
 
-    let result = &vm.stack()[0];
-    assert_eq!(field(result, "outcome"), &Value::string("eof"));
-    assert_eq!(field(result, "status"), &Value::Int(200));
-    assert_eq!(field(result, "items"), &Value::Int(4));
-    assert_eq!(field(result, "bytes_sent"), &Value::Int(0));
+    assert_eq!(
+        vm.stack().last(),
+        Some(&Value::array(vec![
+            Value::string("eof"),
+            Value::Int(200),
+            Value::Int(2),
+            Value::Int(0),
+        ]))
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -519,52 +457,58 @@ async fn sse_callback_inspects_typed_open_headers() {
     let (port, server) = server(vec![
         b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nX-Duplicate: first\r\nX-Duplicate: second\r\nX-Raw: \x80\r\nContent-Length: 0\r\n\r\n",
     ]);
+    // Each response octet maps to one Unicode scalar U+0000..U+00FF.
+    let raw = "\u{80}";
     let source = format!(
         r#"
         use http;
-        fn inspect_event(item: SseEvent) -> bool;
-        fn inspect(item: SseEvent) -> SseCallbackAction {{
-            {{
-                action: if inspect_event(item) => {{ "stop" }} else => {{ "continue" }}
-            }}
+        fn opened(status: int, headers: resource<http.headers>, url: string) -> bool {{
+            if status != 200 {{ let _ = 1 / 0; }}
+            if url != "http://127.0.0.1:{port}/events" {{ let _ = 1 / 0; }}
+            if http::headers::names(&headers) != [
+                "content-length", "content-type", "x-duplicate", "x-duplicate", "x-raw"
+            ] {{ let _ = 1 / 0; }}
+            if http::headers::values(&headers, "x-duplicate") != ["first", "second"] {{ let _ = 1 / 0; }}
+            if http::headers::values(&headers, "X-Raw") != ["{raw}"] {{ let _ = 1 / 0; }}
+            false
         }}
-        let result = http::client::sse(
-            {{ method: "GET", url: "http://127.0.0.1:{port}/events" }},
-            inspect
-        );
-        result;
+        fn dispatch(kind: string, data: string, id: string, retry: string) -> bool {{ true }}
+        let req = http::request::new("GET", "http://127.0.0.1:{port}/events");
+        let summary = http::client::sse(req, dispatch, opened);
+        [http::sse_summary::outcome(&summary), http::sse_summary::items(&summary)];
         "#
     );
-    let compiled = compile_source(&source).expect("SSE source should compile");
-    let mut vm = Vm::new(compiled.program);
-    vm.configure_http(config(port)).unwrap();
-    vm.set_async_bridge(Box::<TokioHostDriver>::default())
-        .expect("test async bridge should install");
-    let mut registry = HostFunctionRegistry::new();
-    registry.register_stack("inspect_event", 1, || Box::new(InspectOpenHeaders));
-    registry.bind_vm_cached(&mut vm).unwrap();
-    drive(&mut vm).await.expect("SSE request");
-    server.join().expect("SSE server should finish");
-    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("stopped"));
-    assert_eq!(field(&vm.stack()[0], "items"), &Value::Int(1));
+    let vm = run_sse_source(&source, config(port)).await.unwrap();
+    server.join().unwrap();
+    // The typed open inspection is proven by `opened` reaching its final
+    // `false` (a mismatch panics instead); `on_open == false` retires the
+    // stream before any event, so the summary is `stopped` with zero items.
+    assert_eq!(
+        vm.stack().last(),
+        Some(&Value::array(
+            vec![Value::string("stopped"), Value::Int(0),]
+        ))
+    );
 }
 
 #[test]
 fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission() {
-    assert!(compile_source(
-        r#"use http; http::client::sse({"method":"GET","url":"http://127.0.0.1:1/"}, |item| 1);"#
-    )
-    .is_err());
+    // The legacy single-map request/callback/action contract no longer compiles.
+    for source in [
+        r#"use http; fn event(a: string,b: string,c: string,d: string) -> bool { true } http::client::sse({method: "GET", url: "http://example.com"}, event);"#,
+        r#"use http; fn event(a: string,b: string,c: string,d: string) -> int { 1 } let req = http::request::new("GET", "http://example.com"); http::client::sse(req, event);"#,
+        r#"use http; fn event(a: string,b: string,c: string,d: string) -> bool { true } fn opened(status: int, headers: int, url: string) -> bool { true } let req = http::request::new("GET", "http://example.com"); http::client::sse(req, event, opened);"#,
+    ] {
+        assert!(compile_source(source).is_err(), "must reject: {source}");
+    }
 
     for (timeout, expected) in [("0", "positive"), ("-1", "positive")] {
         let source = format!(
             r#"
             use http;
-            fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
-            http::client::sse(
-                {{method: "GET", url: "http://127.0.0.1:1/events", timeout_ms: {timeout}}},
-                callback
-            );
+            fn callback(kind: string, data: string, id: string, retry: string) -> bool {{ true }}
+            let req = http::request::new("GET", "http://127.0.0.1:1/events");
+            http::client::sse(req, callback, {timeout});
             "#
         );
         let compiled = compile_source(&source).unwrap();
@@ -584,11 +528,9 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
         compile_source(
             r#"
             use http;
-            fn callback(item: SseEvent) -> SseCallbackAction { {action: "continue"} }
-            http::client::sse(
-                {method: "GET", url: "http://127.0.0.1:1/events", timeout_ms: "1"},
-                callback
-            );
+            fn callback(kind: string, data: string, id: string, retry: string) -> bool { true }
+            let req = http::request::new("GET", "http://127.0.0.1:1/events");
+            http::client::sse(req, callback, "1");
             "#
         )
         .is_err(),
@@ -597,11 +539,9 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
 
     let source = r#"
         use http;
-        fn callback(item: SseEvent) -> SseCallbackAction { {action: "continue"} }
-        http::client::sse(
-            {method: "GET", url: "http://127.0.0.1:1/events", timeout_ms: 1},
-            callback
-        );
+        fn callback(kind: string, data: string, id: string, retry: string) -> bool { true }
+        let req = http::request::new("GET", "http://127.0.0.1:1/events");
+        http::client::sse(req, callback, 1);
     "#;
     let compiled = compile_source(source).unwrap();
     let mut vm = Vm::new(compiled.program);
@@ -616,11 +556,9 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
 
     let source = r#"
         use http;
-        fn callback(item: SseEvent) -> SseCallbackAction { {action: "continue"} }
-        http::client::sse(
-            {method: "PUT", url: "http://127.0.0.1:1/events"},
-            callback
-        );
+        fn callback(kind: string, data: string, id: string, retry: string) -> bool { true }
+        let req = http::request::new("PUT", "http://127.0.0.1:1/events");
+        http::client::sse(req, callback);
     "#;
     let compiled = compile_source(source).unwrap();
     let mut vm = Vm::new(compiled.program);
@@ -634,11 +572,9 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
 fn sse_admission_does_not_require_a_tokio_reactor() {
     let source = r#"
         use http;
-        fn callback(item: SseEvent) -> SseCallbackAction { {action: "continue"} }
-        http::client::sse(
-            {method: "GET", url: "http://127.0.0.1:1/events"},
-            callback
-        );
+        fn callback(kind: string, data: string, id: string, retry: string) -> bool { true }
+        let req = http::request::new("GET", "http://127.0.0.1:1/events");
+        http::client::sse(req, callback);
     "#;
     let compiled = compile_source(source).unwrap();
     let mut vm = Vm::new(compiled.program);
@@ -658,17 +594,22 @@ async fn sse_accepts_post_with_body() {
     let source = format!(
         r#"
         use http;
-        fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
-        http::client::sse(
-            {{method: "POST", url: "http://127.0.0.1:{port}/events", body: {{ kind: "text", text: "payload" }}}},
-            callback
-        );
+        fn callback(kind: string, data: string, id: string, retry: string) -> bool {{ true }}
+        let mut req = http::request::new("POST", "http://127.0.0.1:{port}/events");
+        http::request::set_body_text(&mut req, "payload");
+        let summary = http::client::sse(req, callback);
+        [http::sse_summary::outcome(&summary), http::sse_summary::bytes_sent(&summary)];
         "#
     );
     let mut vm = run_sse_source(&source, config(port)).await.unwrap();
-    assert_eq!(vm.host_context().resource_count(), 0);
     assert_eq!(vm.host_context().operation_count(), 0);
-    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("eof"));
+    assert_eq!(
+        vm.stack().last(),
+        Some(&Value::array(vec![
+            Value::string("eof"),
+            Value::Int("payload".len() as i64),
+        ]))
+    );
     let request = requests.recv().unwrap();
     assert_eq!(request_line(&request), "POST /events HTTP/1.1");
     assert!(request.ends_with("payload"));
@@ -743,8 +684,10 @@ async fn sse_post_redirect_method_and_body_follow_http_rules() {
         let (port, requests, server) = redirect_server(status);
         let source = format!(
             r#"use http;
-            fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
-            http::client::sse({{method:"POST", url:"http://127.0.0.1:{port}/start", body:{{ kind:"text", text:"payload" }}}}, callback);"#
+            fn callback(kind: string, data: string, id: string, retry: string) -> bool {{ true }}
+            let mut req = http::request::new("POST", "http://127.0.0.1:{port}/start");
+            http::request::set_body_text(&mut req, "payload");
+            http::client::sse(req, callback);"#
         );
         run_sse_source(&source, config(port)).await.unwrap();
         let first = requests.recv().unwrap();
@@ -773,8 +716,9 @@ async fn sse_get_redirect_preserves_get_for_301_and_302() {
         let (port, requests, server) = redirect_server(status);
         let source = format!(
             r#"use http;
-            fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
-            http::client::sse({{method:"GET", url:"http://127.0.0.1:{port}/start"}}, callback);"#
+            fn callback(kind: string, data: string, id: string, retry: string) -> bool {{ true }}
+            let req = http::request::new("GET", "http://127.0.0.1:{port}/start");
+            http::client::sse(req, callback);"#
         );
         run_sse_source(&source, config(port)).await.unwrap();
         let first = requests.recv().unwrap();
@@ -796,11 +740,11 @@ async fn sse_rejects_redirect_userinfo_before_reconnecting() {
     });
     let source = format!(
         r#"use http;
-        fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
-        http::client::sse(
-            {{method:"GET", url:"http://127.0.0.1:{port}/start", headers:[{{name:"Authorization", value:"Bearer secret"}}, {{name:"Cookie", value:"a=b"}}]}},
-            callback
-        );"#
+        fn callback(kind: string, data: string, id: string, retry: string) -> bool {{ true }}
+        let mut req = http::request::new("GET", "http://127.0.0.1:{port}/start");
+        http::request::set_header(&mut req, "Authorization", "Bearer secret");
+        http::request::set_header(&mut req, "Cookie", "a=b");
+        http::client::sse(req, callback);"#
     );
     let error = match run_sse_source(&source, config(port)).await {
         Ok(_) => panic!("redirect userinfo must be rejected"),
@@ -838,11 +782,11 @@ async fn sse_rejects_disallowed_redirect_targets_before_connecting() {
         let (source_port, requests, source_server) = recording_server(vec![vec![redirect]]);
         let source = format!(
             r#"use http;
-            fn callback(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
-            http::client::sse(
-                {{method:"GET", url:"http://127.0.0.1:{source_port}/start", headers:[{{name:"Authorization", value:"Bearer secret"}}, {{name:"Cookie", value:"a=b"}}]}},
-                callback
-            );"#
+            fn callback(kind: string, data: string, id: string, retry: string) -> bool {{ true }}
+            let mut req = http::request::new("GET", "http://127.0.0.1:{source_port}/start");
+            http::request::set_header(&mut req, "Authorization", "Bearer secret");
+            http::request::set_header(&mut req, "Cookie", "a=b");
+            http::client::sse(req, callback);"#
         );
         let mut allowed = config(source_port);
         if allow_target_port {
@@ -873,52 +817,54 @@ async fn sse_stop_retires_without_end_and_returns_stopped_summary() {
     ]);
     let source = format!(
         r#"use http;
-        fn stop(item: SseEvent) -> SseCallbackAction {{ {{action: "stop"}} }}
-        http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, stop);"#
+        fn stop(kind: string, data: string, id: string, retry: string) -> bool {{ false }}
+        let req = http::request::new("GET", "http://127.0.0.1:{port}/events");
+        let summary = http::client::sse(req, stop);
+        [http::sse_summary::outcome(&summary), http::sse_summary::items(&summary)];"#
     );
     let vm = run_sse_source(&source, config(port)).await.unwrap();
     server.join().unwrap();
-    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("stopped"));
-    assert_eq!(field(&vm.stack()[0], "items"), &Value::Int(1));
+    assert_eq!(
+        vm.stack().last(),
+        Some(&Value::array(
+            vec![Value::string("stopped"), Value::Int(1),]
+        ))
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn sse_rejected_nested_admission_rolls_back_before_reset_reuse() {
+    // Every hop must deliver at least one event: the resource contract absorbs
+    // the open item without a callback, so only an event reaches the nested
+    // call that admission rejects.
+    let stream_hop = || {
+        vec![
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+                as &'static [u8],
+            b"9\r\ndata: x\n\n\r\n",
+            b"0\r\n\r\n",
+        ]
+    };
     let (port, _requests, server) = recording_server(vec![
-        vec![
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
-            b"9\r\ndata: x\n\n\r\n",
-            b"0\r\n\r\n",
-        ],
-        vec![b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n"],
-        vec![
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
-            b"9\r\ndata: x\n\n\r\n",
-            b"0\r\n\r\n",
-        ],
-        vec![b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n"],
-        vec![
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
-            b"9\r\ndata: x\n\n\r\n",
-            b"0\r\n\r\n",
-        ],
-        vec![b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n"],
+        stream_hop(),
+        stream_hop(),
+        stream_hop(),
+        stream_hop(),
+        stream_hop(),
+        stream_hop(),
     ]);
     let source = format!(
         r#"
         use http;
-        fn inner(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }}
-        fn outer(item: SseEvent) -> SseCallbackAction {{
-            http::client::sse(
-                {{method: "GET", url: "http://127.0.0.1:{port}/inner"}},
-                inner
-            );
-            {{action: "continue"}}
+        fn inner(kind: string, data: string, id: string, retry: string) -> bool {{ true }}
+        fn outer(kind: string, data: string, id: string, retry: string) -> bool {{
+            let request = http::request::new("GET", "http://127.0.0.1:{port}/inner");
+            http::client::sse(request, inner);
+            true
         }}
-        http::client::sse(
-            {{method: "GET", url: "http://127.0.0.1:{port}/outer"}},
-            outer
-        );
+        let request = http::request::new("GET", "http://127.0.0.1:{port}/outer");
+        let summary = http::client::sse(request, outer);
+        [http::sse_summary::outcome(&summary), http::sse_summary::items(&summary)];
         "#
     );
     let compiled = compile_source(&source).unwrap();
@@ -968,10 +914,10 @@ async fn sse_reset_releases_the_connection_permit_before_reuse() {
     ]);
     let source = format!(
         r#"use http;
-        http::client::sse(
-            {{"method":"GET","url":"http://127.0.0.1:{port}/events"}},
-            |item| {{action: "continue"}}
-        );"#
+        fn callback(kind: string, data: string, id: string, retry: string) -> bool {{ true }}
+        let req = http::request::new("GET", "http://127.0.0.1:{port}/events");
+        let summary = http::client::sse(req, callback);
+        [http::sse_summary::outcome(&summary), http::sse_summary::items(&summary)];"#
     );
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
@@ -992,7 +938,10 @@ async fn sse_reset_releases_the_connection_permit_before_reuse() {
         .await
         .expect("SSE reset should complete");
     drive(&mut vm).await.unwrap();
-    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("eof"));
+    assert_eq!(
+        vm.stack().last(),
+        Some(&Value::array(vec![Value::string("eof"), Value::Int(0),]))
+    );
     assert!(
         requests
             .recv_timeout(std::time::Duration::from_secs(1))
@@ -1007,20 +956,22 @@ async fn sse_reset_while_callback_waits_retires_stream_to_quiescence() {
     let (port, _requests, server) = recording_server(vec![
         vec![
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
-            b"5\r\ndata: x\n\n\r\n",
+            b"9\r\ndata: x\n\n\r\n",
             b"0\r\n\r\n",
         ],
-        vec![b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n"],
+        vec![
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"9\r\ndata: x\n\n\r\n",
+            b"0\r\n\r\n",
+        ],
     ]);
     let source = format!(
         r#"use http;
         fn async_wait() -> bool;
-        http::client::sse(
-            {{"method":"GET","url":"http://127.0.0.1:{port}/events"}},
-            |item| {{
-                action: if async_wait() => {{ "continue" }} else => {{ "continue" }}
-            }}
-        );"#
+        fn callback(kind: string, data: string, id: string, retry: string) -> bool {{ async_wait() }}
+        let req = http::request::new("GET", "http://127.0.0.1:{port}/events");
+        let summary = http::client::sse(req, callback);
+        http::sse_summary::outcome(&summary);"#
     );
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
@@ -1051,8 +1002,11 @@ async fn sse_reset_while_callback_waits_retires_stream_to_quiescence() {
     drive(&mut vm)
         .await
         .expect("the reused VM must reacquire the permit");
-    assert_eq!(wait_calls.load(Ordering::SeqCst), 3);
-    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("eof"));
+    // The callback now runs exactly once per protocol event: the retired stream
+    // contributes one waiting callback and the reused stream one more. The
+    // terminal `end` item no longer exists in the resource contract.
+    assert_eq!(wait_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(vm.stack().last(), Some(&Value::string("eof")));
     server.join().unwrap();
 }
 
@@ -1064,7 +1018,7 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
     ] {
         let (port, server) = server(vec![head]);
         let source = format!(
-            r#"use http; fn go(item: SseEvent) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+            r#"use http; fn go(kind: string, data: string, id: string, retry: string) -> bool {{ true }} let req = http::request::new("GET", "http://127.0.0.1:{port}/events"); http::client::sse(req, go);"#
         );
         let error = match run_sse_source(&source, config(port)).await {
             Ok(_) => panic!("invalid SSE response must fail"),
@@ -1088,7 +1042,7 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
     let mut idle_config = config(port);
     idle_config.stream_idle_timeout = std::time::Duration::from_millis(20);
     let source = format!(
-        r#"use http; fn go(item: SseEvent) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+        r#"use http; fn go(kind: string, data: string, id: string, retry: string) -> bool {{ true }} let req = http::request::new("GET", "http://127.0.0.1:{port}/events"); http::client::sse(req, go);"#
     );
     let error = match run_sse_source(&source, idle_config).await {
         Ok(_) => panic!("idle SSE peer must time out"),
@@ -1109,7 +1063,7 @@ async fn sse_rejects_status_content_type_and_idle_peer() {
     let mut opening_config = config(port);
     opening_config.stream_idle_timeout = std::time::Duration::from_millis(20);
     let source = format!(
-        r#"use http; fn go(item: SseEvent) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+        r#"use http; fn go(kind: string, data: string, id: string, retry: string) -> bool {{ true }} let req = http::request::new("GET", "http://127.0.0.1:{port}/events"); http::client::sse(req, go);"#
     );
     let error = match run_sse_source(&source, opening_config).await {
         Ok(_) => panic!("SSE response opening must obey idle timeout"),
@@ -1136,7 +1090,7 @@ async fn sse_script_timeout_shortens_the_host_stream_duration() {
     deadline_config.max_stream_duration = std::time::Duration::from_millis(200);
     deadline_config.stream_idle_timeout = std::time::Duration::from_millis(200);
     let source = format!(
-        r#"use http; fn go(item: SseEvent) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events","timeout_ms":20}}, go);"#
+        r#"use http; fn go(kind: string, data: string, id: string, retry: string) -> bool {{ true }} let req = http::request::new("GET", "http://127.0.0.1:{port}/events"); http::client::sse(req, go, 20);"#
     );
     let error = match run_sse_source(&source, deadline_config).await {
         Ok(_) => panic!("script deadline should shorten the host maximum"),
@@ -1160,7 +1114,7 @@ async fn sse_host_stream_duration_caps_script_timeout_while_opening() {
     deadline_config.max_stream_duration = std::time::Duration::from_millis(250);
     deadline_config.stream_idle_timeout = std::time::Duration::from_millis(800);
     let source = format!(
-        r#"use http; fn go(item: SseEvent) -> SseCallbackAction {{ {{action:"continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events","timeout_ms":1000}}, go);"#
+        r#"use http; fn go(kind: string, data: string, id: string, retry: string) -> bool {{ true }} let req = http::request::new("GET", "http://127.0.0.1:{port}/events"); http::client::sse(req, go, 1000);"#
     );
     let error = match run_sse_source(&source, deadline_config).await {
         Ok(_) => panic!("host duration should cap the script timeout during opening"),
@@ -1197,10 +1151,12 @@ async fn sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout
     let source = format!(
         r#"use http;
         fn count_call() -> bool;
-        fn go(item: SseEvent) -> SseCallbackAction {{
-            {{action: if count_call() => {{"continue"}} else => {{"continue"}}}}
+        fn go(kind: string, data: string, id: string, retry: string) -> bool {{
+            let called = count_call();
+            true
         }}
-        http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, go);"#
+        let req = http::request::new("GET", "http://127.0.0.1:{port}/events");
+        http::client::sse(req, go);"#
     );
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
@@ -1252,7 +1208,12 @@ async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
         first.join().unwrap();
     });
     let source = format!(
-        r#"use http; http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, |item| {{action:"continue"}});"#
+        r#"
+        use http;
+        fn callback(kind: string, data: string, id: string, retry: string) -> bool {{ true }}
+        let req = http::request::new("GET", "http://127.0.0.1:{port}/events");
+        let summary = http::client::sse(req, callback);
+        http::sse_summary::outcome(&summary);"#
     );
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
@@ -1273,7 +1234,7 @@ async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
     drive(&mut vm)
         .await
         .expect("the second stream should acquire the released permit");
-    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("eof"));
+    assert_eq!(vm.stack().last(), Some(&Value::string("eof")));
     server.join().unwrap();
 }
 
@@ -1291,6 +1252,9 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
             )
             .unwrap();
         first.flush().unwrap();
+        // One protocol event drives the callback past the total deadline.
+        first.write_all(b"9\r\ndata: x\n\n\r\n").unwrap();
+        first.flush().unwrap();
         let first = thread::spawn(move || {
             wait_for_test_timeout(std::time::Duration::from_millis(500));
             drop(first);
@@ -1301,7 +1265,7 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
         assert!(second.read(&mut request).unwrap() > 0);
         second
             .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n9\r\ndata: x\n\n\r\n0\r\n\r\n",
             )
             .unwrap();
         first.join().unwrap();
@@ -1310,12 +1274,10 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
         r#"
         use http;
         fn async_wait() -> bool;
-        http::client::sse(
-            {{"method":"GET","url":"http://127.0.0.1:{port}/events"}},
-            |item| {{
-                action: if async_wait() => {{ "stop" }} else => {{ "stop" }}
-            }}
-        );
+        fn callback(kind: string, data: string, id: string, retry: string) -> bool {{ async_wait() }}
+        let req = http::request::new("GET", "http://127.0.0.1:{port}/events");
+        let summary = http::client::sse(req, callback);
+        http::sse_summary::outcome(&summary);
         "#
     );
     let compiled = compile_source(&source).unwrap();
@@ -1326,7 +1288,7 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
     deadline_config.stream_idle_timeout = std::time::Duration::from_secs(1);
     vm.configure_http(deadline_config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
-        .expect("test async bridge should install");
+        .expect("test async bridge must install");
     let wait_calls = Arc::new(AtomicUsize::new(0));
     let mut registry = HostFunctionRegistry::new();
     registry.register_stack("async_wait", 0, {
@@ -1343,23 +1305,22 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
         .await
         .expect_err("a callback action after the total deadline must fail");
     assert!(
-        matches!(error, VmError::HostError(ref message) if message == "SSE total deadline exceeded"),
+        matches!(error, VmError::HostError(ref message) if message.starts_with("SSE total deadline exceeded")),
         "{error}"
     );
     assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
-    assert!(vm.stack().iter().all(|value| {
-        let Value::Map(map) = value else {
-            return true;
-        };
-        map.get(&Value::string("outcome")) != Some(&Value::string("stopped"))
-    }));
+    // A deadline failure never yields a terminal summary: nothing is pushed and
+    // the scope is left with no live resources or operations.
+    assert!(vm.stack().is_empty(), "stack: {:?}", vm.stack());
+    assert_eq!(vm.host_context().resource_count(), 0);
+    assert_eq!(vm.host_context().operation_count(), 0);
 
     vm.reset_for_reuse().expect("SSE reset should complete");
     drive(&mut vm)
         .await
         .expect("the next stream should acquire the released permit");
     assert_eq!(wait_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("stopped"));
+    assert_eq!(vm.stack().last(), Some(&Value::string("eof")));
     server.join().unwrap();
 }
 
@@ -1377,18 +1338,17 @@ async fn sse_callback_continue_after_deadline_fails_before_another_network_poll(
             )
             .unwrap();
         socket.flush().unwrap();
+        socket.write_all(b"9\r\ndata: x\n\n\r\n").unwrap();
+        socket.flush().unwrap();
         wait_for_test_timeout(std::time::Duration::from_millis(500));
     });
     let source = format!(
         r#"
         use http;
         fn async_wait() -> bool;
-        http::client::sse(
-            {{"method":"GET","url":"http://127.0.0.1:{port}/events"}},
-            |item| {{
-                action: if async_wait() => {{ "continue" }} else => {{ "continue" }}
-            }}
-        );
+        fn callback(kind: string, data: string, id: string, retry: string) -> bool {{ async_wait() }}
+        let req = http::request::new("GET", "http://127.0.0.1:{port}/events");
+        http::client::sse(req, callback);
         "#
     );
     let compiled = compile_source(&source).unwrap();
@@ -1415,7 +1375,7 @@ async fn sse_callback_continue_after_deadline_fails_before_another_network_poll(
         .await
         .expect_err("a continue action after the total deadline must fail");
     assert!(
-        matches!(error, VmError::HostError(ref message) if message == "SSE total deadline exceeded"),
+        matches!(error, VmError::HostError(ref message) if message.starts_with("SSE total deadline exceeded")),
         "{error}"
     );
     assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
@@ -1435,7 +1395,7 @@ async fn sse_chunked_trailers_cannot_bypass_total_body_limits() {
     let mut stream_config = config(port);
     stream_config.max_stream_total_bytes = 9;
     let source = format!(
-        r#"use http; fn on_event(item: SseEvent) -> SseCallbackAction {{ {{action: "continue"}} }} http::client::sse({{"method":"GET","url":"http://127.0.0.1:{port}/events"}}, on_event);"#
+        r#"use http; fn on_event(kind: string, data: string, id: string, retry: string) -> bool {{ true }} let req = http::request::new("GET", "http://127.0.0.1:{port}/events"); http::client::sse(req, on_event);"#
     );
     let error = match run_sse_source(&source, stream_config).await {
         Ok(_) => panic!("oversized SSE trailers must be rejected"),
@@ -1453,112 +1413,63 @@ async fn sse_chunked_trailers_cannot_bypass_total_body_limits() {
 async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
     for status in [301, 302, 303, 307, 308] {
         let (target_port, target_requests, target) = recording_server(vec![vec![
-        b"HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream; Charset=UTF-8\r\nX-Obs: \x80\r\nX-Repeat: first\r\nX-Repeat: second\r\nContent-Length: 0\r\n\r\n",
-    ]]);
+            b"HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream; Charset=UTF-8\r\nX-Obs: \x80\r\nX-Repeat: first\r\nX-Repeat: second\r\nContent-Length: 0\r\n\r\n",
+        ]]);
         let redirect = format!(
             "HTTP/1.1 {status} Redirect\r\nLocation: http://127.0.0.1:{target_port}/final\r\nContent-Length: 0\r\n\r\n"
         );
         let redirect = Box::leak(redirect.into_bytes().into_boxed_slice());
         let (source_port, source_requests, source_server) = recording_server(vec![vec![redirect]]);
+        let raw = "\u{80}";
         let source_code = format!(
             r#"
         use http;
-        fn record(item: SseEvent) -> SseCallbackAction {{
-            if item.kind == "open" && item.status != 200 {{ let _ = 1 / 0; }}
-            if item.kind == "end" && item.status != null {{ let _ = 1 / 0; }}
-            {{action: "continue"}}
+        fn opened(status: int, headers: resource<http.headers>, url: string) -> bool {{
+            status == 200
+            && url == "http://127.0.0.1:{target_port}/final"
+            && http::headers::names(&headers) == [
+                "content-length", "content-type", "x-obs", "x-repeat", "x-repeat"
+            ]
+            && http::headers::values(&headers, "x-obs") == ["{raw}"]
+            && http::headers::values(&headers, "x-repeat") == ["first", "second"]
         }}
-        http::client::sse(
-            {{method: "POST", url: "http://127.0.0.1:{source_port}/start", body: {{ kind: "text", text: "payload" }}, headers: [
-                {{ name: "Authorization", value: "Bearer secret" }},
-                {{ name: "Proxy-Authorization", value: "Basic proxy-secret" }},
-                {{ name: "Cookie", value: "a=b" }},
-                {{ name: "X-Api-Key", value: "api-secret" }},
-                {{ name: "X-Arbitrary", value: "custom-secret" }},
-                {{ name: "Content-Type", value: "application/body" }},
-                {{ name: "Accept", value: "text/event-stream" }},
-                {{ name: "Accept-Language", value: "en-US" }},
-                {{ name: "Accept-Encoding", value: "identity" }}
-            ]}},
-            record
-        );
+        fn record(kind: string, data: string, id: string, retry: string) -> bool {{ true }}
+        let mut req = http::request::new("POST", "http://127.0.0.1:{source_port}/start");
+        http::request::set_body_text(&mut req, "payload");
+        http::request::set_header(&mut req, "Authorization", "Bearer secret");
+        http::request::set_header(&mut req, "Proxy-Authorization", "Basic proxy-secret");
+        http::request::set_header(&mut req, "Cookie", "a=b");
+        http::request::set_header(&mut req, "X-Api-Key", "api-secret");
+        http::request::set_header(&mut req, "X-Arbitrary", "custom-secret");
+        http::request::set_header(&mut req, "Content-Type", "application/body");
+        http::request::set_header(&mut req, "Accept", "text/event-stream");
+        http::request::set_header(&mut req, "Accept-Language", "en-US");
+        http::request::set_header(&mut req, "Accept-Encoding", "identity");
+        let summary = http::client::sse(req, record, opened);
+        [http::sse_summary::outcome(&summary), http::sse_summary::status(&summary),
+         http::sse_summary::url(&summary), http::sse_summary::items(&summary),
+         http::sse_summary::bytes_received(&summary), http::sse_summary::bytes_sent(&summary)];
         "#
         );
         let mut allowed = config(source_port);
         allowed.allowed_ports.push(target_port);
         let vm = run_sse_source(&source_code, allowed).await.unwrap();
         let final_url = format!("http://127.0.0.1:{target_port}/final");
-        assert_eq!(
-            &vm.stack()[0],
-            &map([
-                ("outcome", Value::string("eof")),
-                ("status", Value::Int(200)),
-                (
-                    "headers",
-                    Value::Array(Arc::new(vec![
-                        map([
-                            ("name", Value::string("content-length")),
-                            (
-                                "value",
-                                map([
-                                    ("kind", Value::string("text")),
-                                    ("text", Value::string("0")),
-                                    ("bytes", Value::Null),
-                                ]),
-                            ),
-                        ]),
-                        map([
-                            ("name", Value::string("content-type")),
-                            (
-                                "value",
-                                map([
-                                    ("kind", Value::string("text")),
-                                    ("text", Value::string("Text/Event-Stream; Charset=UTF-8")),
-                                    ("bytes", Value::Null),
-                                ]),
-                            ),
-                        ]),
-                        map([
-                            ("name", Value::string("x-obs")),
-                            (
-                                "value",
-                                map([
-                                    ("kind", Value::string("bytes")),
-                                    ("text", Value::Null),
-                                    ("bytes", Value::bytes(vec![0x80])),
-                                ]),
-                            ),
-                        ]),
-                        map([
-                            ("name", Value::string("x-repeat")),
-                            (
-                                "value",
-                                map([
-                                    ("kind", Value::string("text")),
-                                    ("text", Value::string("first")),
-                                    ("bytes", Value::Null),
-                                ]),
-                            ),
-                        ]),
-                        map([
-                            ("name", Value::string("x-repeat")),
-                            (
-                                "value",
-                                map([
-                                    ("kind", Value::string("text")),
-                                    ("text", Value::string("second")),
-                                    ("bytes", Value::Null),
-                                ]),
-                            ),
-                        ]),
-                    ])),
-                ),
-                ("url", Value::string(final_url)),
-                ("items", Value::Int(2)),
-                ("bytes_received", Value::Int(0)),
-                ("bytes_sent", Value::Int(0)),
-            ])
-        );
+        let Some(Value::Array(values)) = vm.stack().last() else {
+            panic!("stack: {:?}", vm.stack())
+        };
+        assert_eq!(values[0], Value::string("eof"));
+        assert_eq!(values[1], Value::Int(200));
+        assert_eq!(values[2], Value::string(final_url));
+        assert_eq!(values[3], Value::Int(0));
+        // Every hop that actually transmits the body is counted; 301/302/303
+        // rewrite POST to GET and therefore send no body on the second hop.
+        let expected_sent = if status == 307 || status == 308 {
+            2 * "payload".len() as i64
+        } else {
+            "payload".len() as i64
+        };
+        assert_eq!(values[5], Value::Int(expected_sent), "status {status}");
         let first = source_requests.recv().unwrap();
         assert_eq!(request_line(&first), "POST /start HTTP/1.1");
         assert!(first.ends_with("payload"));
