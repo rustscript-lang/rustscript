@@ -1462,6 +1462,7 @@ async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
         assert_eq!(values[1], Value::Int(200));
         assert_eq!(values[2], Value::string(final_url));
         assert_eq!(values[3], Value::Int(0));
+        assert_eq!(values[4], Value::Int(0));
         // Every hop that actually transmits the body is counted; 301/302/303
         // rewrite POST to GET and therefore send no body on the second hop.
         let expected_sent = if status == 307 || status == 308 {

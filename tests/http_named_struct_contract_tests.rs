@@ -720,9 +720,8 @@ fn sse_event_timeout_and_open_overloads_compile() {
         }
     "#;
 
-    // One call per program: the frontend rejects the same import name being
-    // imported more than once per module, so each overload is exercised on its
-    // own module.
+    // Each overload is exercised in its own module; repeated use of the same
+    // import name in one module currently reports a duplicate declaration.
     compile_ok(&format!(
         "{CALLBACKS}
         let request = http::request::new(\"GET\", \"http://127.0.0.1:1/events\");
@@ -750,17 +749,22 @@ fn sse_event_timeout_and_open_overloads_compile() {
 }
 
 #[test]
-fn sse_overloads_coexist_in_one_module_when_the_import_name_repeats_once() {
-    // Two SSE calls of different arities are admitted; the frontend only
-    // rejects a *duplicate* import declaration of the same name.
-    compile_ok(
+fn sse_repeated_import_name_reports_duplicate_declaration() {
+    let error = compile_err(
         r#"
         use http;
         fn on_event(kind: string, data: string, id: string, retry: string) -> bool { true }
         let first = http::request::new("GET", "http://127.0.0.1:1/events");
         let summary = http::client::sse(first, on_event);
         http::sse_summary::items(&summary);
+        let second = http::request::new("GET", "http://127.0.0.1:1/events");
+        let timed = http::client::sse(second, on_event, 5000);
+        http::sse_summary::items(&timed);
         "#,
+    );
+    assert!(
+        error.contains("duplicate local declaration 'http::client::sse'"),
+        "{error}"
     );
 }
 
@@ -823,6 +827,21 @@ fn guest_struct_declaration_of_a_former_http_name_stays_a_guest_struct() {
     assert!(
         http_host_catalog().structs().is_empty(),
         "the catalog must not collide with the guest declaration"
+    );
+}
+
+#[test]
+fn guest_struct_colliding_with_a_published_catalog_name_is_rejected() {
+    assert!(
+        standard_host_catalog()
+            .structs()
+            .iter()
+            .any(|schema| schema.name == "JitConfig")
+    );
+    let error = compile_err("struct JitConfig { enabled: bool }");
+    assert!(
+        error.contains("duplicate struct schema 'JitConfig'"),
+        "{error}"
     );
 }
 

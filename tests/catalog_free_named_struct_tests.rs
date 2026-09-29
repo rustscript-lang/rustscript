@@ -1,9 +1,9 @@
 //! Catalog-free parser fallback must not reserve the full standard catalog.
 //!
 //! Public [`parse_source_with_dialect`], import scan, and parses without a
-//! catalog snapshot install HTTP named structs only when the HTTP surface is
-//! available. Unrelated names such as `JitConfig` and `SqliteLimits` stay
-//! unknown unless an explicit catalog provides them.
+//! catalog snapshot do not install the removed HTTP named structs. Unrelated
+//! names such as `JitConfig` and `SqliteLimits` stay unknown unless an explicit
+//! catalog provides them.
 
 use std::sync::Arc;
 
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use vm::{compile_source_file, compile_source_for_repl};
 
 const UNRELATED_STANDARD_STRUCTS: [&str; 2] = ["JitConfig", "SqliteLimits"];
-const HTTP_NAMED_STRUCTS: [&str; 5] = [
+const REMOVED_HTTP_STRUCTS: [&str; 5] = [
     "HttpRequest",
     "HttpResponse",
     "SseRequest",
@@ -142,17 +142,22 @@ fn catalog_free_parse_rejects_jit_config_type() {
 
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
 #[test]
-fn catalog_free_http_parse_installs_sse_named_structs() {
+fn catalog_free_http_parse_does_not_install_removed_named_structs() {
     let ir = catalog_free_parse("1;").expect("trivial source must parse");
     assert_unrelated_standard_structs_absent(&ir);
-    for name in HTTP_NAMED_STRUCTS {
+    for name in REMOVED_HTTP_STRUCTS {
         assert!(
-            ir.struct_schemas.contains_key(name),
-            "catalog-free HTTP parse must install {name}"
+            !ir.struct_schemas.contains_key(name),
+            "catalog-free HTTP parse must not install {name}"
         );
     }
-    catalog_free_parse("fn go() -> SseCallbackAction { { action: \"continue\" } }")
-        .expect("SseCallbackAction must parse on the catalog-free HTTP path");
+    let error = catalog_free_parse("fn go() -> SseCallbackAction { { action: \"continue\" } }")
+        .expect_err("removed SSE struct must stay unknown");
+    assert!(
+        error
+            .message
+            .contains("unknown struct schema 'SseCallbackAction'")
+    );
 }
 
 #[cfg(not(all(feature = "http-client", not(target_family = "wasm"))))]
@@ -160,7 +165,7 @@ fn catalog_free_http_parse_installs_sse_named_structs() {
 fn catalog_free_without_http_installs_no_fallback_structs() {
     let ir = catalog_free_parse("1;").expect("trivial source must parse");
     assert_unrelated_standard_structs_absent(&ir);
-    for name in HTTP_NAMED_STRUCTS {
+    for name in REMOVED_HTTP_STRUCTS {
         assert!(
             !ir.struct_schemas.contains_key(name),
             "catalog-free parse without HTTP must not install {name}"
@@ -232,25 +237,38 @@ fn custom_catalog_remains_authoritative() {
 
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
 #[test]
-fn compile_source_file_without_catalog_admits_sse_named_structs() {
+fn compile_source_file_without_catalog_rejects_removed_sse_structs() {
     let temp = TempRssPath::new("pd_vm_catalog_free_sse_file");
     std::fs::write(
         &temp.path,
         "fn go() -> SseCallbackAction { { action: \"continue\" } }\n",
     )
     .expect("temp rss must write");
-    compile_source_file(&temp.path).unwrap_or_else(|err| {
-        panic!("file frontend without an explicit catalog must admit SseCallbackAction, got {err}")
-    });
+    let error = match compile_source_file(&temp.path) {
+        Ok(_) => panic!("file frontend must not install removed SSE structs"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("unknown struct schema 'SseCallbackAction'")
+    );
 }
 
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
 #[test]
-fn compile_source_for_repl_without_catalog_admits_sse_named_structs() {
-    compile_source_for_repl("fn go() -> SseCallbackAction { { action: \"continue\" } }")
-        .unwrap_or_else(|err| {
-            panic!("REPL without an explicit catalog must admit SseCallbackAction, got {err}")
-        });
+fn compile_source_for_repl_without_catalog_rejects_removed_sse_structs() {
+    let error = match compile_source_for_repl(
+        "fn go() -> SseCallbackAction { { action: \"continue\" } }",
+    ) {
+        Ok(_) => panic!("REPL must not install removed SSE structs"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("unknown struct schema 'SseCallbackAction'")
+    );
 }
 
 #[cfg(not(all(feature = "http-client", not(target_family = "wasm"))))]
