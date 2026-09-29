@@ -991,6 +991,13 @@ impl HostStreamDriver for SseStreamDriver {
             match scope.poll_operation_quiescence(self.scope_operation, cx) {
                 Poll::Pending => {}
                 Poll::Ready(Ok(_)) => state.operation_done = true,
+                Poll::Ready(Err(ExecutionScopeError::Operation(error)))
+                    if !scope.is_active() && error.code() == OperationErrorCode::OperationStale =>
+                {
+                    // Scope close may have drained this terminal operation before
+                    // the stream worker finished its independent teardown.
+                    state.operation_done = true;
+                }
                 Poll::Ready(Err(error)) => {
                     state.operation_done = true;
                     if state.first_error.is_none() {
@@ -1549,6 +1556,7 @@ fn builtin_sse_start(
 }
 
 /// Stream SSE events with an optional open callback and deadline.
+#[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
 #[pd_host_function(name = "http::client::sse", contract = super::http_sse_contract, runtime_owned_pending)]
 pub(super) fn builtin_http_client_sse(
     vm: &mut Vm,
@@ -1559,6 +1567,7 @@ pub(super) fn builtin_http_client_sse(
 }
 
 /// Stream events with an open callback.
+#[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
 #[pd_host_function(name = "http::client::sse", contract = super::http_sse_open_contract, runtime_owned_pending)]
 pub(super) fn builtin_http_client_sse_open(
     vm: &mut Vm,
@@ -1576,6 +1585,7 @@ pub(super) fn builtin_http_client_sse_open(
 }
 
 /// Stream events with a deadline and no open callback.
+#[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
 #[pd_host_function(name = "http::client::sse", contract = super::http_sse_only_timeout_contract, runtime_owned_pending)]
 pub(super) fn builtin_http_client_sse_only_timeout(
     vm: &mut Vm,
@@ -1587,6 +1597,7 @@ pub(super) fn builtin_http_client_sse_only_timeout(
 }
 
 /// Stream events with an optional open callback and timeout.
+#[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
 #[pd_host_function(name = "http::client::sse", contract = super::http_sse_timeout_contract, runtime_owned_pending)]
 pub(super) fn builtin_http_client_sse_timeout(
     vm: &mut Vm,
