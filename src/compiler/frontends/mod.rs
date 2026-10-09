@@ -8,8 +8,8 @@ use crate::compiler::source_map::{LoweredSource, SourceMap, Span};
 use crate::host_api::HostApiCatalog;
 
 use super::{
-    CompileSourceFileOptions, ParseError, ParsePhase, ReplLocalBinding, SharedParserOptions,
-    SourceFlavor, SourceFrontendContext,
+    CompileSourceFileOptions, FrontendImportedDeclaration, ParseError, ParsePhase,
+    ReplLocalBinding, SharedParserOptions, SourceFlavor, SourceFrontendContext,
     ir::FrontendIr,
     parser::{Parser, ParserDialect},
 };
@@ -54,15 +54,21 @@ pub(super) fn parse_source_for_compile(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<FrontendIr, ParseError> {
+    let host_catalog = explicit_host_api_catalog(options);
+    let context = SourceFrontendContext {
+        source_id: 0,
+        original_path: None,
+        phase: ParsePhase::Standalone,
+        host_api_catalog: host_catalog.as_deref(),
+        imports: &[],
+    };
     parse_source_with_source_id_and_externs_with_catalog(
         source,
         flavor,
         options,
-        0,
         false,
-        explicit_host_api_catalog(options),
-        None,
-        ParsePhase::Standalone,
+        host_catalog.clone(),
+        &context,
     )
 }
 
@@ -98,16 +104,23 @@ pub(super) fn parse_module_source_with_source_id(
     original_source_id: u32,
     original_path: Option<&Path>,
     phase: ParsePhase,
+    imports: &[FrontendImportedDeclaration],
 ) -> Result<FrontendIr, ParseError> {
+    let host_catalog = explicit_host_api_catalog(options);
+    let context = SourceFrontendContext {
+        source_id: original_source_id,
+        original_path,
+        phase,
+        host_api_catalog: host_catalog.as_deref(),
+        imports,
+    };
     parse_source_with_source_id_and_externs_with_catalog(
         source,
         flavor,
         options,
-        original_source_id,
         true,
-        explicit_host_api_catalog(options),
-        original_path,
-        phase,
+        host_catalog.clone(),
+        &context,
     )
 }
 
@@ -118,15 +131,21 @@ pub(super) fn parse_source_with_source_id_and_externs(
     original_source_id: u32,
     allow_implicit_externs: bool,
 ) -> Result<FrontendIr, ParseError> {
+    let host_catalog = effective_host_api_catalog(options);
+    let context = SourceFrontendContext {
+        source_id: original_source_id,
+        original_path: None,
+        phase: ParsePhase::Standalone,
+        host_api_catalog: host_catalog.as_deref(),
+        imports: &[],
+    };
     parse_source_with_source_id_and_externs_with_catalog(
         source,
         flavor,
         options,
-        original_source_id,
         allow_implicit_externs,
-        effective_host_api_catalog(options),
-        None,
-        ParsePhase::Standalone,
+        host_catalog.clone(),
+        &context,
     )
 }
 
@@ -134,11 +153,9 @@ fn parse_source_with_source_id_and_externs_with_catalog(
     source: &str,
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
-    original_source_id: u32,
     allow_implicit_externs: bool,
     host_catalog: Option<Arc<HostApiCatalog>>,
-    original_path: Option<&Path>,
-    phase: ParsePhase,
+    context: &SourceFrontendContext<'_>,
 ) -> Result<FrontendIr, ParseError> {
     match flavor {
         SourceFlavor::RustScript => {
@@ -149,7 +166,7 @@ fn parse_source_with_source_id_and_externs_with_catalog(
                 allow_implicit_externs,
                 false,
                 true,
-                original_source_id,
+                context.source_id,
                 false,
                 host_catalog,
             )
@@ -160,14 +177,7 @@ fn parse_source_with_source_id_and_externs_with_catalog(
                     "no frontend plugin registered for {flavor:?} source"
                 )));
             };
-            let context = SourceFrontendContext {
-                source_id: original_source_id,
-                original_path,
-                phase,
-                host_api_catalog: host_catalog.as_deref(),
-                imports: &[],
-            };
-            plugin.parse_source(source, &context)
+            plugin.parse_source(source, context)
         }
     }
 }
@@ -2252,5 +2262,81 @@ mod postfix_provenance_tests {
         assert_eq!(span_slice(source, log.callee_span), "console.log");
         assert_eq!(span_slice(source, log.expr_span), "console.log(\"hi\")");
         assert!(log.is_namespace_call, "dotted call flagged as namespace");
+    }
+}
+
+#[cfg(test)]
+mod module_import_context_tests {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use crate::compiler::ir::FrontendIr;
+    use crate::compiler::modules::{ModuleId, SymbolId};
+    use crate::compiler::{
+        CompileSourceFileOptions, FrontendId, FrontendImportedDeclaration, FrontendTypingPolicy,
+        ParseError, ParsePhase, SourceFlavor, SourceFrontendContext, SourceFrontendDescriptor,
+        SourcePlugin,
+    };
+
+    use super::parse_module_source_with_source_id;
+
+    static OBSERVED_IMPORTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    struct ImportObserver;
+
+    static IMPORT_OBSERVER: ImportObserver = ImportObserver;
+
+    impl SourcePlugin for ImportObserver {
+        fn descriptor(&self) -> SourceFrontendDescriptor {
+            SourceFrontendDescriptor {
+                id: FrontendId::new("dispatcher-import-observer"),
+                extensions: &["observer"],
+                typing_policy: FrontendTypingPolicy::Dynamic,
+                supports_ownership_checking: false,
+            }
+        }
+
+        fn parse_source(
+            &self,
+            _source: &str,
+            context: &SourceFrontendContext<'_>,
+        ) -> Result<FrontendIr, ParseError> {
+            let names: Vec<String> = context
+                .imports
+                .iter()
+                .map(|import| match import {
+                    FrontendImportedDeclaration::Function { local, .. }
+                    | FrontendImportedDeclaration::Type { local, .. } => local.clone(),
+                })
+                .collect();
+            OBSERVED_IMPORTS.lock().unwrap().extend(names);
+            Err(ParseError::new("import context observed"))
+        }
+    }
+
+    #[test]
+    fn module_dispatcher_forwards_borrowed_resolved_imports_to_plugin_context() {
+        OBSERVED_IMPORTS.lock().unwrap().clear();
+        let imports = [FrontendImportedDeclaration::Type {
+            local: "ImportedType".to_string(),
+            symbol: SymbolId {
+                module: ModuleId(4),
+                index: 2,
+            },
+            schema: crate::compiler::ir::TypeSchema::String,
+            declaration: None,
+        }];
+        let options = CompileSourceFileOptions::default().with_source_plugin(&IMPORT_OBSERVER);
+        let result = parse_module_source_with_source_id(
+            "synthetic input",
+            SourceFlavor::Plugin(FrontendId::new("dispatcher-import-observer")),
+            &options,
+            9,
+            Some(Path::new("module.observer")),
+            ParsePhase::Module,
+            &imports,
+        );
+        assert!(result.is_err());
+        assert_eq!(*OBSERVED_IMPORTS.lock().unwrap(), vec!["ImportedType"]);
     }
 }

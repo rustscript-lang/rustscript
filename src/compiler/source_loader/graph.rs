@@ -198,6 +198,7 @@ pub(super) fn collect_module_units(
             module_source_id,
             Some(&resolved),
             ParsePhase::Module,
+            &[],
         )
         .map_err(|mut err| {
             // Nested module sources are parsed verbatim (no synthetic

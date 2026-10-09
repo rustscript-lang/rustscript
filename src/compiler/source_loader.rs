@@ -174,6 +174,7 @@ pub(super) fn load_units_for_source_file_with_context(
         root_source_id,
         original_path,
         root_phase,
+        &[],
     )
     .map_err(|mut err| {
         // Module sources are parsed verbatim (no synthetic prelude, no

@@ -1,12 +1,13 @@
-#[path = "../common/mod.rs"]
-mod common;
-use common::*;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use vm::{
-    CompileSourceFileOptions, FrontendId, FrontendIr, FrontendTypingPolicy, ParseError, ParsePhase,
-    SourceFlavor, SourceFrontendContext, SourceFrontendDescriptor, SourcePlugin,
-    compile_source_file_with_options, compile_source_with_flavor_and_options,
+    CompileSourceFileOptions, Expr, FrontendId, FrontendIr, FrontendTypingPolicy, ParseError,
+    ParsePhase, SourceFlavor, SourceFrontendContext, SourceFrontendDescriptor, SourcePlugin, Stmt,
+    Value, Vm, VmStatus, compile_source_file_with_options, compile_source_with_flavor_and_options,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,13 +152,55 @@ static PLUG_D: SyntheticPlugin = SyntheticPlugin {
     contexts: &PLUG_D_CONTEXTS,
 };
 
-fn plugin_source_path(extension: &str) -> PathBuf {
-    let target = std::env::var_os("CARGO_TARGET_DIR").expect("assigned target dir is set");
-    let root = PathBuf::from(target).join("frontend-plugin-contracts");
-    std::fs::create_dir_all(&root).expect("contract fixture directory should exist");
-    let path = root.join(format!("source.{extension}"));
-    std::fs::write(&path, "synthetic frontend input\n").expect("contract source should write");
-    path
+struct PluginSourceFixture {
+    path: PathBuf,
+}
+
+impl Deref for PluginSourceFixture {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for PluginSourceFixture {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PluginSourceFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+fn plugin_source_path(extension: &str) -> PluginSourceFixture {
+    for _ in 0..32 {
+        let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "pd-vm-frontend-plugin-{}-{id}.{extension}",
+            std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                let fixture = PluginSourceFixture { path };
+                let write_result = file.write_all(b"synthetic frontend input\n");
+                drop(file);
+                if let Err(err) = write_result {
+                    drop(fixture);
+                    panic!("contract source should write: {err}");
+                }
+                return fixture;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => panic!("contract source should create: {err}"),
+        }
+    }
+    panic!("could not allocate a unique frontend fixture path");
 }
 
 fn run_plugin(path: &Path, options: CompileSourceFileOptions, expected: i64) {
@@ -223,7 +266,7 @@ fn plugin_context_preserves_source_phase_path_and_caller_catalog() {
     assert!(seen.iter().any(|context| {
         context.call == "imports"
             && context.source_id == 0
-            && context.original_path.as_deref() == Some(source_path.as_path())
+            && context.original_path.as_deref() == Some(source_path.path.as_path())
             && context.phase == ParsePhase::ImportDiscovery
             && context.catalog_ptr == Some(catalog_ptr)
             && context.import_count == 0
@@ -231,7 +274,7 @@ fn plugin_context_preserves_source_phase_path_and_caller_catalog() {
     assert!(seen.iter().any(|context| {
         context.call == "parse"
             && context.source_id == 0
-            && context.original_path.as_deref() == Some(source_path.as_path())
+            && context.original_path.as_deref() == Some(source_path.path.as_path())
             && context.phase == ParsePhase::Module
             && context.catalog_ptr == Some(catalog_ptr)
             && context.import_count == 0
