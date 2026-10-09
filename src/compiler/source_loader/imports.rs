@@ -181,9 +181,6 @@ pub(super) fn resolve_module_path(
                 .ok_or_else(|| SourcePathError::ImportWithoutParent(base_path.to_path_buf()))?;
             parent.join(override_path)
         };
-        if path.extension().and_then(|value| value.to_str()) != Some("rss") {
-            return Err(SourcePathError::NonRustScriptModule(path));
-        }
         return Ok(module_identity(path));
     }
     if options.module_override_source(spec).is_some() {
@@ -198,9 +195,6 @@ pub(super) fn resolve_module_path(
         if path.extension().is_none() {
             path.set_extension("rss");
         }
-        if path.extension().and_then(|value| value.to_str()) != Some("rss") {
-            return Err(SourcePathError::NonRustScriptModule(path));
-        }
         return Ok(module_identity(path));
     }
 
@@ -214,9 +208,6 @@ pub(super) fn resolve_module_path(
     };
     if path.extension().is_none() {
         path.set_extension("rss");
-    }
-    if path.extension().and_then(|value| value.to_str()) != Some("rss") {
-        return Err(SourcePathError::NonRustScriptModule(path));
     }
     Ok(module_identity(path))
 }

@@ -54,7 +54,7 @@ mod imports;
 mod model;
 
 pub use self::model::{ImportClause, ModuleImport, NamedImport};
-use graph::{collect_module_units, record_module_symbols};
+use graph::{collect_module_units, frontend_imports_for_module, record_module_symbols};
 use imports::{module_identity, parse_module_imports_with_context, strip_import_directives};
 use model::ModuleCollectState;
 pub(super) struct LoadedSourceUnits {
@@ -161,6 +161,8 @@ pub(super) fn load_units_for_source_file_with_context(
         .map(|node| node.source.0)
         .unwrap_or(0);
     let root_parse_source = strip_import_directives(source_raw, flavor, &effective_options)?;
+    let frontend_imports =
+        frontend_imports_for_module(path, &root_imports, &collect_state, &effective_options)?;
 
     let root_phase = if original_path.is_some() {
         ParsePhase::Module
@@ -174,7 +176,7 @@ pub(super) fn load_units_for_source_file_with_context(
         root_source_id,
         original_path,
         root_phase,
-        &[],
+        &frontend_imports,
     )
     .map_err(|mut err| {
         // Module sources are parsed verbatim (no synthetic prelude, no

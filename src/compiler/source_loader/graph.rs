@@ -5,8 +5,8 @@ use crate::compiler::source_map::SourceMap;
 use crate::host_api::HostApiCatalog;
 
 use super::super::{
-    CompileSourceFileOptions, ParseError, ParsePhase, SourceError, SourceFlavor, SourcePathError,
-    frontends,
+    CompileSourceFileOptions, FrontendImportedDeclaration, ParseError, ParsePhase, SourceError,
+    SourceFlavor, SourcePathError, frontends,
     ir::{
         Expr, FrontendIr, FunctionDecl, FunctionRefTarget, ParsedCallTarget, ParsedSemanticIndex,
         Stmt, TypeSchema,
@@ -105,6 +105,7 @@ pub(super) fn collect_module_units(
             continue;
         }
         let resolved = resolve_module_path(path, &spec, options)?;
+        let dependency_flavor = SourceFlavor::from_path_with_options(&resolved, options)?;
         let key = resolved.clone();
         if key == path && is_virtual_host_namespace_spec(&spec, options) {
             // `use io;` / `use re;` inside files named `io.rss` / `re.rss` should
@@ -172,7 +173,7 @@ pub(super) fn collect_module_units(
         collect_module_units(
             &resolved,
             &module_source_raw,
-            SourceFlavor::RustScript,
+            dependency_flavor,
             options,
             state,
         )?;
@@ -186,19 +187,20 @@ pub(super) fn collect_module_units(
             .unwrap_or(0);
         let module_imports = parse_module_imports(
             &module_source_raw,
-            SourceFlavor::RustScript,
+            dependency_flavor,
             &resolved,
             options,
             module_source_id,
         )?;
+        let frontend_imports = frontend_imports_for_module(path, &module_imports, state, options)?;
         let mut parsed = frontends::parse_module_source_with_source_id(
             &module_source_raw,
-            SourceFlavor::RustScript,
+            dependency_flavor,
             options,
             module_source_id,
             Some(&resolved),
             ParsePhase::Module,
-            &[],
+            &frontend_imports,
         )
         .map_err(|mut err| {
             // Nested module sources are parsed verbatim (no synthetic
@@ -274,6 +276,83 @@ fn module_source_override<'a>(
     options.module_override_source(spec).or_else(|| {
         options.module_override_source(&resolved_path.to_string_lossy().replace('\\', "/"))
     })
+}
+
+/// Build frontend-visible function imports after the DFS has parsed their
+/// source modules. Full declarations and graph symbols are passed together so
+/// a plugin can bind the complete signature before parsing its own body.
+pub(super) fn frontend_imports_for_module(
+    path: &Path,
+    imports: &[ModuleImport],
+    state: &ModuleCollectState,
+    options: &CompileSourceFileOptions,
+) -> Result<Vec<FrontendImportedDeclaration>, SourcePathError> {
+    let mut frontend_imports = Vec::new();
+    for import in imports {
+        if is_builtin_host_namespace_spec(&import.spec) || !is_module_specifier(&import.spec) {
+            continue;
+        }
+        let resolved = resolve_module_path(path, &import.spec, options)?;
+        let Some(exports) = state.module_exports.get(&resolved) else {
+            continue;
+        };
+        let Some(source_module) = state.module_graph.module_id_for_identity(&resolved) else {
+            continue;
+        };
+        let mut selected = match &import.clause {
+            ImportClause::Named(named) => named
+                .iter()
+                .map(|binding| (binding.imported.clone(), binding.local.clone()))
+                .collect::<Vec<_>>(),
+            ImportClause::Namespace(alias) => exports
+                .keys()
+                .map(|name| (name.clone(), format!("{alias}::{name}")))
+                .collect(),
+            ImportClause::AllPublic => {
+                let namespace = Path::new(&import.spec)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_default();
+                exports
+                    .keys()
+                    .map(|name| (name.clone(), format!("{namespace}::{name}")))
+                    .collect()
+            }
+            ImportClause::Prefix(prefix) => exports
+                .keys()
+                .map(|name| (name.clone(), format!("{prefix}::{name}")))
+                .collect(),
+        };
+        selected.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        let Some(source_unit) = state.units.iter().find(|unit| unit.module == source_module) else {
+            continue;
+        };
+        for (source_name, local) in selected {
+            if !exports.contains_key(&source_name) {
+                continue;
+            }
+            let Some(symbol) = state
+                .module_graph
+                .symbol_for_export(source_module, &source_name)
+            else {
+                continue;
+            };
+            let Some(declaration) = source_unit
+                .parsed
+                .functions
+                .iter()
+                .find(|function| function.symbol == Some(symbol))
+            else {
+                continue;
+            };
+            frontend_imports.push(FrontendImportedDeclaration::Function {
+                local,
+                symbol,
+                declaration: declaration.clone(),
+            });
+        }
+    }
+    Ok(frontend_imports)
 }
 
 /// Build the exported-signature table keyed by [`SymbolId`].
