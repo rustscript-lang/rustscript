@@ -14,11 +14,11 @@ use super::ir::{
 use super::linker::{ParsedUnit, merge_units};
 use super::modules::ModuleGraph;
 use super::semantic_model::SemanticModel;
-use super::source_loader::load_units_for_source_file;
+use super::source_loader::{load_units_for_source_file, load_units_for_source_file_with_context};
 use super::source_map::SourceMap;
 use super::{
-    CompileError, CompileSourceFileOptions, CompiledProgram, CompiledReplProgram, ParseError,
-    ReplLocalBinding, SourceError, SourceFlavor, SourcePathError, TypingMode, lifetime,
+    CompileError, CompileSourceFileOptions, CompiledProgram, CompiledReplProgram, FrontendPolicy,
+    ParseError, ReplLocalBinding, SourceError, SourceFlavor, SourcePathError, TypingMode, lifetime,
     materialization, parser, typing,
 };
 
@@ -348,6 +348,15 @@ fn is_compiler_primitive_import(name: &str) -> bool {
     name.starts_with("__prim_")
 }
 
+fn frontend_policy_for_flavor(
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<FrontendPolicy, SourcePathError> {
+    options
+        .frontend_policy(flavor)
+        .ok_or(SourcePathError::MissingFrontendPlugin(flavor))
+}
+
 fn compile_parsed_output(
     source: String,
     parsed: FrontendIr,
@@ -391,7 +400,7 @@ fn compile_parsed_output_with_entry_locals(
     // locals here, exactly the space availability/liveness analyze in.
     let pre_lifetime_type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
     if typing_mode.is_strict() {
-        enforce_strict_rustscript_type_resolution(&parsed, &pre_lifetime_type_info)
+        enforce_strict_type_resolution(&parsed, &pre_lifetime_type_info)
             .map_err(SourceError::Compile)?;
     }
     // A local slot is resource-owned when its post-legalize logical schema
@@ -556,14 +565,14 @@ fn reject_strict_unknown_annotations(parsed: &FrontendIr) -> Result<(), ParseErr
     Err(ParseError {
         line: 1,
         message:
-            "RustScript requires concrete compile-time types; 'unknown' annotations are not allowed"
+            "strict frontends require concrete compile-time types; 'unknown' annotations are not allowed"
                 .to_string(),
         span: Some(span),
         code: Some("E_STRICT_UNKNOWN_TYPE".to_string()),
     })
 }
 
-fn enforce_strict_rustscript_type_resolution(
+fn enforce_strict_type_resolution(
     parsed: &FrontendIr,
     type_info: &typing::TypeInferenceResult,
 ) -> Result<(), CompileError> {
@@ -583,7 +592,7 @@ fn enforce_strict_rustscript_type_resolution(
             line: None,
             source_name: None,
             detail: format!(
-                "struct '{}' contains non-concrete field types; RustScript requires concrete schemas",
+                "struct '{}' contains non-concrete field types; strict typing requires concrete schemas",
                 schema.name
             ),
             span,
@@ -606,7 +615,7 @@ fn enforce_strict_rustscript_type_resolution(
                 line: function_decl_lines.get(&decl.index).copied(),
                 source_name: parsed.function_sources.get(&decl.index).cloned(),
                 detail: format!(
-                    "function '{}' uses a non-concrete return schema; RustScript requires concrete return types",
+                    "function '{}' uses a non-concrete return schema; strict typing requires concrete return types",
                     decl.name
                 ),
                 span,
@@ -636,7 +645,7 @@ fn enforce_strict_rustscript_type_resolution(
             line: site.line,
             source_name: site.source_name,
             detail: format!(
-                "{} '{}' does not resolve to a concrete compile-time type in RustScript",
+                "{} '{}' does not resolve to a concrete compile-time type under strict typing",
                 site.kind, site.name
             ),
             span,
@@ -840,11 +849,13 @@ pub fn analyze_source_with_flavor(
     let parsed = frontends::parse_source(source, flavor, &effective).map_err(|err| {
         SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
     })?;
+    let policy = frontend_policy_for_flavor(flavor, &effective)
+        .map_err(|err| SourceError::Parse(ParseError::new(err.to_string())))?;
     analyze_parsed_output(
         source.to_string(),
         parsed,
         source_map,
-        flavor,
+        policy,
         effective.host_api_catalog().cloned(),
         None,
     )
@@ -923,6 +934,7 @@ fn analyze_source_string_at_path(
     options: &CompileSourceFileOptions,
 ) -> Result<SemanticModel, SourcePathError> {
     let effective = default_standard_catalog_options(options);
+    let policy = frontend_policy_for_flavor(flavor, &effective)?;
     // Module-graph, plugin, and custom-catalog compilations share the same
     // frontend pipeline as the compile path: the loader parses every unit
     // verbatim (no second parser), the linker merges the provenance carrier,
@@ -933,7 +945,7 @@ fn analyze_source_string_at_path(
         return analyze_loaded_units(
             source.to_string(),
             loaded.units,
-            flavor,
+            policy,
             loaded.sources,
             catalog,
             Some(loaded.module_graph),
@@ -953,7 +965,7 @@ fn analyze_source_string_at_path(
         source.to_string(),
         parsed,
         source_map,
-        flavor,
+        policy,
         catalog,
         None,
     )
@@ -966,7 +978,7 @@ fn analyze_source_string_at_path(
 fn analyze_loaded_units(
     source: String,
     units: Vec<ParsedUnit>,
-    flavor: SourceFlavor,
+    policy: FrontendPolicy,
     sources: SourceMap,
     custom_catalog: Option<Arc<HostApiCatalog>>,
     module_graph: Option<ModuleGraph>,
@@ -976,7 +988,7 @@ fn analyze_loaded_units(
         source,
         merged,
         sources,
-        flavor,
+        policy,
         custom_catalog,
         module_graph,
     )
@@ -987,11 +999,11 @@ fn analyze_parsed_output(
     _source: String,
     parsed: FrontendIr,
     source_map: SourceMap,
-    flavor: SourceFlavor,
+    policy: FrontendPolicy,
     custom_catalog: Option<Arc<HostApiCatalog>>,
     module_graph: Option<ModuleGraph>,
 ) -> Result<SemanticModel, SourceError> {
-    let typing_mode = TypingMode::for_flavor(flavor);
+    let typing_mode = policy.typing_mode;
     let catalog = custom_catalog.unwrap_or_else(default_analyze_catalog);
 
     // Run legalize and type checking.
@@ -1177,7 +1189,7 @@ fn lint_unknown_inferred_local_types_with_options_impl(
             .map_err(SourcePathError::Source);
     }
 
-    let path = virtual_inmemory_entry_path(flavor);
+    let path = virtual_inmemory_entry_path(flavor, options)?;
     lint_unknown_inferred_local_types_at_path_with_options_impl(&path, source, flavor, options)
 }
 
@@ -1194,7 +1206,7 @@ fn collect_inferred_local_type_hints_with_options_impl(
             .map_err(SourcePathError::Source);
     }
 
-    let path = virtual_inmemory_entry_path(flavor);
+    let path = virtual_inmemory_entry_path(flavor, options)?;
     collect_inferred_local_type_hints_at_path_with_options_impl(&path, source, flavor, options)
 }
 
@@ -1560,7 +1572,7 @@ fn compile_source_for_repl_with_locals_impl(
         &entry_availability,
         &entry_local_types,
         CompileBehavior::REPL,
-        TypingMode::StrictRustScript,
+        TypingMode::Strict,
         true,
     ) {
         Err(SourceError::Parse(err)) => Err(SourceError::Parse(
@@ -1658,12 +1670,14 @@ fn compile_source_with_flavor_impl(
         frontends::parse_source_for_compile(source, flavor, &effective).map_err(|err| {
             SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
         })?;
+    let policy = frontend_policy_for_flavor(flavor, &effective)
+        .map_err(|err| SourceError::Parse(ParseError::new(err.to_string())))?;
     match compile_parsed_output(
         source.to_string(),
         parsed,
         behavior,
-        TypingMode::for_flavor(flavor),
-        matches!(flavor, SourceFlavor::RustScript),
+        policy.typing_mode,
+        policy.ownership_checking,
     ) {
         Err(SourceError::Parse(err)) => Err(SourceError::Parse(
             err.with_line_span_from_source(&source_map, source_id),
@@ -1675,7 +1689,7 @@ fn compile_source_with_flavor_impl(
 fn compile_loaded_units(
     source: String,
     units: Vec<ParsedUnit>,
-    flavor: SourceFlavor,
+    policy: FrontendPolicy,
     // Carried from the loader for Milestone 2+ (structured imports, symbol
     // resolution); codegen output is unchanged until then.
     _module_graph: ModuleGraph,
@@ -1694,8 +1708,8 @@ fn compile_loaded_units(
         source,
         merged,
         CompileBehavior::DEFAULT,
-        TypingMode::for_flavor(flavor),
-        matches!(flavor, SourceFlavor::RustScript),
+        policy.typing_mode,
+        policy.ownership_checking,
     )
     .map_err(|error| match (error, diagnostic_path) {
         (SourceError::Parse(mut parse), Some(path))
@@ -1731,12 +1745,13 @@ fn compile_source_with_flavor_and_options_pipeline(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let path = virtual_inmemory_entry_path(flavor);
-    let loaded = load_units_for_source_file(&path, flavor, source, options)?;
+    let policy = frontend_policy_for_flavor(flavor, options)?;
+    let path = virtual_inmemory_entry_path(flavor, options)?;
+    let loaded = load_units_for_source_file_with_context(&path, flavor, source, options, None)?;
     compile_loaded_units(
         source.to_string(),
         loaded.units,
-        flavor,
+        policy,
         loaded.module_graph,
         loaded.sources,
     )
@@ -1801,23 +1816,36 @@ fn compile_source_at_path_with_flavor_and_options_impl(
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
     let effective = default_http_compile_catalog_options(options);
+    let policy = frontend_policy_for_flavor(flavor, &effective)?;
     let loaded = load_units_for_source_file(path, flavor, source, &effective)?;
     compile_loaded_units(
         source.to_string(),
         loaded.units,
-        flavor,
+        policy,
         loaded.module_graph,
         loaded.sources,
     )
 }
 
-fn virtual_inmemory_entry_path(flavor: SourceFlavor) -> PathBuf {
-    let ext = match flavor {
+fn virtual_inmemory_entry_path(
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<PathBuf, SourcePathError> {
+    let extension = match flavor {
         SourceFlavor::RustScript => "rss",
-        SourceFlavor::JavaScript => "js",
-        SourceFlavor::Lua => "lua",
+        SourceFlavor::Plugin(_) => {
+            let plugin = options
+                .source_plugin_for_flavor(flavor)
+                .ok_or(SourcePathError::MissingFrontendPlugin(flavor))?;
+            plugin
+                .descriptor()
+                .extensions
+                .first()
+                .copied()
+                .ok_or(SourcePathError::MissingExtension)?
+        }
     };
-    PathBuf::from("__pd_vm_inmemory__").join(format!("main.{ext}"))
+    Ok(PathBuf::from("__pd_vm_inmemory__").join(format!("main.{extension}")))
 }
 
 pub fn compile_source_file(path: impl AsRef<Path>) -> Result<CompiledProgram, SourcePathError> {
@@ -1838,12 +1866,13 @@ fn compile_source_file_impl(
 ) -> Result<CompiledProgram, SourcePathError> {
     let effective = default_http_compile_catalog_options(options);
     let flavor = SourceFlavor::from_path_with_options(path, &effective)?;
+    let policy = frontend_policy_for_flavor(flavor, &effective)?;
     let source_raw = std::fs::read_to_string(path)?;
     let loaded = load_units_for_source_file(path, flavor, &source_raw, &effective)?;
     compile_loaded_units(
         source_raw,
         loaded.units,
-        flavor,
+        policy,
         loaded.module_graph,
         loaded.sources,
     )
@@ -2141,7 +2170,7 @@ mod tests {
 
     #[test]
     fn strict_non_concrete_struct_diagnostic_carries_exact_decl_span() {
-        // Strict RustScript rejects struct schemas whose fields are not fully
+        // Strict typing rejects struct schemas whose fields are not fully
         // concrete. The diagnostic must carry the exact parser-origin span of
         // the struct declaration (its name identifier), resolved from the
         // `StructDeclSite` provenance recorded by the parser — never a
@@ -2185,8 +2214,8 @@ mod tests {
             std::iter::once(("x".to_string(), crate::compiler::ir::TypeSchema::Unknown)).collect(),
         );
 
-        let type_info = typing::infer_types(&ir, TypingMode::StrictRustScript, &[]);
-        let err = enforce_strict_rustscript_type_resolution(&ir, &type_info)
+        let type_info = typing::infer_types(&ir, TypingMode::Strict, &[]);
+        let err = enforce_strict_type_resolution(&ir, &type_info)
             .expect_err("non-concrete struct schema must be rejected in strict mode");
         match err {
             CompileError::StrictTypingRequired { span, .. } => {

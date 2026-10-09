@@ -2334,7 +2334,7 @@ mod tests {
             &names,
             &host_returns,
             &host_sigs,
-            TypingMode::StrictRustScript,
+            TypingMode::Strict,
             None,
         );
         find_declared_schema_mismatch(expected, actual, &mut context, String::new())

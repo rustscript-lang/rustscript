@@ -3171,7 +3171,7 @@ mod tests {
             &empty_names,
             &empty_returns,
             &empty_signatures,
-            TypingMode::StrictRustScript,
+            TypingMode::Strict,
             None,
         );
         let state = LocalTypeState::default();
@@ -3228,7 +3228,7 @@ mod tests {
             &empty_names,
             &empty_returns,
             &empty_signatures,
-            TypingMode::StrictRustScript,
+            TypingMode::Strict,
             None,
         );
         let state = LocalTypeState::default();
@@ -3322,7 +3322,7 @@ mod tests {
             &empty_names,
             &returns,
             &empty_signatures,
-            TypingMode::StrictRustScript,
+            TypingMode::Strict,
             None,
         );
         let state = LocalTypeState::default();
@@ -3387,7 +3387,7 @@ mod tests {
             &empty_names,
             &empty_returns,
             &signatures,
-            TypingMode::StrictRustScript,
+            TypingMode::Strict,
             None,
         );
         let state = LocalTypeState::default();

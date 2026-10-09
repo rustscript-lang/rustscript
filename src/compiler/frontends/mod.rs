@@ -1,13 +1,15 @@
 mod rustscript;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::compiler::source_map::{LoweredSource, SourceMap, Span};
 use crate::host_api::HostApiCatalog;
 
 use super::{
-    CompileSourceFileOptions, ParseError, ReplLocalBinding, SharedParserOptions, SourceFlavor,
+    CompileSourceFileOptions, ParseError, ParsePhase, ReplLocalBinding, SharedParserOptions,
+    SourceFlavor, SourceFrontendContext,
     ir::FrontendIr,
     parser::{Parser, ParserDialect},
 };
@@ -59,6 +61,8 @@ pub(super) fn parse_source_for_compile(
         0,
         false,
         explicit_host_api_catalog(options),
+        None,
+        ParsePhase::Standalone,
     )
 }
 
@@ -92,6 +96,8 @@ pub(super) fn parse_module_source_with_source_id(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
     original_source_id: u32,
+    original_path: Option<&Path>,
+    phase: ParsePhase,
 ) -> Result<FrontendIr, ParseError> {
     parse_source_with_source_id_and_externs_with_catalog(
         source,
@@ -100,6 +106,8 @@ pub(super) fn parse_module_source_with_source_id(
         original_source_id,
         true,
         explicit_host_api_catalog(options),
+        original_path,
+        phase,
     )
 }
 
@@ -117,6 +125,8 @@ pub(super) fn parse_source_with_source_id_and_externs(
         original_source_id,
         allow_implicit_externs,
         effective_host_api_catalog(options),
+        None,
+        ParsePhase::Standalone,
     )
 }
 
@@ -127,6 +137,8 @@ fn parse_source_with_source_id_and_externs_with_catalog(
     original_source_id: u32,
     allow_implicit_externs: bool,
     host_catalog: Option<Arc<HostApiCatalog>>,
+    original_path: Option<&Path>,
+    phase: ParsePhase,
 ) -> Result<FrontendIr, ParseError> {
     match flavor {
         SourceFlavor::RustScript => {
@@ -142,13 +154,20 @@ fn parse_source_with_source_id_and_externs_with_catalog(
                 host_catalog,
             )
         }
-        SourceFlavor::JavaScript | SourceFlavor::Lua => {
+        SourceFlavor::Plugin(_) => {
             let Some(plugin) = options.source_plugin_for_flavor(flavor) else {
                 return Err(ParseError::new(format!(
                     "no frontend plugin registered for {flavor:?} source"
                 )));
             };
-            plugin.parse_source(source)
+            let context = SourceFrontendContext {
+                source_id: original_source_id,
+                original_path,
+                phase,
+                host_api_catalog: host_catalog.as_deref(),
+                imports: &[],
+            };
+            plugin.parse_source(source, &context)
         }
     }
 }
@@ -159,7 +178,7 @@ pub(crate) fn parser_dialect_for_flavor(
 ) -> Option<&'static dyn ParserDialect> {
     match flavor {
         SourceFlavor::RustScript => Some(rustscript::parser_dialect()),
-        SourceFlavor::JavaScript | SourceFlavor::Lua => options
+        SourceFlavor::Plugin(_) => options
             .source_plugin_for_flavor(flavor)
             .and_then(|plugin| plugin.parser_dialect()),
     }

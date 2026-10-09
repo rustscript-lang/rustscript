@@ -45,7 +45,7 @@ use crate::compiler::source_map::SourceMap;
 
 use super::modules::ModuleGraph;
 use super::{
-    CompileSourceFileOptions, SourceError, SourceFlavor, SourcePathError, frontends,
+    CompileSourceFileOptions, ParsePhase, SourceError, SourceFlavor, SourcePathError, frontends,
     linker::ParsedUnit,
 };
 
@@ -53,10 +53,10 @@ mod graph;
 mod imports;
 mod model;
 
+pub use self::model::{ImportClause, ModuleImport, NamedImport};
 use graph::{collect_module_units, record_module_symbols};
-use imports::{module_identity, parse_module_imports, strip_import_directives};
+use imports::{module_identity, parse_module_imports_with_context, strip_import_directives};
 use model::ModuleCollectState;
-pub use model::{FrontendImportSyntax, ImportClause, ModuleImport, NamedImport};
 pub(super) struct LoadedSourceUnits {
     pub(super) units: Vec<ParsedUnit>,
     /// Semantic module graph built during discovery (milestones 1-3).
@@ -78,6 +78,16 @@ pub(super) fn load_units_for_source_file(
     source_raw: &str,
     options: &CompileSourceFileOptions,
 ) -> Result<LoadedSourceUnits, SourcePathError> {
+    load_units_for_source_file_with_context(path, flavor, source_raw, options, Some(path))
+}
+
+pub(super) fn load_units_for_source_file_with_context(
+    path: &Path,
+    flavor: SourceFlavor,
+    source_raw: &str,
+    options: &CompileSourceFileOptions,
+    original_path: Option<&Path>,
+) -> Result<LoadedSourceUnits, SourcePathError> {
     let effective_options = effective_source_options(options);
     // The root participates in the same identity scheme as every module:
     // canonical disk identity when the file exists, normalized virtual
@@ -96,23 +106,30 @@ pub(super) fn load_units_for_source_file(
         .add_source_at(0, path.display().to_string(), source_raw.to_string());
     collect_state.visiting.push(path.to_path_buf());
 
-    let root_imports = parse_module_imports(source_raw, flavor, path, &effective_options, 0)
-        .map_err(|err| {
-            // The root's own scan/parse diagnostics attach their span against
-            // the pre-registered root source and carry the compilation-wide map,
-            // so they render from the root's text.
-            match err {
-                SourcePathError::Source(SourceError::Parse(mut parse)) => {
-                    parse.span = None;
-                    parse = parse.with_line_span_from_source(&collect_state.sources, 0);
-                    SourcePathError::SourceWithMap {
-                        error: SourceError::Parse(parse),
-                        sources: collect_state.sources.clone(),
-                    }
+    let root_imports = parse_module_imports_with_context(
+        source_raw,
+        flavor,
+        path,
+        &effective_options,
+        0,
+        original_path,
+    )
+    .map_err(|err| {
+        // The root's own scan/parse diagnostics attach their span against
+        // the pre-registered root source and carry the compilation-wide map,
+        // so they render from the root's text.
+        match err {
+            SourcePathError::Source(SourceError::Parse(mut parse)) => {
+                parse.span = None;
+                parse = parse.with_line_span_from_source(&collect_state.sources, 0);
+                SourcePathError::SourceWithMap {
+                    error: SourceError::Parse(parse),
+                    sources: collect_state.sources.clone(),
                 }
-                other => other,
             }
-        })?;
+            other => other,
+        }
+    })?;
 
     collect_module_units(
         path,
@@ -145,11 +162,18 @@ pub(super) fn load_units_for_source_file(
         .unwrap_or(0);
     let root_parse_source = strip_import_directives(source_raw, flavor, &effective_options)?;
 
+    let root_phase = if original_path.is_some() {
+        ParsePhase::Module
+    } else {
+        ParsePhase::Standalone
+    };
     let mut root_parsed = frontends::parse_module_source_with_source_id(
         &root_parse_source,
         flavor,
         &effective_options,
         root_source_id,
+        original_path,
+        root_phase,
     )
     .map_err(|mut err| {
         // Module sources are parsed verbatim (no synthetic prelude, no

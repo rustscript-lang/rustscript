@@ -4,13 +4,6 @@ use std::path::PathBuf;
 use super::super::linker::ParsedUnit;
 use super::super::modules::ModuleGraph;
 use super::super::source_map::SourceMap;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrontendImportSyntax {
-    RustScript,
-    JavaScript,
-    Lua,
-}
-
 #[derive(Clone, Debug)]
 pub struct NamedImport {
     pub imported: String,

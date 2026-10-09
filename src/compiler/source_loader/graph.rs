@@ -5,7 +5,8 @@ use crate::compiler::source_map::SourceMap;
 use crate::host_api::HostApiCatalog;
 
 use super::super::{
-    CompileSourceFileOptions, ParseError, SourceError, SourceFlavor, SourcePathError, frontends,
+    CompileSourceFileOptions, ParseError, ParsePhase, SourceError, SourceFlavor, SourcePathError,
+    frontends,
     ir::{
         Expr, FrontendIr, FunctionDecl, FunctionRefTarget, ParsedCallTarget, ParsedSemanticIndex,
         Stmt, TypeSchema,
@@ -195,6 +196,8 @@ pub(super) fn collect_module_units(
             SourceFlavor::RustScript,
             options,
             module_source_id,
+            Some(&resolved),
+            ParsePhase::Module,
         )
         .map_err(|mut err| {
             // Nested module sources are parsed verbatim (no synthetic
