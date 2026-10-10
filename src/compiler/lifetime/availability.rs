@@ -103,11 +103,29 @@ impl FlowState {
 }
 
 pub(super) fn enforce_local_availability(
+    ir: FrontendIr,
+    entry_locals: &[EntryLocalAvailability],
+    clear_dead_locals: bool,
+    enable_local_move_semantics: bool,
+    owned_local_slots: &[bool],
+) -> Result<FrontendIr, ParseError> {
+    enforce_source_availability(
+        ir,
+        entry_locals,
+        clear_dead_locals,
+        enable_local_move_semantics,
+        owned_local_slots,
+        None,
+    )
+}
+
+pub(super) fn enforce_source_availability(
     mut ir: FrontendIr,
     entry_locals: &[EntryLocalAvailability],
     clear_dead_locals: bool,
     enable_local_move_semantics: bool,
     owned_local_slots: &[bool],
+    source_policies: Option<&HashMap<String, bool>>,
 ) -> Result<FrontendIr, ParseError> {
     // Pad the post-legalize ownership metadata to the analyzer's local space.
     // Availability runs pre-compaction, so the logical slot indices align with
@@ -118,28 +136,61 @@ pub(super) fn enforce_local_availability(
     }
     let initial_impls = std::mem::take(&mut ir.function_impls);
 
-    let bootstrap_analyzer = AvailabilityAnalyzer::new(
-        ir.locals,
-        &ir.local_bindings,
-        &initial_impls,
-        enable_local_move_semantics,
-        &owned_slots,
-    );
     let mut rewritten_impls = HashMap::with_capacity(initial_impls.len());
-    for (index, function_impl) in initial_impls {
-        let rewritten = bootstrap_analyzer.analyze_function_impl(function_impl)?;
-        rewritten_impls.insert(index, rewritten);
+    for (index, function_impl) in &initial_impls {
+        let policy = source_policies
+            .and_then(|policies| {
+                ir.function_sources
+                    .get(index)
+                    .and_then(|source| policies.get(source))
+            })
+            .copied()
+            .unwrap_or(enable_local_move_semantics);
+        let analyzer = AvailabilityAnalyzer::new(
+            ir.locals,
+            &ir.local_bindings,
+            &initial_impls,
+            policy,
+            &owned_slots,
+        );
+        let rewritten = analyzer.analyze_function_impl(function_impl.clone())?;
+        rewritten_impls.insert(*index, rewritten);
     }
 
-    let analyzer = AvailabilityAnalyzer::new(
-        ir.locals,
-        &ir.local_bindings,
-        &rewritten_impls,
-        enable_local_move_semantics,
-        &owned_slots,
-    );
-    let entry_state = FlowState::reachable_with_entry_locals(ir.locals, entry_locals);
-    let (rewritten_stmts, _) = analyzer.analyze_block(&ir.stmts, entry_state, true)?;
+    let mut state = FlowState::reachable_with_entry_locals(ir.locals, entry_locals);
+    let mut rewritten_stmts = Vec::new();
+    let mut start = 0;
+    while start < ir.stmts.len() {
+        let source = ir
+            .stmt_sources
+            .get(start)
+            .and_then(|source| source.as_deref());
+        let mut end = start + 1;
+        while end < ir.stmts.len()
+            && ir
+                .stmt_sources
+                .get(end)
+                .and_then(|source| source.as_deref())
+                == source
+        {
+            end += 1;
+        }
+        let policy = source_policies
+            .and_then(|policies| source.and_then(|source| policies.get(source)))
+            .copied()
+            .unwrap_or(enable_local_move_semantics);
+        let analyzer = AvailabilityAnalyzer::new(
+            ir.locals,
+            &ir.local_bindings,
+            &rewritten_impls,
+            policy,
+            &owned_slots,
+        );
+        let (stmts, next) = analyzer.analyze_block(&ir.stmts[start..end], state, true)?;
+        rewritten_stmts.extend(stmts);
+        state = next;
+        start = end;
+    }
     ir.stmts = rewritten_stmts;
     ir.function_impls = rewritten_impls;
 

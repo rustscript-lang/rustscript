@@ -24,10 +24,151 @@ pub(crate) use self::state::{
     BoundType, HostCallableSignature, LocalTypeState, TypeInferenceResult,
 };
 use super::CompileError;
+use super::FrontendTypedIr;
 use super::TypingMode;
 use super::ir::{
     Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, StructDecl, TypeSchema,
 };
+
+impl FrontendTypedIr<'_> {
+    /// Returns the compiler's existing logical schema inference for `expression`.
+    pub fn schema_of_expr(&self, expression: &Expr) -> Option<TypeSchema> {
+        let state = local_state_from_schemas(self.local_schemas);
+        let function_names = build_function_names(&self.ir.functions);
+        let function_decls = build_function_decl_map(&self.ir.functions);
+        let host_import_return_types =
+            build_host_import_return_types(&self.ir.functions, &self.ir.function_impls);
+        let host_import_signatures =
+            build_host_import_signatures(&self.ir.functions, &self.ir.function_impls);
+        let mut context = TypeContext::new(
+            &self.ir.function_impls,
+            &function_decls,
+            &self.ir.struct_schemas,
+            &function_names,
+            &host_import_return_types,
+            &host_import_signatures,
+            TypingMode::DynamicHints,
+            self.ir.parsed_semantic_index.as_ref(),
+        );
+        let schema = context
+            .infer_expr_schema(expression, &state)
+            .or_else(|| scalar_schema_from_bound_type(context.infer_expr_type(expression, &state)));
+        schema.map(|schema| {
+            if context.expr_is_optional(expression, &state)
+                && !matches!(schema, TypeSchema::Optional(_))
+            {
+                TypeSchema::Optional(Box::new(schema))
+            } else {
+                schema
+            }
+        })
+    }
+
+    /// Returns the complete logical callable schema for a declared function.
+    pub fn schema_of_function(&self, index: u16) -> Option<TypeSchema> {
+        let declaration = self.ir.functions.iter().find(|decl| decl.index == index)?;
+        let implementation = self.ir.function_impls.get(&index);
+        let state = local_state_from_schemas(self.local_schemas);
+        let function_names = build_function_names(&self.ir.functions);
+        let function_decls = build_function_decl_map(&self.ir.functions);
+        let host_import_return_types =
+            build_host_import_return_types(&self.ir.functions, &self.ir.function_impls);
+        let host_import_signatures =
+            build_host_import_signatures(&self.ir.functions, &self.ir.function_impls);
+        let mut context = TypeContext::new(
+            &self.ir.function_impls,
+            &function_decls,
+            &self.ir.struct_schemas,
+            &function_names,
+            &host_import_return_types,
+            &host_import_signatures,
+            TypingMode::DynamicHints,
+            self.ir.parsed_semantic_index.as_ref(),
+        );
+        let type_args = declaration
+            .type_params
+            .iter()
+            .cloned()
+            .map(TypeSchema::GenericParam)
+            .collect::<Vec<_>>();
+        let args = implementation
+            .map(|implementation| {
+                implementation
+                    .param_slots
+                    .iter()
+                    .copied()
+                    .map(Expr::Var)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let result = declaration
+            .return_schema
+            .clone()
+            .or_else(|| context.infer_function_return_schema(index, &type_args, &args, &state))
+            .unwrap_or(TypeSchema::Unknown);
+        let params = declaration
+            .args
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                declaration
+                    .arg_schemas
+                    .get(index)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| {
+                        implementation
+                            .and_then(|implementation| implementation.param_slots.get(index))
+                            .and_then(|slot| self.local_schemas.get(usize::from(*slot)))
+                            .cloned()
+                            .flatten()
+                    })
+                    .unwrap_or(TypeSchema::Unknown)
+            })
+            .collect();
+        Some(TypeSchema::Callable {
+            params,
+            result: Box::new(result),
+        })
+    }
+}
+
+fn scalar_schema_from_bound_type(bound_type: BoundType) -> Option<TypeSchema> {
+    match bound_type {
+        BoundType::Null => Some(TypeSchema::Null),
+        BoundType::Int => Some(TypeSchema::Int),
+        BoundType::Float => Some(TypeSchema::Float),
+        BoundType::Number => Some(TypeSchema::Number),
+        BoundType::Bool => Some(TypeSchema::Bool),
+        BoundType::String => Some(TypeSchema::String),
+        BoundType::Bytes => Some(TypeSchema::Bytes),
+        BoundType::Unknown
+        | BoundType::Array
+        | BoundType::ArrayOf(_)
+        | BoundType::Map
+        | BoundType::MapOf(_)
+        | BoundType::Callable => None,
+    }
+}
+
+fn local_state_from_schemas(local_schemas: &[Option<TypeSchema>]) -> LocalTypeState {
+    let entry_local_types = local_schemas
+        .iter()
+        .enumerate()
+        .filter_map(|(index, schema)| {
+            Some(EntryLocalType {
+                slot: u16::try_from(index).ok()?,
+                schema: schema.clone(),
+                optional: false,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut state = LocalTypeState::default();
+    seed_entry_local_state(&mut state, &entry_local_types);
+    state
+}
+
+pub(crate) use self::context::render_schema_label;
 
 #[derive(Clone, Debug)]
 pub(super) struct EntryLocalType {
@@ -316,6 +457,15 @@ pub(super) fn validate_if_else_type_consistency(
     typing_mode: TypingMode,
     entry_local_types: &[EntryLocalType],
 ) -> Result<(), CompileError> {
+    validate_source_type_consistency(ir, typing_mode, entry_local_types, None)
+}
+
+pub(super) fn validate_source_type_consistency(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    owner: Option<&str>,
+) -> Result<(), CompileError> {
     let function_names = build_function_names(&ir.functions);
     let function_decls = build_function_decl_map(&ir.functions);
     let host_import_return_types =
@@ -334,6 +484,15 @@ pub(super) fn validate_if_else_type_consistency(
         ir.parsed_semantic_index.as_ref(),
     );
     for (index, stmt) in ir.stmts.iter().enumerate() {
+        if owner.is_some_and(|owner| {
+            ir.stmt_sources
+                .get(index)
+                .and_then(|source| source.as_deref())
+                != Some(owner)
+        }) {
+            context.apply_stmts(std::slice::from_ref(stmt), &mut top_state);
+            continue;
+        }
         validate_stmts(
             std::slice::from_ref(stmt),
             &mut top_state,
@@ -350,6 +509,11 @@ pub(super) fn validate_if_else_type_consistency(
         let Some(function_impl) = ir.function_impls.get(&decl.index) else {
             continue;
         };
+        if owner.is_some_and(|owner| {
+            ir.function_sources.get(&decl.index).map(String::as_str) != Some(owner)
+        }) {
+            continue;
+        }
         validate_function_impl(
             decl.index,
             function_impl,

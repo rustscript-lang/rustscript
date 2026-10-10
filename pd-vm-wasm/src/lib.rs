@@ -6,6 +6,10 @@ mod stdlib;
 
 use std::path::Path;
 
+#[cfg(test)]
+#[path = "../tests/fixtures/coherent_typehint.rs"]
+mod coherent_typehint;
+
 use serde::{Deserialize, Serialize};
 use vm::{
     CompileSourceFileOptions, InferredLocalTypeHint, SourceFlavor,
@@ -62,10 +66,57 @@ struct LintSpanJson {
 
 #[derive(Serialize)]
 struct LocalTypeHintJson {
+    source_name: Option<String>,
+    schema: Option<serde_json::Value>,
+    span: Option<SourceByteSpanJson>,
     name: String,
     inferred_type: String,
     declared_line: Option<u32>,
     last_line: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct SourceByteSpanJson {
+    source_id: u32,
+    lo: usize,
+    hi: usize,
+}
+
+fn type_schema_to_json(schema: &vm::TypeSchema) -> serde_json::Value {
+    use serde_json::json;
+    use vm::TypeSchema;
+    match schema {
+        TypeSchema::Unknown => json!({"kind": "unknown"}),
+        TypeSchema::Null => json!({"kind": "null"}),
+        TypeSchema::Int => json!({"kind": "int"}),
+        TypeSchema::Float => json!({"kind": "float"}),
+        TypeSchema::Number => json!({"kind": "number"}),
+        TypeSchema::Bool => json!({"kind": "bool"}),
+        TypeSchema::String => json!({"kind": "string"}),
+        TypeSchema::Bytes => json!({"kind": "bytes"}),
+        TypeSchema::GenericParam(name) => json!({"kind": "generic_param", "name": name}),
+        TypeSchema::Resource(key) => json!({"kind": "resource", "key": key.as_str()}),
+        TypeSchema::Optional(inner) => {
+            json!({"kind": "optional", "inner": type_schema_to_json(inner)})
+        }
+        TypeSchema::Array(item) => json!({"kind": "array", "item": type_schema_to_json(item)}),
+        TypeSchema::Map(item) => json!({"kind": "map", "item": type_schema_to_json(item)}),
+        TypeSchema::Named(name, args) => {
+            json!({"kind": "named", "name": name, "args": args.iter().map(type_schema_to_json).collect::<Vec<_>>()})
+        }
+        TypeSchema::ArrayTuple(items) => {
+            json!({"kind": "tuple", "items": items.iter().map(type_schema_to_json).collect::<Vec<_>>()})
+        }
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            json!({"kind": "tuple_rest", "prefix": prefix.iter().map(type_schema_to_json).collect::<Vec<_>>(), "rest": type_schema_to_json(rest)})
+        }
+        TypeSchema::Object(fields) => {
+            json!({"kind": "object", "fields": fields.iter().map(|(name, schema)| (name.clone(), type_schema_to_json(schema))).collect::<serde_json::Map<_, _>>()})
+        }
+        TypeSchema::Callable { params, result } => {
+            json!({"kind": "callable", "params": params.iter().map(type_schema_to_json).collect::<Vec<_>>(), "result": type_schema_to_json(result)})
+        }
+    }
 }
 
 #[cfg(feature = "runtime")]
@@ -449,6 +500,13 @@ fn completion_catalog_to_json(catalog: CompletionCatalog) -> Vec<u8> {
 
 fn local_type_hint_to_json(hint: InferredLocalTypeHint) -> LocalTypeHintJson {
     LocalTypeHintJson {
+        source_name: hint.source_name,
+        schema: hint.schema.as_ref().map(type_schema_to_json),
+        span: hint.span.map(|span| SourceByteSpanJson {
+            source_id: span.source_id,
+            lo: span.lo,
+            hi: span.hi,
+        }),
         name: hint.name,
         inferred_type: hint.inferred_type,
         declared_line: hint.declared_line,

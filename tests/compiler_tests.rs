@@ -16,6 +16,16 @@ mod diagnostics_tests;
 mod frontend_plugin_tests;
 
 #[cfg(feature = "runtime")]
+#[path = "compiler/frontend_plugin_catalog_tests.rs"]
+mod frontend_plugin_catalog_tests;
+#[cfg(feature = "runtime")]
+#[path = "compiler/frontend_plugin_module_tests.rs"]
+mod frontend_plugin_module_tests;
+#[cfg(feature = "runtime")]
+#[path = "compiler/frontend_plugin_policy_tests.rs"]
+mod frontend_plugin_policy_tests;
+
+#[cfg(feature = "runtime")]
 #[path = "compiler/module_import_tests.rs"]
 mod module_import_tests;
 

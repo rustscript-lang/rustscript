@@ -735,6 +735,22 @@ pub(super) fn validate_stmts(
                     context,
                     strict_function_add_types,
                 )?;
+                if matches!(expr, Expr::Closure(_))
+                    && let Some(schema @ TypeSchema::Callable { .. }) = declared_schema.as_ref()
+                {
+                    validate_callable_expr_against_schema(
+                        "local",
+                        schema,
+                        expr,
+                        &expr_state,
+                        DiagnosticSite {
+                            line: Some(*line),
+                            source_name,
+                            span: context.stmt_span(*line),
+                        },
+                        context,
+                    )?;
+                }
                 let actual_schema = inferred_expr_assignment_schema(expr, &expr_state, context);
                 validate_declared_local_schema(
                     declared_schema.as_ref(),
@@ -787,6 +803,22 @@ pub(super) fn validate_stmts(
                     .has_declared_schema(*index)
                     .then(|| state.schema(*index).cloned())
                     .flatten();
+                if matches!(expr, Expr::Closure(_))
+                    && let Some(schema @ TypeSchema::Callable { .. }) = declared_schema.as_ref()
+                {
+                    validate_callable_expr_against_schema(
+                        "local",
+                        schema,
+                        expr,
+                        &expr_state,
+                        DiagnosticSite {
+                            line: Some(*line),
+                            source_name,
+                            span: context.stmt_span(*line),
+                        },
+                        context,
+                    )?;
+                }
                 let actual_schema = inferred_expr_assignment_schema(expr, &expr_state, context);
                 validate_declared_local_schema(
                     declared_schema.as_ref(),
@@ -1197,6 +1229,15 @@ fn find_declared_schema_mismatch_with_recursion(
             };
         }
         TypeSchema::Named(name, type_args) => {
+            if let Some(declaration) = context.struct_schemas.get(name)
+                && declaration.type_params.len() != type_args.len()
+            {
+                return Some(format!(
+                    "named type '{name}' expects {} type argument(s), got {}",
+                    declaration.type_params.len(),
+                    type_args.len()
+                ));
+            }
             let instance = render_schema_path_segment(name, type_args);
             let is_recursive = !recursive_named.insert(instance.clone());
             let resolved = context.resolve_schema(expected);

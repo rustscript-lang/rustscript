@@ -325,8 +325,9 @@ pub(super) fn collect_stmt_types(
                 ..
             } => {
                 let expr_state = state.clone();
-                collect_expr_types(
+                collect_contextual_expr_types(
                     expr,
+                    declared_schema.as_ref(),
                     &expr_state,
                     local_types,
                     local_schemas,
@@ -512,6 +513,56 @@ pub(super) fn collect_stmt_types(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn collect_contextual_expr_types(
+    expr: &Expr,
+    expected: Option<&TypeSchema>,
+    state: &LocalTypeState,
+    local_types: &mut [ValueType],
+    local_schemas: &mut [Option<TypeSchema>],
+    local_schema_labels: &mut [Option<String>],
+    callable_slots: &mut [bool],
+    optional_slots: &mut [bool],
+    context: &mut TypeContext<'_>,
+) {
+    if let Expr::Closure(closure) = expr
+        && let Some(TypeSchema::Callable { params, .. }) =
+            expected.map(|schema| context.substitute_schema_generics(schema))
+        && params.len() == closure.param_slots.len()
+    {
+        let params = params.into_iter().map(Some).collect::<Vec<_>>();
+        if let Some(nested) = context.build_callable_state(
+            &closure.param_slots,
+            Some(&params),
+            &closure.capture_copies,
+            None,
+            state,
+        ) {
+            collect_callable_body_types(
+                closure,
+                &nested,
+                local_types,
+                local_schemas,
+                local_schema_labels,
+                callable_slots,
+                optional_slots,
+                context,
+            );
+            return;
+        }
+    }
+    collect_expr_types(
+        expr,
+        state,
+        local_types,
+        local_schemas,
+        local_schema_labels,
+        callable_slots,
+        optional_slots,
+        context,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_expr_types(
     expr: &Expr,
     state: &LocalTypeState,
@@ -589,9 +640,45 @@ fn collect_expr_types(
         Expr::Call(_, _, args, _, _)
         | Expr::LocalCall(_, _, args, _)
         | Expr::ModuleCall(_, _, args, _) => {
-            for arg in args {
-                collect_expr_types(
+            let expected = match expr {
+                Expr::Call(_, _, _, Some(resolved), _) => Some(
+                    resolved
+                        .params
+                        .iter()
+                        .map(|param| Some(param.schema.clone()))
+                        .collect::<Vec<_>>(),
+                ),
+                Expr::Call(index, type_args, _, _, _) => {
+                    context.resolve_function_arg_schemas(*index, type_args)
+                }
+                Expr::LocalCall(slot, type_args, _, _) => match state.callable(*slot).cloned() {
+                    Some(InferredCallable::Function(index, bound_args)) => context
+                        .resolve_function_arg_schemas(
+                            index,
+                            if type_args.is_empty() {
+                                &bound_args
+                            } else {
+                                type_args
+                            },
+                        ),
+                    _ => state.callable_schema(*slot).and_then(|schema| {
+                        match context.resolve_schema(schema) {
+                            TypeSchema::Callable { params, .. } => {
+                                Some(params.into_iter().map(Some).collect())
+                            }
+                            _ => None,
+                        }
+                    }),
+                },
+                _ => None,
+            };
+            for (position, arg) in args.iter().enumerate() {
+                collect_contextual_expr_types(
                     arg,
+                    expected
+                        .as_ref()
+                        .and_then(|params| params.get(position))
+                        .and_then(Option::as_ref),
                     state,
                     local_types,
                     local_schemas,

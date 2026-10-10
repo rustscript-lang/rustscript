@@ -9,11 +9,12 @@ use super::{
         CatalogVisibility, Expr, FrontendIr, FunctionDecl, FunctionDeclSite, FunctionImpl,
         FunctionRefSite, FunctionRefTarget, HostApiIrMetadata, LocalDeclSite, LocalRefSite,
         LocalSlot, ModuleNamespaceAlias, ParsedCallSite, ParsedCallTarget, ParsedLexicalScope,
-        ParsedSemanticIndex, ScopeId, SemanticNodeId, Stmt, StructDecl, StructDeclSite,
+        ParsedSemanticIndex, ScopeId, SemanticNodeId, Stmt, StructDecl, StructDeclSite, TypeSchema,
     },
     modules::{ModuleId, SymbolId},
 };
 
+#[derive(Clone)]
 pub(super) struct ParsedUnit {
     pub(super) parsed: FrontendIr,
     /// Deterministic scope identity for the unit's local bindings at the flat
@@ -38,6 +39,8 @@ pub(super) struct ParsedUnit {
     /// Whether this unit was parsed without an explicit host catalog. This
     /// distinguishes legacy builtin metadata from catalog-backed host imports.
     pub(super) host_catalog_supplied: bool,
+    /// Semantic discovery does not imply runtime reachability.
+    pub(super) runtime_reachable: bool,
 }
 
 /// Deterministic flat-boundary scope identity for a non-root module's local
@@ -68,6 +71,286 @@ pub(super) fn module_scope_prefix(identity: &Path, module: ModuleId) -> String {
 /// discovery-order-dependent string synthesis.
 fn deterministic_flat_name(name: &str, symbol: SymbolId) -> String {
     format!("{}__m{}", name, symbol.module.0)
+}
+
+pub(super) fn internal_guest_type_name(symbol: SymbolId) -> String {
+    format!("__guest_type_m{}_s{}", symbol.module.0, symbol.index)
+}
+
+pub(super) fn remap_guest_type_schemas(parsed: &mut FrontendIr, names: &HashMap<String, String>) {
+    if names.is_empty() {
+        return;
+    }
+    if let Some(index) = parsed.parsed_semantic_index.as_mut() {
+        let source_id = index
+            .scopes
+            .first()
+            .map(|scope| scope.range.source_id)
+            .or_else(|| index.stmt_spans.first().map(|site| site.span.source_id))
+            .unwrap_or(0);
+        let mut spellings: Vec<_> = names.iter().collect();
+        spellings.sort_by_key(|(name, _)| *name);
+        for (name, canonical) in spellings {
+            let span = index
+                .struct_decls
+                .iter()
+                .find(|site| site.name == *name)
+                .map(|site| site.ident_span);
+            index.type_provenance.push(super::ir::GuestTypeProvenance {
+                canonical_name: canonical.clone(),
+                source_name: name.clone(),
+                source_id,
+                declaration_span: span,
+            });
+        }
+    }
+    let mut schemas = HashMap::new();
+    for (name, mut declaration) in std::mem::take(&mut parsed.struct_schemas) {
+        if declaration.is_guest()
+            && let Some(internal) = names.get(&name).or_else(|| names.get(&declaration.name))
+        {
+            declaration.name = internal.clone();
+            remap_type_schema_names(&mut declaration.body_schema, names);
+            schemas.entry(internal.clone()).or_insert(declaration);
+            continue;
+        }
+        schemas.insert(name, declaration);
+    }
+    parsed.struct_schemas = schemas;
+
+    let catalog_import_indices = parsed
+        .host_api_metadata
+        .as_ref()
+        .map(|metadata| {
+            parsed
+                .functions
+                .iter()
+                .filter(|function| metadata.candidates(function.index).is_some())
+                .map(|function| function.index)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    for function in &mut parsed.functions {
+        if catalog_import_indices.contains(&function.index) {
+            continue;
+        }
+        for schema in function.arg_schemas.iter_mut().flatten() {
+            remap_type_schema_names(schema, names);
+        }
+        if let Some(schema) = &mut function.return_schema {
+            remap_type_schema_names(schema, names);
+        }
+    }
+    for statement in &mut parsed.stmts {
+        remap_statement_type_names(statement, names);
+    }
+    for function in parsed.function_impls.values_mut() {
+        for statement in &mut function.body_stmts {
+            remap_statement_type_names(statement, names);
+        }
+        remap_expression_type_names(&mut function.body_expr, names);
+    }
+}
+
+pub(super) fn remap_type_schema_names(schema: &mut TypeSchema, names: &HashMap<String, String>) {
+    match schema {
+        TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
+            remap_type_schema_names(inner, names);
+        }
+        TypeSchema::Named(name, args) => {
+            if let Some(internal) = names.get(name) {
+                *name = internal.clone();
+            }
+            for argument in args {
+                remap_type_schema_names(argument, names);
+            }
+        }
+        TypeSchema::ArrayTuple(items) => {
+            for item in items {
+                remap_type_schema_names(item, names);
+            }
+        }
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            for item in prefix {
+                remap_type_schema_names(item, names);
+            }
+            remap_type_schema_names(rest, names);
+        }
+        TypeSchema::Object(properties) => {
+            for schema in properties.values_mut() {
+                remap_type_schema_names(schema, names);
+            }
+        }
+        TypeSchema::Callable { params, result } => {
+            for parameter in params {
+                remap_type_schema_names(parameter, names);
+            }
+            remap_type_schema_names(result, names);
+        }
+        TypeSchema::Unknown
+        | TypeSchema::Null
+        | TypeSchema::Int
+        | TypeSchema::Float
+        | TypeSchema::Number
+        | TypeSchema::Bool
+        | TypeSchema::String
+        | TypeSchema::Bytes
+        | TypeSchema::GenericParam(_)
+        | TypeSchema::Resource(_) => {}
+    }
+}
+
+fn remap_statement_type_names(statement: &mut Stmt, names: &HashMap<String, String>) {
+    match statement {
+        Stmt::Let {
+            declared_schema,
+            expr,
+            ..
+        } => {
+            if let Some(schema) = declared_schema {
+                remap_type_schema_names(schema, names);
+            }
+            remap_expression_type_names(expr, names);
+        }
+        Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+            remap_expression_type_names(expr, names);
+        }
+        Stmt::ClosureLet { closure, .. } => remap_expression_type_names(&mut closure.body, names),
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            remap_expression_type_names(condition, names);
+            for nested in then_branch.iter_mut().chain(else_branch) {
+                remap_statement_type_names(nested, names);
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            remap_statement_type_names(init, names);
+            remap_expression_type_names(condition, names);
+            remap_statement_type_names(post, names);
+            for nested in body {
+                remap_statement_type_names(nested, names);
+            }
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            remap_expression_type_names(condition, names);
+            for nested in body {
+                remap_statement_type_names(nested, names);
+            }
+        }
+        Stmt::Noop { .. }
+        | Stmt::FuncDecl { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Drop { .. } => {}
+    }
+}
+
+fn remap_expression_type_names(expression: &mut Expr, names: &HashMap<String, String>) {
+    match expression {
+        Expr::FunctionRef(_, types)
+        | Expr::ModuleFunctionRef(_, types)
+        | Expr::UnresolvedFunctionRef {
+            type_args: types, ..
+        } => {
+            for schema in types {
+                remap_type_schema_names(schema, names);
+            }
+        }
+        Expr::Call(_, types, args, _, _)
+        | Expr::ModuleCall(_, types, args, _)
+        | Expr::LocalCall(_, types, args, _) => {
+            for schema in types {
+                remap_type_schema_names(schema, names);
+            }
+            for argument in args {
+                remap_expression_type_names(argument, names);
+            }
+        }
+        Expr::Closure(closure) => remap_expression_type_names(&mut closure.body, names),
+        Expr::ClosureCall(closure, args) => {
+            remap_expression_type_names(&mut closure.body, names);
+            for argument in args {
+                remap_expression_type_names(argument, names);
+            }
+        }
+        Expr::OptionalGet { container, key, .. } => {
+            remap_expression_type_names(container, names);
+            remap_expression_type_names(key, names);
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            remap_expression_type_names(value, names);
+            remap_expression_type_names(fallback, names);
+        }
+        Expr::Add(left, right)
+        | Expr::Sub(left, right)
+        | Expr::Mul(left, right)
+        | Expr::Div(left, right)
+        | Expr::Mod(left, right)
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Eq(left, right)
+        | Expr::Lt(left, right)
+        | Expr::Gt(left, right) => {
+            remap_expression_type_names(left, names);
+            remap_expression_type_names(right, names);
+        }
+        Expr::Neg(value)
+        | Expr::Not(value)
+        | Expr::ToOwned(value)
+        | Expr::Borrow(value)
+        | Expr::BorrowMut(value) => remap_expression_type_names(value, names),
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            remap_expression_type_names(condition, names);
+            remap_expression_type_names(then_expr, names);
+            remap_expression_type_names(else_expr, names);
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            remap_expression_type_names(value, names);
+            for (_, arm) in arms {
+                remap_expression_type_names(arm, names);
+            }
+            remap_expression_type_names(default, names);
+        }
+        Expr::Block { stmts, expr } => {
+            for statement in stmts {
+                remap_statement_type_names(statement, names);
+            }
+            remap_expression_type_names(expr, names);
+        }
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::Bytes(_)
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. } => {}
+    }
 }
 
 pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePathError> {
@@ -132,6 +415,44 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
     let mut merged_lexer_tokens: Vec<crate::compiler::ir::LexerToken> = Vec::new();
 
     for unit in units {
+        if !unit.runtime_reachable {
+            // Keep type facts and source tokens, but allocate no executable
+            // function/local slots or host import families for semantic edges.
+            for (name, schema) in unit.parsed.struct_schemas {
+                if let Some(existing) = merged_struct_schemas.get(&name)
+                    && existing != &schema
+                {
+                    return Err(SourcePathError::Source(SourceError::Parse(
+                        ParseError::new(format!("conflicting type declaration '{name}'")),
+                    )));
+                }
+                merged_struct_schemas.insert(name, schema);
+            }
+            merged_unknown_type_spans.extend(unit.parsed.unknown_type_spans);
+            merged_lexer_tokens.extend(unit.parsed.lexer_tokens);
+            if let Some(index) = unit.parsed.parsed_semantic_index {
+                // Type-only sources retain declaration/scope ownership, while
+                // local/call/function sites never allocate executable slots.
+                let types = ParsedSemanticIndex {
+                    scopes: index.scopes,
+                    struct_decls: index.struct_decls,
+                    type_provenance: index.type_provenance,
+                    next_node_id: index.next_node_id,
+                    next_scope_id: index.next_scope_id,
+                    ..ParsedSemanticIndex::default()
+                };
+                let merged = merged_parsed_index.get_or_insert_with(ParsedSemanticIndex::default);
+                let rebased = rebase_parsed_semantic_index(
+                    &types,
+                    merged.next_node_id,
+                    merged.next_scope_id,
+                    0,
+                    &HashMap::new(),
+                )?;
+                merge_parsed_semantic_index(merged, rebased);
+            }
+            continue;
+        }
         let source_name = unit.source_name.clone();
         let function_map = register_unit_functions(
             &unit,
@@ -543,6 +864,29 @@ fn register_unit_functions(
     let mut map = HashMap::new();
 
     for func in &unit.parsed.functions {
+        if unit
+            .parsed
+            .host_api_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.candidates(func.index).is_some())
+        {
+            let identity = (func.name.clone(), func.arity);
+            let flat = if let Some(&existing) = host_index_by_arity.get(&identity) {
+                merge_host_import_metadata(&mut merged_functions[existing as usize], func)?;
+                existing
+            } else {
+                let flat = next_flat_index(merged_functions)?;
+                let mut declaration = func.clone();
+                declaration.index = flat;
+                declaration.symbol = None;
+                merged_functions.push(declaration);
+                host_index_by_arity.insert(identity, flat);
+                claimed_flat_names.insert(func.name.clone());
+                flat
+            };
+            map.insert(func.index, flat);
+            continue;
+        }
         let Some(symbol) = func.symbol else {
             // Synthetic prelude/stub declaration; resolved by the loader.
             continue;
@@ -1437,6 +1781,7 @@ fn rebase_parsed_semantic_index(
     let stmt_spans = unit.stmt_spans.clone();
 
     Ok(ParsedSemanticIndex {
+        type_provenance: unit.type_provenance.clone(),
         call_sites,
         local_decls,
         local_refs,
@@ -1487,6 +1832,7 @@ fn merge_parsed_semantic_index(merged: &mut ParsedSemanticIndex, unit: ParsedSem
     merged.local_refs.extend(unit.local_refs);
     merged.func_decls.extend(unit.func_decls);
     merged.struct_decls.extend(unit.struct_decls);
+    merged.type_provenance.extend(unit.type_provenance);
     merged.func_refs.extend(unit.func_refs);
     merged.scopes.extend(unit.scopes);
     merged.stmt_spans.extend(unit.stmt_spans);
@@ -1734,6 +2080,7 @@ mod linker_metadata_remap_tests {
             module: ModuleId(module),
             source_id: 0,
             host_catalog_supplied: false,
+            runtime_reachable: true,
         }
     }
 
@@ -2198,6 +2545,7 @@ mod linker_provenance_merge_tests {
             module: ModuleId(module),
             source_id,
             host_catalog_supplied: false,
+            runtime_reachable: true,
         }
     }
 
@@ -2265,6 +2613,7 @@ mod linker_provenance_merge_tests {
             }],
             stmt_spans: Vec::new(),
             struct_decls: Vec::new(),
+            type_provenance: Vec::new(),
             next_node_id,
             next_scope_id,
         }
@@ -2418,6 +2767,7 @@ mod linker_provenance_merge_tests {
             }],
             stmt_spans: Vec::new(),
             struct_decls: Vec::new(),
+            type_provenance: Vec::new(),
             next_node_id: 3,
             next_scope_id: 1,
         };
@@ -2443,6 +2793,7 @@ mod linker_provenance_merge_tests {
             }],
             stmt_spans: Vec::new(),
             struct_decls: Vec::new(),
+            type_provenance: Vec::new(),
             next_node_id: 1,
             next_scope_id: 1,
         };
@@ -2559,6 +2910,7 @@ mod linker_provenance_merge_tests {
             local_refs: Vec::new(),
             func_decls: Vec::new(),
             struct_decls: Vec::new(),
+            type_provenance: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
             stmt_spans: Vec::new(),
@@ -2579,6 +2931,7 @@ mod linker_provenance_merge_tests {
             local_refs: Vec::new(),
             func_decls: Vec::new(),
             struct_decls: Vec::new(),
+            type_provenance: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
             stmt_spans: Vec::new(),
@@ -2649,6 +3002,7 @@ mod linker_provenance_merge_tests {
             local_refs: Vec::new(),
             func_decls: Vec::new(),
             struct_decls: Vec::new(),
+            type_provenance: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
             stmt_spans: Vec::new(),
@@ -2978,10 +3332,7 @@ mod linker_provenance_merge_tests {
                 UsePathSegment::Ident("a".to_string()),
                 UsePathSegment::Ident("util".to_string()),
             ],
-            clause: ImportClause::Named(vec![NamedImport {
-                imported: "helper".to_string(),
-                local: "h".to_string(),
-            }]),
+            clause: ImportClause::Named(vec![NamedImport::value("helper", "h")]),
             span: span(source_id, 0, 20),
             line,
         };
@@ -3120,6 +3471,7 @@ mod linker_provenance_merge_tests {
             module: ModuleId(1),
             source_id: 1,
             host_catalog_supplied: false,
+            runtime_reachable: true,
         };
         let merged = merge_units(vec![a]).expect("provenance-less unit must merge");
         assert!(merged.parsed_semantic_index.is_none());

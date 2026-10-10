@@ -411,7 +411,7 @@ impl Parser {
                 }
                 self.direct_host_call_aliases.insert(local.clone(), target);
             }
-            named.push(NamedImport { imported, local });
+            named.push(NamedImport::value(imported, local));
             if self.match_kind(&TokenKind::Comma) {
                 if self.check(&TokenKind::RBrace) {
                     break;

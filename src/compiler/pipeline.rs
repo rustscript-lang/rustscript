@@ -18,8 +18,8 @@ use super::source_loader::{load_units_for_source_file, load_units_for_source_fil
 use super::source_map::SourceMap;
 use super::{
     CompileError, CompileSourceFileOptions, CompiledProgram, CompiledReplProgram, FrontendPolicy,
-    ParseError, ReplLocalBinding, SourceError, SourceFlavor, SourcePathError, TypingMode, lifetime,
-    materialization, parser, typing,
+    FrontendTypedIr, ParseError, ReplLocalBinding, SourceError, SourceFlavor, SourcePathError,
+    TypingMode, lifetime, materialization, parser, typing,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -37,10 +37,13 @@ pub struct UnknownInferredLocal {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferredLocalTypeHint {
+    pub source_name: Option<String>,
     pub name: String,
     pub inferred_type: String,
     pub declared_line: Option<u32>,
     pub last_line: Option<u32>,
+    pub schema: Option<TypeSchema>,
+    pub span: Option<crate::compiler::source_map::Span>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -55,6 +58,261 @@ impl CompileBehavior {
     const REPL: Self = Self {
         clear_dead_locals: false,
     };
+}
+
+struct PreparedTypedUnits {
+    ir: FrontendIr,
+    type_info: typing::TypeInferenceResult,
+    owned_ir: FrontendIr,
+    sources: SourceMap,
+    catalog: Arc<HostApiCatalog>,
+    module_graph: Option<ModuleGraph>,
+}
+
+fn prepare_typed_units(
+    units: Vec<ParsedUnit>,
+    sources: SourceMap,
+    policy: FrontendPolicy,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+    behavior: CompileBehavior,
+    module_graph: Option<ModuleGraph>,
+) -> Result<PreparedTypedUnits, SourcePathError> {
+    let diagnostic_path = units
+        .iter()
+        .find(|unit| !unit.parsed.unknown_type_spans.is_empty())
+        .map(|unit| PathBuf::from(&unit.source_name));
+    // Capture admission ownership before flattening. Source identity and policy
+    // are independent of runtime reachability and of the root frontend.
+    let mut owners = Vec::new();
+    for unit in &units {
+        let producer = if unit.module.0 == 0 {
+            flavor
+        } else {
+            SourceFlavor::from_path_with_options(Path::new(&unit.source_name), options)?
+        };
+        let producer_policy = if unit.module.0 == 0 {
+            policy
+        } else {
+            frontend_policy_for_flavor(producer, options)?
+        };
+        let plugin = options.source_plugin_for_flavor(producer);
+        owners.push(TypedSourceOwner {
+            source_id: unit.source_id,
+            source_name: unit.source_name.clone(),
+            policy: producer_policy,
+            plugin,
+            semantic_only: (!unit.runtime_reachable).then(|| unit.parsed.clone()),
+        });
+    }
+    let parsed = merge_units(units)?;
+    let (ir, type_info, owned_ir) =
+        prepare_owned_typed_ir(parsed, &owners, options, behavior, &sources).map_err(|error| {
+            SourcePathError::SourceWithMap {
+                error: preserve_strict_diagnostic_path(error, diagnostic_path.as_deref()),
+                sources: sources.clone(),
+            }
+        })?;
+    let catalog = options
+        .host_api_catalog()
+        .cloned()
+        .unwrap_or_else(default_analyze_catalog);
+    Ok(PreparedTypedUnits {
+        ir,
+        type_info,
+        owned_ir,
+        sources,
+        catalog,
+        module_graph,
+    })
+}
+
+fn preserve_strict_diagnostic_path(
+    error: SourceError,
+    diagnostic_path: Option<&Path>,
+) -> SourceError {
+    match (error, diagnostic_path) {
+        (SourceError::Parse(mut parse), Some(path))
+            if parse.code.as_deref() == Some("E_STRICT_UNKNOWN_TYPE") =>
+        {
+            parse.message = format!("{}: {}", path.display(), parse.message);
+            SourceError::Parse(parse)
+        }
+        (error, _) => error,
+    }
+}
+
+fn prepare_typed_ir(
+    parsed: FrontendIr,
+    policy: FrontendPolicy,
+    options: &CompileSourceFileOptions,
+    behavior: CompileBehavior,
+    plugin: Option<&dyn super::SourcePlugin>,
+    sources: &SourceMap,
+) -> Result<(FrontendIr, typing::TypeInferenceResult, FrontendIr), SourceError> {
+    let owners = [TypedSourceOwner {
+        source_id: 0,
+        source_name: String::new(),
+        policy,
+        plugin,
+        semantic_only: None,
+    }];
+    prepare_owned_typed_ir(parsed, &owners, options, behavior, sources)
+}
+
+struct TypedSourceOwner<'a> {
+    source_id: u32,
+    source_name: String,
+    policy: FrontendPolicy,
+    plugin: Option<&'a dyn super::SourcePlugin>,
+    semantic_only: Option<FrontendIr>,
+}
+
+// Select admission sites only. The shared IR remains authoritative for all
+// inference, imported signatures, nominal bodies and validation queries.
+fn owned_admission_sites(ir: &FrontendIr, owner: &TypedSourceOwner<'_>) -> FrontendIr {
+    let mut owned = ir.clone();
+    if owner.source_name.is_empty() {
+        return owned;
+    }
+    let statements: Vec<_> = owned
+        .stmts
+        .into_iter()
+        .zip(&ir.stmt_sources)
+        .filter(|(_, source)| source.as_deref() == Some(owner.source_name.as_str()))
+        .collect();
+    owned.stmts = statements.iter().map(|(stmt, _)| stmt.clone()).collect();
+    owned.stmt_sources = statements
+        .into_iter()
+        .map(|(_, source)| source.clone())
+        .collect();
+    owned
+        .function_impls
+        .retain(|index, _| ir.function_sources.get(index) == Some(&owner.source_name));
+    owned
+        .functions
+        .retain(|decl| owned.function_impls.contains_key(&decl.index));
+    owned
+        .unknown_type_spans
+        .retain(|span| span.source_id == owner.source_id);
+    if let Some(index) = &ir.parsed_semantic_index {
+        owned.local_bindings.retain(|(_, slot)| {
+            index
+                .local_decls
+                .iter()
+                .any(|decl| decl.slot == *slot && decl.ident_span.source_id == owner.source_id)
+        });
+        owned.struct_schemas.retain(|name, decl| {
+            !decl.is_guest()
+                || index.type_provenance.iter().any(|site| {
+                    site.canonical_name == *name
+                        && site.source_id == owner.source_id
+                        && site.declaration_span.is_some()
+                })
+        });
+    }
+    owned
+}
+
+fn prepare_owned_typed_ir(
+    mut parsed: FrontendIr,
+    owners: &[TypedSourceOwner<'_>],
+    options: &CompileSourceFileOptions,
+    behavior: CompileBehavior,
+    sources: &SourceMap,
+) -> Result<(FrontendIr, typing::TypeInferenceResult, FrontendIr), SourceError> {
+    for owner in owners
+        .iter()
+        .filter(|owner| owner.policy.typing_mode.is_strict())
+    {
+        let owned = owner
+            .semantic_only
+            .clone()
+            .unwrap_or_else(|| owned_admission_sites(&parsed, owner));
+        reject_strict_unknown_annotations(&owned).map_err(SourceError::Parse)?;
+    }
+    // Legalization and inference do not impose the root's language policy on
+    // dependencies. Admission below uses each producer's own descriptor.
+    parsed = typing::legalize_builtins_and_bind_types(parsed, TypingMode::DynamicHints, &[])
+        .map_err(SourceError::Compile)?;
+    let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, &[]);
+    for owner in owners {
+        if let Some(semantic) = &owner.semantic_only {
+            let semantic = typing::legalize_builtins_and_bind_types(
+                semantic.clone(),
+                owner.policy.typing_mode,
+                &[],
+            )
+            .map_err(SourceError::Compile)?;
+            typing::validate_if_else_type_consistency(&semantic, owner.policy.typing_mode, &[])
+                .map_err(SourceError::Compile)?;
+            if owner.policy.typing_mode.is_strict() {
+                let facts = typing::infer_types(&semantic, owner.policy.typing_mode, &[]);
+                enforce_strict_type_resolution(&semantic, &facts).map_err(SourceError::Compile)?;
+            }
+        } else {
+            typing::validate_source_type_consistency(
+                &parsed,
+                owner.policy.typing_mode,
+                &[],
+                (!owner.source_name.is_empty()).then_some(owner.source_name.as_str()),
+            )
+            .map_err(SourceError::Compile)?;
+            if owner.policy.typing_mode.is_strict() {
+                enforce_strict_type_resolution(&owned_admission_sites(&parsed, owner), &type_info)
+                    .map_err(SourceError::Compile)?;
+            }
+        }
+    }
+    let logical_schemas = type_info.logical_schemas();
+    parsed.semantic_index = Some(SemanticIndex::build(logical_schemas.clone(), &parsed));
+    let owned_local_slots = type_info
+        .local_schemas
+        .iter()
+        .map(|schema| {
+            schema.as_ref().is_some_and(|schema| {
+                schema.contains_resource_with_named_types(&parsed.struct_schemas)
+            })
+        })
+        .collect::<Vec<_>>();
+    let policies = owners
+        .iter()
+        .map(|owner| (owner.source_name.clone(), owner.policy.ownership_checking))
+        .collect();
+    let owned_ir = lifetime::enforce_source_availability(
+        parsed.clone(),
+        behavior.clear_dead_locals,
+        &owned_local_slots,
+        &policies,
+        owners
+            .first()
+            .is_some_and(|owner| owner.policy.ownership_checking),
+    )
+    .map_err(SourceError::Parse)?;
+    for owner in owners {
+        if let Some(plugin) = owner.plugin {
+            let (view, schemas) = if let Some(semantic) = &owner.semantic_only {
+                let mut view = semantic.clone();
+                let schemas =
+                    typing::infer_types(&view, owner.policy.typing_mode, &[]).logical_schemas();
+                view.semantic_index = Some(SemanticIndex::build(schemas.clone(), &view));
+                (Some(view), schemas)
+            } else {
+                (None, logical_schemas.clone())
+            };
+            let typed = FrontendTypedIr {
+                source_id: Some(owner.source_id),
+                ir: view.as_ref().unwrap_or(&parsed),
+                local_schemas: &schemas,
+                host_api_catalog: options.host_api_catalog().map(Arc::as_ref),
+                source_map: Some(sources),
+            };
+            plugin
+                .validate_typed_ir(&typed)
+                .map_err(SourceError::Compile)?;
+        }
+    }
+    Ok((parsed, type_info, owned_ir))
 }
 
 fn collect_named_local_debug_ranges(parsed: &FrontendIr) -> HashMap<String, LocalDebugRange> {
@@ -394,19 +652,11 @@ fn compile_parsed_output_with_entry_locals(
         .map_err(SourceError::Compile)?;
     typing::validate_if_else_type_consistency(&parsed, typing_mode, entry_local_types)
         .map_err(SourceError::Compile)?;
-    // One strict inference run over the post-legalize IR: it feeds both the
-    // strict RustScript resolution gate and the resource-ownership metadata
-    // for the lifetime passes. Slot indices are the pre-compaction logical
-    // locals here, exactly the space availability/liveness analyze in.
     let pre_lifetime_type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
     if typing_mode.is_strict() {
         enforce_strict_type_resolution(&parsed, &pre_lifetime_type_info)
             .map_err(SourceError::Compile)?;
     }
-    // A local slot is resource-owned when its post-legalize logical schema
-    // contains a resource anywhere (direct or nested). These slots are the
-    // move-only contract for availability/liveness; plain programs carry no
-    // resource schemas, so their behavior is untouched.
     let owned_local_slots = pre_lifetime_type_info
         .local_schemas
         .iter()
@@ -424,6 +674,24 @@ fn compile_parsed_output_with_entry_locals(
         &owned_local_slots,
     )
     .map_err(SourceError::Parse)?;
+    compile_owned_ir_output(
+        source,
+        parsed,
+        entry_local_types,
+        typing_mode,
+        enable_local_move_semantics,
+        local_debug_ranges,
+    )
+}
+
+fn compile_owned_ir_output(
+    source: String,
+    parsed: FrontendIr,
+    entry_local_types: &[typing::EntryLocalType],
+    typing_mode: TypingMode,
+    enable_local_move_semantics: bool,
+    local_debug_ranges: HashMap<String, LocalDebugRange>,
+) -> Result<CompiledProgram, SourceError> {
     // Classify named callable materialization on the final merged IR
     // (post-lifetime, so capture metadata and rewritten uses are
     // authoritative). Codegen consumes `requires_callable_slot` to omit
@@ -585,7 +853,13 @@ fn enforce_strict_type_resolution(
             index
                 .struct_decls
                 .iter()
-                .find(|site| site.name == schema.name)
+                .find(|site| {
+                    site.name == schema.name
+                        || index.type_provenance.iter().any(|provenance| {
+                            provenance.canonical_name == schema.name
+                                && provenance.declaration_span == Some(site.ident_span)
+                        })
+                })
                 .map(|site| site.ident_span)
         });
         return Err(CompileError::StrictTypingRequired {
@@ -843,7 +1117,7 @@ pub fn analyze_source_with_flavor(
     source: &str,
     flavor: SourceFlavor,
 ) -> Result<SemanticModel, SourceError> {
-    let effective = default_standard_catalog_options(&CompileSourceFileOptions::default());
+    let effective = default_standard_catalog_options(flavor, &CompileSourceFileOptions::default());
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
     let parsed = frontends::parse_source(source, flavor, &effective).map_err(|err| {
@@ -933,66 +1207,75 @@ fn analyze_source_string_at_path(
     source: &str,
     options: &CompileSourceFileOptions,
 ) -> Result<SemanticModel, SourcePathError> {
-    let effective = default_standard_catalog_options(options);
+    let effective = default_standard_catalog_options(flavor, options);
     let policy = frontend_policy_for_flavor(flavor, &effective)?;
-    // Module-graph, plugin, and custom-catalog compilations share the same
-    // frontend pipeline as the compile path: the loader parses every unit
-    // verbatim (no second parser), the linker merges the provenance carrier,
-    // and analysis builds the semantic index from the merged IR.
-    if effective.has_module_overrides() || effective.has_source_plugins() {
-        let loaded = load_units_for_source_file(path, flavor, source, &effective)?;
-        let catalog = effective.host_api_catalog().cloned();
-        return analyze_loaded_units(
-            source.to_string(),
-            loaded.units,
-            policy,
-            loaded.sources,
-            catalog,
-            Some(loaded.module_graph),
-        );
-    }
-
-    let mut source_map = SourceMap::new();
-    let source_id = source_map.add_source(path.display().to_string(), source.to_string());
-    let parsed = frontends::parse_source(source, flavor, &effective).map_err(|err| {
-        SourcePathError::Source(SourceError::Parse(
-            err.with_line_span_from_source(&source_map, source_id),
-        ))
-    })?;
-
-    let catalog = effective.host_api_catalog().cloned();
-    analyze_parsed_output(
-        source.to_string(),
-        parsed,
-        source_map,
+    let loaded = load_units_for_source_file(path, flavor, source, &effective)?;
+    analyze_loaded_units(
+        loaded.units,
         policy,
-        catalog,
-        None,
+        loaded.sources,
+        Some(loaded.module_graph),
+        flavor,
+        &effective,
     )
-    .map_err(SourcePathError::Source)
 }
 
 /// Analyze the merged output of the module loader through the shared
 /// frontend pipeline: merge units, then legalize + type-check + build the
 /// provenance-driven semantic index. No second parser is involved.
 fn analyze_loaded_units(
-    source: String,
     units: Vec<ParsedUnit>,
     policy: FrontendPolicy,
     sources: SourceMap,
-    custom_catalog: Option<Arc<HostApiCatalog>>,
     module_graph: Option<ModuleGraph>,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
 ) -> Result<SemanticModel, SourcePathError> {
-    let merged = merge_units(units)?;
-    analyze_parsed_output(
-        source,
-        merged,
+    // Preserve the semantic API's recoverable host-resolution diagnostic
+    // contract. Checked admission still runs first; this retained source IR
+    // is diagnostic-only and never feeds compilation or type hints.
+    let diagnostic_units = units.clone();
+    let mut prepared = match prepare_typed_units(
+        units,
         sources,
         policy,
-        custom_catalog,
-        module_graph,
-    )
-    .map_err(SourcePathError::Source)
+        flavor,
+        options,
+        CompileBehavior::DEFAULT,
+        None,
+    ) {
+        Ok(prepared) => prepared,
+        Err(SourcePathError::SourceWithMap {
+            error: SourceError::Compile(error @ CompileError::HostCallResolve { .. }),
+            sources,
+        }) => {
+            let mut ir = merge_units(diagnostic_units)?;
+            let facts = typing::infer_types(&ir, policy.typing_mode, &[]);
+            ir.semantic_index = Some(SemanticIndex::build(facts.logical_schemas(), &ir));
+            let catalog = options
+                .host_api_catalog()
+                .cloned()
+                .unwrap_or_else(default_analyze_catalog);
+            return Ok(match module_graph {
+                Some(graph) => {
+                    SemanticModel::new_with_module_graph(ir, sources, catalog, vec![error], graph)
+                }
+                None => SemanticModel::new(ir, sources, catalog, vec![error]),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    prepared.module_graph = module_graph;
+    Ok(match prepared.module_graph {
+        Some(module_graph) => SemanticModel::new_with_module_graph(
+            prepared.ir,
+            prepared.sources,
+            prepared.catalog,
+            Vec::new(),
+            module_graph,
+        ),
+        None => SemanticModel::new(prepared.ir, prepared.sources, prepared.catalog, Vec::new()),
+    })
 }
 
 fn analyze_parsed_output(
@@ -1167,13 +1450,23 @@ fn collect_inferred_local_type_hints_impl(
     source: &str,
     flavor: SourceFlavor,
 ) -> Result<Vec<InferredLocalTypeHint>, SourceError> {
+    let options = CompileSourceFileOptions::default();
+    let policy = frontend_policy_for_flavor(flavor, &options)
+        .map_err(|error| SourceError::Parse(ParseError::new(error.to_string())))?;
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
-    let parsed = frontends::parse_source(source, flavor, &CompileSourceFileOptions::default())
-        .map_err(|err| {
-            SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
-        })?;
-    collect_named_local_type_hints(parsed).map_err(SourceError::Compile)
+    let parsed = frontends::parse_source(source, flavor, &options).map_err(|err| {
+        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+    })?;
+    let (ir, type_info, _) = prepare_typed_ir(
+        parsed,
+        policy,
+        &options,
+        CompileBehavior::DEFAULT,
+        None,
+        &source_map,
+    )?;
+    Ok(collect_named_local_type_hints(&ir, &type_info, &source_map))
 }
 
 fn lint_unknown_inferred_local_types_with_options_impl(
@@ -1198,14 +1491,6 @@ fn collect_inferred_local_type_hints_with_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<Vec<InferredLocalTypeHint>, SourcePathError> {
-    if !options.has_module_overrides()
-        && !options.has_source_plugins()
-        && options.host_api_catalog().is_none()
-    {
-        return collect_inferred_local_type_hints_impl(source, flavor)
-            .map_err(SourcePathError::Source);
-    }
-
     let path = virtual_inmemory_entry_path(flavor, options)?;
     collect_inferred_local_type_hints_at_path_with_options_impl(&path, source, flavor, options)
 }
@@ -1235,15 +1520,22 @@ fn collect_inferred_local_type_hints_at_path_with_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<Vec<InferredLocalTypeHint>, SourcePathError> {
+    let policy = frontend_policy_for_flavor(flavor, options)?;
     let loaded = load_units_for_source_file(path, flavor, source, options)?;
-    let parsed = loaded
-        .units
-        .into_iter()
-        .last()
-        .map(|unit| unit.parsed)
-        .expect("root parsed unit should always be present");
-    collect_named_local_type_hints(parsed)
-        .map_err(|error| SourcePathError::Source(SourceError::Compile(error)))
+    let prepared = prepare_typed_units(
+        loaded.units,
+        loaded.sources,
+        policy,
+        flavor,
+        options,
+        CompileBehavior::DEFAULT,
+        Some(loaded.module_graph),
+    )?;
+    Ok(collect_named_local_type_hints(
+        &prepared.ir,
+        &prepared.type_info,
+        &prepared.sources,
+    ))
 }
 
 fn collect_unknown_inferred_local_types(
@@ -1295,46 +1587,134 @@ fn collect_unknown_inferred_local_types(
 }
 
 fn collect_named_local_type_hints(
-    parsed: FrontendIr,
-) -> Result<Vec<InferredLocalTypeHint>, CompileError> {
+    parsed: &FrontendIr,
+    type_info: &typing::TypeInferenceResult,
+    source_map: &SourceMap,
+) -> Vec<InferredLocalTypeHint> {
+    let logical_schemas = type_info.logical_schemas();
     let slot_ranges = collect_local_debug_ranges(&parsed.stmts, &parsed.function_impls);
-    let function_decl_lines = collect_function_decl_lines(&parsed.stmts);
-    let parsed = typing::legalize_builtins_and_bind_types(parsed, TypingMode::DynamicHints, &[])?;
-    let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, &[]);
-
+    let semantic_index = parsed.semantic_index.as_ref();
+    let mut seen = std::collections::HashSet::new();
     let mut hints = Vec::new();
-    for (name, slot) in &parsed.local_bindings {
-        hints.push(InferredLocalTypeHint {
-            name: name.clone(),
-            inferred_type: inferred_slot_type_name(&type_info, *slot),
-            declared_line: slot_ranges.get(slot).and_then(|range| range.declared_line),
-            last_line: slot_ranges.get(slot).and_then(|range| range.last_line),
-        });
-    }
 
-    for decl in &parsed.functions {
-        let Some(function_impl) = parsed.function_impls.get(&decl.index) else {
-            continue;
-        };
-        let declared_line = function_decl_lines.get(&decl.index).copied();
-        let last_line = function_scope_last_line(function_impl).or(declared_line);
-        for (name, slot) in decl.args.iter().zip(function_impl.param_slots.iter()) {
+    if let Some(semantic_index) = semantic_index {
+        for decl in &semantic_index.parsed.local_decls {
+            let declaration_identity = (
+                decl.ident_span.source_id,
+                decl.slot,
+                decl.ident_span.lo,
+                decl.ident_span.hi,
+            );
+            if !seen.insert(declaration_identity) {
+                continue;
+            }
+            let schema = logical_schemas
+                .get(usize::from(decl.slot))
+                .cloned()
+                .flatten();
+            let declaration_line = source_map
+                .line_col_for_offset(decl.ident_span.source_id, decl.ident_span.lo)
+                .and_then(|(line, _)| u32::try_from(line).ok());
+            let range = slot_ranges.get(&decl.slot);
             hints.push(InferredLocalTypeHint {
+                source_name: source_map
+                    .file_name(decl.ident_span.source_id)
+                    .map(str::to_string),
+                name: decl.name.clone(),
+                inferred_type: schema
+                    .as_ref()
+                    .map(|schema| {
+                        typing::render_schema_label(
+                            &parsed.source_schema(schema, decl.ident_span.source_id),
+                        )
+                    })
+                    .unwrap_or_else(|| inferred_slot_type_name(type_info, decl.slot)),
+                declared_line: declaration_line
+                    .or_else(|| range.and_then(|range| range.declared_line)),
+                last_line: range.and_then(|range| range.last_line),
+                schema,
+                span: source_map
+                    .span_text(decl.ident_span)
+                    .map(|_| decl.ident_span),
+            });
+        }
+
+        for function in &parsed.functions {
+            let Some(function_impl) = parsed.function_impls.get(&function.index) else {
+                continue;
+            };
+            let Some(function_site) = semantic_index
+                .parsed
+                .func_decls
+                .iter()
+                .find(|site| site.function_index == function.index)
+            else {
+                continue;
+            };
+            let declared_line = source_map
+                .line_col_for_offset(
+                    function_site.ident_span.source_id,
+                    function_site.ident_span.lo,
+                )
+                .and_then(|(line, _)| u32::try_from(line).ok());
+            let last_line = function_scope_last_line(function_impl).or(declared_line);
+            for (name, slot) in function.args.iter().zip(function_impl.param_slots.iter()) {
+                let parameter_has_site = semantic_index.parsed.local_decls.iter().any(|decl| {
+                    decl.ident_span.source_id == function_site.ident_span.source_id
+                        && decl.slot == *slot
+                        && decl.name == *name
+                        && (decl.decl_order as usize) < function.args.len()
+                });
+                if parameter_has_site {
+                    continue;
+                }
+                if !seen.insert((
+                    function_site.ident_span.source_id,
+                    *slot,
+                    usize::MAX,
+                    usize::MAX,
+                )) {
+                    continue;
+                }
+                let schema = logical_schemas.get(usize::from(*slot)).cloned().flatten();
+                let range = slot_ranges.get(slot);
+                hints.push(InferredLocalTypeHint {
+                    source_name: source_map
+                        .file_name(function_site.ident_span.source_id)
+                        .map(str::to_string),
+                    name: name.clone(),
+                    inferred_type: schema
+                        .as_ref()
+                        .map(typing::render_schema_label)
+                        .unwrap_or_else(|| inferred_slot_type_name(type_info, *slot)),
+                    declared_line: range
+                        .and_then(|range| range.declared_line)
+                        .or(declared_line),
+                    last_line: range.and_then(|range| range.last_line).or(last_line),
+                    schema,
+                    span: None,
+                });
+            }
+        }
+    } else {
+        for (name, slot) in &parsed.local_bindings {
+            let schema = logical_schemas.get(usize::from(*slot)).cloned().flatten();
+            let range = slot_ranges.get(slot);
+            hints.push(InferredLocalTypeHint {
+                source_name: None,
                 name: name.clone(),
-                inferred_type: inferred_slot_type_name(&type_info, *slot),
-                declared_line: slot_ranges
-                    .get(slot)
-                    .and_then(|range| range.declared_line)
-                    .or(declared_line),
-                last_line: slot_ranges
-                    .get(slot)
-                    .and_then(|range| range.last_line)
-                    .or(last_line),
+                inferred_type: schema
+                    .as_ref()
+                    .map(typing::render_schema_label)
+                    .unwrap_or_else(|| inferred_slot_type_name(type_info, *slot)),
+                declared_line: range.and_then(|range| range.declared_line),
+                last_line: range.and_then(|range| range.last_line),
+                schema,
+                span: None,
             });
         }
     }
-
-    Ok(hints)
+    hints
 }
 
 fn inferred_slot_type_name(type_info: &typing::TypeInferenceResult, slot: LocalSlot) -> String {
@@ -1665,7 +2045,8 @@ fn compile_source_with_flavor_impl(
 ) -> Result<CompiledProgram, SourceError> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
-    let effective = default_http_compile_catalog_options(&CompileSourceFileOptions::default());
+    let effective =
+        default_http_compile_catalog_options(flavor, &CompileSourceFileOptions::default());
     let parsed =
         frontends::parse_source_for_compile(source, flavor, &effective).map_err(|err| {
             SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
@@ -1690,39 +2071,32 @@ fn compile_loaded_units(
     source: String,
     units: Vec<ParsedUnit>,
     policy: FrontendPolicy,
-    // Carried from the loader for Milestone 2+ (structured imports, symbol
-    // resolution); codegen output is unchanged until then.
-    _module_graph: ModuleGraph,
-    // Compilation-wide source map keyed by the module graph's `SourceId`
-    // space (milestone 5). Every span produced during load/merge references
-    // this map, so errors are returned with it and render from the owning
-    // source.
+    module_graph: ModuleGraph,
     sources: SourceMap,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let diagnostic_path = units
-        .iter()
-        .find(|unit| !unit.parsed.unknown_type_spans.is_empty())
-        .map(|unit| PathBuf::from(&unit.source_name));
-    let merged = merge_units(units)?;
-    compile_parsed_output(
-        source,
-        merged,
+    let prepared = prepare_typed_units(
+        units,
+        sources,
+        policy,
+        flavor,
+        options,
         CompileBehavior::DEFAULT,
+        Some(module_graph),
+    )?;
+    let local_debug_ranges = collect_named_local_debug_ranges(&prepared.ir);
+    let owned_ir = prepared.owned_ir;
+    let sources = prepared.sources;
+    compile_owned_ir_output(
+        source,
+        owned_ir,
+        &[],
         policy.typing_mode,
         policy.ownership_checking,
+        local_debug_ranges,
     )
-    .map_err(|error| match (error, diagnostic_path) {
-        (SourceError::Parse(mut parse), Some(path))
-            if parse.code.as_deref() == Some("E_STRICT_UNKNOWN_TYPE") =>
-        {
-            parse.message = format!("{}: {}", path.display(), parse.message);
-            SourcePathError::SourceWithMap {
-                error: SourceError::Parse(parse),
-                sources,
-            }
-        }
-        (error, _) => SourcePathError::SourceWithMap { error, sources },
-    })
+    .map_err(|error| SourcePathError::SourceWithMap { error, sources })
 }
 
 fn compile_source_with_flavor_and_options_impl(
@@ -1733,7 +2107,7 @@ fn compile_source_with_flavor_and_options_impl(
     // Explicit catalogs are forwarded unchanged. Otherwise the HTTP catalog is
     // installed so `http::client::sse` named structs and function schemas are
     // available without converting `io::` / `sqlite::` / `jit::` builtins.
-    let effective = default_http_compile_catalog_options(options);
+    let effective = default_http_compile_catalog_options(flavor, options);
 
     compile_source_with_flavor_and_options_pipeline(source, flavor, &effective)
 }
@@ -1754,6 +2128,8 @@ fn compile_source_with_flavor_and_options_pipeline(
         policy,
         loaded.module_graph,
         loaded.sources,
+        flavor,
+        options,
     )
 }
 
@@ -1761,8 +2137,12 @@ fn compile_source_with_flavor_and_options_pipeline(
 /// surface is enabled and the caller did not supply a custom catalog. Explicit
 /// catalogs remain unchanged.
 fn default_standard_catalog_options(
+    flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> CompileSourceFileOptions {
+    if matches!(flavor, SourceFlavor::Plugin(_)) {
+        return options.clone();
+    }
     #[cfg(feature = "runtime")]
     {
         let mut effective = options.clone();
@@ -1782,8 +2162,12 @@ fn default_standard_catalog_options(
 /// and function schemas without pulling `io::` / `sqlite::` / `jit::` into
 /// catalog host imports.
 fn default_http_compile_catalog_options(
+    flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> CompileSourceFileOptions {
+    if matches!(flavor, SourceFlavor::Plugin(_)) {
+        return options.clone();
+    }
     #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
     {
         let mut effective = options.clone();
@@ -1815,7 +2199,7 @@ fn compile_source_at_path_with_flavor_and_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let effective = default_http_compile_catalog_options(options);
+    let effective = default_http_compile_catalog_options(flavor, options);
     let policy = frontend_policy_for_flavor(flavor, &effective)?;
     let loaded = load_units_for_source_file(path, flavor, source, &effective)?;
     compile_loaded_units(
@@ -1824,6 +2208,8 @@ fn compile_source_at_path_with_flavor_and_options_impl(
         policy,
         loaded.module_graph,
         loaded.sources,
+        flavor,
+        &effective,
     )
 }
 
@@ -1864,8 +2250,8 @@ fn compile_source_file_impl(
     path: &Path,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let effective = default_http_compile_catalog_options(options);
-    let flavor = SourceFlavor::from_path_with_options(path, &effective)?;
+    let flavor = SourceFlavor::from_path_with_options(path, options)?;
+    let effective = default_http_compile_catalog_options(flavor, options);
     let policy = frontend_policy_for_flavor(flavor, &effective)?;
     let source_raw = std::fs::read_to_string(path)?;
     let loaded = load_units_for_source_file(path, flavor, &source_raw, &effective)?;
@@ -1875,6 +2261,8 @@ fn compile_source_file_impl(
         policy,
         loaded.module_graph,
         loaded.sources,
+        flavor,
+        &effective,
     )
 }
 

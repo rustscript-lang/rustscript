@@ -167,7 +167,7 @@ pub(super) fn are_compatible_bound_types(lhs: BoundType, rhs: BoundType) -> bool
 
 #[derive(Clone, Debug)]
 pub(super) enum InferredCallable {
-    Function(u16),
+    Function(u16, Vec<TypeSchema>),
     Closure(ClosureExpr),
 }
 
@@ -316,7 +316,7 @@ impl LocalTypeState {
     }
 
     pub(crate) fn bind_function(&mut self, slot: LocalSlot, index: u16) {
-        self.bind_callable(slot, InferredCallable::Function(index));
+        self.bind_callable(slot, InferredCallable::Function(index, Vec::new()));
     }
 
     pub(crate) fn bind_closure(&mut self, slot: LocalSlot, closure: &ClosureExpr) {
@@ -376,11 +376,13 @@ impl LocalTypeState {
         for slot in lhs.callables.keys().chain(rhs.callables.keys()) {
             match (lhs.callable(*slot), rhs.callable(*slot)) {
                 (
-                    Some(InferredCallable::Function(lhs_index)),
-                    Some(InferredCallable::Function(rhs_index)),
-                ) if lhs_index == rhs_index => {
-                    self.callables
-                        .insert(*slot, InferredCallable::Function(*lhs_index));
+                    Some(InferredCallable::Function(lhs_index, lhs_args)),
+                    Some(InferredCallable::Function(rhs_index, rhs_args)),
+                ) if lhs_index == rhs_index && lhs_args == rhs_args => {
+                    self.callables.insert(
+                        *slot,
+                        InferredCallable::Function(*lhs_index, lhs_args.clone()),
+                    );
                 }
                 _ => {}
             }
@@ -429,6 +431,26 @@ pub(crate) struct TypeInferenceResult {
     pub local_schema_labels: Vec<Option<String>>,
     pub callable_slots: Vec<bool>,
     pub optional_slots: Vec<bool>,
+}
+
+impl TypeInferenceResult {
+    pub(crate) fn logical_schemas(&self) -> Vec<Option<TypeSchema>> {
+        self.local_schemas
+            .iter()
+            .enumerate()
+            .map(|(slot, schema)| {
+                schema.clone().map(|schema| {
+                    if self.optional_slots.get(slot).copied().unwrap_or(false)
+                        && !matches!(schema, TypeSchema::Optional(_))
+                    {
+                        TypeSchema::Optional(Box::new(schema))
+                    } else {
+                        schema
+                    }
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]

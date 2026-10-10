@@ -38,8 +38,9 @@ pub use self::frontends::parse_source_with_dialect;
 pub use self::host_call_resolve::{HostCallResolveError, HostCallResolver};
 pub use self::ir::{
     AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, FunctionParam,
-    LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern, ResolvedHostCall, ResolvedHostParam,
-    SemanticIndex, Stmt, StructDecl, StructDeclOrigin, TypeSchema,
+    GuestTypeProvenance, LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern,
+    ResolvedHostCall, ResolvedHostParam, SemanticIndex, Stmt, StructDecl, StructDeclOrigin,
+    TypeSchema,
 };
 pub use self::modules::{
     DeclSymbol, ExportEntry, ImportTargetKind, ImportedBinding, ModuleGraph, ModuleId, ModuleNode,
@@ -63,7 +64,7 @@ pub use self::semantic_model::{
     CompletionItemKind, Definition, SemanticCompletion, SemanticDiagnostic, SemanticModel,
     SourcePosition,
 };
-pub use self::source_loader::{ImportClause, ModuleImport, NamedImport};
+pub use self::source_loader::{DeclarationNamespace, ImportClause, ModuleImport, NamedImport};
 
 #[derive(Debug)]
 pub enum CompileError {
@@ -300,9 +301,18 @@ impl ParseError {
     }
 
     pub fn with_line_span_from_source(mut self, source_map: &SourceMap, source_id: u32) -> Self {
-        if self.span.is_some() {
+        if self.span.is_some_and(|span| {
+            span.source_id == source_id
+                && span.lo <= span.hi
+                && source_map.source(source_id).is_some_and(|text| {
+                    span.hi <= text.len()
+                        && text.is_char_boundary(span.lo)
+                        && text.is_char_boundary(span.hi)
+                })
+        }) {
             return self;
         }
+        self.span = None;
         if let Some(span) = source_map.line_span(source_id, self.line) {
             self.span = Some(span);
         }
@@ -498,6 +508,9 @@ pub struct SourceFrontendContext<'a> {
 }
 
 pub struct FrontendTypedIr<'a> {
+    /// Source whose producer is being admitted. The IR and logical schemas are
+    /// shared across the compilation; validators scope their rules to this id.
+    pub source_id: Option<u32>,
     pub ir: &'a FrontendIr,
     pub local_schemas: &'a [Option<TypeSchema>],
     pub host_api_catalog: Option<&'a crate::host_api::HostApiCatalog>,

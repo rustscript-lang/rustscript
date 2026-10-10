@@ -4,7 +4,8 @@ use std::hash::{Hash, Hasher};
 use crate::ValueType;
 use crate::builtins::default_host_callable;
 use crate::host_api::{
-    HostApiFingerprint, HostFunctionSchema, HostParamPassing, HostTypeSchema, ResourceTypeKey,
+    HostApiCatalog, HostApiFingerprint, HostFunctionSchema, HostParamPassing, HostTypeSchema,
+    ResourceTypeKey,
 };
 
 use super::ParseError;
@@ -922,6 +923,100 @@ impl HostApiIrMetadata {
         self.candidates_by_function_index.insert(index, candidates);
         Ok(())
     }
+
+    /// Confirms an installed index still carries the complete catalog family
+    /// for the exact logical name and arity that owns it.
+    pub(crate) fn validate_binding(
+        &self,
+        index: u16,
+        catalog: &HostApiCatalog,
+        name: &str,
+        arity: u8,
+    ) -> Result<(), ParseError> {
+        if self.fingerprint != catalog.fingerprint() {
+            return Err(ParseError::new(format!(
+                "host catalog identity mismatch while validating '{name}'"
+            )));
+        }
+        let expected = catalog
+            .functions_named(name)
+            .into_iter()
+            .filter(|candidate| candidate.params.len() == usize::from(arity))
+            .cloned()
+            .collect::<Vec<_>>();
+        if expected.is_empty() {
+            return Err(ParseError::new(format!(
+                "host function '{name}' has no overload with {arity} argument(s)"
+            )));
+        }
+        let candidates = self.candidates(index).ok_or_else(|| {
+            ParseError::new(format!(
+                "catalog-bound host function '{name}' at index {index} has no candidate metadata"
+            ))
+        })?;
+        if candidates != expected.as_slice() {
+            return Err(ParseError::new(format!(
+                "catalog-bound host function '{name}' at index {index} does not retain its complete {arity}-argument candidate family"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fails closed before code generation when a plugin emits an import for a
+    /// catalog-owned name without the exact caller-catalog candidate binding.
+    pub(crate) fn validate_catalog_bindings(
+        metadata: Option<&Self>,
+        functions: &[FunctionDecl],
+        function_impls: &HashMap<u16, FunctionImpl>,
+        catalog: &HostApiCatalog,
+    ) -> Result<(), ParseError> {
+        let Some(metadata) = metadata else {
+            if let Some(function) = functions.iter().find(|function| {
+                !function_impls.contains_key(&function.index)
+                    && !catalog.functions_named(&function.name).is_empty()
+            }) {
+                return Err(ParseError::new(format!(
+                    "catalog-bound host function '{}' at index {} has no host catalog metadata",
+                    function.name, function.index
+                )));
+            }
+            return Ok(());
+        };
+        if metadata.fingerprint != catalog.fingerprint() {
+            return Err(ParseError::new(
+                "frontend IR host metadata belongs to a different caller catalog",
+            ));
+        }
+        for index in metadata.function_indices() {
+            let mut declarations = functions.iter().filter(|function| function.index == index);
+            let Some(function) = declarations.next() else {
+                return Err(ParseError::new(format!(
+                    "host metadata references missing function index {index}"
+                )));
+            };
+            if declarations.next().is_some() {
+                return Err(ParseError::new(format!(
+                    "host metadata function index {index} is declared more than once"
+                )));
+            }
+            if function_impls.contains_key(&index) {
+                return Err(ParseError::new(format!(
+                    "host metadata is attached to implemented function '{}' at index {index}",
+                    function.name
+                )));
+            }
+            metadata.validate_binding(index, catalog, &function.name, function.arity)?;
+        }
+        for function in functions {
+            if function_impls.contains_key(&function.index)
+                || catalog.functions_named(&function.name).is_empty()
+            {
+                continue;
+            }
+            metadata.validate_binding(function.index, catalog, &function.name, function.arity)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1525,6 +1620,8 @@ pub struct LexerToken {
 /// collision-free during unit merge.
 #[derive(Clone, Debug, Default)]
 pub struct ParsedSemanticIndex {
+    /// Canonical nominal identities joined to their source declaration/alias.
+    pub type_provenance: Vec<GuestTypeProvenance>,
     /// All parsed call sites, in allocation order.
     pub call_sites: Vec<ParsedCallSite>,
     /// All parsed local declarations, in allocation order.
@@ -1561,6 +1658,40 @@ pub struct StmtSpanSite {
     /// token), never a line-wide guess. The same line may host many
     /// statements; each records its own independent span.
     pub span: Span,
+}
+
+/// One source spelling of a module-owned guest type. Display never changes
+/// the canonical schema identity or the original parser declaration name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestTypeProvenance {
+    pub canonical_name: String,
+    pub source_name: String,
+    pub source_id: u32,
+    pub declaration_span: Option<Span>,
+}
+
+impl FrontendIr {
+    /// Canonical schema with source-owned spellings for language-neutral labels.
+    pub fn source_schema(&self, schema: &TypeSchema, source_id: u32) -> TypeSchema {
+        let mut names = HashMap::new();
+        if let Some(index) = &self.parsed_semantic_index {
+            for provenance in &index.type_provenance {
+                if provenance.source_id == source_id {
+                    names
+                        .entry(provenance.canonical_name.clone())
+                        .or_insert_with(|| provenance.source_name.clone());
+                }
+            }
+            for provenance in &index.type_provenance {
+                names
+                    .entry(provenance.canonical_name.clone())
+                    .or_insert_with(|| provenance.source_name.clone());
+            }
+        }
+        let mut display = schema.clone();
+        super::linker::remap_type_schema_names(&mut display, &names);
+        display
+    }
 }
 
 impl ParsedSemanticIndex {

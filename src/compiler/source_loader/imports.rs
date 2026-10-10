@@ -144,6 +144,8 @@ fn use_declarations_to_module_imports(
                 spec,
                 clause: decl.clause.clone(),
                 line: decl.line,
+                namespace: super::model::DeclarationNamespace::Value,
+                span: Some(decl.span),
             })
         })
         .collect()

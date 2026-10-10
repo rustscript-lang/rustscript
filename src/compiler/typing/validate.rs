@@ -44,7 +44,7 @@ fn observe_direct_function_call_types(
     let function_index = match expr {
         Expr::Call(index, _, _, _, _) if context.function_impls.contains_key(index) => Some(*index),
         Expr::LocalCall(slot, _, _, _) => match state.callable(*slot).cloned() {
-            Some(InferredCallable::Function(index))
+            Some(InferredCallable::Function(index, _))
                 if context.function_impls.contains_key(&index) =>
             {
                 Some(index)

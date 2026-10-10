@@ -5,13 +5,16 @@ use crate::compiler::source_map::SourceMap;
 use crate::host_api::HostApiCatalog;
 
 use super::super::{
-    CompileSourceFileOptions, FrontendImportedDeclaration, ParseError, ParsePhase, SourceError,
-    SourceFlavor, SourcePathError, frontends,
+    CompileSourceFileOptions, FrontendImportedDeclaration, FrontendTypeExport, ParseError,
+    ParsePhase, SourceError, SourceFlavor, SourceFrontendContext, SourcePathError, frontends,
     ir::{
         Expr, FrontendIr, FunctionDecl, FunctionRefTarget, ParsedCallTarget, ParsedSemanticIndex,
         Stmt, TypeSchema,
     },
-    linker::{ParsedUnit, module_scope_prefix},
+    linker::{
+        ParsedUnit, internal_guest_type_name, module_scope_prefix, remap_guest_type_schemas,
+        remap_type_schema_names,
+    },
     modules::{ImportTargetKind, ImportedBinding, ModuleGraph, ModuleId, ResolvedImport, SymbolId},
 };
 use super::imports::{
@@ -19,7 +22,34 @@ use super::imports::{
     parse_module_imports, resolve_module_path, scan_module_imports,
     should_treat_missing_module_as_host_namespace,
 };
-use super::model::{ExportedFunctionSignature, ImportClause, ModuleCollectState, ModuleImport};
+use super::model::{
+    DeclarationNamespace, ExportedFunctionSignature, ImportClause, ModuleCollectState, ModuleImport,
+};
+
+pub(super) fn index_type_exports(
+    exports: Vec<FrontendTypeExport>,
+) -> Result<HashMap<String, FrontendTypeExport>, String> {
+    let mut indexed = HashMap::new();
+    for export in exports {
+        let name = export.source_name.clone();
+        if indexed.insert(name.clone(), export).is_some() {
+            return Err(format!("duplicate exported type '{name}'"));
+        }
+    }
+    Ok(indexed)
+}
+
+fn catalog_import_indices(parsed: &FrontendIr) -> HashSet<u16> {
+    let Some(metadata) = &parsed.host_api_metadata else {
+        return HashSet::new();
+    };
+    parsed
+        .functions
+        .iter()
+        .filter(|function| metadata.candidates(function.index).is_some())
+        .map(|function| function.index)
+        .collect()
+}
 
 pub(super) fn collect_module_units(
     path: &Path,
@@ -61,7 +91,6 @@ pub(super) fn collect_module_units(
             match err {
                 SourcePathError::Source(SourceError::Parse(mut parse)) => {
                     parse.message = format!("{}: {}", path.display(), parse.message);
-                    parse.span = None;
                     parse = parse.with_line_span_from_source(&state.sources, current_source_id.0);
                     SourcePathError::Source(SourceError::Parse(parse))
                 }
@@ -70,10 +99,24 @@ pub(super) fn collect_module_units(
         })?;
     for (import_index, import) in imports.iter().enumerate() {
         let spec = import.spec.clone();
-        let span = decls
-            .get(import_index)
-            .map(|decl| decl.span)
-            .unwrap_or_else(|| crate::compiler::source_map::Span::new(0, 0, 0));
+        let span = import
+            .span
+            .filter(|span| {
+                span.source_id == current_source_id.0
+                    && span.lo <= span.hi
+                    && span.hi <= source.len()
+                    && source.is_char_boundary(span.lo)
+                    && source.is_char_boundary(span.hi)
+            })
+            .or_else(|| decls.get(import_index).map(|decl| decl.span))
+            .unwrap_or_else(|| {
+                state
+                    .sources
+                    .line_span(current_source_id.0, import.line.max(1))
+                    .unwrap_or_else(|| {
+                        crate::compiler::source_map::Span::new(current_source_id.0, 0, 0)
+                    })
+            });
         if is_builtin_host_namespace_spec(&spec) {
             state.module_graph.add_import(
                 current_id,
@@ -81,6 +124,7 @@ pub(super) fn collect_module_units(
                     kind: ImportTargetKind::BuiltinNamespace,
                     spec,
                     clause: import.clause.clone(),
+                    namespace: import.namespace,
                     span,
                     line: import.line,
                     target: None,
@@ -97,6 +141,7 @@ pub(super) fn collect_module_units(
                     kind: ImportTargetKind::HostNamespace,
                     spec,
                     clause: import.clause.clone(),
+                    namespace: import.namespace,
                     span,
                     line: import.line,
                     target: None,
@@ -116,6 +161,7 @@ pub(super) fn collect_module_units(
                     kind: ImportTargetKind::HostNamespace,
                     spec,
                     clause: import.clause.clone(),
+                    namespace: import.namespace,
                     span,
                     line: import.line,
                     target: None,
@@ -136,6 +182,7 @@ pub(super) fn collect_module_units(
                     kind: ImportTargetKind::FileModule,
                     spec,
                     clause: import.clause.clone(),
+                    namespace: import.namespace,
                     span,
                     line: import.line,
                     target,
@@ -158,6 +205,7 @@ pub(super) fn collect_module_units(
                                     kind: ImportTargetKind::HostNamespace,
                                     spec,
                                     clause: import.clause.clone(),
+                                    namespace: import.namespace,
                                     span,
                                     line: import.line,
                                     target: None,
@@ -192,7 +240,8 @@ pub(super) fn collect_module_units(
             options,
             module_source_id,
         )?;
-        let frontend_imports = frontend_imports_for_module(path, &module_imports, state, options)?;
+        let frontend_imports =
+            frontend_imports_for_module(&resolved, &module_imports, state, options)?;
         let mut parsed = frontends::parse_module_source_with_source_id(
             &module_source_raw,
             dependency_flavor,
@@ -202,25 +251,61 @@ pub(super) fn collect_module_units(
             ParsePhase::Module,
             &frontend_imports,
         )
-        .map_err(|mut err| {
+        .map_err(|err| {
             // Nested module sources are parsed verbatim (no synthetic
             // prelude, no textual rewrite), so the parse already reports the
             // owning module's lines; rebuild the span against the
             // compilation-wide map and prefix the module path.
-            err.span = None;
             let mut parse = err.with_line_span_from_source(&state.sources, module_source_id);
             parse.message = format!("{}: {}", resolved.display(), parse.message);
             SourceError::Parse(parse)
         })?;
+        let type_exports = match dependency_flavor {
+            SourceFlavor::Plugin(_) => {
+                let plugin = options
+                    .source_plugin_for_flavor(dependency_flavor)
+                    .expect("registered dependency plugin was selected");
+                let context = SourceFrontendContext {
+                    source_id: module_source_id,
+                    original_path: Some(&resolved),
+                    phase: ParsePhase::Module,
+                    host_api_catalog: options.host_api_catalog().map(|catalog| catalog.as_ref()),
+                    imports: &frontend_imports,
+                };
+                plugin
+                    .module_type_exports(&module_source_raw, &context, &parsed)
+                    .map_err(|err| {
+                        let mut parse =
+                            err.with_line_span_from_source(&state.sources, module_source_id);
+                        parse.message = format!("{}: {}", resolved.display(), parse.message);
+                        SourcePathError::Source(SourceError::Parse(parse))
+                    })?
+            }
+            SourceFlavor::RustScript => native_signature_type_exports(&parsed),
+        };
+        let type_exports = index_type_exports(type_exports).map_err(|message| {
+            SourcePathError::Source(SourceError::Parse(ParseError {
+                span: state.sources.line_span(module_source_id, 1),
+                code: None,
+                line: 1,
+                message: format!("{}: {message}", resolved.display()),
+            }))
+        })?;
+        state.module_type_exports.insert(key.clone(), type_exports);
         let extern_names = parsed
             .implicit_extern_names
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
+        let catalog_import_indices = catalog_import_indices(&parsed);
         let exports = parsed
             .functions
             .iter()
-            .filter(|func| func.exported && !extern_names.contains(func.name.as_str()))
+            .filter(|func| {
+                func.exported
+                    && !extern_names.contains(func.name.as_str())
+                    && !catalog_import_indices.contains(&func.index)
+            })
             .map(|func| {
                 (
                     func.name.clone(),
@@ -243,6 +328,24 @@ pub(super) fn collect_module_units(
             &mut parsed,
             options,
         )?;
+        let guest_type_names = guest_type_names_for_module(&state.module_graph, target);
+        remap_guest_type_schemas(&mut parsed, &guest_type_names);
+        if let Some(exports) = state.module_type_exports.get_mut(&key) {
+            for export in exports.values_mut() {
+                remap_type_schema_names(&mut export.schema, &guest_type_names);
+                if let Some(declaration) = &mut export.declaration
+                    && declaration.is_guest()
+                {
+                    if let Some(internal) = guest_type_names
+                        .get(&declaration.name)
+                        .or_else(|| guest_type_names.get(&export.source_name))
+                    {
+                        declaration.name = internal.clone();
+                    }
+                    remap_type_schema_names(&mut declaration.body_schema, &guest_type_names);
+                }
+            }
+        }
         state.units.push(ParsedUnit {
             parsed,
             scope_identity: Some(module_scope_prefix(&resolved, target)),
@@ -250,6 +353,7 @@ pub(super) fn collect_module_units(
             module: target,
             source_id: module_source_id,
             host_catalog_supplied: options.host_api_catalog().is_some(),
+            runtime_reachable: true,
         });
         state.module_graph.add_import(
             current_id,
@@ -257,6 +361,7 @@ pub(super) fn collect_module_units(
                 kind: ImportTargetKind::FileModule,
                 spec,
                 clause: import.clause.clone(),
+                namespace: import.namespace,
                 span,
                 line: import.line,
                 target: Some(target),
@@ -278,6 +383,89 @@ fn module_source_override<'a>(
     })
 }
 
+pub(super) fn native_signature_type_exports(parsed: &FrontendIr) -> Vec<FrontendTypeExport> {
+    let mut names = HashSet::new();
+    for function in parsed.functions.iter().filter(|function| function.exported) {
+        for schema in function.arg_schemas.iter().flatten() {
+            collect_named_schema_names(schema, &mut names);
+        }
+        if let Some(schema) = &function.return_schema {
+            collect_named_schema_names(schema, &mut names);
+        }
+    }
+    let mut names = names.into_iter().collect::<Vec<_>>();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let declaration = parsed.struct_schemas.get(&name)?.clone();
+            if !declaration.is_guest() {
+                return None;
+            }
+            let schema = TypeSchema::Named(
+                name.clone(),
+                declaration
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .map(TypeSchema::GenericParam)
+                    .collect(),
+            );
+            Some(FrontendTypeExport {
+                source_name: name,
+                schema,
+                declaration: Some(declaration),
+            })
+        })
+        .collect()
+}
+
+fn collect_named_schema_names(schema: &TypeSchema, names: &mut HashSet<String>) {
+    match schema {
+        TypeSchema::Named(name, arguments) => {
+            names.insert(name.clone());
+            for argument in arguments {
+                collect_named_schema_names(argument, names);
+            }
+        }
+        TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
+            collect_named_schema_names(inner, names);
+        }
+        TypeSchema::ArrayTuple(items) => {
+            for item in items {
+                collect_named_schema_names(item, names);
+            }
+        }
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            for item in prefix {
+                collect_named_schema_names(item, names);
+            }
+            collect_named_schema_names(rest, names);
+        }
+        TypeSchema::Object(fields) => {
+            for schema in fields.values() {
+                collect_named_schema_names(schema, names);
+            }
+        }
+        TypeSchema::Callable { params, result } => {
+            for schema in params {
+                collect_named_schema_names(schema, names);
+            }
+            collect_named_schema_names(result, names);
+        }
+        TypeSchema::Unknown
+        | TypeSchema::Null
+        | TypeSchema::Int
+        | TypeSchema::Float
+        | TypeSchema::Number
+        | TypeSchema::Bool
+        | TypeSchema::String
+        | TypeSchema::Bytes
+        | TypeSchema::GenericParam(_)
+        | TypeSchema::Resource(_) => {}
+    }
+}
+
 /// Build frontend-visible function imports after the DFS has parsed their
 /// source modules. Full declarations and graph symbols are passed together so
 /// a plugin can bind the complete signature before parsing its own body.
@@ -289,7 +477,10 @@ pub(super) fn frontend_imports_for_module(
 ) -> Result<Vec<FrontendImportedDeclaration>, SourcePathError> {
     let mut frontend_imports = Vec::new();
     for import in imports {
-        if is_builtin_host_namespace_spec(&import.spec) || !is_module_specifier(&import.spec) {
+        if import.namespace == DeclarationNamespace::Type
+            || is_builtin_host_namespace_spec(&import.spec)
+            || !is_module_specifier(&import.spec)
+        {
             continue;
         }
         let resolved = resolve_module_path(path, &import.spec, options)?;
@@ -302,6 +493,7 @@ pub(super) fn frontend_imports_for_module(
         let mut selected = match &import.clause {
             ImportClause::Named(named) => named
                 .iter()
+                .filter(|binding| binding.namespace == DeclarationNamespace::Value)
                 .map(|binding| (binding.imported.clone(), binding.local.clone()))
                 .collect::<Vec<_>>(),
             ImportClause::Namespace(alias) => exports
@@ -352,7 +544,129 @@ pub(super) fn frontend_imports_for_module(
             });
         }
     }
+    frontend_imports.extend(
+        type_import_bindings(path, imports, state, options)?
+            .into_iter()
+            .map(|binding| FrontendImportedDeclaration::Type {
+                local: binding.local_name,
+                symbol: binding.source_symbol,
+                schema: binding.export.schema,
+                declaration: binding.export.declaration,
+            }),
+    );
     Ok(frontend_imports)
+}
+
+struct TypeImportBinding {
+    local_name: String,
+    source_name: String,
+    source_module: ModuleId,
+    source_symbol: SymbolId,
+    line: usize,
+    export: FrontendTypeExport,
+}
+
+fn type_import_bindings(
+    path: &Path,
+    imports: &[ModuleImport],
+    state: &ModuleCollectState,
+    options: &CompileSourceFileOptions,
+) -> Result<Vec<TypeImportBinding>, SourcePathError> {
+    let mut bindings = Vec::new();
+    for import in imports {
+        let requested = match &import.clause {
+            ImportClause::Named(named) => named
+                .iter()
+                .filter(|binding| {
+                    import.namespace == DeclarationNamespace::Type
+                        || binding.namespace == DeclarationNamespace::Type
+                })
+                .map(|binding| (binding.imported.clone(), binding.local.clone()))
+                .collect::<Vec<_>>(),
+            ImportClause::Namespace(alias) if import.namespace == DeclarationNamespace::Type => {
+                let resolved = resolve_module_path(path, &import.spec, options)?;
+                state
+                    .module_type_exports
+                    .get(&resolved)
+                    .into_iter()
+                    .flat_map(|exports| exports.keys())
+                    .map(|name| (name.clone(), format!("{alias}::{name}")))
+                    .collect()
+            }
+            ImportClause::AllPublic if import.namespace == DeclarationNamespace::Type => {
+                let resolved = resolve_module_path(path, &import.spec, options)?;
+                let namespace = Path::new(&import.spec)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_default();
+                state
+                    .module_type_exports
+                    .get(&resolved)
+                    .into_iter()
+                    .flat_map(|exports| exports.keys())
+                    .map(|name| (name.clone(), format!("{namespace}::{name}")))
+                    .collect()
+            }
+            ImportClause::Prefix(prefix) if import.namespace == DeclarationNamespace::Type => {
+                let resolved = resolve_module_path(path, &import.spec, options)?;
+                state
+                    .module_type_exports
+                    .get(&resolved)
+                    .into_iter()
+                    .flat_map(|exports| exports.keys())
+                    .map(|name| (name.clone(), format!("{prefix}::{name}")))
+                    .collect()
+            }
+            ImportClause::Namespace(_) | ImportClause::AllPublic | ImportClause::Prefix(_) => {
+                Vec::new()
+            }
+        };
+        if requested.is_empty() {
+            continue;
+        }
+        if is_builtin_host_namespace_spec(&import.spec) || !is_module_specifier(&import.spec) {
+            continue;
+        }
+        let resolved = resolve_module_path(path, &import.spec, options)?;
+        let Some(exports) = state.module_type_exports.get(&resolved) else {
+            return Err(SourcePathError::InvalidImportSyntax {
+                path: path.to_path_buf(),
+                line: import.line,
+                message: format!("module '{}' did not load its public types", import.spec),
+            });
+        };
+        let Some(source_module) = state.module_graph.module_id_for_identity(&resolved) else {
+            continue;
+        };
+        for (source_name, local_name) in requested {
+            let Some(export) = exports.get(&source_name) else {
+                return Err(SourcePathError::InvalidImportSyntax {
+                    path: path.to_path_buf(),
+                    line: import.line,
+                    message: format!(
+                        "module '{}' has no public type '{}'",
+                        import.spec, source_name
+                    ),
+                });
+            };
+            let Some(source_symbol) = state.module_graph.symbol_for_export_in_namespace(
+                source_module,
+                DeclarationNamespace::Type,
+                &source_name,
+            ) else {
+                continue;
+            };
+            bindings.push(TypeImportBinding {
+                local_name,
+                source_name,
+                source_module,
+                source_symbol,
+                line: import.line,
+                export: export.clone(),
+            });
+        }
+    }
+    Ok(bindings)
 }
 
 /// Build the exported-signature table keyed by [`SymbolId`].
@@ -370,6 +684,9 @@ fn exported_signature_table(
             continue;
         };
         for entry in &node.exports {
+            if entry.namespace != DeclarationNamespace::Value {
+                continue;
+            }
             if let Some(signature) = exports.get(&entry.name) {
                 table.insert(entry.symbol, signature.clone());
             }
@@ -415,7 +732,11 @@ fn file_module_targets_for_namespace(
     };
     let mut targets = Vec::new();
     for import in &node.imports {
-        if import.kind != ImportTargetKind::FileModule {
+        if import.kind != ImportTargetKind::FileModule
+            || import.namespace != DeclarationNamespace::Value
+            || matches!(&import.clause, ImportClause::Named(names)
+                if !names.iter().any(|name| name.namespace == DeclarationNamespace::Value))
+        {
             continue;
         }
         let Some(target) = import.target else {
@@ -454,6 +775,8 @@ fn namespace_has_file_module_target(
 /// One function binding introduced by an import edge, before it is recorded
 /// in the module graph.
 struct ImportBindingData {
+    /// Namespace of the introduced binding.
+    namespace: DeclarationNamespace,
     /// Name the importing module binds (`as` alias for named imports).
     local_name: String,
     /// Name of the declaration in the source module.
@@ -481,7 +804,9 @@ fn collect_imported_bindings(
 ) -> Result<Vec<ImportBindingData>, SourcePathError> {
     let mut bindings = Vec::new();
     for import in imports {
-        if is_builtin_host_namespace_spec(&import.spec) {
+        if import.namespace == DeclarationNamespace::Type
+            || is_builtin_host_namespace_spec(&import.spec)
+        {
             continue;
         }
         if !is_module_specifier(&import.spec) {
@@ -505,6 +830,7 @@ fn collect_imported_bindings(
             ImportClause::AllPublic | ImportClause::Namespace(_) | ImportClause::Prefix(_) => {
                 for name in exports.keys() {
                     bindings.push(ImportBindingData {
+                        namespace: DeclarationNamespace::Value,
                         local_name: name.clone(),
                         source_name: name.clone(),
                         source_module,
@@ -514,6 +840,9 @@ fn collect_imported_bindings(
             }
             ImportClause::Named(named) => {
                 for binding in named {
+                    if binding.namespace == DeclarationNamespace::Type {
+                        continue;
+                    }
                     let _signature = exports.get(&binding.imported).cloned().ok_or_else(|| {
                         SourcePathError::InvalidImportSyntax {
                             path: path.to_path_buf(),
@@ -525,6 +854,7 @@ fn collect_imported_bindings(
                         }
                     })?;
                     bindings.push(ImportBindingData {
+                        namespace: DeclarationNamespace::Value,
                         local_name: binding.local.clone(),
                         source_name: binding.imported.clone(),
                         source_module,
@@ -541,15 +871,47 @@ fn collect_imported_bindings(
 /// unit's module node, then resolve imported call sites to their target
 /// symbols (milestone 4).
 ///
-/// Runs once per module, right after its unit is parsed: imported-binding
-/// mirror declarations and implicit externs are skipped, every remaining
-/// function declaration receives a [`SymbolId`] owned by the module, public
-/// declarations populate the module's export table, and every import-introduced
-/// binding is recorded separately in the module's imported-binding table.
-/// The same `symbol` is written back onto the parsed [`FunctionDecl`] so the
-/// linker can collect it through `merge_units`. Finally, calls to imported
-/// functions and module namespace members are resolved to [`Expr::ModuleCall`]
-/// nodes carrying the target [`SymbolId`].
+pub(super) fn guest_type_names_for_module(
+    graph: &ModuleGraph,
+    module: ModuleId,
+) -> HashMap<String, String> {
+    let Some(node) = graph.node(module) else {
+        return HashMap::new();
+    };
+    let mut names = HashMap::new();
+    for declaration in &node.declarations {
+        if declaration.namespace == DeclarationNamespace::Type
+            && graph.is_guest_named_type(declaration.symbol)
+        {
+            names.insert(
+                declaration.name.clone(),
+                internal_guest_type_name(
+                    graph
+                        .canonical_guest_type_symbol(declaration.symbol)
+                        .unwrap(),
+                ),
+            );
+        }
+    }
+    for binding in &node.imported_bindings {
+        if binding.namespace == DeclarationNamespace::Type
+            && graph.is_guest_named_type(binding.source_symbol)
+        {
+            names.insert(
+                binding.local_name.clone(),
+                internal_guest_type_name(
+                    graph
+                        .canonical_guest_type_symbol(binding.source_symbol)
+                        .unwrap(),
+                ),
+            );
+        }
+    }
+    names
+}
+
+/// Runs once per module after parse: local value/type declarations receive
+/// symbols before import bindings and call sites resolve against them.
 pub(super) fn record_module_symbols(
     state: &mut ModuleCollectState,
     module: ModuleId,
@@ -558,6 +920,12 @@ pub(super) fn record_module_symbols(
     parsed: &mut FrontendIr,
     options: &CompileSourceFileOptions,
 ) -> Result<(), SourcePathError> {
+    let identity = state
+        .module_graph
+        .node(module)
+        .map(|node| node.identity.clone())
+        .unwrap_or_else(|| path.to_path_buf());
+    let type_bindings = type_import_bindings(path, imports, state, options)?;
     let bindings = collect_imported_bindings(
         path,
         imports,
@@ -572,6 +940,7 @@ pub(super) fn record_module_symbols(
         .iter()
         .cloned()
         .collect::<HashSet<_>>();
+    let catalog_import_indices = catalog_import_indices(parsed);
 
     let module_source_id = state
         .module_graph
@@ -582,9 +951,10 @@ pub(super) fn record_module_symbols(
     let signatures = exported_signature_table(state, &state.module_graph);
 
     for func in &mut parsed.functions {
-        if extern_names.contains(func.name.as_str()) {
-            // Implicit extern (module mode): the resolution pass resolves
-            // (or rejects) its call sites; never a local decl.
+        if extern_names.contains(func.name.as_str()) || catalog_import_indices.contains(&func.index)
+        {
+            // Implicit externs and catalog-declared host imports are resolved
+            // through their own metadata paths, never as guest declarations.
             continue;
         }
         if func.name.contains("::")
@@ -622,6 +992,82 @@ pub(super) fn record_module_symbols(
         func.symbol = Some(symbol);
     }
 
+    let exported_type_names = state
+        .module_type_exports
+        .get(&identity)
+        .cloned()
+        .unwrap_or_default();
+    let mut local_type_names = parsed
+        .struct_schemas
+        .iter()
+        .filter(|(_, declaration)| declaration.is_guest())
+        .map(|(name, _)| name.clone())
+        .collect::<HashSet<_>>();
+    local_type_names.extend(exported_type_names.keys().cloned());
+    let mut local_type_names = local_type_names.into_iter().collect::<Vec<_>>();
+    local_type_names.sort();
+    for name in local_type_names {
+        let type_symbol = state
+            .module_graph
+            .add_declaration_in_namespace(
+                module,
+                DeclarationNamespace::Type,
+                &name,
+                exported_type_names.contains_key(&name),
+            )
+            .map_err(|message| {
+                SourcePathError::Source(SourceError::Parse(ParseError {
+                    span: state.sources.line_span(module_source_id, 1),
+                    code: None,
+                    line: 1,
+                    message: format!("{}: {message}", path.display()),
+                }))
+            })?;
+        let is_guest_named_type = parsed
+            .struct_schemas
+            .get(&name)
+            .is_some_and(|declaration| declaration.is_guest())
+            || exported_type_names
+                .get(&name)
+                .and_then(|export| export.declaration.as_ref())
+                .is_some_and(|declaration| declaration.is_guest());
+        if is_guest_named_type {
+            state
+                .module_graph
+                .mark_guest_named_type(type_symbol)
+                .map_err(|message| {
+                    SourcePathError::Source(SourceError::Parse(ParseError {
+                        span: state.sources.line_span(module_source_id, 1),
+                        code: None,
+                        line: 1,
+                        message: format!("{}: {message}", path.display()),
+                    }))
+                })?;
+        }
+    }
+
+    for (name, export) in &exported_type_names {
+        if let Some(declaration) = export
+            .declaration
+            .as_ref()
+            .filter(|declaration| declaration.is_guest())
+        {
+            let alias = state.module_graph.declaration_symbol_in_namespace(
+                module,
+                DeclarationNamespace::Type,
+                name,
+            );
+            let canonical = state.module_graph.declaration_symbol_in_namespace(
+                module,
+                DeclarationNamespace::Type,
+                &declaration.name,
+            );
+            if let (Some(alias), Some(canonical)) = (alias, canonical) {
+                state.module_graph.bind_guest_type_alias(alias, canonical);
+            }
+        }
+    }
+
     for binding in bindings {
         let Some(source_module) = binding.source_module else {
             continue;
@@ -653,8 +1099,34 @@ pub(super) fn record_module_symbols(
                 module,
                 ImportedBinding {
                     local_name: binding.local_name,
+                    namespace: binding.namespace,
                     source_module,
                     source_symbol,
+                    source_name: binding.source_name,
+                },
+            )
+            .map_err(|message| {
+                let span = state.sources.line_span(module_source_id, binding_line);
+                SourcePathError::Source(SourceError::Parse(ParseError {
+                    span,
+                    code: None,
+                    line: binding_line,
+                    message: format!("{}: {message}", path.display()),
+                }))
+            })?;
+    }
+
+    for binding in type_bindings {
+        let binding_line = binding.line.max(1);
+        state
+            .module_graph
+            .add_imported_binding(
+                module,
+                ImportedBinding {
+                    local_name: binding.local_name,
+                    namespace: DeclarationNamespace::Type,
+                    source_module: binding.source_module,
+                    source_symbol: binding.source_symbol,
                     source_name: binding.source_name,
                 },
             )
@@ -717,6 +1189,8 @@ fn record_function_decl_lines(stmts: &[Stmt], lines: &mut HashMap<u16, u32>) {
 /// Resolution context for one module's imported-call pass.
 struct CallResolutionContext<'a> {
     functions_by_index: HashMap<u16, &'a FunctionDecl>,
+    /// Exact catalog-bound slots are host identities, never guest symbols.
+    catalog_import_indices: HashSet<u16>,
     /// Direct call names bound by exactly one source module (keyed by the
     /// name the importing module binds: `as` alias or source name).
     plain_symbols: HashMap<String, SymbolId>,
@@ -960,6 +1434,9 @@ fn resolve_imported_call_sites(
     let mut ambiguous_names = HashSet::<String>::new();
     if let Some(node) = graph.node(module) {
         for binding in &node.imported_bindings {
+            if binding.namespace != DeclarationNamespace::Value {
+                continue;
+            }
             match plain_symbols.entry(binding.local_name.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(binding.source_symbol);
@@ -980,8 +1457,22 @@ fn resolve_imported_call_sites(
         .map(|func| (func.index, func))
         .collect::<HashMap<_, _>>();
 
+    let catalog_import_indices = parsed
+        .host_api_metadata
+        .as_ref()
+        .map(|metadata| {
+            parsed
+                .functions
+                .iter()
+                .filter(|decl| metadata.candidates(decl.index).is_some())
+                .map(|decl| decl.index)
+                .collect()
+        })
+        .unwrap_or_default();
+
     let ctx = CallResolutionContext {
         functions_by_index,
+        catalog_import_indices,
         plain_symbols,
         ambiguous_names,
         signatures,
@@ -1185,6 +1676,10 @@ fn resolve_expr_imported_calls(
                 // not part of the unit's declaration table.
                 return Ok(());
             };
+            if ctx.catalog_import_indices.contains(index) {
+                validate_deferred_host_type_args(ctx, &decl.name, type_args, line)?;
+                return Ok(());
+            }
             if decl.symbol.is_some() {
                 // Local declaration or host import: resolved by the linker.
                 // Host imports whose type arguments were deferred at parse
@@ -1243,7 +1738,7 @@ fn resolve_expr_imported_calls(
             let Some(decl) = ctx.functions_by_index.get(index) else {
                 return Ok(());
             };
-            if decl.symbol.is_none() {
+            if decl.symbol.is_none() && !ctx.catalog_import_indices.contains(index) {
                 return Err(unknown_function_error(
                     ctx.path,
                     &decl.name,

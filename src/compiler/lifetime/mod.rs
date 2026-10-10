@@ -69,4 +69,21 @@ pub(super) fn enforce_local_availability_with_entry_locals(
     )
 }
 
+pub(super) fn enforce_source_availability(
+    ir: FrontendIr,
+    clear_dead_locals: bool,
+    owned_local_slots: &[bool],
+    policies: &std::collections::HashMap<String, bool>,
+    default_policy: bool,
+) -> Result<FrontendIr, ParseError> {
+    availability::enforce_source_availability(
+        ir,
+        &[],
+        clear_dead_locals,
+        default_policy,
+        owned_local_slots,
+        Some(policies),
+    )
+}
+
 pub(super) use availability::allocate_local_slots;
