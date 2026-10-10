@@ -470,13 +470,16 @@ mod tests {
             .push_resource(HttpHeaders(Vec::new()))
             .unwrap();
         let raw = Value::Int(summary.handle().raw() as i64);
-        assert_eq!(sse_outcome(&mut vm, &[raw.clone()]).unwrap(), "eof");
+        assert_eq!(
+            sse_outcome(&mut vm, std::slice::from_ref(&raw)).unwrap(),
+            "eof"
+        );
         assert!(sse_outcome(&mut vm, &[Value::Int(wrong.handle().raw() as i64)]).is_err());
         assert!(sse_headers(&mut vm, &[Value::Int(wrong.handle().raw() as i64)]).is_err());
         vm.host_context()
             .close_resource::<SseSummary>(summary.handle(), ResourceCloseReason::Requested)
             .unwrap();
-        assert!(sse_outcome(&mut vm, &[raw.clone()]).is_err());
+        assert!(sse_outcome(&mut vm, std::slice::from_ref(&raw)).is_err());
         assert!(sse_headers(&mut vm, &[raw]).is_err());
     }
 
@@ -505,7 +508,7 @@ mod tests {
             vec![Value::string("first"), Value::string("second")],
         );
         assert_eq!(
-            headers_names(&mut vm, &[handle.clone()]).unwrap(),
+            headers_names(&mut vm, std::slice::from_ref(&handle)).unwrap(),
             vec![Value::string("x-repeat"), Value::string("x-repeat")]
         );
         assert!(matches!(

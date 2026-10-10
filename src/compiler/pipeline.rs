@@ -74,7 +74,7 @@ struct PreparedTypedUnits {
     sources: SourceMap,
     catalog: Arc<HostApiCatalog>,
     module_graph: Option<ModuleGraph>,
-    host_error: Option<CompileError>,
+    analysis_errors: Vec<CompileError>,
 }
 
 fn prepare_typed_units(
@@ -117,7 +117,7 @@ fn prepare_typed_units(
         .then(|| merge_units(units.clone()))
         .transpose()?;
     let parsed = merge_admission_units(units)?;
-    let (ir, type_info, admission_owned, host_error) =
+    let (ir, type_info, admission_owned, analysis_errors) =
         prepare_owned_typed_ir(parsed, &owners, options, behavior, &sources).map_err(|error| {
             SourcePathError::SourceWithMap {
                 error: preserve_strict_diagnostic_path(error, diagnostic_path.as_deref()),
@@ -158,7 +158,7 @@ fn prepare_typed_units(
         sources,
         catalog,
         module_graph,
-        host_error,
+        analysis_errors,
     })
 }
 
@@ -259,7 +259,7 @@ fn prepare_owned_typed_ir(
         FrontendIr,
         typing::TypeInferenceResult,
         FrontendIr,
-        Option<CompileError>,
+        Vec<CompileError>,
     ),
     SourceError,
 > {
@@ -276,15 +276,33 @@ fn prepare_owned_typed_ir(
         typing::legalize_for_admission(parsed, TypingMode::DynamicHints, &[]);
     parsed = legalized;
     let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, &[]);
+    let mut analysis_errors = Vec::new();
     let mut deferred_resolution_error = None;
     for owner in owners {
-        typing::validate_source_type_consistency(
-            &parsed,
-            owner.policy.typing_mode,
-            &[],
-            (!owner.source_name.is_empty()).then_some(owner.source_name.as_str()),
-        )
-        .map_err(SourceError::Compile)?;
+        let source_name = (!owner.source_name.is_empty()).then_some(owner.source_name.as_str());
+        // Native analysis retains only positioned typing diagnostics from the
+        // same linked/legalized IR. Plugin admission errors remain fatal;
+        // recovery never admits unknown schemas, ownership or source hooks.
+        if behavior.recover_host_errors && owner.plugin.is_none() {
+            analysis_errors.extend(
+                typing::analyze_source_type_consistency(
+                    &parsed,
+                    owner.policy.typing_mode,
+                    &[],
+                    source_name,
+                    host_error.as_ref(),
+                )
+                .map_err(SourceError::Compile)?,
+            );
+        } else {
+            typing::validate_source_type_consistency(
+                &parsed,
+                owner.policy.typing_mode,
+                &[],
+                source_name,
+            )
+            .map_err(SourceError::Compile)?;
+        }
         if owner.policy.typing_mode.is_strict()
             && let Err(error) = enforce_strict_type_resolution_with_host_recovery(
                 &owned_admission_sites(&parsed, owner),
@@ -305,8 +323,22 @@ fn prepare_owned_typed_ir(
     }
     let logical_schemas = type_info.logical_schemas();
     parsed.semantic_index = Some(SemanticIndex::build(logical_schemas.clone(), &parsed));
-    let owned_ir = enforce_owned_sources(parsed.clone(), &type_info, owners, behavior, sources)
-        .map_err(SourceError::Parse)?;
+    let owned_ir =
+        match enforce_owned_sources(parsed.clone(), &type_info, owners, behavior, sources) {
+            Ok(owned) => owned,
+            Err(error)
+                if !behavior.recover_host_errors
+                    && host_error.as_ref().is_some_and(|host| {
+                        resource_copy_duplicates_host_call(&parsed, host, &error)
+                    }) =>
+            {
+                // The resolver already rejected this exact call's argument passing.
+                // Retain its primary diagnostic without bypassing source hooks. This
+                // admission-only IR cannot reach codegen: host_error is returned below.
+                parsed.clone()
+            }
+            Err(error) => return Err(SourceError::Parse(error)),
+        };
     for owner in owners {
         if let Some(plugin) = owner.plugin {
             let typed = FrontendTypedIr {
@@ -321,15 +353,57 @@ fn prepare_owned_typed_ir(
                 .map_err(SourceError::Compile)?;
         }
     }
-    if !behavior.recover_host_errors
-        && let Some(error) = host_error
-    {
-        return Err(SourceError::Compile(error));
+    if let Some(error) = host_error {
+        if !behavior.recover_host_errors {
+            return Err(SourceError::Compile(error));
+        }
+        analysis_errors.push(error);
     }
     if let Some(error) = deferred_resolution_error {
         return Err(SourceError::Compile(error));
     }
-    Ok((parsed, type_info, owned_ir, host_error))
+    Ok((parsed, type_info, owned_ir, analysis_errors))
+}
+
+fn resource_copy_duplicates_host_call(
+    ir: &FrontendIr,
+    host: &CompileError,
+    ownership: &ParseError,
+) -> bool {
+    let CompileError::HostCallResolve {
+        span: Some(callee), ..
+    } = host
+    else {
+        return false;
+    };
+    if ownership.code.as_deref() != Some("E_OWNERSHIP_COPY_RESOURCE") {
+        return false;
+    }
+    let Some(owned_span) = ownership.span else {
+        return false;
+    };
+    // Only a standalone failed call at the very same source site can duplicate
+    // the copy rejection. Line equality alone would alias independent calls,
+    // statements or module owners; missing provenance must remain fail-closed.
+    ir.parsed_semantic_index.as_ref().is_some_and(|index| {
+        // Availability can fall back to a statement span by source and line.
+        // Such a fallback is not exact enough to prioritize a call if more
+        // than one statement occupies that line.
+        index
+            .stmt_spans
+            .iter()
+            .filter(|site| {
+                site.span.source_id == owned_span.source_id && site.line as usize == ownership.line
+            })
+            .count()
+            == 1
+            && index.call_sites.iter().any(|site| {
+                site.callee_span == *callee
+                    && site.expr_span.source_id == owned_span.source_id
+                    && site.expr_span.lo == owned_span.lo
+                    && site.expr_span.hi <= owned_span.hi
+            })
+    })
 }
 
 fn enforce_owned_sources(
@@ -1343,7 +1417,7 @@ fn analyze_loaded_units(
         CompileBehavior::ANALYZE,
         None,
     )?;
-    let errors = prepared.host_error.take().into_iter().collect::<Vec<_>>();
+    let errors = std::mem::take(&mut prepared.analysis_errors);
     prepared.module_graph = module_graph;
     Ok(match prepared.module_graph {
         Some(module_graph) => SemanticModel::new_with_module_graph(
@@ -1365,52 +1439,27 @@ fn analyze_parsed_output(
     custom_catalog: Option<Arc<HostApiCatalog>>,
     module_graph: Option<ModuleGraph>,
 ) -> Result<SemanticModel, SourceError> {
-    let typing_mode = policy.typing_mode;
     let catalog = custom_catalog.unwrap_or_else(default_analyze_catalog);
-
-    // Run legalize and type checking.
-    let legalize_result =
-        typing::legalize_builtins_and_bind_types(parsed.clone(), typing_mode, &[]);
-    let mut errors = Vec::new();
-
-    let (mut parsed_after_legalize, type_info) = match legalize_result {
-        Ok(legalized) => {
-            let type_info = typing::infer_types(&legalized, typing_mode, &[]);
-            (legalized, type_info)
-        }
-        Err(compile_err) => {
-            errors.push(compile_err);
-            // Even on error, run type inference on the original IR for partial results.
-            let type_info = typing::infer_types(&parsed, typing_mode, &[]);
-            (parsed, type_info)
-        }
-    };
-
-    // Run validation, collecting errors.
-    if let Err(compile_err) =
-        typing::validate_if_else_type_consistency(&parsed_after_legalize, typing_mode, &[])
-    {
-        errors.push(compile_err);
-    }
-
-    // Build the semantic index directly from the parser provenance carried
-    // on the legalized IR plus the typed/resolved IR keyed by SemanticNodeId.
-    // No source-text reconstruction is involved.
-    let semantic_index =
-        SemanticIndex::build(type_info.local_schemas.clone(), &parsed_after_legalize);
-
-    // Attach the semantic index to the IR.
-    parsed_after_legalize.semantic_index = Some(semantic_index);
+    let options = CompileSourceFileOptions::new().with_host_api_catalog(Arc::clone(&catalog));
+    let owners = [TypedSourceOwner {
+        source_id: 0,
+        source_name: String::new(),
+        policy,
+        plugin: None,
+    }];
+    let (ir, _, _, errors) = prepare_owned_typed_ir(
+        parsed,
+        &owners,
+        &options,
+        CompileBehavior::ANALYZE,
+        &source_map,
+    )?;
 
     Ok(match module_graph {
-        Some(module_graph) => SemanticModel::new_with_module_graph(
-            parsed_after_legalize,
-            source_map,
-            catalog,
-            errors,
-            module_graph,
-        ),
-        None => SemanticModel::new(parsed_after_legalize, source_map, catalog, errors),
+        Some(module_graph) => {
+            SemanticModel::new_with_module_graph(ir, source_map, catalog, errors, module_graph)
+        }
+        None => SemanticModel::new(ir, source_map, catalog, errors),
     })
 }
 
@@ -1677,7 +1726,17 @@ fn collect_named_local_type_hints(
     let mut hints = Vec::new();
 
     if let Some(semantic_index) = semantic_index {
-        for decl in &semantic_index.parsed.local_decls {
+        // Linked IR is merged in dependency order; editor hints follow source
+        // provenance instead, retaining every declaration from every owner.
+        let mut declarations = semantic_index.parsed.local_decls.iter().collect::<Vec<_>>();
+        declarations.sort_by_key(|decl| {
+            (
+                decl.ident_span.source_id,
+                decl.ident_span.lo,
+                decl.ident_span.hi,
+            )
+        });
+        for decl in declarations {
             let declaration_identity = (
                 decl.ident_span.source_id,
                 decl.slot,
@@ -2633,6 +2692,142 @@ mod tests {
         let mut vm = Vm::try_new(compiled.program).expect("test VM construction must not fail");
         let status = vm.run().expect("vm should run");
         assert_eq!(status, crate::vm::VmStatus::Halted);
+    }
+
+    #[test]
+    fn rejected_host_return_diagnostics_keep_linked_provenance_and_independent_strict_admission() {
+        let mut builder = crate::HostApiBuilder::new();
+        builder.function(crate::HostFunctionSchema::with_return(
+            "sample::probe",
+            vec![crate::HostParamSchema::value(
+                "value",
+                crate::HostTypeSchema::Int,
+            )],
+            crate::HostTypeSchema::Int,
+        ));
+        let catalog = Arc::new(builder.build().unwrap());
+        let options =
+            || CompileSourceFileOptions::new().with_host_api_catalog(Arc::clone(&catalog));
+        let source = "use sample;\nfn main() { sample::probe(\"wrong\"); }\n";
+        let model = analyze_source_from_string_with_options("main.rss", source, options())
+            .expect("failed host return retains its diagnostic model");
+        assert_eq!(
+            model.diagnostics().len(),
+            1,
+            "only the primary host rejection is published"
+        );
+        let host = model
+            .diagnostics()
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("sample::probe"))
+            .expect("primary host rejection is not masked by return inference");
+        assert_eq!(
+            model.sources().span_text(host.span.unwrap()),
+            Some("sample::probe")
+        );
+        assert!(
+            compile_source_at_path_with_flavor_and_options(
+                "main.rss",
+                source,
+                SourceFlavor::RustScript,
+                options(),
+            )
+            .is_err()
+        );
+        assert!(
+            collect_inferred_local_type_hints_at_path_with_options(
+                "main.rss",
+                source,
+                SourceFlavor::RustScript,
+                options(),
+            )
+            .is_err()
+        );
+        let linked = "use a::util;\nfn run() { helper(); }\n";
+        let options = || {
+            options().with_module_override_source(
+                "a/util.rss",
+                "use sample;\npub fn helper() { sample::probe(\"wrong\"); }\n",
+            )
+        };
+        let model = analyze_source_from_string_with_options("main.rss", linked, options())
+            .expect("linked direct return dependency retains the host diagnostic");
+        assert_eq!(
+            model.diagnostics().len(),
+            1,
+            "dependent returns do not add cascade diagnostics"
+        );
+        let host = model
+            .diagnostics()
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("sample::probe"))
+            .unwrap();
+        assert_eq!(host.span.unwrap().source_id, 1);
+        assert_eq!(
+            model.sources().span_text(host.span.unwrap()),
+            Some("sample::probe")
+        );
+        assert!(
+            compile_source_at_path_with_flavor_and_options(
+                "main.rss",
+                linked,
+                SourceFlavor::RustScript,
+                options(),
+            )
+            .is_err()
+        );
+        assert!(
+            collect_inferred_local_type_hints_at_path_with_options(
+                "main.rss",
+                linked,
+                SourceFlavor::RustScript,
+                options(),
+            )
+            .is_err()
+        );
+        for invalid in [
+            "use sample;\nfn main(value) { sample::probe(\"wrong\"); }\n",
+            "use sample;\nfn main() { sample::probe(\"wrong\"); }\nfn independent(value) -> int { 1 }\n",
+            "use sample;\nfn main() { sample::probe(\"wrong\"); }\nfn independent(value: unknown) -> int { 1 }\n",
+        ] {
+            assert!(
+                analyze_source_from_string_with_options("main.rss", invalid, options()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn linked_local_hints_order_by_source_without_erasing_dependency_provenance() {
+        let source = "use a::util as util;\nlet value = util::identity(42);\n";
+        let dependency = "pub fn identity(value: int) -> int { value }\n";
+        let options =
+            CompileSourceFileOptions::new().with_module_override_source("a/util.rss", dependency);
+        let hints = collect_inferred_local_type_hints_with_options(
+            source,
+            SourceFlavor::RustScript,
+            options,
+        )
+        .expect("linked hints retain both source owners");
+        let values = hints
+            .iter()
+            .filter(|hint| hint.name == "value")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values.len(),
+            2,
+            "root local and dependency parameter survive"
+        );
+        assert_eq!(values[0].span.unwrap().source_id, 0);
+        assert_eq!(values[0].declared_line, Some(2));
+        assert_eq!(values[0].last_line, Some(2));
+        assert_eq!(values[1].span.unwrap().source_id, 1);
+        assert_eq!(values[1].declared_line, Some(1));
+        for (hint, text) in values.iter().zip([source, dependency]) {
+            let span = hint.span.unwrap();
+            assert_eq!(&text[span.lo..span.hi], "value");
+            assert_eq!(hint.schema, Some(TypeSchema::Int));
+        }
+        assert_ne!(values[0].source_name, values[1].source_name);
     }
 
     #[test]

@@ -4,7 +4,7 @@ mod helpers;
 mod state;
 mod validate;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::ValueType;
 
@@ -488,6 +488,32 @@ pub(super) fn validate_source_type_consistency(
     entry_local_types: &[EntryLocalType],
     owner: Option<&str>,
 ) -> Result<(), CompileError> {
+    check_source_type_consistency(ir, typing_mode, entry_local_types, owner, false, None)
+        .map(|_| ())
+}
+
+pub(super) fn analyze_source_type_consistency(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    owner: Option<&str>,
+    host_error: Option<&CompileError>,
+) -> Result<Vec<CompileError>, CompileError> {
+    check_source_type_consistency(ir, typing_mode, entry_local_types, owner, true, host_error)
+}
+
+fn check_source_type_consistency(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    owner: Option<&str>,
+    recover_typing_diagnostics: bool,
+    host_error: Option<&CompileError>,
+) -> Result<Vec<CompileError>, CompileError> {
+    let mut diagnostics = Vec::new();
+    let dependent_host_returns = host_error
+        .map(|error| host_error_dependent_returns(ir, error))
+        .unwrap_or_default();
     let function_names = build_function_names(&ir.functions);
     let function_decls = build_function_decl_map(&ir.functions);
     let host_import_return_types =
@@ -515,7 +541,7 @@ pub(super) fn validate_source_type_consistency(
             context.apply_stmts(std::slice::from_ref(stmt), &mut top_state);
             continue;
         }
-        validate_stmts(
+        if let Err(error) = validate_stmts(
             std::slice::from_ref(stmt),
             &mut top_state,
             None,
@@ -524,7 +550,12 @@ pub(super) fn validate_source_type_consistency(
                 .and_then(|source| source.as_deref()),
             &mut context,
             false,
-        )?;
+        ) {
+            retain_native_typing_diagnostic(error, recover_typing_diagnostics, &mut diagnostics)?;
+            // A failed statement still contributes its real type flow to later
+            // validation sites; an earlier diagnostic cannot mask a hard error.
+            context.apply_stmts(std::slice::from_ref(stmt), &mut top_state);
+        }
     }
 
     for decl in &ir.functions {
@@ -536,15 +567,99 @@ pub(super) fn validate_source_type_consistency(
         }) {
             continue;
         }
-        validate_function_impl(
+        if let Err(error) = validate_function_impl(
             decl.index,
             function_impl,
             ir.function_sources.get(&decl.index).map(String::as_str),
             &mut context,
-        )?;
+        ) {
+            // Only the final inferred-return error of a provenance-proven
+            // direct call chain is fallout from this rejected host call.
+            // Body validation already ran; independent Strict slot admission
+            // and source hooks still run in the shared pipeline afterwards.
+            if recover_typing_diagnostics
+                && dependent_host_returns.contains(&decl.index)
+                && matches!(&error, CompileError::StrictTypingRequired {
+                    line: Some(line), span: Some(span), ..
+                } if *line == function_impl.body_expr_line
+                    && ir.parsed_semantic_index.as_ref().is_some_and(|index| {
+                        index.func_decls.iter().any(|site| {
+                            site.function_index == decl.index && site.ident_span == *span
+                        })
+                    }))
+            {
+                // Its unresolved facts remain unchanged; the exact host error
+                // is retained by the pipeline instead of a return cascade.
+                continue;
+            }
+            retain_native_typing_diagnostic(error, recover_typing_diagnostics, &mut diagnostics)?;
+        }
     }
 
-    Ok(())
+    Ok(diagnostics)
+}
+
+fn host_error_dependent_returns(ir: &FrontendIr, error: &CompileError) -> HashSet<u16> {
+    let CompileError::HostCallResolve {
+        span: Some(callee), ..
+    } = error
+    else {
+        return HashSet::new();
+    };
+    let Some(index) = ir.parsed_semantic_index.as_ref() else {
+        return HashSet::new();
+    };
+    let mut affected = HashSet::new();
+    loop {
+        let before = affected.len();
+        for declaration in &ir.functions {
+            if declaration.return_schema.is_some() || affected.contains(&declaration.index) {
+                continue;
+            }
+            let Some(implementation) = ir.function_impls.get(&declaration.index) else {
+                continue;
+            };
+            let Expr::Call(target, _, _, None, Some(id)) = &implementation.body_expr else {
+                continue;
+            };
+            let Some(site) = index.call_sites.iter().find(|site| site.id == *id) else {
+                continue;
+            };
+            let failed_host = site.callee_span == *callee
+                && ir
+                    .host_api_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.candidates(*target))
+                    .is_some();
+            if failed_host || affected.contains(target) {
+                affected.insert(declaration.index);
+            }
+        }
+        if before == affected.len() {
+            break;
+        }
+    }
+    affected
+}
+
+fn retain_native_typing_diagnostic(
+    error: CompileError,
+    recover: bool,
+    diagnostics: &mut Vec<CompileError>,
+) -> Result<(), CompileError> {
+    if recover
+        && matches!(
+            error,
+            CompileError::BinaryOperandTypeMismatch { .. }
+                | CompileError::IfElseBranchTypeMismatch { .. }
+                | CompileError::CallableArgumentTypeMismatch { .. }
+        )
+    {
+        diagnostics.push(error);
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 pub(crate) fn infer_expr_type(expr: &Expr, state: &LocalTypeState) -> BoundType {
@@ -982,23 +1097,101 @@ mod catalog_call_resolution_tests {
         let hint_error = crate::compiler::collect_inferred_local_type_hints_with_options(
             source,
             SourceFlavor::RustScript,
-            CompileSourceFileOptions::default().with_host_api_catalog(catalog),
+            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog)),
         )
         .expect_err("hint collection must return the resolver error");
 
-        for error in [compile_error, hint_error] {
+        for (entrypoint, error) in [("compile", compile_error), ("hint", hint_error)] {
             let source_error = match error {
                 crate::compiler::SourcePathError::Source(error) => error,
                 crate::compiler::SourcePathError::SourceWithMap { error, .. } => error,
                 other => panic!("unexpected path error: {other}"),
             };
-            assert!(matches!(
-                source_error,
-                crate::compiler::SourceError::Compile(CompileError::HostCallResolve {
-                    line: Some(3),
+            assert!(
+                matches!(
+                    source_error,
+                    crate::compiler::SourceError::Compile(CompileError::HostCallResolve {
+                        line: Some(3),
+                        ..
+                    })
+                ),
+                "{entrypoint}: {source_error:?}"
+            );
+        }
+
+        let configured =
+            || CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+        let valid = "use acme;\nlet file = acme::open(\"x\");\nacme::consume(file);\n";
+        crate::compiler::compile_source_with_flavor_and_options(
+            valid,
+            SourceFlavor::RustScript,
+            configured(),
+        )
+        .expect("the original owned resource remains admissible");
+        let hints = crate::compiler::collect_inferred_local_type_hints_with_options(
+            valid,
+            SourceFlavor::RustScript,
+            configured(),
+        )
+        .unwrap();
+        assert!(hints.iter().any(|hint| {
+            hint.name == "file"
+                && hint.schema
+                    == Some(TypeSchema::Resource(
+                        ResourceTypeKey::new("acme.file").unwrap(),
+                    ))
+        }));
+
+        // Recovery still runs ownership admission. A standalone copy or a
+        // use-after-move is independent of an invalid catalog call, including
+        // when the independent statement shares the same source line.
+        for invalid in [
+            source,
+            "use acme;\nlet file = acme::open(\"x\");\nfile.copy(); acme::consume(42);\n",
+            "use acme;\nlet file = acme::open(\"x\");\nacme::consume(42); file.copy();\n",
+            "use acme;\nlet file = acme::open(\"x\");\nacme::consume(file);\nfile;\nacme::consume(42);\n",
+        ] {
+            let analyzed = crate::compiler::analyze_source_from_string_with_options(
+                "main.rss",
+                invalid,
+                configured(),
+            )
+            .err()
+            .expect("host recovery must retain ownership rejection");
+            let mut errors = vec![analyzed];
+            if invalid != source {
+                errors.push(
+                    crate::compiler::compile_source_with_flavor_and_options(
+                        invalid,
+                        SourceFlavor::RustScript,
+                        configured(),
+                    )
+                    .err()
+                    .expect("independent ownership rejection in compile"),
+                );
+                errors.push(
+                    crate::compiler::collect_inferred_local_type_hints_with_options(
+                        invalid,
+                        SourceFlavor::RustScript,
+                        configured(),
+                    )
+                    .expect_err("independent ownership rejection in hints"),
+                );
+            }
+            for error in errors {
+                let crate::compiler::SourcePathError::SourceWithMap {
+                    error: crate::compiler::SourceError::Parse(error),
                     ..
-                })
-            ));
+                } = error
+                else {
+                    panic!("independent ownership diagnostic required: {error:?}");
+                };
+                assert!(
+                    error.code.as_deref() == Some("E_OWNERSHIP_COPY_RESOURCE")
+                        || error.message.contains("moved"),
+                    "{error:?}"
+                );
+            }
         }
     }
 

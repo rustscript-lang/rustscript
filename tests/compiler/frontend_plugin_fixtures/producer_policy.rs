@@ -2,6 +2,7 @@ use super::*;
 use std::sync::Mutex;
 
 static VALIDATIONS: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+static SERIAL: Mutex<()> = Mutex::new(());
 struct ProducerPolicy {
     id: &'static str,
     extension: &'static [&'static str],
@@ -76,6 +77,7 @@ fn options() -> CompileSourceFileOptions {
 }
 #[test]
 fn strict_dependency_cannot_be_erased_by_dynamic_root_and_dynamic_dependency_remains_dynamic() {
+    let _lock = SERIAL.lock().unwrap();
     let root = temp_root("producer-policy");
     let entry = root.join("main.flow");
     write_source(
@@ -114,6 +116,7 @@ fn strict_dependency_cannot_be_erased_by_dynamic_root_and_dynamic_dependency_rem
 }
 #[test]
 fn each_dependency_validator_runs_once_for_compile_analyze_hint_including_native_root() {
+    let _lock = SERIAL.lock().unwrap();
     let root = temp_root("producer-hooks");
     write_source(
         &root.join("lib.checked"),

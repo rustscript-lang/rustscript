@@ -1136,43 +1136,43 @@ mod tests {
             items: VecDeque::new(),
             actions: Arc::new(Mutex::new(vec![])),
         };
-        let rejection = vm
-            .submit_callable_stream_callbacks(
-                event.clone(),
-                None,
-                &[TypeSchema::String],
-                &[],
-                driver(),
-            )
-            .err()
-            .expect("arity rejection");
+        let rejection = match vm.submit_callable_stream_callbacks(
+            event.clone(),
+            None,
+            &[TypeSchema::String],
+            &[],
+            driver(),
+        ) {
+            Ok(_) => panic!("arity rejection"),
+            Err(rejection) => rejection,
+        };
         assert!(matches!(
             rejection.primary,
             VmError::CallableArityMismatch { .. }
         ));
         vm.rollback_rejected_callable_stream(rejection);
-        let rejection = vm
-            .submit_callable_stream_callbacks(
-                event.clone(),
-                Some(open),
-                &[TypeSchema::String, TypeSchema::String],
-                &[TypeSchema::Int, TypeSchema::String],
-                driver(),
-            )
-            .err()
-            .expect("open result rejection");
+        let rejection = match vm.submit_callable_stream_callbacks(
+            event.clone(),
+            Some(open),
+            &[TypeSchema::String, TypeSchema::String],
+            &[TypeSchema::Int, TypeSchema::String],
+            driver(),
+        ) {
+            Ok(_) => panic!("open result rejection"),
+            Err(rejection) => rejection,
+        };
         assert!(matches!(rejection.primary, VmError::TypeMismatch(_)));
         vm.rollback_rejected_callable_stream(rejection);
-        let rejection = vm
-            .submit_callable_stream_callbacks(
-                event,
-                None,
-                &[TypeSchema::Int, TypeSchema::String],
-                &[],
-                driver(),
-            )
-            .err()
-            .expect("event parameter rejection");
+        let rejection = match vm.submit_callable_stream_callbacks(
+            event,
+            None,
+            &[TypeSchema::Int, TypeSchema::String],
+            &[],
+            driver(),
+        ) {
+            Ok(_) => panic!("event parameter rejection"),
+            Err(rejection) => rejection,
+        };
         assert!(matches!(rejection.primary, VmError::TypeMismatch(_)));
         vm.rollback_rejected_callable_stream(rejection);
     }

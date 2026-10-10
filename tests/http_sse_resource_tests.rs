@@ -247,11 +247,11 @@ async fn resource_sse_post_redirect_counts_each_transmitted_body() {
                     let count = stream.read(&mut chunk).unwrap();
                     assert!(count > 0, "request ended before body");
                     request.extend_from_slice(&chunk[..count]);
-                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                        if request.len() >= end + 4 + 7 {
-                            assert_eq!(&request[end + 4..end + 11], b"payload");
-                            break;
-                        }
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        && request.len() >= end + 4 + 7
+                    {
+                        assert_eq!(&request[end + 4..end + 11], b"payload");
+                        break;
                     }
                 }
                 assert!(request.starts_with(if hop == 0 {
