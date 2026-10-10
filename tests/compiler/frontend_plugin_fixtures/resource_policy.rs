@@ -137,7 +137,7 @@ impl SourcePlugin for ResourceProducer {
         Ok(ir)
     }
 }
-fn remap_stmt(stmt: &mut vm::Stmt, indexes: &std::collections::HashMap<u16, u16>) {
+pub(super) fn remap_stmt(stmt: &mut vm::Stmt, indexes: &std::collections::HashMap<u16, u16>) {
     match stmt {
         vm::Stmt::Let { expr, .. } | vm::Stmt::Expr { expr, .. } => remap_expr(expr, indexes),
         vm::Stmt::ClosureLet { closure, .. } => remap_expr(&mut closure.body, indexes),
@@ -168,7 +168,11 @@ fn remap_expr(expr: &mut vm::Expr, indexes: &std::collections::HashMap<u16, u16>
                 remap_expr(arg, indexes);
             }
         }
-        vm::Expr::Int(_) | vm::Expr::Var(_) | vm::Expr::Null => {}
+        vm::Expr::Int(_)
+        | vm::Expr::Bool(_)
+        | vm::Expr::String(_)
+        | vm::Expr::Var(_)
+        | vm::Expr::Null => {}
         _ => panic!("unsupported resource fixture expression"),
     }
 }
@@ -298,6 +302,72 @@ fn enabled_resource_policy_repeated_borrow_mutation_close_and_rejection_before_h
     }
 }
 #[test]
+fn host_resolution_recovery_preserves_independent_resource_rejection() {
+    let _lock = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    CALLS.store(0, Ordering::SeqCst);
+    let catalog = catalog();
+    let source = "let handle = open_handle();\nclose_handle(handle);\nread_handle(handle);\nread_handle(42);\n";
+    let error =
+        vm::analyze_source_from_string_with_options("main.owned", source, options(&catalog))
+            .err()
+            .expect("host error must not hide resource rejection");
+    assert!(error.to_string().contains("moved"), "{error}");
+    let vm::SourcePathError::SourceWithMap {
+        error: vm::SourceError::Parse(parse),
+        sources,
+    } = error
+    else {
+        panic!("ownership diagnostic required")
+    };
+    let span = parse.span.expect("ownership source span");
+    assert_eq!(span.source_id, 0);
+    assert_eq!(sources.span_text(span), Some("read_handle(handle);"));
+    for error in [
+        vm::compile_source_with_flavor_and_options(
+            source,
+            vm::SourceFlavor::Plugin(FrontendId::new("neutral-resource-producer")),
+            options(&catalog),
+        )
+        .err()
+        .unwrap()
+        .to_string(),
+        vm::collect_inferred_local_type_hints_with_options(
+            source,
+            vm::SourceFlavor::Plugin(FrontendId::new("neutral-resource-producer")),
+            options(&catalog),
+        )
+        .err()
+        .unwrap()
+        .to_string(),
+    ] {
+        assert!(error.contains("moved"), "{error}");
+    }
+    assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+    let host_only = "read_handle(42);\n";
+    let model =
+        vm::analyze_source_from_string_with_options("main.owned", host_only, options(&catalog))
+            .unwrap();
+    assert!(!model.diagnostics().is_empty());
+    assert!(
+        vm::compile_source_with_flavor_and_options(
+            host_only,
+            vm::SourceFlavor::Plugin(FrontendId::new("neutral-resource-producer")),
+            options(&catalog)
+        )
+        .is_err()
+    );
+    assert!(
+        vm::collect_inferred_local_type_hints_with_options(
+            host_only,
+            vm::SourceFlavor::Plugin(FrontendId::new("neutral-resource-producer")),
+            options(&catalog)
+        )
+        .is_err()
+    );
+    assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn semantic_only_resource_producer_retains_type_provenance_without_runtime_authority() {
     let _lock = SERIAL
         .lock()
@@ -350,6 +420,49 @@ fn semantic_only_resource_producer_retains_type_provenance_without_runtime_autho
         3,
         "value promotion initializes once"
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn semantic_only_resource_producer_rejects_owned_misuse() {
+    let _lock = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let root = temp_root("semantic-owned-rejection");
+    let catalog = catalog();
+    let entry = root.join("main.graph");
+    let source = "bind type Box Item ./lib.owned\nlet value: Item = { value: 42 };\nvalue.value;\n";
+    write_source(&entry, source);
+    write_source(
+        &root.join("lib.owned"),
+        "struct Box { value: int }\nlet handle = open_handle();\nclose_handle(handle);\nread_handle(handle);\n",
+    );
+    let configured = || options(&catalog).with_source_plugin(&graph_format::GRAPH_FORMAT);
+    CALLS.store(0, Ordering::SeqCst);
+    for operation in 0..3 {
+        let error = match operation {
+            0 => compile_source_file_with_options(&entry, configured()).map(|_| ()),
+            1 => vm::compiler::analyze_source_file_with_options(&entry, configured()).map(|_| ()),
+            _ => vm::collect_inferred_local_type_hints_at_path_with_options(
+                &entry,
+                source,
+                vm::SourceFlavor::Plugin(FrontendId::new("neutral-graph-format")),
+                configured(),
+            )
+            .map(|_| ()),
+        }
+        .expect_err("Type edge must retain ownership admission");
+        assert!(error.to_string().contains("moved"), "{error}");
+        let vm::SourcePathError::SourceWithMap {
+            error: vm::SourceError::Parse(parse),
+            sources,
+        } = error
+        else {
+            panic!("owner diagnostic required")
+        };
+        let span = parse.span.unwrap();
+        assert_eq!(span.source_id, 1);
+        assert_eq!(sources.span_text(span), Some("read_handle(handle);"));
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 

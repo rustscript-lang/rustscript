@@ -75,6 +75,7 @@ pub(super) fn enforce_source_availability(
     owned_local_slots: &[bool],
     policies: &std::collections::HashMap<String, bool>,
     default_policy: bool,
+    sources: &super::source_map::SourceMap,
 ) -> Result<FrontendIr, ParseError> {
     availability::enforce_source_availability(
         ir,
@@ -83,6 +84,7 @@ pub(super) fn enforce_source_availability(
         default_policy,
         owned_local_slots,
         Some(policies),
+        Some(sources),
     )
 }
 

@@ -354,6 +354,19 @@ fn remap_expression_type_names(expression: &mut Expr, names: &HashMap<String, St
 }
 
 pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePathError> {
+    merge_units_for_view(units, false)
+}
+
+/// Link every reachable source for admission without granting runtime authority.
+/// The runtime projection still uses the original Value reachability flags.
+pub(super) fn merge_admission_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePathError> {
+    merge_units_for_view(units, true)
+}
+
+fn merge_units_for_view(
+    units: Vec<ParsedUnit>,
+    admission: bool,
+) -> Result<FrontendIr, SourcePathError> {
     let mut merged_stmts = Vec::new();
     let mut merged_stmt_sources = Vec::new();
     let mut merged_local_bindings = Vec::new();
@@ -415,7 +428,7 @@ pub(super) fn merge_units(units: Vec<ParsedUnit>) -> Result<FrontendIr, SourcePa
     let mut merged_lexer_tokens: Vec<crate::compiler::ir::LexerToken> = Vec::new();
 
     for unit in units {
-        if !unit.runtime_reachable {
+        if !admission && !unit.runtime_reachable {
             // Keep type facts and source tokens, but allocate no executable
             // function/local slots or host import families for semantic edges.
             for (name, schema) in unit.parsed.struct_schemas {

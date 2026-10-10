@@ -1102,7 +1102,12 @@ impl<'a> TypeContext<'a> {
                             .as_ref()
                             .map(|schema| self.substitute_schema_generics(schema))
                             .or_else(|| {
-                                self.infer_observed_function_return_schema(*index, type_args)
+                                let schema =
+                                    self.infer_observed_function_return_schema(*index, type_args)?;
+                                Some(logical_optional_schema(
+                                    schema,
+                                    self.function_returns_optional(*index),
+                                ))
                             })
                             .unwrap_or(TypeSchema::Unknown),
                     ),
@@ -1143,6 +1148,8 @@ impl<'a> TypeContext<'a> {
                         )
                     })
                     .unwrap_or(TypeSchema::Unknown);
+                let result =
+                    logical_optional_schema(result, self.expr_is_optional(&closure.body, &nested));
                 Some(TypeSchema::Callable {
                     params: param_schemas
                         .into_iter()
@@ -2743,6 +2750,19 @@ fn schema_from_bound_type(ty: BoundType) -> Option<TypeSchema> {
             params: Vec::new(),
             result: Box::new(TypeSchema::Unknown),
         }),
+    }
+}
+
+fn logical_optional_schema(schema: TypeSchema, optional: bool) -> TypeSchema {
+    if optional
+        && !matches!(
+            schema,
+            TypeSchema::Optional(_) | TypeSchema::Unknown | TypeSchema::Null
+        )
+    {
+        TypeSchema::Optional(Box::new(schema))
+    } else {
+        schema
     }
 }
 

@@ -35,6 +35,7 @@ pub struct Compiler {
     typing_mode: TypingMode,
     type_state: typing::LocalTypeState,
     type_map: TypeMap,
+    function_schemas: HashMap<u16, TypeSchema>,
     root_local_count: usize,
     frame_local_count: usize,
     function_slots: HashMap<u16, LocalSlot>,
@@ -101,6 +102,7 @@ impl Compiler {
             typing_mode: TypingMode::DynamicHints,
             type_state: typing::LocalTypeState::default(),
             type_map: TypeMap::default(),
+            function_schemas: HashMap::new(),
             root_local_count: 0,
             frame_local_count: 0,
             function_slots: HashMap::new(),
@@ -202,6 +204,7 @@ impl Compiler {
         self.type_map.local_schemas = type_info.local_schemas;
         self.type_map.callable_slots = type_info.callable_slots;
         self.type_map.optional_slots = type_info.optional_slots;
+        self.function_schemas = type_info.function_schemas;
     }
 
     pub fn compile_program(mut self, stmts: &[Stmt]) -> Result<Program, CompileError> {
@@ -381,14 +384,22 @@ impl Compiler {
                     })
                     .collect(),
                 self_slot: hidden_slot,
-                schema: decl.map(|decl| TypeSchema::Callable {
-                    params: decl
-                        .arg_schemas
-                        .iter()
-                        .map(|schema| schema.clone().unwrap_or(TypeSchema::Unknown))
-                        .collect(),
-                    result: Box::new(decl.return_schema.clone().unwrap_or(TypeSchema::Unknown)),
-                }),
+                schema: self
+                    .function_schemas
+                    .get(&function_index)
+                    .cloned()
+                    .or_else(|| {
+                        decl.map(|decl| TypeSchema::Callable {
+                            params: decl
+                                .arg_schemas
+                                .iter()
+                                .map(|schema| schema.clone().unwrap_or(TypeSchema::Unknown))
+                                .collect(),
+                            result: Box::new(
+                                decl.return_schema.clone().unwrap_or(TypeSchema::Unknown),
+                            ),
+                        })
+                    }),
             });
             if function_impl.capture_copies.is_empty()
                 && let Some(hidden_slot) = hidden_slot
@@ -1585,6 +1596,9 @@ impl Compiler {
             .cloned()
             .zip(type_args.iter().cloned())
             .collect::<HashMap<_, _>>();
+        if let Some(schema) = self.function_schemas.get(&index) {
+            return Some(substitute_type_schema(schema, &bindings));
+        }
         Some(TypeSchema::Callable {
             params: decl
                 .arg_schemas

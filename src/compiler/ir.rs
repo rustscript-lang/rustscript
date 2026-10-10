@@ -1134,6 +1134,13 @@ impl SemanticIndex {
     /// leaves [`None`]. In that case the caller gets a minimal index with no
     /// provenance records.
     pub fn build(slot_schemas: Vec<Option<TypeSchema>>, ir: &FrontendIr) -> Self {
+        let typed = super::FrontendTypedIr {
+            source_id: None,
+            ir,
+            local_schemas: &slot_schemas,
+            host_api_catalog: None,
+            source_map: None,
+        };
         let mut resolved_calls = HashMap::new();
         let mut function_return_schemas = HashMap::new();
         let mut func_params = HashMap::new();
@@ -1141,7 +1148,11 @@ impl SemanticIndex {
         // Per-function declaration metadata from the flat function table.
         for decl in &ir.functions {
             func_params.insert(decl.index, decl.args.clone());
-            function_return_schemas.insert(decl.index, decl.return_schema.clone());
+            let result = match typed.schema_of_function(decl.index) {
+                Some(TypeSchema::Callable { result, .. }) => Some(*result),
+                _ => None,
+            };
+            function_return_schemas.insert(decl.index, result);
         }
 
         // Pair every parsed call site with the typed/resolved Expr node that
@@ -1161,26 +1172,16 @@ impl SemanticIndex {
             }
             // Walk the legalized IR and attach resolved facts by node id.
             for stmt in &ir.stmts {
-                collect_resolved_calls_in_stmt(
-                    stmt,
-                    &mut by_id,
-                    &function_return_schemas,
-                    &slot_schemas,
-                );
+                collect_resolved_calls_in_stmt(stmt, &mut by_id, &typed, &slot_schemas);
             }
             for function_impl in ir.function_impls.values() {
                 for stmt in &function_impl.body_stmts {
-                    collect_resolved_calls_in_stmt(
-                        stmt,
-                        &mut by_id,
-                        &function_return_schemas,
-                        &slot_schemas,
-                    );
+                    collect_resolved_calls_in_stmt(stmt, &mut by_id, &typed, &slot_schemas);
                 }
                 collect_resolved_calls_in_expr(
                     &function_impl.body_expr,
                     &mut by_id,
-                    &function_return_schemas,
+                    &typed,
                     &slot_schemas,
                 );
             }
@@ -1207,20 +1208,15 @@ impl SemanticIndex {
 fn collect_resolved_calls_in_stmt(
     stmt: &Stmt,
     by_id: &mut HashMap<SemanticNodeId, ResolvedCallInfo>,
-    function_return_schemas: &HashMap<u16, Option<TypeSchema>>,
+    typed: &super::FrontendTypedIr<'_>,
     slot_schemas: &[Option<TypeSchema>],
 ) {
     match stmt {
         Stmt::Let { expr, .. } | Stmt::Expr { expr, .. } | Stmt::Assign { expr, .. } => {
-            collect_resolved_calls_in_expr(expr, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(expr, by_id, typed, slot_schemas);
         }
         Stmt::ClosureLet { closure, .. } => {
-            collect_resolved_calls_in_expr(
-                &closure.body,
-                by_id,
-                function_return_schemas,
-                slot_schemas,
-            );
+            collect_resolved_calls_in_expr(&closure.body, by_id, typed, slot_schemas);
         }
         Stmt::IfElse {
             condition,
@@ -1228,9 +1224,9 @@ fn collect_resolved_calls_in_stmt(
             else_branch,
             ..
         } => {
-            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(condition, by_id, typed, slot_schemas);
             for s in then_branch.iter().chain(else_branch.iter()) {
-                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_stmt(s, by_id, typed, slot_schemas);
             }
         }
         Stmt::For {
@@ -1240,19 +1236,19 @@ fn collect_resolved_calls_in_stmt(
             body,
             ..
         } => {
-            collect_resolved_calls_in_stmt(init, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_stmt(post, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_stmt(init, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_expr(condition, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_stmt(post, by_id, typed, slot_schemas);
             for s in body {
-                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_stmt(s, by_id, typed, slot_schemas);
             }
         }
         Stmt::While {
             condition, body, ..
         } => {
-            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(condition, by_id, typed, slot_schemas);
             for s in body {
-                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_stmt(s, by_id, typed, slot_schemas);
             }
         }
         _ => {}
@@ -1263,23 +1259,23 @@ fn collect_resolved_calls_in_stmt(
 fn collect_resolved_calls_in_expr(
     expr: &Expr,
     by_id: &mut HashMap<SemanticNodeId, ResolvedCallInfo>,
-    function_return_schemas: &HashMap<u16, Option<TypeSchema>>,
+    typed: &super::FrontendTypedIr<'_>,
     slot_schemas: &[Option<TypeSchema>],
 ) {
     match expr {
-        Expr::Call(index, _type_args, args, host, semantic_id) => {
+        Expr::Call(_index, _type_args, args, host, semantic_id) => {
             if let Some(id) = semantic_id
                 && let Some(entry) = by_id.get_mut(id)
             {
                 if let Some(resolved) = host {
                     entry.return_type = resolved.return_type.clone();
                     entry.host = Some((**resolved).clone());
-                } else if let Some(schema) = function_return_schemas.get(index).cloned() {
-                    entry.return_type = schema.unwrap_or(TypeSchema::Unknown);
+                } else {
+                    entry.return_type = typed.schema_of_expr(expr).unwrap_or(TypeSchema::Unknown);
                 }
             }
             for arg in args {
-                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_expr(arg, by_id, typed, slot_schemas);
             }
         }
         Expr::ModuleCall(_symbol, _type_args, args, semantic_id) => {
@@ -1293,7 +1289,7 @@ fn collect_resolved_calls_in_expr(
                 entry.return_type = TypeSchema::Unknown;
             }
             for arg in args {
-                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_expr(arg, by_id, typed, slot_schemas);
             }
         }
         Expr::LocalCall(slot, _type_args, args, semantic_id) => {
@@ -1315,14 +1311,14 @@ fn collect_resolved_calls_in_expr(
                     .unwrap_or(TypeSchema::Unknown);
             }
             for arg in args {
-                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_expr(arg, by_id, typed, slot_schemas);
             }
         }
         Expr::Block { stmts, expr: inner } => {
             for s in stmts {
-                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_stmt(s, by_id, typed, slot_schemas);
             }
-            collect_resolved_calls_in_expr(inner, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(inner, by_id, typed, slot_schemas);
         }
         Expr::IfElse {
             condition,
@@ -1330,9 +1326,9 @@ fn collect_resolved_calls_in_expr(
             else_expr,
             ..
         } => {
-            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_expr(then_expr, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_expr(else_expr, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(condition, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_expr(then_expr, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_expr(else_expr, by_id, typed, slot_schemas);
         }
         Expr::Match {
             value,
@@ -1340,35 +1336,20 @@ fn collect_resolved_calls_in_expr(
             default,
             ..
         } => {
-            collect_resolved_calls_in_expr(value, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(value, by_id, typed, slot_schemas);
             for (_, arm_expr) in arms {
-                collect_resolved_calls_in_expr(
-                    arm_expr,
-                    by_id,
-                    function_return_schemas,
-                    slot_schemas,
-                );
+                collect_resolved_calls_in_expr(arm_expr, by_id, typed, slot_schemas);
             }
-            collect_resolved_calls_in_expr(default, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(default, by_id, typed, slot_schemas);
         }
         Expr::Closure(closure) => {
-            collect_resolved_calls_in_expr(
-                &closure.body,
-                by_id,
-                function_return_schemas,
-                slot_schemas,
-            );
+            collect_resolved_calls_in_expr(&closure.body, by_id, typed, slot_schemas);
         }
         Expr::ClosureCall(closure, args) => {
             for arg in args {
-                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_expr(arg, by_id, typed, slot_schemas);
             }
-            collect_resolved_calls_in_expr(
-                &closure.body,
-                by_id,
-                function_return_schemas,
-                slot_schemas,
-            );
+            collect_resolved_calls_in_expr(&closure.body, by_id, typed, slot_schemas);
         }
         Expr::Add(l, r)
         | Expr::Sub(l, r)
@@ -1380,25 +1361,25 @@ fn collect_resolved_calls_in_expr(
         | Expr::Eq(l, r)
         | Expr::Lt(l, r)
         | Expr::Gt(l, r) => {
-            collect_resolved_calls_in_expr(l, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_expr(r, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(l, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_expr(r, by_id, typed, slot_schemas);
         }
         Expr::Neg(inner)
         | Expr::Not(inner)
         | Expr::ToOwned(inner)
         | Expr::Borrow(inner)
         | Expr::BorrowMut(inner) => {
-            collect_resolved_calls_in_expr(inner, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(inner, by_id, typed, slot_schemas);
         }
         Expr::OptionalGet { container, key, .. } => {
-            collect_resolved_calls_in_expr(container, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_expr(key, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(container, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_expr(key, by_id, typed, slot_schemas);
         }
         Expr::OptionUnwrapOr {
             value, fallback, ..
         } => {
-            collect_resolved_calls_in_expr(value, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_expr(fallback, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(value, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_expr(fallback, by_id, typed, slot_schemas);
         }
         _ => {}
     }

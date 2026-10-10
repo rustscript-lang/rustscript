@@ -431,6 +431,8 @@ pub(crate) struct TypeInferenceResult {
     pub local_schema_labels: Vec<Option<String>>,
     pub callable_slots: Vec<bool>,
     pub optional_slots: Vec<bool>,
+    /// Canonical logical function contracts, separate from authored annotations.
+    pub function_schemas: HashMap<u16, TypeSchema>,
 }
 
 impl TypeInferenceResult {

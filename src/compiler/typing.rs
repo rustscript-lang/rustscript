@@ -67,7 +67,6 @@ impl FrontendTypedIr<'_> {
     /// Returns the complete logical callable schema for a declared function.
     pub fn schema_of_function(&self, index: u16) -> Option<TypeSchema> {
         let declaration = self.ir.functions.iter().find(|decl| decl.index == index)?;
-        let implementation = self.ir.function_impls.get(&index);
         let state = local_state_from_schemas(self.local_schemas);
         let function_names = build_function_names(&self.ir.functions);
         let function_decls = build_function_decl_map(&self.ir.functions);
@@ -91,21 +90,10 @@ impl FrontendTypedIr<'_> {
             .cloned()
             .map(TypeSchema::GenericParam)
             .collect::<Vec<_>>();
-        let args = implementation
-            .map(|implementation| {
-                implementation
-                    .param_slots
-                    .iter()
-                    .copied()
-                    .map(Expr::Var)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let result = declaration
-            .return_schema
-            .clone()
-            .or_else(|| context.infer_function_return_schema(index, &type_args, &args, &state))
-            .unwrap_or(TypeSchema::Unknown);
+        let result = match context.infer_expr_schema(&Expr::FunctionRef(index, type_args), &state) {
+            Some(TypeSchema::Callable { result, .. }) => *result,
+            _ => TypeSchema::Unknown,
+        };
         let params = declaration
             .args
             .iter()
@@ -116,13 +104,9 @@ impl FrontendTypedIr<'_> {
                     .get(index)
                     .cloned()
                     .flatten()
-                    .or_else(|| {
-                        implementation
-                            .and_then(|implementation| implementation.param_slots.get(index))
-                            .and_then(|slot| self.local_schemas.get(usize::from(*slot)))
-                            .cloned()
-                            .flatten()
-                    })
+                    // Body-local observations are inference hints, not a
+                    // declaration-wide argument contract. Keep unannotated
+                    // parameters dynamic, as FunctionRef does.
                     .unwrap_or(TypeSchema::Unknown)
             })
             .collect();
@@ -239,10 +223,24 @@ fn record_entry_local_types(
 }
 
 pub(super) fn legalize_builtins_and_bind_types(
-    mut ir: FrontendIr,
+    ir: FrontendIr,
     typing_mode: TypingMode,
     entry_local_types: &[EntryLocalType],
 ) -> Result<FrontendIr, CompileError> {
+    let (ir, error) = legalize_for_admission(ir, typing_mode, entry_local_types);
+    match error {
+        Some(error) => Err(error),
+        None => Ok(ir),
+    }
+}
+
+// Retain all successfully resolved facts even when another host call fails.
+// This view is admission/diagnostic-only until the error is discharged.
+pub(super) fn legalize_for_admission(
+    mut ir: FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+) -> (FrontendIr, Option<CompileError>) {
     // Exact callee spans for every parsed call site, keyed by the
     // [`SemanticNodeId`] carried on the typed [`Expr::Call`] nodes. The
     // host-call resolver attaches these to its failure diagnostic so the
@@ -263,7 +261,7 @@ pub(super) fn legalize_builtins_and_bind_types(
         let mut pass = HostCallResolutionPass::new(None, HostCallResolutionPhase::Disabled)
             .with_call_site_spans(&call_site_spans);
         run_legalize_round(&mut ir, typing_mode, entry_local_types, &mut pass);
-        return Ok(ir);
+        return (ir, None);
     };
 
     loop {
@@ -275,7 +273,7 @@ pub(super) fn legalize_builtins_and_bind_types(
             continue;
         }
         if refine.unresolved() == 0 {
-            return Ok(ir);
+            return (ir, None);
         }
 
         let mut final_pass =
@@ -286,11 +284,16 @@ pub(super) fn legalize_builtins_and_bind_types(
             continue;
         }
         if final_pass.unresolved() == 0 {
-            return Ok(ir);
+            return (ir, None);
         }
-        return Err(final_pass
-            .take_error()
-            .expect("a final unresolved catalog call must record a compile error"));
+        return (
+            ir,
+            Some(
+                final_pass
+                    .take_error()
+                    .expect("a final unresolved catalog call must record a compile error"),
+            ),
+        );
     }
 }
 
@@ -443,13 +446,32 @@ pub(super) fn infer_types(
         collect_function_types(decl.index, function_impl, decl, &mut outputs, &env);
     }
 
-    TypeInferenceResult {
+    let mut facts = TypeInferenceResult {
         local_types,
         local_schemas,
         local_schema_labels,
         callable_slots,
         optional_slots,
-    }
+        function_schemas: HashMap::new(),
+    };
+    let schemas = facts.logical_schemas();
+    let typed = FrontendTypedIr {
+        source_id: None,
+        ir,
+        local_schemas: &schemas,
+        host_api_catalog: None,
+        source_map: None,
+    };
+    facts.function_schemas = ir
+        .functions
+        .iter()
+        .filter_map(|decl| {
+            typed
+                .schema_of_function(decl.index)
+                .map(|schema| (decl.index, schema))
+        })
+        .collect();
+    facts
 }
 
 pub(super) fn validate_if_else_type_consistency(

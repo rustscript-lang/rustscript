@@ -101,6 +101,41 @@ fn coherent_recursive_json_keeps_distinct_module_nominals_and_instantiated_calla
 }
 
 #[test]
+fn coherent_inferred_callable_json_keeps_optional_results_and_per_call_generics() {
+    let source = "// 中文\r\nfn maybe(value: int?) { value }\r\nlet g = maybe;\r\nlet closure: fn(int?) -> int? = |value| value;\r\nfn answer() { 42 }\r\nlet f = answer;\r\nfn identity<T>(value: T) -> T { value }\r\nlet output = identity::<int>(41);\r\ng(null);\r\n";
+    let response: serde_json::Value =
+        serde_json::from_slice(&local_type_hints_json_with_context_response(
+            source,
+            "rustscript",
+            "/neutral/main.rss",
+            "[]",
+        ))
+        .unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+    let hints = response["hints"].as_array().unwrap();
+    let hint = |name| hints.iter().find(|hint| hint["name"] == name).unwrap();
+    let optional = serde_json::json!({"kind": "optional", "inner": {"kind": "int"}});
+    let callable =
+        serde_json::json!({"kind": "callable", "params": [optional.clone()], "result": optional});
+    assert_eq!(hint("g")["schema"], callable);
+    assert_eq!(hint("closure")["schema"], callable);
+    assert_eq!(
+        hint("f")["schema"],
+        serde_json::json!({"kind":"callable", "params":[], "result":{"kind":"int"}})
+    );
+    assert_eq!(hint("output")["schema"], serde_json::json!({"kind":"int"}));
+    for name in ["g", "closure", "f", "output"] {
+        let span = &hint(name)["span"];
+        assert_eq!(span["source_id"], 0);
+        assert_eq!(
+            &source[span["lo"].as_u64().unwrap() as usize..span["hi"].as_u64().unwrap() as usize],
+            name
+        );
+        assert_eq!(hint(name)["source_name"], "/neutral/main.rss");
+    }
+}
+
+#[test]
 fn coherent_typehint_json_preserves_errors_and_existing_scalar_fields() {
     let response: serde_json::Value = serde_json::from_slice(&local_type_hints_json_response(
         "let value = 42;",

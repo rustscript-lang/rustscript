@@ -4,6 +4,8 @@ mod diagnostic_provenance;
 mod graph_acceptance;
 #[path = "frontend_plugin_fixtures/graph_format.rs"]
 mod graph_format;
+#[path = "frontend_plugin_fixtures/linked_admission.rs"]
+mod linked_admission;
 #[path = "frontend_plugin_fixtures/producer_policy.rs"]
 mod producer_policy;
 #[path = "frontend_plugin_fixtures/rejection_policy.rs"]

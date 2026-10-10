@@ -103,11 +103,19 @@ pub(super) fn seed_function_param_state(
                 .flatten()
         });
         if let Some(schema) = schema {
-            let ty = if ty == BoundType::Unknown {
-                super::context::bound_type_from_schema(&schema)
-            } else {
-                ty
-            };
+            let declared_type = declared_schema
+                .as_ref()
+                .map(super::context::bound_type_from_schema);
+            let ty =
+                if let Some(declared_type) = declared_type.filter(|ty| *ty != BoundType::Unknown) {
+                    // A bad imported argument cannot overwrite its producer's
+                    // authored parameter contract before call-site admission.
+                    declared_type
+                } else if ty == BoundType::Unknown {
+                    super::context::bound_type_from_schema(&schema)
+                } else {
+                    ty
+                };
             state.set_with_optional_schema_origin(
                 *slot,
                 ty,

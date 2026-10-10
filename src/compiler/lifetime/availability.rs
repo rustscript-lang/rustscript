@@ -116,6 +116,7 @@ pub(super) fn enforce_local_availability(
         enable_local_move_semantics,
         owned_local_slots,
         None,
+        None,
     )
 }
 
@@ -126,6 +127,7 @@ pub(super) fn enforce_source_availability(
     enable_local_move_semantics: bool,
     owned_local_slots: &[bool],
     source_policies: Option<&HashMap<String, bool>>,
+    sources: Option<&super::super::source_map::SourceMap>,
 ) -> Result<FrontendIr, ParseError> {
     // Pad the post-legalize ownership metadata to the analyzer's local space.
     // Availability runs pre-compaction, so the logical slot indices align with
@@ -134,6 +136,24 @@ pub(super) fn enforce_source_availability(
     for (slot, is_owned) in owned_local_slots.iter().enumerate().take(ir.locals) {
         owned_slots[slot] = *is_owned;
     }
+    let attach_owner = |mut error: ParseError, source: Option<&str>| {
+        if let Some(sources) = sources {
+            let id = source
+                .and_then(|name| sources.source_id_by_name(name))
+                .unwrap_or(0);
+            if error.span.is_none() {
+                error.span = ir.parsed_semantic_index.as_ref().and_then(|index| {
+                    index
+                        .stmt_spans
+                        .iter()
+                        .find(|site| site.line as usize == error.line && site.span.source_id == id)
+                        .map(|site| site.span)
+                });
+            }
+            error = error.with_line_span_from_source(sources, id);
+        }
+        error
+    };
     let initial_impls = std::mem::take(&mut ir.function_impls);
 
     let mut rewritten_impls = HashMap::with_capacity(initial_impls.len());
@@ -153,7 +173,11 @@ pub(super) fn enforce_source_availability(
             policy,
             &owned_slots,
         );
-        let rewritten = analyzer.analyze_function_impl(function_impl.clone())?;
+        let rewritten = analyzer
+            .analyze_function_impl(function_impl.clone())
+            .map_err(|error| {
+                attach_owner(error, ir.function_sources.get(index).map(String::as_str))
+            })?;
         rewritten_impls.insert(*index, rewritten);
     }
 
@@ -186,7 +210,9 @@ pub(super) fn enforce_source_availability(
             policy,
             &owned_slots,
         );
-        let (stmts, next) = analyzer.analyze_block(&ir.stmts[start..end], state, true)?;
+        let (stmts, next) = analyzer
+            .analyze_block(&ir.stmts[start..end], state, true)
+            .map_err(|error| attach_owner(error, source))?;
         rewritten_stmts.extend(stmts);
         state = next;
         start = end;

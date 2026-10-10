@@ -658,6 +658,278 @@ fn logical_optional_schema_is_complete_in_hints_and_validation_queries() {
 }
 
 #[test]
+fn inferred_optional_callable_results_agree_across_native_and_neutral_queries() {
+    let optional = TypeSchema::Optional(Box::new(TypeSchema::Int));
+    let expected = TypeSchema::Callable {
+        params: vec![optional.clone()],
+        result: Box::new(optional),
+    };
+    for (flavor, path) in [
+        (SourceFlavor::RustScript, "main.rss"),
+        (
+            SourceFlavor::Plugin(FrontendId::new("neutral-logical-schemas")),
+            "main.logical",
+        ),
+    ] {
+        let options = || CompileSourceFileOptions::new().with_source_plugin(&LOGICAL_SCHEMA_PLUGIN);
+        for source in [
+            "fn maybe(value: int?) { value }\nlet g = maybe;\ng(null);\n",
+            "let g: fn(int?) -> int? = |value| value;\ng(null);\n",
+        ] {
+            let hints =
+                collect_inferred_local_type_hints_with_options(source, flavor, options()).unwrap();
+            assert_eq!(named_hint(&hints, "g").schema, Some(expected.clone()));
+            let span = named_hint(&hints, "g").span.unwrap();
+            assert_eq!(&source[span.lo..span.hi], "g");
+            let model = analyze_source_from_string_with_options(path, source, options()).unwrap();
+            assert_eq!(
+                model.inferred_schema_at(vm::SourcePosition::new(0, span.lo)),
+                Some(expected.clone())
+            );
+            let expression = model
+                .ir()
+                .stmts
+                .iter()
+                .find_map(|stmt| match stmt {
+                    Stmt::Let { expr, .. } => Some(expr),
+                    _ => None,
+                })
+                .unwrap();
+            let typed = FrontendTypedIr {
+                source_id: Some(0),
+                ir: model.ir(),
+                local_schemas: &model.ir().semantic_index.as_ref().unwrap().slot_schemas,
+                host_api_catalog: None,
+                source_map: None,
+            };
+            assert_eq!(typed.schema_of_expr(expression), Some(expected.clone()));
+            if let Some(decl) = model
+                .ir()
+                .functions
+                .iter()
+                .find(|decl| decl.name == "maybe")
+            {
+                assert_eq!(typed.schema_of_function(decl.index), Some(expected.clone()));
+                assert!(
+                    decl.return_schema.is_none(),
+                    "authored declaration stays unannotated"
+                );
+            }
+            let compiled =
+                compile_source_with_flavor_and_options(source, flavor, options()).unwrap();
+            let mut machine = Vm::new(compiled.program);
+            assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+            assert_eq!(machine.stack(), &[Value::Null]);
+        }
+    }
+}
+
+#[test]
+fn finalized_dynamic_callable_parameters_do_not_narrow_from_call_observations() {
+    let source = "fn eq(lhs, rhs) { lhs == rhs; }\nfn is_empty(value) { eq(value, \"\"); }\npub fn non_empty(value) { eq(is_empty(value), false); }\nlet comparator = eq;\nnon_empty(\"x\");\n";
+    let model = analyze_source_from_string_with_options(
+        "dynamic.rss",
+        source,
+        CompileSourceFileOptions::new(),
+    )
+    .unwrap();
+    let typed = FrontendTypedIr {
+        source_id: Some(0),
+        ir: model.ir(),
+        local_schemas: &model.ir().semantic_index.as_ref().unwrap().slot_schemas,
+        host_api_catalog: None,
+        source_map: None,
+    };
+    let declaration = model
+        .ir()
+        .functions
+        .iter()
+        .find(|decl| decl.name == "eq")
+        .unwrap();
+    let reference = vm::Expr::FunctionRef(declaration.index, vec![]);
+    let expected = typed.schema_of_expr(&reference).unwrap();
+    let TypeSchema::Callable { params, .. } = &expected else {
+        panic!("function reference must have a callable schema")
+    };
+    assert_eq!(params, &vec![TypeSchema::Unknown; 2]);
+    assert_eq!(
+        typed.schema_of_function(declaration.index),
+        Some(expected.clone())
+    );
+    let hints = collect_inferred_local_type_hints_with_options(
+        source,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        named_hint(&hints, "comparator").schema,
+        Some(expected.clone())
+    );
+    let compiled = compile_source_with_flavor_and_options(
+        source,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::new(),
+    )
+    .unwrap();
+    assert!(
+        compiled
+            .program
+            .callable_prototypes
+            .iter()
+            .any(|prototype| prototype.schema.as_ref() == Some(&expected))
+    );
+    let mut machine = Vm::new(compiled.program);
+    assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+    assert_eq!(machine.stack(), &[Value::Bool(true)]);
+}
+
+#[test]
+fn finalized_named_and_contextual_callable_consumers_keep_authored_generic_declarations() {
+    for (flavor, path) in [
+        (SourceFlavor::RustScript, "main.rss"),
+        (
+            SourceFlavor::Plugin(FrontendId::new("neutral-logical-schemas")),
+            "main.logical",
+        ),
+    ] {
+        let options = || CompileSourceFileOptions::new().with_source_plugin(&LOGICAL_SCHEMA_PLUGIN);
+        for (source, name, result, local) in [
+            (
+                "fn answer() { 42 }\nlet f = answer;\nanswer();\nf();\n",
+                "answer",
+                TypeSchema::Int,
+                "f",
+            ),
+            (
+                "fn maybe(value: int?) { value }\nlet g = maybe;\nmaybe(null);\ng(null);\n",
+                "maybe",
+                TypeSchema::Optional(Box::new(TypeSchema::Int)),
+                "g",
+            ),
+        ] {
+            let model = analyze_source_from_string_with_options(path, source, options()).unwrap();
+            let index = model.ir().parsed_semantic_index.as_ref().unwrap();
+            let declaration = index
+                .func_decls
+                .iter()
+                .find(|decl| decl.name == name)
+                .unwrap();
+            assert_eq!(
+                model.inferred_schema_at(vm::SourcePosition::new(0, declaration.ident_span.lo)),
+                Some(result.clone())
+            );
+            for site in index
+                .call_sites
+                .iter()
+                .filter(|site| &source[site.callee_span.lo..site.callee_span.hi] == name)
+            {
+                assert_eq!(
+                    model.inferred_schema_at(vm::SourcePosition::new(0, site.callee_span.lo)),
+                    Some(result.clone())
+                );
+                assert_eq!(
+                    model.ir().semantic_index.as_ref().unwrap().resolved_calls[&site.id]
+                        .return_type,
+                    result
+                );
+            }
+            let hints =
+                collect_inferred_local_type_hints_with_options(source, flavor, options()).unwrap();
+            let expected = named_hint(&hints, local).schema.clone().unwrap();
+            let compiled =
+                compile_source_with_flavor_and_options(source, flavor, options()).unwrap();
+            assert!(
+                compiled
+                    .program
+                    .callable_prototypes
+                    .iter()
+                    .any(|prototype| prototype.schema.as_ref() == Some(&expected)),
+                "actual executable named prototype {expected:?}: {:?}",
+                compiled.program.callable_prototypes
+            );
+            assert!(
+                model
+                    .ir()
+                    .functions
+                    .iter()
+                    .find(|decl| decl.name == name)
+                    .unwrap()
+                    .return_schema
+                    .is_none()
+            );
+            let mut machine = Vm::new(compiled.program);
+            assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+            assert_eq!(
+                machine.stack().last(),
+                Some(if name == "answer" {
+                    &Value::Int(42)
+                } else {
+                    &Value::Null
+                })
+            );
+        }
+        let source = "fn identity<T>(value: T) -> T { value }\nlet output = identity::<int>(41);\nlet other = identity::<string>(\"authored\");\noutput;\n";
+        let model = analyze_source_from_string_with_options(path, source, options()).unwrap();
+        let index = model.ir().parsed_semantic_index.as_ref().unwrap();
+        let decl = model
+            .ir()
+            .functions
+            .iter()
+            .find(|decl| decl.name == "identity")
+            .unwrap();
+        assert_eq!(
+            decl.return_schema,
+            Some(TypeSchema::GenericParam("T".to_string()))
+        );
+        assert_eq!(
+            decl.arg_schemas,
+            [Some(TypeSchema::GenericParam("T".to_string()))]
+        );
+        for (needle, expected) in [
+            ("identity::<int>", TypeSchema::Int),
+            ("identity::<string>", TypeSchema::String),
+        ] {
+            let offset = source.find(needle).unwrap();
+            assert_eq!(
+                model.inferred_schema_at(vm::SourcePosition::new(0, offset)),
+                Some(expected)
+            );
+        }
+        let declaration = index
+            .func_decls
+            .iter()
+            .find(|decl| decl.name == "identity")
+            .unwrap();
+        assert_eq!(
+            model.inferred_schema_at(vm::SourcePosition::new(0, declaration.ident_span.lo)),
+            Some(TypeSchema::GenericParam("T".to_string()))
+        );
+        let hints =
+            collect_inferred_local_type_hints_with_options(source, flavor, options()).unwrap();
+        assert_eq!(named_hint(&hints, "output").schema, Some(TypeSchema::Int));
+        assert_eq!(named_hint(&hints, "other").schema, Some(TypeSchema::String));
+        let compiled = compile_source_with_flavor_and_options(source, flavor, options()).unwrap();
+        let mut machine = Vm::new(compiled.program);
+        assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+        assert_eq!(machine.stack(), &[Value::Int(41)]);
+        let source = "let g: fn(int?) -> int? = |value| value;\ng(null);\n";
+        let expected = TypeSchema::Callable {
+            params: vec![TypeSchema::Optional(Box::new(TypeSchema::Int))],
+            result: Box::new(TypeSchema::Optional(Box::new(TypeSchema::Int))),
+        };
+        let compiled = compile_source_with_flavor_and_options(source, flavor, options()).unwrap();
+        assert!(
+            compiled
+                .program
+                .callable_prototypes
+                .iter()
+                .any(|prototype| prototype.schema.as_ref() == Some(&expected))
+        );
+    }
+}
+
+#[test]
 fn finalized_validation_hook_checks_real_source_for_compile_analyze_and_hints() {
     let _guard = VALIDATION_TEST_LOCK.lock().unwrap();
     VALIDATION_FAILURES.lock().unwrap().clear();

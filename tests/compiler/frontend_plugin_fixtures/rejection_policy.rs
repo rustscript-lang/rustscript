@@ -1,4 +1,6 @@
 use super::*;
+static HOOKS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+static MIXED_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct RejectionPolicy {
     id: &'static str,
@@ -37,10 +39,52 @@ impl SourcePlugin for RejectionPolicy {
         source: &str,
         context: &SourceFrontendContext<'_>,
     ) -> Result<FrontendIr, ParseError> {
-        graph_format::GRAPH_FORMAT.parse_source(source, context)
+        let mut ir = graph_format::GRAPH_FORMAT.parse_source(source, context)?;
+        if let Some(old) = ir
+            .functions
+            .iter()
+            .find(|decl| decl.name == "probe")
+            .cloned()
+        {
+            ir.functions.retain(|decl| decl.index != old.index);
+            ir.implicit_extern_names.retain(|name| name != "probe");
+            let installed = context.install_host_function(&mut ir, "neutral::probe", 1)?;
+            let indexes = std::collections::HashMap::from([(old.index, installed)]);
+            for stmt in &mut ir.stmts {
+                resource_policy::remap_stmt(stmt, &indexes);
+            }
+        }
+        Ok(ir)
     }
     fn validate_typed_ir(&self, typed: &vm::FrontendTypedIr<'_>) -> Result<(), vm::CompileError> {
         let owner = typed.source_id.unwrap();
+        if typed.host_api_catalog.is_some() {
+            let checked = typed
+                .ir
+                .parsed_semantic_index
+                .as_ref()
+                .unwrap()
+                .local_decls
+                .iter()
+                .find(|decl| decl.name == "checked" && decl.ident_span.source_id == owner)
+                .unwrap();
+            let initializer = typed
+                .ir
+                .stmts
+                .iter()
+                .find_map(|stmt| match stmt {
+                    vm::Stmt::Let { index, expr, .. } if *index == checked.slot => Some(expr),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(matches!(initializer, vm::Expr::Call(_, _, _, Some(_), _)));
+            assert_eq!(typed.schema_of_expr(initializer), Some(vm::TypeSchema::Int));
+            assert_eq!(
+                typed.schema_of_expr(&vm::Expr::Var(checked.slot)),
+                Some(vm::TypeSchema::Int)
+            );
+            HOOKS.lock().unwrap().push(owner);
+        }
         let declaration = typed
             .ir
             .parsed_semantic_index
@@ -146,5 +190,165 @@ fn distinct_root_and_dependency_semantic_rejections_preserve_owner_across_checke
     .err()
     .unwrap();
     assert!(error.to_string().contains(DEPENDENCY_POLICY.id), "{error}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unresolved_host_result_recovery_keeps_independent_parameter_admission() {
+    let _lock = MIXED_SERIAL.lock().unwrap();
+    let root = temp_root("host-result-admission");
+    let entry = root.join("main.predicate");
+    let mut builder = vm::HostApiBuilder::new();
+    builder.function(vm::HostFunctionSchema::with_return(
+        "neutral::probe",
+        vec![vm::HostParamSchema::value("value", vm::HostTypeSchema::Int)],
+        vm::HostTypeSchema::Int,
+    ));
+    let catalog = std::sync::Arc::new(builder.build().unwrap());
+    let configured = || {
+        CompileSourceFileOptions::new()
+            .with_source_plugin(&ROOT_POLICY)
+            .with_host_api_catalog(catalog.clone())
+    };
+    let source = "let result = true;\nlet checked = probe(41);\nlet failed = probe(\"wrong\");\n";
+    write_source(&entry, source);
+    HOOKS.lock().unwrap().clear();
+    let model = vm::compiler::analyze_source_file_with_options(&entry, configured())
+        .expect("host-only failure retains diagnostic model despite unresolved result local");
+    assert_eq!(model.diagnostics().len(), 1);
+    let span = model.diagnostics()[0].span.unwrap();
+    assert_eq!(model.sources().span_text(span), Some("probe"));
+    assert_eq!(*HOOKS.lock().unwrap(), vec![0]);
+    assert!(compile_source_file_with_options(&entry, configured()).is_err());
+    assert!(
+        vm::collect_inferred_local_type_hints_at_path_with_options(
+            &entry,
+            source,
+            vm::SourceFlavor::Plugin(FrontendId::new(ROOT_POLICY.id)),
+            configured(),
+        )
+        .is_err()
+    );
+    let source = format!("{source}fn unresolved(value) -> int {{ 42 }}\n");
+    write_source(&entry, &source);
+    let error = vm::compiler::analyze_source_file_with_options(&entry, configured())
+        .err()
+        .expect("independent untyped parameter must remain rejected");
+    let vm::SourcePathError::SourceWithMap {
+        error:
+            vm::SourceError::Compile(vm::CompileError::StrictTypingRequired {
+                span: Some(span),
+                detail,
+                ..
+            }),
+        sources,
+    } = error
+    else {
+        panic!("independent strict parameter diagnostic required")
+    };
+    assert!(detail.contains("parameter"), "{detail}");
+    assert_eq!(sources.span_text(span), Some("value"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_recovery_retains_mixed_owner_hooks_and_independent_strict_errors() {
+    let _lock = MIXED_SERIAL.lock().unwrap();
+    let root = temp_root("mixed-admission");
+    let entry = root.join("main.predicate");
+    let library = root.join("lib.label");
+    let mut builder = vm::HostApiBuilder::new();
+    builder.function(vm::HostFunctionSchema::with_return(
+        "neutral::probe",
+        vec![vm::HostParamSchema::value("value", vm::HostTypeSchema::Int)],
+        vm::HostTypeSchema::Int,
+    ));
+    let catalog = std::sync::Arc::new(builder.build().unwrap());
+    let configured = || {
+        CompileSourceFileOptions::new()
+            .with_source_plugin(&ROOT_POLICY)
+            .with_source_plugin(&DEPENDENCY_POLICY)
+            .with_host_api_catalog(catalog.clone())
+    };
+    for rejected in [0, 1, 2] {
+        let root_result = if rejected == 1 { "true" } else { "1" };
+        let dependency_result = if rejected == 0 { "\"label\"" } else { "1" };
+        let source = format!(
+            "bind value answer answer ./lib.label\nlet result = {root_result};\nlet checked = probe(41);\nprobe(\"wrong\");\nanswer();\n"
+        );
+        write_source(&entry, &source);
+        write_source(
+            &library,
+            &format!(
+                "let result = {dependency_result};\nlet checked = probe(41);\npub fn answer() -> int {{ 42 }}\n"
+            ),
+        );
+        for operation in 0..3 {
+            HOOKS.lock().unwrap().clear();
+            let error = match operation {
+                0 => compile_source_file_with_options(&entry, configured()).map(|_| ()),
+                1 => {
+                    vm::compiler::analyze_source_file_with_options(&entry, configured()).map(|_| ())
+                }
+                _ => vm::collect_inferred_local_type_hints_at_path_with_options(
+                    &entry,
+                    &source,
+                    vm::SourceFlavor::Plugin(FrontendId::new(ROOT_POLICY.id)),
+                    configured(),
+                )
+                .map(|_| ()),
+            }
+            .expect_err("real semantic rejection must survive wrong installed host call");
+            let hooks = HOOKS.lock().unwrap().clone();
+            assert!(!hooks.is_empty());
+            assert_eq!(
+                hooks
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                hooks.len()
+            );
+            let owner = if rejected == 2 {
+                *hooks.last().unwrap()
+            } else {
+                rejected
+            };
+            assert_eq!(hooks.last(), Some(&owner));
+            let vm::SourcePathError::SourceWithMap {
+                error:
+                    vm::SourceError::Compile(vm::CompileError::StrictTypingRequired {
+                        span: Some(span),
+                        ..
+                    }),
+                sources,
+            } = error
+            else {
+                panic!("owner policy error required")
+            };
+            assert_eq!(span.source_id, owner);
+            assert_eq!(sources.span_text(span), Some("result"));
+        }
+    }
+    let source = "bind value answer answer ./lib.label\nlet result = true;\nlet checked = probe(41);\nlet wrong: int = \"bad\";\nprobe(\"wrong\");\nanswer();\n";
+    write_source(&entry, source);
+    write_source(
+        &library,
+        "let result = \"label\";\nlet checked = probe(41);\npub fn answer() -> int { 42 }\n",
+    );
+    let error = vm::compiler::analyze_source_file_with_options(&entry, configured())
+        .err()
+        .unwrap();
+    assert!(!matches!(
+        &error,
+        vm::SourcePathError::SourceWithMap {
+            error: vm::SourceError::Compile(vm::CompileError::HostCallResolve { .. }),
+            ..
+        }
+    ));
+    assert!(
+        error.to_string().contains("schema") || error.to_string().contains("type"),
+        "{error}"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }

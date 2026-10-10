@@ -11,7 +11,7 @@ use super::frontends;
 use super::ir::{
     Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, SemanticIndex, Stmt, TypeSchema,
 };
-use super::linker::{ParsedUnit, merge_units};
+use super::linker::{ParsedUnit, merge_admission_units, merge_units};
 use super::modules::ModuleGraph;
 use super::semantic_model::SemanticModel;
 use super::source_loader::{load_units_for_source_file, load_units_for_source_file_with_context};
@@ -49,14 +49,21 @@ pub struct InferredLocalTypeHint {
 #[derive(Clone, Copy, Debug)]
 struct CompileBehavior {
     clear_dead_locals: bool,
+    recover_host_errors: bool,
 }
 
 impl CompileBehavior {
     const DEFAULT: Self = Self {
         clear_dead_locals: true,
+        recover_host_errors: false,
+    };
+    const ANALYZE: Self = Self {
+        recover_host_errors: true,
+        ..Self::DEFAULT
     };
     const REPL: Self = Self {
         clear_dead_locals: false,
+        recover_host_errors: false,
     };
 }
 
@@ -67,6 +74,7 @@ struct PreparedTypedUnits {
     sources: SourceMap,
     catalog: Arc<HostApiCatalog>,
     module_graph: Option<ModuleGraph>,
+    host_error: Option<CompileError>,
 }
 
 fn prepare_typed_units(
@@ -102,17 +110,43 @@ fn prepare_typed_units(
             source_name: unit.source_name.clone(),
             policy: producer_policy,
             plugin,
-            semantic_only: (!unit.runtime_reachable).then(|| unit.parsed.clone()),
         });
     }
-    let parsed = merge_units(units)?;
-    let (ir, type_info, owned_ir) =
+    let has_semantic_only = units.iter().any(|unit| !unit.runtime_reachable);
+    let runtime = has_semantic_only
+        .then(|| merge_units(units.clone()))
+        .transpose()?;
+    let parsed = merge_admission_units(units)?;
+    let (ir, type_info, admission_owned, host_error) =
         prepare_owned_typed_ir(parsed, &owners, options, behavior, &sources).map_err(|error| {
             SourcePathError::SourceWithMap {
                 error: preserve_strict_diagnostic_path(error, diagnostic_path.as_deref()),
                 sources: sources.clone(),
             }
         })?;
+    let owned_ir = if let Some(runtime) = runtime {
+        // Admission has already checked every source and invoked each hook once.
+        // Link/codegen authority is independently restricted to Value paths.
+        let (runtime, error) =
+            typing::legalize_for_admission(runtime, TypingMode::DynamicHints, &[]);
+        if !behavior.recover_host_errors
+            && let Some(error) = error
+        {
+            return Err(SourcePathError::SourceWithMap {
+                error: SourceError::Compile(error),
+                sources,
+            });
+        }
+        let facts = typing::infer_types(&runtime, TypingMode::DynamicHints, &[]);
+        enforce_owned_sources(runtime, &facts, &owners, behavior, &sources).map_err(|error| {
+            SourcePathError::SourceWithMap {
+                error: SourceError::Parse(error),
+                sources: sources.clone(),
+            }
+        })?
+    } else {
+        admission_owned
+    };
     let catalog = options
         .host_api_catalog()
         .cloned()
@@ -124,6 +158,7 @@ fn prepare_typed_units(
         sources,
         catalog,
         module_graph,
+        host_error,
     })
 }
 
@@ -155,9 +190,9 @@ fn prepare_typed_ir(
         source_name: String::new(),
         policy,
         plugin,
-        semantic_only: None,
     }];
     prepare_owned_typed_ir(parsed, &owners, options, behavior, sources)
+        .map(|(ir, facts, owned, _)| (ir, facts, owned))
 }
 
 struct TypedSourceOwner<'a> {
@@ -165,7 +200,6 @@ struct TypedSourceOwner<'a> {
     source_name: String,
     policy: FrontendPolicy,
     plugin: Option<&'a dyn super::SourcePlugin>,
-    semantic_only: Option<FrontendIr>,
 }
 
 // Select admission sites only. The shared IR remains authoritative for all
@@ -220,90 +254,65 @@ fn prepare_owned_typed_ir(
     options: &CompileSourceFileOptions,
     behavior: CompileBehavior,
     sources: &SourceMap,
-) -> Result<(FrontendIr, typing::TypeInferenceResult, FrontendIr), SourceError> {
+) -> Result<
+    (
+        FrontendIr,
+        typing::TypeInferenceResult,
+        FrontendIr,
+        Option<CompileError>,
+    ),
+    SourceError,
+> {
     for owner in owners
         .iter()
         .filter(|owner| owner.policy.typing_mode.is_strict())
     {
-        let owned = owner
-            .semantic_only
-            .clone()
-            .unwrap_or_else(|| owned_admission_sites(&parsed, owner));
+        let owned = owned_admission_sites(&parsed, owner);
         reject_strict_unknown_annotations(&owned).map_err(SourceError::Parse)?;
     }
     // Legalization and inference do not impose the root's language policy on
     // dependencies. Admission below uses each producer's own descriptor.
-    parsed = typing::legalize_builtins_and_bind_types(parsed, TypingMode::DynamicHints, &[])
-        .map_err(SourceError::Compile)?;
+    let (legalized, host_error) =
+        typing::legalize_for_admission(parsed, TypingMode::DynamicHints, &[]);
+    parsed = legalized;
     let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, &[]);
+    let mut deferred_resolution_error = None;
     for owner in owners {
-        if let Some(semantic) = &owner.semantic_only {
-            let semantic = typing::legalize_builtins_and_bind_types(
-                semantic.clone(),
-                owner.policy.typing_mode,
-                &[],
+        typing::validate_source_type_consistency(
+            &parsed,
+            owner.policy.typing_mode,
+            &[],
+            (!owner.source_name.is_empty()).then_some(owner.source_name.as_str()),
+        )
+        .map_err(SourceError::Compile)?;
+        if owner.policy.typing_mode.is_strict()
+            && let Err(error) = enforce_strict_type_resolution_with_host_recovery(
+                &owned_admission_sites(&parsed, owner),
+                &type_info,
+                behavior.recover_host_errors && host_error.is_some(),
             )
-            .map_err(SourceError::Compile)?;
-            typing::validate_if_else_type_consistency(&semantic, owner.policy.typing_mode, &[])
-                .map_err(SourceError::Compile)?;
-            if owner.policy.typing_mode.is_strict() {
-                let facts = typing::infer_types(&semantic, owner.policy.typing_mode, &[]);
-                enforce_strict_type_resolution(&semantic, &facts).map_err(SourceError::Compile)?;
-            }
-        } else {
-            typing::validate_source_type_consistency(
-                &parsed,
-                owner.policy.typing_mode,
-                &[],
-                (!owner.source_name.is_empty()).then_some(owner.source_name.as_str()),
-            )
-            .map_err(SourceError::Compile)?;
-            if owner.policy.typing_mode.is_strict() {
-                enforce_strict_type_resolution(&owned_admission_sites(&parsed, owner), &type_info)
-                    .map_err(SourceError::Compile)?;
+        {
+            // A failed catalog call can leave its result local Unknown. For
+            // non-recovering entries retain the primary host diagnostic, but
+            // still run independent ownership and source-hook admission.
+            // Analysis must continue rejecting independent strict failures.
+            if host_error.is_some() && !behavior.recover_host_errors {
+                deferred_resolution_error.get_or_insert(error);
+            } else {
+                return Err(SourceError::Compile(error));
             }
         }
     }
     let logical_schemas = type_info.logical_schemas();
     parsed.semantic_index = Some(SemanticIndex::build(logical_schemas.clone(), &parsed));
-    let owned_local_slots = type_info
-        .local_schemas
-        .iter()
-        .map(|schema| {
-            schema.as_ref().is_some_and(|schema| {
-                schema.contains_resource_with_named_types(&parsed.struct_schemas)
-            })
-        })
-        .collect::<Vec<_>>();
-    let policies = owners
-        .iter()
-        .map(|owner| (owner.source_name.clone(), owner.policy.ownership_checking))
-        .collect();
-    let owned_ir = lifetime::enforce_source_availability(
-        parsed.clone(),
-        behavior.clear_dead_locals,
-        &owned_local_slots,
-        &policies,
-        owners
-            .first()
-            .is_some_and(|owner| owner.policy.ownership_checking),
-    )
-    .map_err(SourceError::Parse)?;
+    let owned_ir = enforce_owned_sources(parsed.clone(), &type_info, owners, behavior, sources)
+        .map_err(SourceError::Parse)?;
     for owner in owners {
         if let Some(plugin) = owner.plugin {
-            let (view, schemas) = if let Some(semantic) = &owner.semantic_only {
-                let mut view = semantic.clone();
-                let schemas =
-                    typing::infer_types(&view, owner.policy.typing_mode, &[]).logical_schemas();
-                view.semantic_index = Some(SemanticIndex::build(schemas.clone(), &view));
-                (Some(view), schemas)
-            } else {
-                (None, logical_schemas.clone())
-            };
             let typed = FrontendTypedIr {
                 source_id: Some(owner.source_id),
-                ir: view.as_ref().unwrap_or(&parsed),
-                local_schemas: &schemas,
+                ir: &parsed,
+                local_schemas: &logical_schemas,
                 host_api_catalog: options.host_api_catalog().map(Arc::as_ref),
                 source_map: Some(sources),
             };
@@ -312,7 +321,47 @@ fn prepare_owned_typed_ir(
                 .map_err(SourceError::Compile)?;
         }
     }
-    Ok((parsed, type_info, owned_ir))
+    if !behavior.recover_host_errors
+        && let Some(error) = host_error
+    {
+        return Err(SourceError::Compile(error));
+    }
+    if let Some(error) = deferred_resolution_error {
+        return Err(SourceError::Compile(error));
+    }
+    Ok((parsed, type_info, owned_ir, host_error))
+}
+
+fn enforce_owned_sources(
+    ir: FrontendIr,
+    facts: &typing::TypeInferenceResult,
+    owners: &[TypedSourceOwner<'_>],
+    behavior: CompileBehavior,
+    sources: &SourceMap,
+) -> Result<FrontendIr, ParseError> {
+    let owned_slots = facts
+        .local_schemas
+        .iter()
+        .map(|schema| {
+            schema
+                .as_ref()
+                .is_some_and(|schema| schema.contains_resource_with_named_types(&ir.struct_schemas))
+        })
+        .collect::<Vec<_>>();
+    let policies = owners
+        .iter()
+        .map(|owner| (owner.source_name.clone(), owner.policy.ownership_checking))
+        .collect();
+    lifetime::enforce_source_availability(
+        ir,
+        behavior.clear_dead_locals,
+        &owned_slots,
+        &policies,
+        owners
+            .first()
+            .is_some_and(|owner| owner.policy.ownership_checking),
+        sources,
+    )
 }
 
 fn collect_named_local_debug_ranges(parsed: &FrontendIr) -> HashMap<String, LocalDebugRange> {
@@ -844,6 +893,14 @@ fn enforce_strict_type_resolution(
     parsed: &FrontendIr,
     type_info: &typing::TypeInferenceResult,
 ) -> Result<(), CompileError> {
+    enforce_strict_type_resolution_with_host_recovery(parsed, type_info, false)
+}
+
+fn enforce_strict_type_resolution_with_host_recovery(
+    parsed: &FrontendIr,
+    type_info: &typing::TypeInferenceResult,
+    recover_host_results: bool,
+) -> Result<(), CompileError> {
     let parsed_index = parsed.parsed_semantic_index.as_ref();
     for schema in parsed.struct_schemas.values() {
         if schema_is_fully_known(&schema.body_schema) {
@@ -901,6 +958,18 @@ fn enforce_strict_type_resolution(
         if slot_is_fully_typed(slot, type_info) {
             continue;
         }
+        // Only a direct unresolved catalog-call result is diagnostic fallout.
+        // Keep its schema Unknown and all owner hooks/ownership checks intact;
+        // unrelated locals and parameters still require strict admission.
+        if recover_host_results
+            && site.kind == "local"
+            && (has_unresolved_host_initializer(&parsed.stmts, slot, parsed)
+                || parsed.function_impls.values().any(|implementation| {
+                    has_unresolved_host_initializer(&implementation.body_stmts, slot, parsed)
+                }))
+        {
+            continue;
+        }
         let span = parsed_index.and_then(|index| {
             index
                 .local_decls
@@ -927,6 +996,38 @@ fn enforce_strict_type_resolution(
     }
 
     Ok(())
+}
+
+fn has_unresolved_host_initializer(stmts: &[Stmt], slot: LocalSlot, ir: &FrontendIr) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Let {
+            index,
+            expr: Expr::Call(function, _, _, None, _),
+            declared_schema: None,
+            ..
+        } if *index == slot => ir
+            .host_api_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.candidates(*function))
+            .is_some(),
+        Stmt::IfElse {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            has_unresolved_host_initializer(then_branch, slot, ir)
+                || has_unresolved_host_initializer(else_branch, slot, ir)
+        }
+        Stmt::For {
+            init, post, body, ..
+        } => {
+            has_unresolved_host_initializer(std::slice::from_ref(init.as_ref()), slot, ir)
+                || has_unresolved_host_initializer(std::slice::from_ref(post.as_ref()), slot, ir)
+                || has_unresolved_host_initializer(body, slot, ir)
+        }
+        Stmt::While { body, .. } => has_unresolved_host_initializer(body, slot, ir),
+        _ => false,
+    })
 }
 
 fn slot_is_fully_typed(slot: LocalSlot, type_info: &typing::TypeInferenceResult) -> bool {
@@ -1231,50 +1332,28 @@ fn analyze_loaded_units(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<SemanticModel, SourcePathError> {
-    // Preserve the semantic API's recoverable host-resolution diagnostic
-    // contract. Checked admission still runs first; this retained source IR
-    // is diagnostic-only and never feeds compilation or type hints.
-    let diagnostic_units = units.clone();
-    let mut prepared = match prepare_typed_units(
+    // Diagnostic recovery uses the same finalized owner admission as compile
+    // and hints. A host error grants no execution authority.
+    let mut prepared = prepare_typed_units(
         units,
         sources,
         policy,
         flavor,
         options,
-        CompileBehavior::DEFAULT,
+        CompileBehavior::ANALYZE,
         None,
-    ) {
-        Ok(prepared) => prepared,
-        Err(SourcePathError::SourceWithMap {
-            error: SourceError::Compile(error @ CompileError::HostCallResolve { .. }),
-            sources,
-        }) => {
-            let mut ir = merge_units(diagnostic_units)?;
-            let facts = typing::infer_types(&ir, policy.typing_mode, &[]);
-            ir.semantic_index = Some(SemanticIndex::build(facts.logical_schemas(), &ir));
-            let catalog = options
-                .host_api_catalog()
-                .cloned()
-                .unwrap_or_else(default_analyze_catalog);
-            return Ok(match module_graph {
-                Some(graph) => {
-                    SemanticModel::new_with_module_graph(ir, sources, catalog, vec![error], graph)
-                }
-                None => SemanticModel::new(ir, sources, catalog, vec![error]),
-            });
-        }
-        Err(error) => return Err(error),
-    };
+    )?;
+    let errors = prepared.host_error.take().into_iter().collect::<Vec<_>>();
     prepared.module_graph = module_graph;
     Ok(match prepared.module_graph {
         Some(module_graph) => SemanticModel::new_with_module_graph(
             prepared.ir,
             prepared.sources,
             prepared.catalog,
-            Vec::new(),
+            errors,
             module_graph,
         ),
-        None => SemanticModel::new(prepared.ir, prepared.sources, prepared.catalog, Vec::new()),
+        None => SemanticModel::new(prepared.ir, prepared.sources, prepared.catalog, errors),
     })
 }
 
