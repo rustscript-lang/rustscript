@@ -1783,6 +1783,7 @@ fn resolve_expr_imported_calls(
         | Expr::MoveField { .. }
         | Expr::MoveIndex { .. } => {}
         Expr::OptionalGet {
+            field_projection: _,
             container,
             key,
             container_slot: _,

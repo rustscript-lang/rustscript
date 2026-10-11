@@ -1375,6 +1375,7 @@ fn remap_expr_indices(
             );
         }
         Expr::OptionalGet {
+            field_projection: _,
             container,
             key,
             container_slot,

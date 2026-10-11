@@ -883,21 +883,7 @@ impl AvailabilityAnalyzer {
                 self.mark_field_moved(&mut out, *root, field_key);
                 Ok(out)
             }
-            Expr::OptionalGet {
-                container,
-                key,
-                container_slot,
-                key_slot,
-                semantic_id: _,
-            } => {
-                let container_state = self.analyze_expr(container, state, line)?;
-                let mut out = container_state;
-                self.mark_owned_value_reads_moved(container, &mut out);
-                out = self.analyze_expr(key, &out, line)?;
-                self.mark_available(&mut out, *container_slot, line)?;
-                self.mark_available(&mut out, *key_slot, line)?;
-                Ok(out)
-            }
+            Expr::OptionalGet { .. } => self.analyze_optional_get(expr, state, line, false),
             Expr::OptionUnwrapOr {
                 value,
                 value_slot,
@@ -1125,6 +1111,54 @@ impl AvailabilityAnalyzer {
         }
     }
 
+    fn analyze_optional_get(
+        &self,
+        expr: &Expr,
+        state: &FlowState,
+        line: u32,
+        copy_projection: bool,
+    ) -> Result<FlowState, ParseError> {
+        let Expr::OptionalGet {
+            field_projection,
+            container,
+            key,
+            container_slot,
+            key_slot,
+            ..
+        } = expr
+        else {
+            unreachable!("optional lookup expression");
+        };
+        let mut out = if *field_projection {
+            let Some((root, field_key)) = self.extract_optional_field_projection(expr) else {
+                return Err(ParseError {
+                    span: None,
+                    code: Some("E_OPTIONAL_FIELD_PROJECTION".to_string()),
+                    line: line as usize,
+                    message: "optional field projection requires a direct local and a literal key"
+                        .to_string(),
+                });
+            };
+            let mut out = self.analyze_projection_root_expr(container, state, line)?;
+            out = self.analyze_expr(key, &out, line)?;
+            self.require_field_available(root, &field_key, &out, line)?;
+            if self.enable_local_move_semantics
+                && !copy_projection
+                && !self.is_copyable_field(root, &field_key, &out)
+            {
+                self.mark_field_moved(&mut out, root, field_key);
+            }
+            out
+        } else {
+            let mut out = self.analyze_expr(container, state, line)?;
+            self.mark_owned_value_reads_moved(container, &mut out);
+            self.analyze_expr(key, &out, line)?
+        };
+        self.mark_available(&mut out, *container_slot, line)?;
+        self.mark_available(&mut out, *key_slot, line)?;
+        Ok(out)
+    }
+
     fn analyze_expr_to_owned(
         &self,
         inner: &Expr,
@@ -1146,6 +1180,9 @@ impl AvailabilityAnalyzer {
             let out = self.analyze_projection_args(args, state, line)?;
             self.require_field_available(root_slot, &field_key, &out, line)?;
             return Ok(out);
+        }
+        if self.extract_optional_field_projection(inner).is_some() {
+            return self.analyze_optional_get(inner, state, line, true);
         }
         self.analyze_expr(inner, state, line)
     }
@@ -1299,8 +1336,16 @@ impl AvailabilityAnalyzer {
                     self.mark_field_moved(state, *root, MovedFieldKey::Index(*index));
                 }
             }
-            Expr::OptionalGet { container, .. }
-            | Expr::OptionUnwrapOr {
+            Expr::OptionalGet { container, .. } => {
+                if let Some((root, key)) = self.extract_optional_field_projection(expr) {
+                    if !self.is_copyable_field(root, &key, state) {
+                        self.mark_field_moved(state, root, key);
+                    }
+                } else {
+                    self.mark_owned_value_reads_moved(container, state);
+                }
+            }
+            Expr::OptionUnwrapOr {
                 value: container, ..
             } => {
                 self.mark_owned_value_reads_moved(container, state);
@@ -1342,6 +1387,7 @@ impl AvailabilityAnalyzer {
                 self.is_owned_slot(*root)
             }
             Expr::OptionalGet {
+                field_projection: _,
                 container,
                 key,
                 container_slot,
@@ -1589,7 +1635,7 @@ impl AvailabilityAnalyzer {
                 })
             }
             _ => {
-                let rewritten = self.rewrite_expr_for_ownership(expr)?;
+                let rewritten = self.rewrite_expr_for_ownership(expr, state)?;
                 Ok(self.rewrite_runtime_field_move_expr(&rewritten, state))
             }
         }
@@ -1606,20 +1652,25 @@ impl AvailabilityAnalyzer {
     ///   `MoveVar` (aggregate insertion transfers ownership).
     ///
     /// Plain (non-resource) programs are structurally preserved.
-    fn rewrite_expr_for_ownership(&self, expr: &Expr) -> Result<Expr, ParseError> {
-        self.rewrite_expr_ownership_inner(expr, false)
+    fn rewrite_expr_for_ownership(
+        &self,
+        expr: &Expr,
+        state: &FlowState,
+    ) -> Result<Expr, ParseError> {
+        self.rewrite_expr_ownership_inner(expr, false, state)
     }
 
     fn rewrite_expr_ownership_inner(
         &self,
         expr: &Expr,
         in_call_arg: bool,
+        state: &FlowState,
     ) -> Result<Expr, ParseError> {
         match expr {
             Expr::Call(index, type_args, args, resolution, source_node_id) => {
                 let mut rewritten_args = Vec::with_capacity(args.len());
                 for arg in args {
-                    rewritten_args.push(self.rewrite_expr_ownership_inner(arg, true)?);
+                    rewritten_args.push(self.rewrite_expr_ownership_inner(arg, true, state)?);
                 }
                 if let Some(resolution) = resolution.as_deref() {
                     for (position, arg) in rewritten_args.iter_mut().enumerate() {
@@ -1678,14 +1729,20 @@ impl AvailabilityAnalyzer {
                 index: *index,
             }),
             Expr::OptionalGet {
+                field_projection: true,
+                ..
+            } => Ok(self.rewrite_runtime_field_move_expr(expr, state)),
+            Expr::OptionalGet {
+                field_projection,
                 container,
                 key,
                 container_slot,
                 key_slot,
                 semantic_id,
             } => Ok(Expr::OptionalGet {
-                container: Box::new(self.rewrite_expr_ownership_inner(container, false)?),
-                key: Box::new(self.rewrite_expr_ownership_inner(key, false)?),
+                field_projection: *field_projection,
+                container: Box::new(self.rewrite_expr_ownership_inner(container, false, state)?),
+                key: Box::new(self.rewrite_expr_ownership_inner(key, false, state)?),
                 container_slot: *container_slot,
                 key_slot: *key_slot,
                 semantic_id: *semantic_id,
@@ -1696,36 +1753,50 @@ impl AvailabilityAnalyzer {
                 fallback,
                 semantic_id,
             } => Ok(Expr::OptionUnwrapOr {
-                value: Box::new(self.rewrite_expr_ownership_inner(value, false)?),
+                value: Box::new(self.rewrite_expr_ownership_inner(value, false, state)?),
                 value_slot: *value_slot,
-                fallback: Box::new(self.rewrite_expr_ownership_inner(fallback, false)?),
+                fallback: Box::new(self.rewrite_expr_ownership_inner(fallback, false, state)?),
                 semantic_id: *semantic_id,
             }),
             Expr::LocalCall(index, type_args, args, semantic_id) => Ok(Expr::LocalCall(
                 *index,
                 type_args.clone(),
-                self.rewrite_call_args(args)?,
+                self.rewrite_call_args(args, state)?,
                 *semantic_id,
             )),
             Expr::ModuleCall(index, type_args, args, semantic_id) => Ok(Expr::ModuleCall(
                 *index,
                 type_args.clone(),
-                self.rewrite_call_args(args)?,
+                self.rewrite_call_args(args, state)?,
                 *semantic_id,
             )),
-            Expr::Closure(closure) => Ok(Expr::Closure(ClosureExpr {
-                param_slots: closure.param_slots.clone(),
-                capture_copies: closure.capture_copies.clone(),
-                body: Box::new(self.rewrite_expr_ownership_inner(&closure.body, false)?),
-            })),
-            Expr::ClosureCall(closure, args) => Ok(Expr::ClosureCall(
-                ClosureExpr {
+            Expr::Closure(closure) => {
+                let closure_state = self.closure_flow_state(closure, state, 0)?;
+                Ok(Expr::Closure(ClosureExpr {
                     param_slots: closure.param_slots.clone(),
                     capture_copies: closure.capture_copies.clone(),
-                    body: Box::new(self.rewrite_expr_ownership_inner(&closure.body, false)?),
-                },
-                self.rewrite_call_args(args)?,
-            )),
+                    body: Box::new(self.rewrite_expr_ownership_inner(
+                        &closure.body,
+                        false,
+                        &closure_state,
+                    )?),
+                }))
+            }
+            Expr::ClosureCall(closure, args) => {
+                let closure_state = self.closure_flow_state(closure, state, 0)?;
+                Ok(Expr::ClosureCall(
+                    ClosureExpr {
+                        param_slots: closure.param_slots.clone(),
+                        capture_copies: closure.capture_copies.clone(),
+                        body: Box::new(self.rewrite_expr_ownership_inner(
+                            &closure.body,
+                            false,
+                            &closure_state,
+                        )?),
+                    },
+                    self.rewrite_call_args(args, state)?,
+                ))
+            }
             Expr::Add(lhs, rhs)
             | Expr::Sub(lhs, rhs)
             | Expr::Mul(lhs, rhs)
@@ -1736,8 +1807,8 @@ impl AvailabilityAnalyzer {
             | Expr::Eq(lhs, rhs)
             | Expr::Lt(lhs, rhs)
             | Expr::Gt(lhs, rhs) => {
-                let lhs = self.rewrite_expr_ownership_inner(lhs, false)?;
-                let rhs = self.rewrite_expr_ownership_inner(rhs, false)?;
+                let lhs = self.rewrite_expr_ownership_inner(lhs, false, state)?;
+                let rhs = self.rewrite_expr_ownership_inner(rhs, false, state)?;
                 Ok(match expr {
                     Expr::Add(..) => Expr::Add(Box::new(lhs), Box::new(rhs)),
                     Expr::Sub(..) => Expr::Sub(Box::new(lhs), Box::new(rhs)),
@@ -1753,11 +1824,16 @@ impl AvailabilityAnalyzer {
                 })
             }
             Expr::Neg(inner) | Expr::Not(inner) => {
-                let inner = self.rewrite_expr_ownership_inner(inner, false)?;
+                let inner = self.rewrite_expr_ownership_inner(inner, false, state)?;
                 Ok(match expr {
                     Expr::Neg(..) => Expr::Neg(Box::new(inner)),
                     _ => Expr::Not(Box::new(inner)),
                 })
+            }
+            Expr::ToOwned(inner) if self.extract_optional_field_projection(inner).is_some() => {
+                // An explicit non-resource copy checks availability without
+                // removing the projected child from its original record.
+                Ok(expr.clone())
             }
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 // Non-resource borrow/copy wrappers are preserved verbatim;
@@ -1765,7 +1841,7 @@ impl AvailabilityAnalyzer {
                 // The inner read keeps the call-argument context when nested
                 // inside one, so a borrow of an owned local in a host-call
                 // argument stays a plain read (never a MoveVar).
-                let inner = self.rewrite_expr_ownership_inner(inner, in_call_arg)?;
+                let inner = self.rewrite_expr_ownership_inner(inner, in_call_arg, state)?;
                 Ok(match expr {
                     Expr::ToOwned(..) => Expr::ToOwned(Box::new(inner)),
                     Expr::Borrow(..) => Expr::Borrow(Box::new(inner)),
@@ -1777,9 +1853,9 @@ impl AvailabilityAnalyzer {
                 then_expr,
                 else_expr,
             } => Ok(Expr::IfElse {
-                condition: Box::new(self.rewrite_expr_ownership_inner(condition, false)?),
-                then_expr: Box::new(self.rewrite_expr_ownership_inner(then_expr, false)?),
-                else_expr: Box::new(self.rewrite_expr_ownership_inner(else_expr, false)?),
+                condition: Box::new(self.rewrite_expr_ownership_inner(condition, false, state)?),
+                then_expr: Box::new(self.rewrite_expr_ownership_inner(then_expr, false, state)?),
+                else_expr: Box::new(self.rewrite_expr_ownership_inner(else_expr, false, state)?),
             }),
             Expr::Match {
                 value_slot,
@@ -1792,25 +1868,18 @@ impl AvailabilityAnalyzer {
                 for (pattern, arm_expr) in arms {
                     rewritten_arms.push((
                         pattern.clone(),
-                        self.rewrite_expr_ownership_inner(arm_expr, false)?,
+                        self.rewrite_expr_ownership_inner(arm_expr, false, state)?,
                     ));
                 }
                 Ok(Expr::Match {
                     value_slot: *value_slot,
                     result_slot: *result_slot,
-                    value: Box::new(self.rewrite_expr_ownership_inner(value, false)?),
+                    value: Box::new(self.rewrite_expr_ownership_inner(value, false, state)?),
                     arms: rewritten_arms,
-                    default: Box::new(self.rewrite_expr_ownership_inner(default, false)?),
+                    default: Box::new(self.rewrite_expr_ownership_inner(default, false, state)?),
                 })
             }
-            Expr::Block { stmts, expr } => Ok(Expr::Block {
-                // Statement-level rewrites run through the stmt handlers
-                // during analysis. Preserve those transformations when the
-                // block is nested inside an expression instead of retaining
-                // the pre-analysis statements.
-                stmts: self.rewrite_block_stmts_for_ownership(stmts)?,
-                expr: Box::new(self.rewrite_expr_ownership_inner(expr, false)?),
-            }),
+            Expr::Block { .. } => self.rewrite_expr_for_ownership_with_state(expr, state, 0),
             Expr::Null
             | Expr::Int(_)
             | Expr::Float(_)
@@ -1823,94 +1892,10 @@ impl AvailabilityAnalyzer {
         }
     }
 
-    fn rewrite_block_stmts_for_ownership(&self, stmts: &[Stmt]) -> Result<Vec<Stmt>, ParseError> {
-        stmts
-            .iter()
-            .map(|stmt| self.rewrite_stmt_for_ownership(stmt))
-            .collect()
-    }
-
-    fn rewrite_stmt_for_ownership(&self, stmt: &Stmt) -> Result<Stmt, ParseError> {
-        match stmt {
-            Stmt::Noop { .. }
-            | Stmt::FuncDecl { .. }
-            | Stmt::Break { .. }
-            | Stmt::Continue { .. }
-            | Stmt::Drop { .. } => Ok(stmt.clone()),
-            Stmt::Let {
-                index,
-                declared_schema,
-                expr,
-                line,
-            } => Ok(Stmt::Let {
-                index: *index,
-                declared_schema: declared_schema.clone(),
-                expr: self.rewrite_expr_ownership_inner(expr, false)?,
-                line: *line,
-            }),
-            Stmt::Assign {
-                kind,
-                index,
-                expr,
-                line,
-            } => Ok(Stmt::Assign {
-                kind: kind.clone(),
-                index: *index,
-                expr: self.rewrite_expr_ownership_inner(expr, false)?,
-                line: *line,
-            }),
-            Stmt::ClosureLet { line, closure } => Ok(Stmt::ClosureLet {
-                line: *line,
-                closure: ClosureExpr {
-                    param_slots: closure.param_slots.clone(),
-                    capture_copies: closure.capture_copies.clone(),
-                    body: Box::new(self.rewrite_expr_ownership_inner(&closure.body, false)?),
-                },
-            }),
-            Stmt::Expr { expr, line } => Ok(Stmt::Expr {
-                expr: self.rewrite_expr_ownership_inner(expr, false)?,
-                line: *line,
-            }),
-            Stmt::IfElse {
-                condition,
-                then_branch,
-                else_branch,
-                line,
-            } => Ok(Stmt::IfElse {
-                condition: self.rewrite_expr_ownership_inner(condition, false)?,
-                then_branch: self.rewrite_block_stmts_for_ownership(then_branch)?,
-                else_branch: self.rewrite_block_stmts_for_ownership(else_branch)?,
-                line: *line,
-            }),
-            Stmt::For {
-                init,
-                condition,
-                post,
-                body,
-                line,
-            } => Ok(Stmt::For {
-                init: Box::new(self.rewrite_stmt_for_ownership(init)?),
-                condition: self.rewrite_expr_ownership_inner(condition, false)?,
-                post: Box::new(self.rewrite_stmt_for_ownership(post)?),
-                body: self.rewrite_block_stmts_for_ownership(body)?,
-                line: *line,
-            }),
-            Stmt::While {
-                condition,
-                body,
-                line,
-            } => Ok(Stmt::While {
-                condition: self.rewrite_expr_ownership_inner(condition, false)?,
-                body: self.rewrite_block_stmts_for_ownership(body)?,
-                line: *line,
-            }),
-        }
-    }
-
-    fn rewrite_call_args(&self, args: &[Expr]) -> Result<Vec<Expr>, ParseError> {
+    fn rewrite_call_args(&self, args: &[Expr], state: &FlowState) -> Result<Vec<Expr>, ParseError> {
         let mut rewritten = Vec::with_capacity(args.len());
         for arg in args {
-            rewritten.push(self.rewrite_expr_ownership_inner(arg, true)?);
+            rewritten.push(self.rewrite_expr_ownership_inner(arg, true, state)?);
         }
         Ok(rewritten)
     }
@@ -2145,6 +2130,82 @@ impl AvailabilityAnalyzer {
         if !self.enable_local_move_semantics {
             return expr.clone();
         }
+        if let Some((root, key)) = self.extract_optional_field_projection(expr) {
+            if self.is_copyable_field(root, &key, state) {
+                return expr.clone();
+            }
+            let Expr::OptionalGet { container_slot, .. } = expr else {
+                unreachable!("optional field projection");
+            };
+            // Save the missing-to-Null result, then detach the same child as
+            // ordinary Get. Do not insert a missing child or clone the record.
+            let mut lookup = expr.clone();
+            if let Expr::OptionalGet {
+                field_projection, ..
+            } = &mut lookup
+            {
+                *field_projection = false;
+            }
+            let key_expr = match key {
+                MovedFieldKey::String(value) => Expr::String(value),
+                MovedFieldKey::Index(value) => Expr::Int(value),
+                _ => unreachable!("literal projection key"),
+            };
+            let call = |builtin: BuiltinFunction, args| {
+                Expr::Call(builtin.call_index(), vec![], args, None, None)
+            };
+            let has = call(
+                BuiltinFunction::Has,
+                vec![Expr::Var(root), key_expr.clone()],
+            );
+            let present = if matches!(key_expr, Expr::Int(_)) {
+                Expr::IfElse {
+                    condition: Box::new(Expr::Eq(
+                        Box::new(call(BuiltinFunction::TypeOf, vec![Expr::Var(root)])),
+                        Box::new(Expr::String("map".to_string())),
+                    )),
+                    then_expr: Box::new(has),
+                    else_expr: Box::new(Expr::And(
+                        Box::new(Expr::Not(Box::new(Expr::Lt(
+                            Box::new(key_expr.clone()),
+                            Box::new(Expr::Int(0)),
+                        )))),
+                        Box::new(Expr::Lt(
+                            Box::new(key_expr.clone()),
+                            Box::new(call(BuiltinFunction::Len, vec![Expr::Var(root)])),
+                        )),
+                    )),
+                }
+            } else {
+                has
+            };
+            return Expr::Block {
+                stmts: vec![
+                    Stmt::Let {
+                        index: *container_slot,
+                        expr: lookup,
+                        line: 0,
+                        declared_schema: None,
+                    },
+                    Stmt::IfElse {
+                        condition: present,
+                        then_branch: vec![Stmt::Assign {
+                            kind: super::super::ir::AssignmentKind::Set,
+                            index: root,
+                            expr: call(
+                                BuiltinFunction::Set,
+                                vec![Expr::Var(root), key_expr, Expr::Null],
+                            ),
+                            line: 0,
+                        }],
+                        else_branch: vec![],
+                        line: 0,
+                    },
+                ],
+                expr: Box::new(Expr::Var(*container_slot)),
+            };
+        }
+
         let Expr::Call(index, _, args, _, _) = expr else {
             return expr.clone();
         };

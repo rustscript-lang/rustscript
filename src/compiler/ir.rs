@@ -544,7 +544,14 @@ pub enum Expr {
         name: String,
         type_args: Vec<TypeSchema>,
     },
+    /// Missing-key lookup. Value mode retains optional-container ownership;
+    /// projection mode reads a literal child of a direct local with the same
+    /// availability, copyability and resource rules as ordinary `Get`.
     OptionalGet {
+        /// Explicit producer intent. A projection requires `Var` plus a
+        /// literal String/Int key; borrowed, temporary and dynamic-key
+        /// receivers must use value mode. Native `?.` remains value mode.
+        field_projection: bool,
         container: Box<Expr>,
         key: Box<Expr>,
         container_slot: LocalSlot,

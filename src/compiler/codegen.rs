@@ -747,6 +747,7 @@ impl Compiler {
                 self.assembler.push_const(Value::bytes(value.clone()));
             }
             Expr::OptionalGet {
+                field_projection: _,
                 container,
                 key,
                 container_slot,

@@ -525,6 +525,7 @@ impl LivenessRewriter {
                 self.mark_live(live, *root)
             }
             Expr::OptionalGet {
+                field_projection: _,
                 container,
                 key,
                 container_slot,
@@ -1065,6 +1066,7 @@ impl LocalSlotAllocator {
                 self.add_slot_live_edges(*root, &live_during);
             }
             Expr::OptionalGet {
+                field_projection: _,
                 container,
                 key,
                 container_slot,
@@ -1340,6 +1342,7 @@ impl LocalSlotAllocator {
                 self.mark_set_slot(set, *root);
             }
             Expr::OptionalGet {
+                field_projection: _,
                 container,
                 key,
                 container_slot,
@@ -1934,6 +1937,7 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
             *root = remap_slot(*root, mapping)?;
         }
         Expr::OptionalGet {
+            field_projection: _,
             container,
             key,
             container_slot,

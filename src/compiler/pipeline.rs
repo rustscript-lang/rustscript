@@ -570,6 +570,7 @@ fn record_expr_local_debug_ranges(
             note_local_use(ranges, *root, line);
         }
         Expr::OptionalGet {
+            field_projection: _,
             container,
             key,
             container_slot,
@@ -2828,6 +2829,135 @@ mod tests {
             assert_eq!(hint.schema, Some(TypeSchema::Int));
         }
         assert_ne!(values[0].source_name, values[1].source_name);
+    }
+
+    #[test]
+    fn native_ir_available_optional_sibling_after_normal_projection() {
+        let source = "struct Entry { name: string, note: string? }\nlet entry: Entry = { name: \"first\" };\nlet name = entry.name;\nlet note = entry?.note;\nnote;\n";
+        let mut parsed = crate::compiler::frontends::parse_source(
+            source,
+            SourceFlavor::RustScript,
+            &CompileSourceFileOptions::new(),
+        )
+        .unwrap();
+        // Native parser IR, with explicit language-neutral field intent.
+        // Native `?.` syntax itself keeps its established value semantics.
+        for stmt in &mut parsed.stmts {
+            if let Stmt::Let {
+                expr: Expr::OptionalGet {
+                    field_projection, ..
+                },
+                ..
+            } = stmt
+            {
+                *field_projection = true;
+            }
+        }
+        let compiled = compile_parsed_output(
+            source.to_string(),
+            parsed,
+            CompileBehavior::DEFAULT,
+            TypingMode::Strict,
+            true,
+        )
+        .unwrap_or_else(|error| panic!("native strict sibling projection: {error}"));
+        let mut machine = crate::Vm::new(compiled.program);
+        assert_eq!(machine.run().unwrap(), crate::VmStatus::Halted);
+        assert_eq!(machine.stack(), &[crate::Value::Null]);
+    }
+
+    #[test]
+    fn native_ir_projection_detaches_present_child_without_inserting_absent_child() {
+        for field in ["", ", note: null", ", note: \"ready\""] {
+            let source = format!(
+                "struct Entry {{ name: string, note: string? }}\nlet entry: Entry = {{ name: \"first\"{field} }};\nlet note = entry?.note;\nnote;"
+            );
+            let mut parsed = crate::compiler::frontends::parse_source(
+                &source,
+                SourceFlavor::RustScript,
+                &CompileSourceFileOptions::new(),
+            )
+            .unwrap();
+            let root = parsed
+                .local_bindings
+                .iter()
+                .find(|(name, _)| name == "entry")
+                .unwrap()
+                .1;
+            for stmt in &mut parsed.stmts {
+                if let Stmt::Let {
+                    expr:
+                        Expr::OptionalGet {
+                            field_projection, ..
+                        },
+                    ..
+                } = stmt
+                {
+                    *field_projection = true;
+                }
+            }
+            let compiled = compile_parsed_output(
+                source,
+                parsed,
+                CompileBehavior::REPL,
+                TypingMode::Strict,
+                true,
+            )
+            .unwrap();
+            let mut machine = crate::Vm::new(compiled.program);
+            assert_eq!(machine.run().unwrap(), crate::VmStatus::Halted);
+            let crate::Value::Map(record) = &machine.locals()[root as usize] else {
+                panic!("record retained in REPL");
+            };
+            assert!(
+                record.get(&crate::Value::string("note")).is_none(),
+                "moved child must be removed: {record:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_ir_nested_optional_projection_detaches_noncopy_child() {
+        let source = "struct Entry { note: string? }\nlet entry: Entry = { note: \"ready\" };\nlet note = (entry?.note).unwrap_or(\"fallback\");\nnote;";
+        let mut parsed = crate::compiler::frontends::parse_source(
+            source,
+            SourceFlavor::RustScript,
+            &CompileSourceFileOptions::new(),
+        )
+        .unwrap();
+        let root = parsed
+            .local_bindings
+            .iter()
+            .find(|(name, _)| name == "entry")
+            .unwrap()
+            .1;
+        for stmt in &mut parsed.stmts {
+            if let Stmt::Let {
+                expr: Expr::OptionUnwrapOr { value, .. },
+                ..
+            } = stmt
+                && let Expr::OptionalGet {
+                    field_projection, ..
+                } = value.as_mut()
+            {
+                *field_projection = true;
+            }
+        }
+        let compiled = compile_parsed_output(
+            source.to_string(),
+            parsed,
+            CompileBehavior::REPL,
+            TypingMode::Strict,
+            true,
+        )
+        .unwrap();
+        let mut machine = crate::Vm::new(compiled.program);
+        assert_eq!(machine.run().unwrap(), crate::VmStatus::Halted);
+        assert_eq!(machine.stack(), &[crate::Value::string("ready")]);
+        let crate::Value::Map(record) = &machine.locals()[root as usize] else {
+            panic!("record retained in REPL");
+        };
+        assert!(record.get(&crate::Value::string("note")).is_none());
     }
 
     #[test]

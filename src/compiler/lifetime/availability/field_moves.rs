@@ -1,6 +1,25 @@
 use super::*;
 
 impl AvailabilityAnalyzer {
+    pub(super) fn extract_optional_field_projection(
+        &self,
+        expr: &Expr,
+    ) -> Option<(LocalSlot, MovedFieldKey)> {
+        let Expr::OptionalGet {
+            field_projection: true,
+            container,
+            key,
+            ..
+        } = expr
+        else {
+            return None;
+        };
+        let Expr::Var(root) = container.as_ref() else {
+            return None;
+        };
+        Some((*root, self.extract_literal_moved_field_key(key)?))
+    }
+
     pub(super) fn extract_moved_field_access(
         &self,
         call_index: u16,
@@ -546,6 +565,10 @@ impl AvailabilityAnalyzer {
             Expr::Call(index, _, args, _, _) => self
                 .extract_moved_field_access(*index, args)
                 .map(|(root_slot, field_key)| self.is_copyable_field(root_slot, &field_key, state))
+                .unwrap_or(false),
+            Expr::OptionalGet { .. } => self
+                .extract_optional_field_projection(expr)
+                .map(|(root, key)| self.is_copyable_field(root, &key, state))
                 .unwrap_or(false),
             Expr::IfElse {
                 then_expr,
