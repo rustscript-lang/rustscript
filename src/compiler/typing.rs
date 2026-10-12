@@ -928,6 +928,120 @@ mod catalog_call_resolution_tests {
     }
 
     #[test]
+    fn root_result_join_preserves_context_guards_and_aggregate() {
+        for (source, expected, optional) in [
+            (
+                "let maybe: float? = 2.5; let y = if true => { maybe } else => { null };",
+                Some(TypeSchema::Float),
+                true,
+            ),
+            (
+                "let maybe: float? = 2.5; let y = match 1 { 1 => maybe, _ => null };",
+                Some(TypeSchema::Float),
+                true,
+            ),
+            // Match keeps its existing explicit-arm disagreement rule.
+            (
+                "let maybe: float? = 2.5; let y = match 1 { 1 => maybe, 2 => null, _ => maybe };",
+                None,
+                true,
+            ),
+            (
+                "struct Left { value: int } struct Right { value: int } let left: Left? = { value: 1 }; let right: Right? = { value: 2 }; let y = if true => { left } else => { right };",
+                None,
+                true,
+            ),
+            (
+                "struct Left { value: int } struct Right { value: int } let left: Left? = { value: 1 }; let right: Right? = { value: 2 }; let y = match 1 { 1 => left, _ => right };",
+                None,
+                true,
+            ),
+            (
+                "let y = if true => { null } else => { null };",
+                Some(TypeSchema::Null),
+                false,
+            ),
+        ] {
+            let ir = parse(source, catalog(vec![], vec![]));
+            let slot = ir
+                .local_bindings
+                .iter()
+                .find(|(name, _)| name == "y")
+                .unwrap()
+                .1;
+            let before = format!("{ir:?}");
+            let aggregate = infer_types(&ir, TypingMode::DynamicHints, &[]);
+            let (projected, roots) =
+                infer_types_with_root_projection(&ir, TypingMode::DynamicHints, &[], &[slot]);
+            assert_eq!(aggregate, projected, "{source}");
+            assert_eq!(before, format!("{ir:?}"));
+            let declarations = HashMap::new();
+            let names = HashMap::new();
+            let returns = HashMap::new();
+            let signatures = HashMap::new();
+            let mut reference = TypeContext::new(
+                &ir.function_impls,
+                &declarations,
+                &ir.struct_schemas,
+                &names,
+                &returns,
+                &signatures,
+                TypingMode::DynamicHints,
+                None,
+            );
+            let mut reference_state = LocalTypeState::default();
+            reference.apply_stmts(&ir.stmts, &mut reference_state);
+            let reference_schema = reference
+                .infer_expr_schema(&Expr::Var(slot), &reference_state)
+                .or_else(|| scalar_schema_from_bound_type(reference_state.get(slot)));
+            assert_eq!(
+                roots[0].schema, reference_schema,
+                "existing context: {source}"
+            );
+            assert_eq!(roots[0].optional, reference_state.is_optional(slot));
+            assert_eq!(roots[0].schema, expected, "{source}");
+            assert_eq!(roots[0].optional, optional, "{source}");
+        }
+    }
+
+    #[test]
+    fn root_result_join_unknown_snapshot_is_not_null_or_a_reused_slot() {
+        for reverse in [false, true] {
+            let mut ir = parse(
+                "let maybe: float? = 2.5; let y = if true => { maybe } else => { null };",
+                catalog(vec![], vec![]),
+            );
+            let Stmt::Let { index, expr, .. } = &mut ir.stmts[1] else {
+                panic!("result binding")
+            };
+            let result_slot = *index;
+            let Expr::IfElse {
+                then_expr,
+                else_expr,
+                ..
+            } = expr
+            else {
+                panic!("conditional")
+            };
+            // An unbound inference-only value carries schema=None, not Null.
+            **else_expr = Expr::Var(60000);
+            if reverse {
+                std::mem::swap(then_expr, else_expr);
+            }
+            let aggregate = infer_types(&ir, TypingMode::DynamicHints, &[]);
+            let (projected, roots) = infer_types_with_root_projection(
+                &ir,
+                TypingMode::DynamicHints,
+                &[],
+                &[result_slot],
+            );
+            assert_eq!(aggregate, projected);
+            assert_eq!(roots[0].schema, None);
+            assert!(roots[0].optional);
+        }
+    }
+
+    #[test]
     fn root_expression_effects_block_local_shadow_is_a_distinct_slot() {
         use crate::compiler::ir::AssignmentKind;
         let mut ir = parse("let mut x = 1; let ignored = 0;", catalog(vec![], vec![]));

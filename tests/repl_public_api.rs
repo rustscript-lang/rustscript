@@ -1,6 +1,291 @@
 use vm::compiler::TypeSchema;
 use vm::{ReplLocalBinding, ReplLocalState, compile_source_for_repl_with_state};
 
+#[test]
+fn root_result_join_optional_float_uses_expression_schema() {
+    let compiled = vm::compile_source_for_repl_with_state_and_options(
+        "let maybe: float? = 2.5; let y = if true => { maybe } else => { null };",
+        &[],
+        vm::CompileSourceFileOptions::default(),
+    )
+    .unwrap();
+    let binding = compiled.bindings.iter().find(|b| b.name == "y").unwrap();
+    println!("root result join: y={binding:?}");
+    #[cfg(feature = "runtime")]
+    {
+        let mut machine = vm::Vm::new(compiled.compiled.program.clone());
+        assert_eq!(machine.run().unwrap(), vm::VmStatus::Halted);
+        let slot = machine.debug_info().unwrap().local_index("y").unwrap();
+        assert_eq!(machine.locals()[slot as usize], vm::Value::Float(2.5));
+        println!(
+            "root result join: runtime y={:?}",
+            machine.locals()[slot as usize]
+        );
+    }
+    assert_eq!(binding.schema, Some(TypeSchema::Float));
+    assert!(binding.optional);
+    let states = compiled
+        .bindings
+        .into_iter()
+        .map(|binding| ReplLocalState {
+            binding,
+            moved: false,
+        })
+        .collect::<Vec<_>>();
+    let next = vm::compile_source_for_repl_with_state_and_options(
+        "let following = y; following;",
+        &states,
+        vm::CompileSourceFileOptions::default(),
+    )
+    .unwrap();
+    let following = next
+        .bindings
+        .iter()
+        .find(|b| b.name == "following")
+        .unwrap();
+    assert_eq!(following.schema, Some(TypeSchema::Float));
+    assert!(following.optional);
+    #[cfg(feature = "runtime")]
+    assert_eq!(
+        execute_persistent_snippets(
+            &[
+                "let maybe: float? = 2.5; let y = if true => { maybe } else => { null };",
+                "let following = y; following;",
+            ],
+            vm::CompileSourceFileOptions::default(),
+        ),
+        vec![vm::Value::Float(2.5)]
+    );
+}
+
+#[test]
+fn root_result_join_optional_named_retains_checked_host_identity() {
+    let named = vm::HostStructSchema::new(
+        "ResultJoinRoot",
+        vec![vm::HostStructField::new("value", vm::HostTypeSchema::Int)],
+    );
+    let optional_named = vm::HostTypeSchema::Optional(Box::new(named.as_type()));
+    let mut builder = vm::HostApiBuilder::new();
+    builder.named_struct(named.clone());
+    builder.function(vm::HostFunctionSchema::with_return(
+        "resultjoin::origin",
+        vec![],
+        optional_named,
+    ));
+    let catalog = std::sync::Arc::new(builder.build().unwrap());
+    let options = vm::CompileSourceFileOptions::default()
+        .with_host_api_catalog(std::sync::Arc::clone(&catalog));
+    #[cfg(feature = "runtime")]
+    let registry = {
+        fn origin(_: &mut vm::Vm, _: &[vm::Value]) -> vm::VmResult<vm::CallOutcome> {
+            Ok(vm::CallOutcome::Return(vm::return_one(vm::Value::map(
+                vec![(vm::Value::string("value"), vm::Value::Int(42))],
+            ))))
+        }
+        let mut registry = vm::HostFunctionRegistry::new();
+        registry
+            .register_catalog_static(
+                vm::catalog_import_schemas(&catalog, "resultjoin::origin").remove(0),
+                origin,
+            )
+            .unwrap();
+        registry
+    };
+    for (expression, flag, expected) in [
+        ("if flag => { maybe } else => { null }", true, 42),
+        ("if flag => { null } else => { maybe }", false, 42),
+        ("if flag => { maybe } else => { null }", false, 0),
+        ("if flag => { null } else => { maybe }", true, 0),
+        ("match choice { 1 => maybe, _ => null }", true, 42),
+        ("match choice { 1 => null, _ => maybe }", false, 42),
+        ("match choice { 1 => maybe, _ => null }", false, 0),
+        ("match choice { 1 => null, _ => maybe }", true, 0),
+    ] {
+        let source = format!(
+            "let flag = {flag}; let choice = if flag => {{ 1 }} else => {{ 2 }}; let maybe: ResultJoinRoot? = resultjoin::origin(); let y = {expression};"
+        );
+        let first =
+            vm::compile_source_for_repl_with_state_and_options(&source, &[], options.clone())
+                .unwrap();
+        let y = first.bindings.iter().find(|b| b.name == "y").unwrap();
+        println!("root result join: {expression}, y={y:?}");
+        assert_eq!(
+            y.schema,
+            Some(TypeSchema::Named("ResultJoinRoot".into(), vec![]))
+        );
+        assert!(y.optional);
+        let states = first
+            .bindings
+            .iter()
+            .cloned()
+            .map(|binding| ReplLocalState {
+                binding,
+                moved: false,
+            })
+            .collect::<Vec<_>>();
+        let second = vm::compile_source_for_repl_with_state_and_options(
+            "let following = y; following == null;",
+            &states,
+            options.clone(),
+        )
+        .unwrap();
+        let following = second
+            .bindings
+            .iter()
+            .find(|b| b.name == "following")
+            .unwrap();
+        assert_eq!(following.schema, y.schema);
+        assert!(following.optional);
+        #[cfg(feature = "runtime")]
+        {
+            let mut machine = vm::Vm::new(first.compiled.program);
+            registry.bind_vm_cached(&mut machine).unwrap();
+            assert_eq!(machine.run().unwrap(), vm::VmStatus::Halted);
+            let mut next = vm::Vm::new(second.compiled.program);
+            registry.bind_vm_cached(&mut next).unwrap();
+            for binding in &first.bindings {
+                let previous_slot = machine
+                    .debug_info()
+                    .unwrap()
+                    .local_index(&binding.name)
+                    .unwrap();
+                let slot = next
+                    .debug_info()
+                    .unwrap()
+                    .local_index(&binding.name)
+                    .unwrap();
+                next.set_local(slot, machine.locals()[previous_slot as usize].clone())
+                    .unwrap();
+            }
+            let y_slot = machine.debug_info().unwrap().local_index("y").unwrap();
+            if expected == 0 {
+                assert_eq!(machine.locals()[y_slot as usize], vm::Value::Null);
+            } else {
+                let vm::Value::Map(fields) = &machine.locals()[y_slot as usize] else {
+                    panic!("host result carrier")
+                };
+                assert_eq!(
+                    fields.get(&vm::Value::string("value")),
+                    Some(&vm::Value::Int(expected))
+                );
+            }
+            assert_eq!(next.run().unwrap(), vm::VmStatus::Halted);
+            assert_eq!(next.stack(), &[vm::Value::Bool(expected == 0)]);
+        }
+        #[cfg(not(feature = "runtime"))]
+        let _ = expected;
+    }
+}
+
+#[test]
+fn root_result_join_match_uses_existing_expression_alternatives() {
+    for expression in [
+        "match 1 { 1 => maybe, _ => null }",
+        "match 2 { 1 => null, _ => maybe }",
+    ] {
+        let source = format!("let maybe: float? = 2.5; let y = {expression};");
+        let compiled = vm::compile_source_for_repl_with_state_and_options(
+            &source,
+            &[],
+            vm::CompileSourceFileOptions::default(),
+        )
+        .unwrap();
+        let y = compiled.bindings.iter().find(|b| b.name == "y").unwrap();
+        println!("root result join: {expression}, y={y:?}");
+        assert_eq!(y.schema, Some(TypeSchema::Float));
+        assert!(y.optional);
+        #[cfg(feature = "runtime")]
+        assert_eq!(
+            execute_persistent_snippets(
+                &[&source, "let following = y; following;"],
+                vm::CompileSourceFileOptions::default()
+            ),
+            vec![vm::Value::Float(2.5)],
+        );
+    }
+}
+
+#[test]
+fn root_result_join_conservative_guards_preserve_optional_flags() {
+    for (source, schema, optional) in [
+        (
+            "let y = if true => { null } else => { null };",
+            Some(TypeSchema::Null),
+            false,
+        ),
+        (
+            "let y = match 1 { 1 => null, _ => null };",
+            Some(TypeSchema::Null),
+            false,
+        ),
+    ] {
+        let compiled = vm::compile_source_for_repl_with_state_and_options(
+            source,
+            &[],
+            vm::CompileSourceFileOptions::default(),
+        )
+        .unwrap();
+        let y = compiled.bindings.iter().find(|b| b.name == "y").unwrap();
+        println!("root result join: conservative source={source}, y={y:?}");
+        assert_eq!(y.schema, schema, "{source}");
+        assert_eq!(y.optional, optional, "{source}");
+    }
+    for expression in [
+        "if flag => { left } else => { right }",
+        "match choice { 1 => left, _ => right }",
+    ] {
+        let source = format!(
+            "struct Left {{ value: int }} struct Right {{ value: int }} let flag = true; let choice = 1; let left: Left? = {{ value: 1 }}; let right: Right? = {{ value: 2 }}; let y = {expression};"
+        );
+        let error = vm::compile_source_for_repl_with_state_and_options(
+            &source,
+            &[],
+            vm::CompileSourceFileOptions::default(),
+        )
+        .err()
+        .expect("strict typing still rejects divergent nominal results");
+        assert!(
+            matches!(
+                error,
+                vm::SourceError::Compile(vm::CompileError::StrictTypingRequired { .. })
+            ),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
+fn root_result_join_nullable_result_keeps_binding_effects_separate() {
+    for expression in [
+        "if flag => { x = 2.5; maybe } else => { x = 2.5; null }",
+        "match choice { 1 => if flag => { x = 2.5; maybe } else => { x = 2.5; maybe }, _ => if flag => { x = 2.5; null } else => { x = 2.5; null } }",
+    ] {
+        let source = format!(
+            "let flag = true; let choice = 1; let mut x = 1; let maybe: float? = 3.5; let y = {expression};"
+        );
+        let compiled = vm::compile_source_for_repl_with_state_and_options(
+            &source,
+            &[],
+            vm::CompileSourceFileOptions::default(),
+        )
+        .unwrap();
+        let x = compiled.bindings.iter().find(|b| b.name == "x").unwrap();
+        let y = compiled.bindings.iter().find(|b| b.name == "y").unwrap();
+        assert_eq!(x.schema, Some(TypeSchema::Float));
+        assert!(!x.optional);
+        assert_eq!(y.schema, Some(TypeSchema::Float));
+        assert!(y.optional);
+        #[cfg(feature = "runtime")]
+        assert_eq!(
+            execute_persistent_snippets(
+                &[&source, "let following: float = x; following; y;"],
+                vm::CompileSourceFileOptions::default()
+            ),
+            vec![vm::Value::Float(2.5), vm::Value::Float(3.5)],
+        );
+    }
+}
+
 fn sequential_callee_source() -> String {
     format!(
         "fn f() -> int {{ {} t256 }} f();",

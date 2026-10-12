@@ -183,6 +183,22 @@ fn root_operand_slot(state: &LocalTypeState, excluded: Option<LocalSlot>) -> Loc
         .expect("private expression facts require a free inference slot")
 }
 
+// Result alternatives use expression inference, not binding-state joins. Reserve
+// snapshot slots even when an unknown value has no binding to copy.
+fn root_result_operand(
+    value: &LocalTypeState,
+    inferred: &mut LocalTypeState,
+    reserved: &mut std::collections::HashSet<LocalSlot>,
+) -> Expr {
+    let slot = (0..=LocalSlot::MAX)
+        .rev()
+        .find(|slot| !inferred.has_binding(*slot) && !reserved.contains(slot))
+        .expect("private expression results require a free inference slot");
+    reserved.insert(slot);
+    inferred.copy_exact_binding_from(value, 0, slot);
+    Expr::Var(slot)
+}
+
 fn collect_root_expr(
     expr: &Expr,
     state: &mut LocalTypeState,
@@ -211,16 +227,30 @@ fn collect_root_expr(
             let mut joined = LocalTypeState::default();
             joined.merge_from_branches(&then_state, &else_state);
             commit_root_scope(state, &joined, visible);
-            let mut value = LocalTypeState::default();
-            value.merge_from_branches(&then_value, &else_value);
-            return value;
+            let mut inferred = LocalTypeState::default();
+            let mut reserved = std::collections::HashSet::new();
+            let result_expr = Expr::IfElse {
+                // Branch refinements and effects have already been applied.
+                condition: Box::new(Expr::Bool(true)),
+                then_expr: Box::new(root_result_operand(
+                    &then_value,
+                    &mut inferred,
+                    &mut reserved,
+                )),
+                else_expr: Box::new(root_result_operand(
+                    &else_value,
+                    &mut inferred,
+                    &mut reserved,
+                )),
+            };
+            return root_expr_value(&result_expr, &inferred, context);
         }
         Expr::Match {
             value_slot,
+            result_slot,
             value,
             arms,
             default,
-            ..
         } => {
             let value = collect_root_expr(value, state, visible, context);
             let mut nested = state.clone();
@@ -228,8 +258,17 @@ fn collect_root_expr(
             let mut scope = visible.clone();
             scope.insert(*value_slot);
             let mut default_state = nested.clone();
-            let mut result = collect_root_expr(default, &mut default_state, &scope, context);
+            let default_value = collect_root_expr(default, &mut default_state, &scope, context);
             let mut joined = default_state;
+            let mut inferred = LocalTypeState::default();
+            let mut reserved = std::collections::HashSet::from([*value_slot, *result_slot]);
+            reserved.extend(
+                arms.iter()
+                    .filter_map(|(pattern, _)| pattern.binding_slot()),
+            );
+            let value_expr = root_result_operand(&value, &mut inferred, &mut reserved);
+            let default_expr = root_result_operand(&default_value, &mut inferred, &mut reserved);
+            let mut result_arms = Vec::with_capacity(arms.len());
             for (pattern, expr) in arms {
                 let mut arm_state = refine_state_for_match_pattern(&nested, pattern, *value_slot);
                 let mut arm_scope = scope.clone();
@@ -239,11 +278,22 @@ fn collect_root_expr(
                 let arm_value = collect_root_expr(expr, &mut arm_state, &arm_scope, context);
                 let previous = joined.clone();
                 joined.merge_from_branches(&previous, &arm_state);
-                let previous = result.clone();
-                result.merge_from_branches(&previous, &arm_value);
+                result_arms.push((
+                    pattern.clone(),
+                    root_result_operand(&arm_value, &mut inferred, &mut reserved),
+                ));
             }
             commit_root_scope(state, &joined, visible);
-            return result;
+            // Preserve Match's arm/default inference rules (which are distinct
+            // from IfElse), with no original branch expressions left to replay.
+            let result_expr = Expr::Match {
+                value_slot: *value_slot,
+                result_slot: *result_slot,
+                value: Box::new(value_expr),
+                arms: result_arms,
+                default: Box::new(default_expr),
+            };
+            return root_expr_value(&result_expr, &inferred, context);
         }
         _ => {}
     }
