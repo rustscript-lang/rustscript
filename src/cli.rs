@@ -1366,7 +1366,13 @@ fn sync_repl_session(
         if repl_value_contains_callable(value) {
             continue;
         }
-        let (schema, optional) = repl_local_schema_from_vm(vm, index as usize, value);
+        let (schema, optional) = if binding.schema.is_some() {
+            (binding.schema.clone(), binding.optional)
+        } else {
+            // Legacy callers can supply bindings without checked schema facts.
+            let (schema, optional) = repl_local_schema_from_vm(vm, index as usize, value);
+            (schema, optional || binding.optional)
+        };
         let moved = moved_by_rebinding.contains(&binding.name)
             || (!optional
                 && value == &Value::Null
@@ -1910,77 +1916,135 @@ mod tests {
                 )
                 .unwrap();
         }
-        let mut session = super::ReplSession::default();
-        for source in [
-            "let root = layout::root(); let maybe = layout::maybe();",
-            "use calibration; layout::read(root); maybe == null; calibration::value();",
-            "use calibration; calibration::value();",
-            "layout::read(root); maybe == null;",
+        let large_callee = format!(
+            "use calibration; fn f() -> int {{ {} t256 }} f();",
+            (0..257)
+                .map(|i| format!("let t{i} = {i};"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let first_combined = format!(
+            "let mut root = layout::root(); let mut maybe = layout::maybe(); {large_callee}"
+        );
+        let recursive_capture = format!(
+            "use calibration; fn recurse(n: int) -> int {{ if n == 0 => {{ 0 }} else => {{ 1 + recurse(n - 1) }} }} fn large() -> int {{ let delta = layout::read(root); let add = |value| value + delta; {} add(t256) + recurse(3) }} large();",
+            (0..257)
+                .map(|i| format!("let t{i} = {i};"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for (initial, mutable) in [
+            (
+                "let root = layout::root(); let maybe = layout::maybe();",
+                false,
+            ),
+            (first_combined.as_str(), true),
         ] {
-            let first_snippet = session.locals.is_empty();
-            let compiled =
-                super::compile_repl_snippet_with_options(source, &session.locals, &options)
-                    .unwrap();
-            let moved =
-                super::repl_locals_moved_by_rebinding(&compiled.compiled.program, &session.locals);
-            let mut machine = Vm::new(compiled.compiled.program);
-            registry.bind_vm_cached(&mut machine).unwrap();
-            super::seed_repl_vm_locals(&mut machine, &session.locals).unwrap();
-            assert_eq!(machine.run().unwrap(), VmStatus::Halted);
-            if source.starts_with("use calibration;") {
-                assert!(machine.locals().len() >= 11);
-            }
-            let map = machine.program().type_map.as_ref().unwrap();
-            let mut expected = Vec::new();
-            for (name, optional, value) in [
-                (
-                    "root",
-                    false,
-                    Value::map(vec![(Value::string("value"), Value::Int(41))]),
-                ),
-                ("maybe", true, Value::Null),
-            ] {
-                let slot = machine.debug_info().unwrap().local_index(name).unwrap() as usize;
-                let schema = crate::TypeSchema::Named("RootNamedOptional".into(), vec![]);
-                // New optional host results retain their Optional wrapper;
-                // entry reseeding uses the base schema plus the optional bit.
-                let schema = if optional && first_snippet {
-                    crate::TypeSchema::Optional(Box::new(schema))
+            let mut session = super::ReplSession::default();
+            for source in [
+                initial,
+                "use calibration; layout::read(root); maybe == null; calibration::value();",
+                "use calibration; calibration::value();",
+                large_callee.as_str(),
+                recursive_capture.as_str(),
+                if mutable {
+                    "root = layout::root();"
                 } else {
-                    schema
-                };
-                assert_eq!(
-                    map.local_schemas[slot],
-                    Some(schema.clone()),
-                    "{source}: {name} at {slot}"
+                    "layout::read(root); maybe == null;"
+                },
+                "layout::read(root); maybe == null;",
+            ] {
+                let first_snippet = session.locals.is_empty();
+                let compiled =
+                    super::compile_repl_snippet_with_options(source, &session.locals, &options)
+                        .unwrap();
+                let moved = super::repl_locals_moved_by_rebinding(
+                    &compiled.compiled.program,
+                    &session.locals,
                 );
-                assert_eq!(
-                    map.optional_slots[slot], optional,
-                    "{source}: {name} at {slot}"
+                let mut machine = Vm::new(compiled.compiled.program);
+                registry.bind_vm_cached(&mut machine).unwrap();
+                super::seed_repl_vm_locals(&mut machine, &session.locals).unwrap();
+                assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+                assert_ne!(
+                    machine.debug_info().unwrap().local_index("root"),
+                    machine.debug_info().unwrap().local_index("maybe"),
+                    "independent persistent roots require distinct physical slots"
                 );
-                assert_eq!(machine.locals()[slot], value, "{source}: {name} at {slot}");
-                println!(
-                    "final-layout source={source:?} name={name} slot={slot} locals={} schema={:?} optional={} value={:?}",
-                    machine.locals().len(),
-                    map.local_schemas[slot],
-                    map.optional_slots[slot],
-                    machine.locals()[slot]
-                );
-                expected.push((
-                    name,
-                    super::ReplSessionLocal {
-                        value,
-                        mutable: false,
-                        schema: Some(schema),
-                        optional,
-                        moved: false,
-                    },
-                ));
-            }
-            super::sync_repl_session(&machine, &compiled.bindings, &moved, &mut session);
-            for (name, state) in expected {
-                assert_eq!(session.locals[name], state, "{source}: {name}");
-                println!("final-layout synced {name}={:?}", session.locals[name]);
+                if source == large_callee {
+                    assert_eq!(machine.stack(), &[Value::Int(256)]);
+                    assert!(
+                        machine
+                            .program()
+                            .callable_prototypes
+                            .iter()
+                            .all(|p| p.frame_local_count < 257)
+                    );
+                }
+                let map = machine.program().type_map.as_ref().unwrap();
+                println!("backend-map source={source:?} map={map:?}");
+                let mut expected = Vec::new();
+                for (name, optional, value) in [
+                    (
+                        "root",
+                        false,
+                        Value::map(vec![(Value::string("value"), Value::Int(41))]),
+                    ),
+                    ("maybe", true, Value::Null),
+                ] {
+                    let slot = machine.debug_info().unwrap().local_index(name).unwrap() as usize;
+                    let schema = crate::TypeSchema::Named("RootNamedOptional".into(), vec![]);
+                    // New optional host results retain their Optional wrapper;
+                    // entry reseeding uses the base schema plus the optional bit.
+                    let schema = if optional && first_snippet {
+                        crate::TypeSchema::Optional(Box::new(schema))
+                    } else {
+                        schema
+                    };
+                    let binding = compiled
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.name == name)
+                        .unwrap();
+                    assert_eq!(
+                        binding.schema,
+                        Some(schema.clone()),
+                        "{source}: projected {name} at final debug slot {slot}"
+                    );
+                    assert_eq!(
+                        binding.optional, optional,
+                        "{source}: projected {name} at {slot}"
+                    );
+                    if source == large_callee && name == "maybe" {
+                        // The same physical index also summarizes an Int callee
+                        // local. Backend observations remain frame-aggregate.
+                        assert_eq!(map.local_schemas[slot], Some(crate::TypeSchema::Int));
+                        assert!(map.optional_slots[slot]);
+                    }
+                    assert_eq!(machine.locals()[slot], value, "{source}: {name} at {slot}");
+                    println!(
+                        "final-layout source={source:?} name={name} slot={slot} locals={} schema={:?} optional={} value={:?}",
+                        machine.locals().len(),
+                        binding.schema,
+                        binding.optional,
+                        machine.locals()[slot]
+                    );
+                    expected.push((
+                        name,
+                        super::ReplSessionLocal {
+                            value,
+                            mutable,
+                            schema: Some(schema),
+                            optional,
+                            moved: false,
+                        },
+                    ));
+                }
+                super::sync_repl_session(&machine, &compiled.bindings, &moved, &mut session);
+                for (name, state) in expected {
+                    assert_eq!(session.locals[name], state, "{source}: {name}");
+                    println!("final-layout synced {name}={:?}", session.locals[name]);
+                }
             }
         }
     }

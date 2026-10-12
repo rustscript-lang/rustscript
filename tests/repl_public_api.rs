@@ -1,6 +1,62 @@
 use vm::compiler::TypeSchema;
 use vm::{ReplLocalBinding, ReplLocalState, compile_source_for_repl_with_state};
 
+fn sequential_callee_source() -> String {
+    format!(
+        "fn f() -> int {{ {} t256 }} f();",
+        (0..257)
+            .map(|i| format!("let t{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+}
+
+#[test]
+fn persistence_allocator_compacts_257_sequential_callee_locals() {
+    let source = sequential_callee_source();
+    assert_eq!(source.len(), 3919);
+    let compiled = vm::compile_source_for_repl_with_state(&source, &[])
+        .expect("REPL must compact callee locals independently of persistent roots");
+    assert!(compiled.bindings.is_empty());
+    assert_eq!(
+        compiled.compiled.program.callable_prototypes[0].frame_local_count,
+        1
+    );
+    #[cfg(feature = "runtime")]
+    {
+        let mut machine = vm::Vm::new(compiled.compiled.program.clone());
+        assert_eq!(machine.run().unwrap(), vm::VmStatus::Halted);
+        assert_eq!(machine.stack(), &[vm::Value::Int(256)]);
+    }
+    #[cfg(all(feature = "cranelift-jit", target_arch = "x86_64"))]
+    {
+        let mut machine = vm::Vm::new(compiled.compiled.program);
+        machine.compile_aot().unwrap();
+        assert!(machine.has_aot_program());
+        assert_eq!(machine.run().unwrap(), vm::VmStatus::Halted);
+        assert_eq!(machine.stack(), &[vm::Value::Int(256)]);
+        assert!(machine.aot_exec_count() > 0);
+        println!(
+            "capacity parity: interpreter and native AOT return Int(256), native executions={}",
+            machine.aot_exec_count()
+        );
+    }
+}
+
+#[test]
+fn persistence_allocator_ordinary_257_callee_control() {
+    let compiled =
+        vm::compile_source_with_flavor(&sequential_callee_source(), vm::SourceFlavor::RustScript)
+            .unwrap();
+    assert_eq!(compiled.program.callable_prototypes[0].frame_local_count, 1);
+    #[cfg(feature = "runtime")]
+    {
+        let mut machine = vm::Vm::new(compiled.program);
+        assert_eq!(machine.run().unwrap(), vm::VmStatus::Halted);
+        assert_eq!(machine.stack(), &[vm::Value::Int(256)]);
+    }
+}
+
 const NINE_MODULE_LOCALS: &str = "let a = 101; let b = 102; let c = 103; let d = 104; let e = 105; let f = 106; let g = 107; let h = 108; let i = 109; pub fn value() -> int { 1 }";
 
 #[cfg(feature = "runtime")]
@@ -24,15 +80,12 @@ fn execute_persistent_snippets(
         results.extend_from_slice(machine.stack());
         states.clear();
         values.clear();
-        for mut binding in compiled.bindings {
+        for binding in compiled.bindings {
             let slot = machine
                 .debug_info()
                 .unwrap()
                 .local_index(&binding.name)
                 .unwrap() as usize;
-            let map = machine.program().type_map.as_ref().unwrap();
-            binding.schema = map.local_schemas[slot].clone();
-            binding.optional = map.optional_slots[slot];
             values.insert(binding.name.clone(), machine.locals()[slot].clone());
             states.push(ReplLocalState {
                 binding,
@@ -41,6 +94,67 @@ fn execute_persistent_snippets(
         }
     }
     results
+}
+
+#[cfg(feature = "runtime")]
+#[test]
+fn persistence_allocator_combines_roots_module_recursion_and_captures() {
+    let large = format!(
+        "use calibration; fn recurse(n: int) -> int {{ if n == 0 => {{ 0 }} else => {{ 1 + recurse(n - 1) }} }} fn large() -> int {{ let delta = base; let add = |value| value + delta; {} add(t256) + recurse(3) }} let fresh = 77; large();",
+        (0..257)
+            .map(|i| format!("let t{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let results = execute_persistent_snippets(
+        &[
+            "let mut base = 41; let a = 11; let b = 12; let c = 13; let d = 14; let e = 15; let f = 16; let g = 17; let h = 18; let i = 19;",
+            &large,
+            "base = base + 1; base; a; b; c; d; e; f; g; h; i; fresh;",
+        ],
+        vm::CompileSourceFileOptions::default()
+            .with_module_override_source("calibration.rss", NINE_MODULE_LOCALS),
+    );
+    let expected = std::iter::once(vm::Value::Int(256 + 41 + 3))
+        .chain(std::iter::once(vm::Value::Int(42)))
+        .chain((11..=19).map(vm::Value::Int))
+        .chain(std::iter::once(vm::Value::Int(77)))
+        .collect::<Vec<_>>();
+    assert_eq!(results, expected);
+}
+
+#[test]
+fn persistence_allocator_rejects_257_simultaneously_live_roots_and_callee() {
+    let definitions = (0..257)
+        .map(|i| format!("let t{i} = {i};"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let uses = (0..257)
+        .map(|i| format!("t{i}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    for source in [
+        definitions.clone(),
+        format!("fn f() -> int {{ {definitions} {uses} }} f();"),
+    ] {
+        let error = vm::compile_source_for_repl_with_state(&source, &[])
+            .err()
+            .expect("simultaneous liveness must still enforce the 256-slot limit");
+        assert!(
+            matches!(&error, vm::SourceError::Parse(error) if error.message == "too many simultaneously live locals (requires more than 256 slots)"),
+            "{error:?}"
+        );
+    }
+    let ordinary = vm::compile_source_with_flavor(
+        &format!("fn f() -> int {{ {definitions} {uses} }} f();"),
+        vm::SourceFlavor::RustScript,
+    )
+    .err()
+    .expect("ordinary callee liveness limit is unchanged");
+    assert!(
+        matches!(&ordinary, vm::SourceError::Parse(error) if error.message == "too many simultaneously live locals (requires more than 256 slots)"),
+        "{ordinary:?}"
+    );
 }
 
 #[cfg(feature = "runtime")]
@@ -155,15 +269,17 @@ fn final_layout_named_optional_entry_seeds_follow_final_debug_slots() {
         },
         moved: false,
     });
+    let large = format!("use calibration; {}", sequential_callee_source());
     for source in [
         "use calibration; root.value; maybe == null; calibration::value();",
         "use calibration; calibration::value();",
+        large.as_str(),
+        "use calibration; fn recurse(n: int) -> int { if n == 0 => { 0 } else => { 1 + recurse(n - 1) } } fn capture() -> int { let value = root.value; let add = |n| n + value; add(recurse(3)) } capture();",
     ] {
         let compiled =
             vm::compile_source_for_repl_with_state_and_options(source, &states, options.clone())
                 .unwrap();
         let program = compiled.compiled.program;
-        let map = program.type_map.as_ref().unwrap();
         for state in &states {
             let slot = program
                 .debug
@@ -171,17 +287,28 @@ fn final_layout_named_optional_entry_seeds_follow_final_debug_slots() {
                 .unwrap()
                 .local_index(&state.binding.name)
                 .unwrap() as usize;
+            let binding = compiled
+                .bindings
+                .iter()
+                .find(|binding| binding.name == state.binding.name)
+                .unwrap();
             assert_eq!(
-                map.local_schemas[slot],
+                binding.schema,
                 Some(schema.clone()),
-                "{} in {source}",
+                "{} in {source}, final debug slot {slot}",
                 state.binding.name
             );
             assert_eq!(
-                map.optional_slots[slot], state.binding.optional,
-                "{} in {source}",
+                binding.optional, state.binding.optional,
+                "{} in {source}, final debug slot {slot}",
                 state.binding.name
             );
+            // No-callee-conflict controls retain the previous backend map.
+            if !source.contains("fn ") {
+                let map = program.type_map.as_ref().unwrap();
+                assert_eq!(map.local_schemas[slot], Some(schema.clone()));
+                assert_eq!(map.optional_slots[slot], state.binding.optional);
+            }
         }
     }
 }

@@ -251,12 +251,22 @@ pub(super) fn enforce_source_availability(
 /// spurious dynamic-target facts. Pre-compaction slots are the true
 /// frame-relative value identities, so the classification is strictly more
 /// precise on the unallocated IR.
-pub(crate) fn allocate_local_slots(mut ir: FrontendIr) -> Result<FrontendIr, ParseError> {
+pub(crate) fn allocate_local_slots(ir: FrontendIr) -> Result<FrontendIr, ParseError> {
+    allocate_local_slots_with_root_slots(ir, &[]).map(|allocation| allocation.ir)
+}
+
+pub(in crate::compiler) fn allocate_local_slots_with_root_slots(
+    ir: FrontendIr,
+    root_slots: &[LocalSlot],
+) -> Result<super::LocalSlotAllocation, ParseError> {
     if ir.locals > LOCAL_SLOT_ALLOCATOR_COMPAT_THRESHOLD {
         let allocator = LocalSlotAllocator::new(ir.locals, &ir.local_bindings, &ir.function_impls);
-        ir = allocator.allocate(ir)?;
+        allocator.allocate(ir, root_slots)
+    } else {
+        // Tiny programs retain their original layout, including the entry seeds.
+        let mapping = (0..ir.locals).map(|slot| slot as LocalSlot).collect();
+        Ok(super::LocalSlotAllocation { ir, mapping })
     }
-    Ok(ir)
 }
 
 pub(crate) fn function_capture_binding_mode(

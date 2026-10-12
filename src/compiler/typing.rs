@@ -371,6 +371,17 @@ pub(super) fn infer_types(
     typing_mode: TypingMode,
     entry_local_types: &[EntryLocalType],
 ) -> TypeInferenceResult {
+    infer_types_with_root_projection(ir, typing_mode, entry_local_types, &[]).0
+}
+
+/// Root bindings describe the final checked root state. The aggregate result
+/// continues to summarize physical slots across root and callee frames.
+pub(super) fn infer_types_with_root_projection(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    root_slots: &[LocalSlot],
+) -> (TypeInferenceResult, Vec<EntryLocalType>) {
     let function_names = build_function_names(&ir.functions);
     let function_decls = build_function_decl_map(&ir.functions);
     let host_import_return_types =
@@ -412,6 +423,18 @@ pub(super) fn infer_types(
         &mut optional_slots,
         &mut context,
     );
+    // Collection vectors can already contain closure-body observations. Query
+    // the actual root state rather than cloning those aggregate vectors.
+    let root_projection = root_slots
+        .iter()
+        .map(|&slot| EntryLocalType {
+            slot,
+            schema: context
+                .infer_expr_schema(&Expr::Var(slot), &top_state)
+                .or_else(|| scalar_schema_from_bound_type(top_state.get(slot))),
+            optional: top_state.is_optional(slot),
+        })
+        .collect();
     let observed_function_param_types = context.observed_function_param_types.clone();
     let observed_function_param_schemas = context.observed_function_param_schemas.clone();
     let observed_function_param_callables = context.observed_function_param_callables.clone();
@@ -471,7 +494,7 @@ pub(super) fn infer_types(
                 .map(|schema| (decl.index, schema))
         })
         .collect();
-    facts
+    (facts, root_projection)
 }
 
 pub(super) fn validate_if_else_type_consistency(
@@ -875,6 +898,87 @@ mod catalog_call_resolution_tests {
 
     fn stmt_exprs(ir: &FrontendIr) -> Vec<&Expr> {
         ir.stmts.iter().filter_map(stmt_expr).collect()
+    }
+
+    #[test]
+    fn root_projection_preserves_aggregate_callee_and_closure_facts() {
+        let named = crate::HostStructSchema::new(
+            "ProjectionRoot",
+            vec![crate::HostStructField::new("value", HostTypeSchema::Int)],
+        );
+        let mut builder = HostApiBuilder::new();
+        builder.named_struct(named.clone());
+        builder.function(HostFunctionSchema::with_return(
+            "layout::root",
+            vec![],
+            named.as_type(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "layout::maybe",
+            vec![],
+            HostTypeSchema::Optional(Box::new(named.as_type())),
+        ));
+        let catalog = Arc::new(builder.build().unwrap());
+        let locals = (0..257)
+            .map(|i| format!("let t{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for body in [
+            format!("fn f() -> int {{ {locals} t256 }} f();"),
+            format!("let f = |n| if n > 0 => {{ {locals} t256 + n }} else => {{ n }}; f(1);"),
+        ] {
+            let ir = parse(
+                &format!(
+                    "use layout; let root = layout::root(); let maybe = layout::maybe(); {body}"
+                ),
+                Arc::clone(&catalog),
+            );
+            let ir = legalize_builtins_and_bind_types(ir, TypingMode::DynamicHints, &[]).unwrap();
+            let roots = ["root", "maybe"]
+                .map(|name| ir.local_bindings.iter().find(|(n, _)| n == name).unwrap().1);
+            let allocated =
+                crate::compiler::lifetime::allocate_local_slots_with_root_slots(ir, &roots)
+                    .unwrap();
+            let roots = roots.map(|slot| allocated.mapping[slot as usize]);
+            let aggregate = infer_types(&allocated.ir, TypingMode::DynamicHints, &[]);
+            let (projected_aggregate, projection) = infer_types_with_root_projection(
+                &allocated.ir,
+                TypingMode::DynamicHints,
+                &[],
+                &roots,
+            );
+            assert_eq!(aggregate.local_types, projected_aggregate.local_types);
+            assert_eq!(aggregate.local_schemas, projected_aggregate.local_schemas);
+            assert_eq!(
+                aggregate.local_schema_labels,
+                projected_aggregate.local_schema_labels
+            );
+            assert_eq!(aggregate.callable_slots, projected_aggregate.callable_slots);
+            assert_eq!(aggregate.optional_slots, projected_aggregate.optional_slots);
+            assert_eq!(
+                aggregate.function_schemas,
+                projected_aggregate.function_schemas
+            );
+            let schema = TypeSchema::Named("ProjectionRoot".into(), vec![]);
+            assert_eq!(projection[0].slot, roots[0]);
+            assert_eq!(projection[0].schema, Some(schema.clone()));
+            assert!(!projection[0].optional);
+            assert_eq!(projection[1].slot, roots[1]);
+            assert_eq!(
+                projection[1].schema,
+                Some(TypeSchema::Optional(Box::new(schema)))
+            );
+            assert!(projection[1].optional);
+            let expected_backend = if body.starts_with("fn ") {
+                TypeSchema::Int
+            } else {
+                TypeSchema::Named("ProjectionRoot".into(), vec![])
+            };
+            assert_eq!(
+                aggregate.local_schemas[roots[0] as usize],
+                Some(expected_backend)
+            );
+        }
     }
 
     #[test]
