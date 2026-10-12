@@ -1,6 +1,191 @@
 use vm::compiler::TypeSchema;
 use vm::{ReplLocalBinding, ReplLocalState, compile_source_for_repl_with_state};
 
+const NINE_MODULE_LOCALS: &str = "let a = 101; let b = 102; let c = 103; let d = 104; let e = 105; let f = 106; let g = 107; let h = 108; let i = 109; pub fn value() -> int { 1 }";
+
+#[cfg(feature = "runtime")]
+fn execute_persistent_snippets(
+    snippets: &[&str],
+    options: vm::CompileSourceFileOptions,
+) -> Vec<vm::Value> {
+    let mut states = Vec::<ReplLocalState>::new();
+    let mut values = std::collections::BTreeMap::<String, vm::Value>::new();
+    let mut results = Vec::new();
+    for source in snippets {
+        let compiled =
+            vm::compile_source_for_repl_with_state_and_options(source, &states, options.clone())
+                .unwrap();
+        let mut machine = vm::Vm::new(compiled.compiled.program);
+        for (name, value) in &values {
+            let slot = machine.debug_info().unwrap().local_index(name).unwrap();
+            machine.set_local(slot, value.clone()).unwrap();
+        }
+        assert_eq!(machine.run().unwrap(), vm::VmStatus::Halted);
+        results.extend_from_slice(machine.stack());
+        states.clear();
+        values.clear();
+        for mut binding in compiled.bindings {
+            let slot = machine
+                .debug_info()
+                .unwrap()
+                .local_index(&binding.name)
+                .unwrap() as usize;
+            let map = machine.program().type_map.as_ref().unwrap();
+            binding.schema = map.local_schemas[slot].clone();
+            binding.optional = map.optional_slots[slot];
+            values.insert(binding.name.clone(), machine.locals()[slot].clone());
+            states.push(ReplLocalState {
+                binding,
+                moved: false,
+            });
+        }
+    }
+    results
+}
+
+#[cfg(feature = "runtime")]
+#[test]
+fn final_layout_preserves_unused_entry_across_nine_local_module() {
+    let options = vm::CompileSourceFileOptions::default()
+        .with_module_override_source("calibration.rss", NINE_MODULE_LOCALS);
+    let results = execute_persistent_snippets(
+        &[
+            "let x = 41;",
+            "use calibration; calibration::value();",
+            "x;",
+        ],
+        options,
+    );
+    assert_eq!(results.last(), Some(&vm::Value::Int(41)));
+}
+
+#[cfg(feature = "runtime")]
+#[test]
+fn final_layout_preserves_all_nine_first_snippet_locals() {
+    let results = execute_persistent_snippets(
+        &[
+            "let a = 11; let b = 12; let c = 13; let d = 14; let e = 15; let f = 16; let g = 17; let h = 18; let i = 19;",
+            "a;",
+            "b;",
+            "c;",
+            "d;",
+            "e;",
+            "f;",
+            "g;",
+            "h;",
+            "i;",
+        ],
+        vm::CompileSourceFileOptions::default(),
+    );
+    assert_eq!(results, (11..=19).map(vm::Value::Int).collect::<Vec<_>>());
+}
+
+#[test]
+fn final_layout_ordinary_source_and_file_keep_compaction() {
+    let source = "let a = 11; let b = 12; let c = 13; let d = 14; let e = 15; let f = 16; let g = 17; let h = 18; let i = 19; i;";
+    let ordinary = vm::compile_source_with_flavor(source, vm::SourceFlavor::RustScript).unwrap();
+    let file = vm::compile_source_at_path_with_flavor_and_options(
+        "layout.rss",
+        source,
+        vm::SourceFlavor::RustScript,
+        vm::CompileSourceFileOptions::default(),
+    )
+    .unwrap();
+    assert!(ordinary.locals < 9, "{}", ordinary.locals);
+    assert!(file.locals < 9, "{}", file.locals);
+    let repl = vm::compile_source_for_repl_with_state(source, &[]).unwrap();
+    assert!(repl.compiled.locals >= 9, "{}", repl.compiled.locals);
+    #[cfg(feature = "runtime")]
+    for program in [ordinary.program, file.program] {
+        let mut machine = vm::Vm::new(program);
+        machine.run().unwrap();
+        assert_eq!(machine.stack().last(), Some(&vm::Value::Int(19)));
+    }
+}
+
+#[test]
+fn final_layout_named_optional_entry_seeds_follow_final_debug_slots() {
+    let named = vm::HostStructSchema::new(
+        "RootNamedOptional",
+        vec![vm::HostStructField::new("value", vm::HostTypeSchema::Int)],
+    );
+    let mut builder = vm::HostApiBuilder::new();
+    builder.named_struct(named.clone());
+    builder.function(vm::HostFunctionSchema::with_return(
+        "layout::root",
+        vec![],
+        named.as_type(),
+    ));
+    let options = vm::CompileSourceFileOptions::default()
+        .with_host_api_catalog(std::sync::Arc::new(builder.build().unwrap()))
+        .with_module_override_source("calibration.rss", NINE_MODULE_LOCALS);
+    let first = vm::compile_source_for_repl_with_state_and_options(
+        "let root = layout::root();",
+        &[],
+        options.clone(),
+    )
+    .unwrap();
+    let slot = first
+        .compiled
+        .program
+        .debug
+        .as_ref()
+        .unwrap()
+        .local_index("root")
+        .unwrap() as usize;
+    let schema = first
+        .compiled
+        .program
+        .type_map
+        .as_ref()
+        .unwrap()
+        .local_schemas[slot]
+        .clone()
+        .unwrap();
+    assert_eq!(
+        schema,
+        TypeSchema::Named("RootNamedOptional".into(), vec![])
+    );
+    let states = [false, true].map(|optional| ReplLocalState {
+        binding: ReplLocalBinding {
+            name: if optional { "maybe" } else { "root" }.into(),
+            mutable: false,
+            schema: Some(schema.clone()),
+            optional,
+        },
+        moved: false,
+    });
+    for source in [
+        "use calibration; root.value; maybe == null; calibration::value();",
+        "use calibration; calibration::value();",
+    ] {
+        let compiled =
+            vm::compile_source_for_repl_with_state_and_options(source, &states, options.clone())
+                .unwrap();
+        let program = compiled.compiled.program;
+        let map = program.type_map.as_ref().unwrap();
+        for state in &states {
+            let slot = program
+                .debug
+                .as_ref()
+                .unwrap()
+                .local_index(&state.binding.name)
+                .unwrap() as usize;
+            assert_eq!(
+                map.local_schemas[slot],
+                Some(schema.clone()),
+                "{} in {source}",
+                state.binding.name
+            );
+            assert_eq!(
+                map.optional_slots[slot], state.binding.optional,
+                "{} in {source}",
+                state.binding.name
+            );
+        }
+    }
+}
+
 #[test]
 fn public_repl_state_api_preserves_moved_local_semantics() {
     let binding = ReplLocalBinding {
@@ -30,7 +215,7 @@ fn public_repl_state_api_preserves_moved_local_semantics() {
 #[test]
 fn native_repl_module_admission_rejects_wrong_types_resource_copy_and_moved_entry() {
     let options = vm::CompileSourceFileOptions::default()
-        .with_module_override_source("calibration.rss", "pub fn value() -> int { 1 }");
+        .with_module_override_source("calibration.rss", NINE_MODULE_LOCALS);
     let state = |name: &str, schema, moved| ReplLocalState {
         binding: ReplLocalBinding {
             name: name.into(),

@@ -887,7 +887,17 @@ fn compile_parsed_output_with_entry_locals(
         typing_mode,
         enable_local_move_semantics,
         local_debug_ranges,
+        LocalLayoutPolicy::Compact,
     )
+}
+
+/// Final layout belongs to the compilation owner, not current-snippet liveness.
+/// REPL root bindings remain observable by later snippets, even on the first
+/// compilation or when no persisted entry is referenced in this snippet.
+#[derive(Clone, Copy)]
+enum LocalLayoutPolicy {
+    Compact,
+    Preserve,
 }
 
 fn compile_owned_ir_output(
@@ -897,6 +907,7 @@ fn compile_owned_ir_output(
     typing_mode: TypingMode,
     enable_local_move_semantics: bool,
     local_debug_ranges: HashMap<String, LocalDebugRange>,
+    local_layout: LocalLayoutPolicy,
 ) -> Result<CompiledProgram, SourceError> {
     // Classify named callable materialization on the final merged IR
     // (post-lifetime, so capture metadata and rewritten uses are
@@ -910,7 +921,15 @@ fn compile_owned_ir_output(
     // value identities, so the classification is strictly more precise on
     // the unallocated IR.
     let callable_use_facts = materialization::classify_named_callables(&parsed);
-    let parsed = lifetime::allocate_local_slots(parsed).map_err(SourceError::Parse)?;
+    let parsed = match local_layout {
+        LocalLayoutPolicy::Compact => {
+            lifetime::allocate_local_slots(parsed).map_err(SourceError::Parse)?
+        }
+        // Keep debug bindings, entry type/optional seeds and runtime values in
+        // the same logical layout. Later session restoration cannot repair a
+        // persisted slot already overwritten by a module initializer.
+        LocalLayoutPolicy::Preserve => parsed,
+    };
     let type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
     let FrontendIr {
         stmts,
@@ -2208,6 +2227,7 @@ fn compile_source_for_repl_with_locals_impl(
             policy.typing_mode,
             policy.ownership_checking,
             debug_ranges,
+            LocalLayoutPolicy::Preserve,
         )
         .map_err(|error| SourcePathError::SourceWithMap {
             error,
@@ -2350,6 +2370,7 @@ fn compile_loaded_units(
         policy.typing_mode,
         policy.ownership_checking,
         local_debug_ranges,
+        LocalLayoutPolicy::Compact,
     )
     .map_err(|error| SourcePathError::SourceWithMap { error, sources })
 }

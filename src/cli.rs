@@ -1852,6 +1852,140 @@ mod tests {
     }
 
     #[test]
+    fn final_layout_repl_sync_preserves_checked_named_optional_state() {
+        use crate::{
+            HostApiBuilder, HostFunctionRegistry, HostFunctionSchema, HostStructField,
+            HostStructSchema, HostTypeSchema,
+        };
+        let named = HostStructSchema::new(
+            "RootNamedOptional",
+            vec![HostStructField::new("value", HostTypeSchema::Int)],
+        );
+        let mut builder = HostApiBuilder::new();
+        builder.named_struct(named.clone());
+        builder.function(HostFunctionSchema::with_return(
+            "layout::root",
+            vec![],
+            named.as_type(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "layout::maybe",
+            vec![],
+            HostTypeSchema::Optional(Box::new(named.as_type())),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "layout::read",
+            vec![crate::HostParamSchema::value("root", named.as_type())],
+            HostTypeSchema::Int,
+        ));
+        let catalog = std::sync::Arc::new(builder.build().unwrap());
+        let options = CompileSourceFileOptions::default().with_host_api_catalog(std::sync::Arc::clone(&catalog))
+            .with_module_override_source("calibration.rss", "let a = 101; let b = 102; let c = 103; let d = 104; let e = 105; let f = 106; let g = 107; let h = 108; let i = 109; pub fn value() -> int { 1 }");
+        fn root(_: &mut Vm, _: &[Value]) -> crate::VmResult<crate::CallOutcome> {
+            Ok(crate::CallOutcome::Return(crate::return_one(Value::map(
+                vec![(Value::string("value"), Value::Int(41))],
+            ))))
+        }
+        fn maybe(_: &mut Vm, _: &[Value]) -> crate::VmResult<crate::CallOutcome> {
+            Ok(crate::CallOutcome::Return(crate::return_one(Value::Null)))
+        }
+        fn read(_: &mut Vm, args: &[Value]) -> crate::VmResult<crate::CallOutcome> {
+            let Value::Map(fields) = &args[0] else {
+                return Err(crate::VmError::TypeMismatch("RootNamedOptional"));
+            };
+            Ok(crate::CallOutcome::Return(crate::return_one(
+                fields.get(&Value::string("value")).unwrap().clone(),
+            )))
+        }
+        let mut registry = HostFunctionRegistry::new();
+        for (name, handler) in [
+            ("layout::root", root as crate::StaticHostFunction),
+            ("layout::maybe", maybe),
+            ("layout::read", read),
+        ] {
+            registry
+                .register_catalog_static(
+                    crate::catalog_import_schemas(&catalog, name).remove(0),
+                    handler,
+                )
+                .unwrap();
+        }
+        let mut session = super::ReplSession::default();
+        for source in [
+            "let root = layout::root(); let maybe = layout::maybe();",
+            "use calibration; layout::read(root); maybe == null; calibration::value();",
+            "use calibration; calibration::value();",
+            "layout::read(root); maybe == null;",
+        ] {
+            let first_snippet = session.locals.is_empty();
+            let compiled =
+                super::compile_repl_snippet_with_options(source, &session.locals, &options)
+                    .unwrap();
+            let moved =
+                super::repl_locals_moved_by_rebinding(&compiled.compiled.program, &session.locals);
+            let mut machine = Vm::new(compiled.compiled.program);
+            registry.bind_vm_cached(&mut machine).unwrap();
+            super::seed_repl_vm_locals(&mut machine, &session.locals).unwrap();
+            assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+            if source.starts_with("use calibration;") {
+                assert!(machine.locals().len() >= 11);
+            }
+            let map = machine.program().type_map.as_ref().unwrap();
+            let mut expected = Vec::new();
+            for (name, optional, value) in [
+                (
+                    "root",
+                    false,
+                    Value::map(vec![(Value::string("value"), Value::Int(41))]),
+                ),
+                ("maybe", true, Value::Null),
+            ] {
+                let slot = machine.debug_info().unwrap().local_index(name).unwrap() as usize;
+                let schema = crate::TypeSchema::Named("RootNamedOptional".into(), vec![]);
+                // New optional host results retain their Optional wrapper;
+                // entry reseeding uses the base schema plus the optional bit.
+                let schema = if optional && first_snippet {
+                    crate::TypeSchema::Optional(Box::new(schema))
+                } else {
+                    schema
+                };
+                assert_eq!(
+                    map.local_schemas[slot],
+                    Some(schema.clone()),
+                    "{source}: {name} at {slot}"
+                );
+                assert_eq!(
+                    map.optional_slots[slot], optional,
+                    "{source}: {name} at {slot}"
+                );
+                assert_eq!(machine.locals()[slot], value, "{source}: {name} at {slot}");
+                println!(
+                    "final-layout source={source:?} name={name} slot={slot} locals={} schema={:?} optional={} value={:?}",
+                    machine.locals().len(),
+                    map.local_schemas[slot],
+                    map.optional_slots[slot],
+                    machine.locals()[slot]
+                );
+                expected.push((
+                    name,
+                    super::ReplSessionLocal {
+                        value,
+                        mutable: false,
+                        schema: Some(schema),
+                        optional,
+                        moved: false,
+                    },
+                ));
+            }
+            super::sync_repl_session(&machine, &compiled.bindings, &moved, &mut session);
+            for (name, state) in expected {
+                assert_eq!(session.locals[name], state, "{source}: {name}");
+                println!("final-layout synced {name}={:?}", session.locals[name]);
+            }
+        }
+    }
+
+    #[test]
     fn register_imports_binds_cached_cli_host_registry_plan() {
         let imports = vec![
             HostImport {
