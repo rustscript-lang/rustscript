@@ -253,14 +253,36 @@ fn legacy_three_field_cli_can_emit_an_artifact_for_an_unbound_embedding() {
 }
 
 #[test]
-fn repl_rejects_unsupported_module_options_instead_of_discarding_them() {
+fn repl_module_override_preserves_native_entry_locals() {
     let options = CompileSourceFileOptions::default()
-        .with_module_override_source("calibration", "pub fn value() -> int { 42 }");
-    let result = vm::compile_source_for_repl_with_state_and_options("1;", &[], options);
-    assert!(
-        result.is_err(),
-        "native-only REPL must not silently discard module options"
-    );
+        .with_module_override_source("calibration.rss", "pub fn value() -> int { 1 }");
+    let first =
+        vm::compile_source_for_repl_with_state_and_options("let x = 41;", &[], options.clone())
+            .unwrap();
+    let mut first_vm = vm::Vm::new(first.compiled.program);
+    first_vm.run().unwrap();
+    let slot = first_vm.debug_info().unwrap().local_index("x").unwrap();
+    let value = first_vm.locals()[slot as usize].clone();
+    let state = vm::ReplLocalState {
+        binding: vm::ReplLocalBinding {
+            name: "x".into(),
+            mutable: false,
+            schema: Some(vm::TypeSchema::Int),
+            optional: false,
+        },
+        moved: false,
+    };
+    let second = vm::compile_source_for_repl_with_state_and_options(
+        "use calibration; x + calibration::value();",
+        &[state],
+        options,
+    )
+    .expect("selected modules must use the generic checked pipeline with entry locals");
+    let mut second_vm = vm::Vm::new(second.compiled.program);
+    let slot = second_vm.debug_info().unwrap().local_index("x").unwrap();
+    second_vm.set_local(slot, value).unwrap();
+    second_vm.run().unwrap();
+    assert_eq!(second_vm.stack().last(), Some(&Value::Int(42)));
 }
 
 #[test]
@@ -310,6 +332,262 @@ fn services_preserve_catalog_conflicts_missing_bindings_and_restricted_capabilit
     .unwrap();
     let mut unbound = vm::Vm::new(compiled.program);
     assert!(unbound.run().is_err());
+}
+
+struct SelectedModuleFrontend;
+static SELECTED_MODULE_FRONTEND: SelectedModuleFrontend = SelectedModuleFrontend;
+static SELECTED_HOOKS: AtomicUsize = AtomicUsize::new(0);
+static SELECTED_TEST_LOCK: Mutex<()> = Mutex::new(());
+impl vm::SourcePlugin for SelectedModuleFrontend {
+    fn descriptor(&self) -> vm::SourceFrontendDescriptor {
+        vm::SourceFrontendDescriptor {
+            id: vm::FrontendId::new("selected-module-probe"),
+            extensions: &["selected"],
+            typing_policy: vm::FrontendTypingPolicy::Strict,
+            supports_ownership_checking: true,
+        }
+    }
+    fn parse_source(
+        &self,
+        source: &str,
+        context: &vm::SourceFrontendContext<'_>,
+    ) -> Result<vm::FrontendIr, vm::ParseError> {
+        struct Grammar;
+        impl vm::ParserDialect for Grammar {}
+        static GRAMMAR: Grammar = Grammar;
+        assert_eq!(context.source_id, 1);
+        assert_eq!(context.phase, vm::ParsePhase::Module);
+        assert!(
+            context
+                .original_path
+                .unwrap()
+                .ends_with("calibration.selected")
+        );
+        assert!(
+            !context
+                .host_api_catalog
+                .unwrap()
+                .functions_named("measure::scale")
+                .is_empty()
+        );
+        vm::parse_source_with_dialect(
+            source,
+            &GRAMMAR,
+            vm::SharedParserOptions {
+                source_id: context.source_id,
+                allow_implicit_externs: false,
+                allow_implicit_semicolons: false,
+                enforce_mutable_bindings: true,
+                import_scan_mode: false,
+            },
+        )
+    }
+    fn parse_module_imports(
+        &self,
+        source: &str,
+        _: &std::path::Path,
+        context: &vm::SourceFrontendContext<'_>,
+    ) -> Result<Vec<vm::ModuleImport>, vm::SourcePathError> {
+        assert_eq!(context.source_id, 1);
+        assert_eq!(context.phase, vm::ParsePhase::ImportDiscovery);
+        assert!(context.host_api_catalog.is_some());
+        if source.contains("semantic-dependency") {
+            return Ok(vec![
+                vm::ModuleImport::value("ghost.rss", vm::ImportClause::AllPublic, 1).type_only(),
+            ]);
+        }
+        Ok(Vec::new())
+    }
+    fn validate_typed_ir(&self, typed: &vm::FrontendTypedIr<'_>) -> Result<(), vm::CompileError> {
+        assert_eq!(typed.source_id, Some(1));
+        assert!(
+            typed
+                .source_map
+                .unwrap()
+                .file(1)
+                .unwrap()
+                .name
+                .ends_with("calibration.selected")
+        );
+        assert!(typed.host_api_catalog.is_some());
+        let slot = typed
+            .ir
+            .local_bindings
+            .iter()
+            .find(|(name, _)| name == "x")
+            .unwrap()
+            .1;
+        assert_eq!(
+            typed.local_schemas[slot as usize],
+            Some(vm::TypeSchema::Int)
+        );
+        SELECTED_HOOKS.fetch_add(1, Ordering::SeqCst);
+        if typed.ir.function_impls.values().any(|function| matches!(&function.body_expr, vm::Expr::Int(-1)) || matches!(&function.body_expr, vm::Expr::Neg(inner) if matches!(inner.as_ref(), vm::Expr::Int(1)))) {
+            return Err(vm::CompileError::HostCallResolve { line: None, source_name: None, span: None, detail: "selected module admission rejected input".into() });
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn native_repl_selected_module_hook_receives_catalog_source_and_entry_types() {
+    let _guard = SELECTED_TEST_LOCK.lock().unwrap();
+    SELECTED_HOOKS.store(0, Ordering::SeqCst);
+    let services = scalar_services(
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let options = services
+        .compile_options(
+            CompileSourceFileOptions::default()
+                .with_source_plugin(&SELECTED_MODULE_FRONTEND)
+                .with_module_override_path("calibration.rss", "calibration.selected")
+                .with_module_override_source("calibration.rss", "pub fn value() -> int { 1; }"),
+        )
+        .unwrap();
+    let state = vm::ReplLocalState {
+        binding: vm::ReplLocalBinding {
+            name: "x".into(),
+            mutable: false,
+            schema: Some(vm::TypeSchema::Int),
+            optional: false,
+        },
+        moved: false,
+    };
+    let compiled = vm::compile_source_for_repl_with_state_and_options(
+        "use calibration; x + calibration::value();",
+        &[state],
+        options,
+    )
+    .unwrap();
+    assert_eq!(SELECTED_HOOKS.load(Ordering::SeqCst), 1);
+    let mut machine = vm::Vm::new(compiled.compiled.program);
+    let slot = machine.debug_info().unwrap().local_index("x").unwrap();
+    machine.set_local(slot, Value::Int(41)).unwrap();
+    machine.run().unwrap();
+    assert_eq!(machine.stack().last(), Some(&Value::Int(42)));
+}
+
+#[test]
+fn native_repl_runtime_entry_slots_exclude_semantic_only_module_locals() {
+    let _guard = SELECTED_TEST_LOCK.lock().unwrap();
+    SELECTED_HOOKS.store(0, Ordering::SeqCst);
+    let services = scalar_services(
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let options = services
+        .compile_options(
+            CompileSourceFileOptions::default()
+                .with_source_plugin(&SELECTED_MODULE_FRONTEND)
+                .with_module_override_path("calibration.rss", "calibration.selected")
+                .with_module_override_source(
+                    "calibration.rss",
+                    "// semantic-dependency\npub fn value() -> int { 1; }",
+                )
+                .with_module_override_source(
+                    "ghost.rss",
+                    "measure::scale(666); let semantic_local = 40; pub fn invisible() -> int { 3 }",
+                ),
+        )
+        .unwrap();
+    let state = vm::ReplLocalState {
+        binding: vm::ReplLocalBinding {
+            name: "x".into(),
+            mutable: false,
+            schema: Some(vm::TypeSchema::Int),
+            optional: false,
+        },
+        moved: false,
+    };
+    let compiled = vm::compile_source_for_repl_with_state_and_options(
+        "use calibration; x + calibration::value();",
+        &[state],
+        options,
+    )
+    .unwrap();
+    assert_eq!(SELECTED_HOOKS.load(Ordering::SeqCst), 1);
+    assert!(
+        compiled
+            .compiled
+            .program
+            .debug
+            .as_ref()
+            .unwrap()
+            .locals
+            .iter()
+            .all(|local| !local.name.contains("semantic_local"))
+    );
+    assert!(
+        compiled.compiled.program.imports.is_empty(),
+        "type-only host effects must not be runtime reachable"
+    );
+    let mut machine = vm::Vm::new(compiled.compiled.program);
+    let slot = machine.debug_info().unwrap().local_index("x").unwrap();
+    machine.set_local(slot, Value::Int(41)).unwrap();
+    machine.run().unwrap();
+    assert_eq!(machine.stack().last(), Some(&Value::Int(42)));
+}
+
+#[test]
+fn native_repl_selected_module_admission_precedes_initialization_and_guest_effects() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    for (module, snippet, diagnostic, inits) in [
+        (
+            "pub fn value() -> int { 1; }",
+            "use calibration; measure::scale(x + calibration::value());",
+            "=> 126",
+            2,
+        ),
+        (
+            "pub fn value() -> int { -1; }",
+            "use calibration; measure::scale(x + calibration::value());",
+            "selected module admission rejected input",
+            1,
+        ),
+        (
+            "pub fn value() -> int { 1; }",
+            "use calibration; let bad: bool = x + calibration::value(); measure::scale(x);",
+            "error:",
+            1,
+        ),
+    ] {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "embedding_repl_child",
+                "--nocapture",
+            ])
+            .env("EMBEDDING_SELECTED_MODULE", module)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("let x = 41;\n{snippet}\n.quit\n").as_bytes())
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        let out = String::from_utf8(result.stdout).unwrap();
+        let err = String::from_utf8(result.stderr).unwrap();
+        assert!(result.status.success(), "{out}\n{err}");
+        assert!(
+            out.contains(diagnostic) || err.contains(diagnostic),
+            "{out}\n{err}"
+        );
+        assert!(
+            out.contains(&format!("embedding-init-count={inits}")),
+            "{out}\n{err}"
+        );
+        if inits == 1 {
+            assert!(!out.contains("=> 126") && !out.contains("=> 120"), "{out}");
+        }
+    }
 }
 
 struct CalibrationFrontend;
@@ -398,11 +676,80 @@ fn public_cli_preserves_language_neutral_frontend_options_and_typed_hooks() {
     );
     assert_eq!(*seen.lock().unwrap(), vec![42]);
     assert_eq!(inits.load(Ordering::SeqCst), 1);
-    assert!(
-        vm::compile_source_for_repl_with_state_and_options("1;", &[], (runtime.compile_options)())
-            .is_err(),
-        "native-only REPL must reject unsupported frontend hooks"
-    );
+    vm::compile_source_for_repl_with_state_and_options("1;", &[], (runtime.compile_options)())
+        .expect("an unselected file frontend must not reject native snippets");
+}
+
+struct UnusedFrontend;
+static UNUSED_FRONTEND: UnusedFrontend = UnusedFrontend;
+static UNUSED_HOOKS: AtomicUsize = AtomicUsize::new(0);
+impl vm::SourcePlugin for UnusedFrontend {
+    fn descriptor(&self) -> vm::SourceFrontendDescriptor {
+        vm::SourceFrontendDescriptor {
+            id: vm::FrontendId::new("unused-file-probe"),
+            extensions: &["unused"],
+            typing_policy: vm::FrontendTypingPolicy::Strict,
+            supports_ownership_checking: true,
+        }
+    }
+    fn parse_source(
+        &self,
+        _: &str,
+        _: &vm::SourceFrontendContext<'_>,
+    ) -> Result<vm::FrontendIr, vm::ParseError> {
+        UNUSED_HOOKS.fetch_add(1, Ordering::SeqCst);
+        Err(vm::ParseError::new("unselected frontend invoked"))
+    }
+    fn validate_typed_ir(&self, _: &vm::FrontendTypedIr<'_>) -> Result<(), vm::CompileError> {
+        UNUSED_HOOKS.fetch_add(1, Ordering::SeqCst);
+        panic!("unselected frontend hook invoked")
+    }
+}
+
+#[test]
+fn native_repl_accepts_unused_file_registration_with_default_and_configured_services() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    for default_services in [false, true] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "embedding_repl_child",
+                "--nocapture",
+            ])
+            .env("EMBEDDING_UNUSED_PLUGIN", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if default_services {
+            command.env("EMBEDDING_DEFAULT_SERVICES", "1");
+        }
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"let x = 41;\nx + 1\n.quit\n")
+            .unwrap();
+        let result = child.wait_with_output().unwrap();
+        let out = String::from_utf8(result.stdout).unwrap();
+        let err = String::from_utf8(result.stderr).unwrap();
+        assert!(result.status.success(), "{out}\n{err}");
+        assert!(
+            out.contains("=> 42"),
+            "default={default_services}: {out}\n{err}"
+        );
+        assert!(
+            !err.contains("not module overrides or source plugins"),
+            "{err}"
+        );
+        assert!(out.contains("unused-plugin-hooks=0"), "{out}");
+        if !default_services {
+            assert!(out.contains("embedding-init-count=2"), "{out}");
+        }
+    }
 }
 
 // Subprocess harness only; never counted as a business test.
@@ -414,7 +761,31 @@ fn embedding_repl_child() {
     let args = std::env::var("EMBEDDING_CLI_ARGS")
         .map(|raw| serde_json::from_str::<Vec<String>>(&raw).unwrap())
         .unwrap_or_else(|_| vec!["repl".into()]);
-    run_with_args(&runtime(), &args, &services).unwrap();
+    let mut runtime = runtime();
+    if std::env::var_os("EMBEDDING_UNUSED_PLUGIN").is_some() {
+        runtime.compile_options =
+            || CompileSourceFileOptions::default().with_source_plugin(&UNUSED_FRONTEND);
+    }
+    if std::env::var_os("EMBEDDING_SELECTED_MODULE").is_some() {
+        runtime.compile_options = || {
+            CompileSourceFileOptions::default()
+                .with_source_plugin(&SELECTED_MODULE_FRONTEND)
+                .with_module_override_path("calibration.rss", "calibration.selected")
+                .with_module_override_source(
+                    "calibration.rss",
+                    std::env::var("EMBEDDING_SELECTED_MODULE").unwrap(),
+                )
+        };
+    }
+    if std::env::var_os("EMBEDDING_DEFAULT_SERVICES").is_some() {
+        run_with_args(&runtime, &args, &CliHostServices::default()).unwrap();
+    } else {
+        run_with_args(&runtime, &args, &services).unwrap();
+    }
+    println!(
+        "unused-plugin-hooks={}",
+        UNUSED_HOOKS.load(Ordering::SeqCst)
+    );
     println!("embedding-init-count={}", inits.load(Ordering::SeqCst));
 }
 

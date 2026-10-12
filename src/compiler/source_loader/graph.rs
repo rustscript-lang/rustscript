@@ -58,6 +58,17 @@ pub(super) fn collect_module_units(
     options: &CompileSourceFileOptions,
     state: &mut ModuleCollectState,
 ) -> Result<(), SourcePathError> {
+    collect_module_units_with_entry_locals(path, source, flavor, options, state, None)
+}
+
+pub(super) fn collect_module_units_with_entry_locals(
+    path: &Path,
+    source: &str,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+    state: &mut ModuleCollectState,
+    entry_locals: Option<&[super::super::ReplLocalBinding]>,
+) -> Result<(), SourcePathError> {
     // Register this module in the semantic graph. Registration is
     // identity-keyed and idempotent, so the root and every nested module get
     // a deterministic `ModuleId`/`SourceId` in first-encounter order.
@@ -79,24 +90,33 @@ pub(super) fn collect_module_units(
         path.display().to_string(),
         source.to_string(),
     );
-    let (imports, decls) = scan_module_imports(source, flavor, path, options, current_source_id.0)
-        .map_err(|err| {
-            // Nested module sources surface their parse errors through the same
-            // path-prefixed diagnostic shape the compile parse uses. The root is
-            // scanned (and fails, if at all) in `load_units_for_source_file`
-            // before this point, so it never receives a prefix here. The scan
-            // parser numbers spans with its own local source id 0, so the span
-            // is always rebuilt against the owning module's graph source id —
-            // offsets from one module must never be interpreted in another.
-            match err {
-                SourcePathError::Source(SourceError::Parse(mut parse)) => {
-                    parse.message = format!("{}: {}", path.display(), parse.message);
-                    parse = parse.with_line_span_from_source(&state.sources, current_source_id.0);
-                    SourcePathError::Source(SourceError::Parse(parse))
-                }
-                other => other,
+    let scan = match entry_locals {
+        Some(locals) => super::imports::scan_module_imports_with_entry_locals(
+            source,
+            path,
+            options,
+            current_source_id.0,
+            locals,
+        ),
+        None => scan_module_imports(source, flavor, path, options, current_source_id.0),
+    };
+    let (imports, decls) = scan.map_err(|err| {
+        // Nested module sources surface their parse errors through the same
+        // path-prefixed diagnostic shape the compile parse uses. The root is
+        // scanned (and fails, if at all) in `load_units_for_source_file`
+        // before this point, so it never receives a prefix here. The scan
+        // parser numbers spans with its own local source id 0, so the span
+        // is always rebuilt against the owning module's graph source id —
+        // offsets from one module must never be interpreted in another.
+        match err {
+            SourcePathError::Source(SourceError::Parse(mut parse)) => {
+                parse.message = format!("{}: {}", path.display(), parse.message);
+                parse = parse.with_line_span_from_source(&state.sources, current_source_id.0);
+                SourcePathError::Source(SourceError::Parse(parse))
             }
-        })?;
+            other => other,
+        }
+    })?;
     for (import_index, import) in imports.iter().enumerate() {
         let spec = import.spec.clone();
         let span = import

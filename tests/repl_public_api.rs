@@ -27,6 +27,54 @@ fn public_repl_state_api_preserves_moved_local_semantics() {
     );
 }
 
+#[test]
+fn native_repl_module_admission_rejects_wrong_types_resource_copy_and_moved_entry() {
+    let options = vm::CompileSourceFileOptions::default()
+        .with_module_override_source("calibration.rss", "pub fn value() -> int { 1 }");
+    let state = |name: &str, schema, moved| ReplLocalState {
+        binding: ReplLocalBinding {
+            name: name.into(),
+            mutable: false,
+            schema: Some(schema),
+            optional: false,
+        },
+        moved,
+    };
+    let wrong = vm::compile_source_for_repl_with_state_and_options(
+        "use calibration; let result: bool = x + calibration::value();",
+        &[state("x", TypeSchema::Int, false)],
+        options.clone(),
+    )
+    .err()
+    .expect("admission must reject before producing a Program");
+    assert!(matches!(wrong, vm::SourceError::Compile(_)), "{wrong:?}");
+    let resource = vm::ResourceTypeKey::new("repl.admission-resource").unwrap();
+    let copy = vm::compile_source_for_repl_with_state_and_options(
+        "use calibration; let duplicate = owned.copy(); calibration::value();",
+        &[state("owned", TypeSchema::Resource(resource), false)],
+        options.clone(),
+    )
+    .err()
+    .expect("admission must reject before producing a Program");
+    assert!(
+        matches!(&copy, vm::SourceError::Parse(error) if error.code.as_deref() == Some("E_OWNERSHIP_COPY_RESOURCE")),
+        "{copy:?}"
+    );
+    let moved = vm::compile_source_for_repl_with_state_and_options(
+        "use calibration; message; calibration::value();",
+        &[state("message", TypeSchema::String, true)],
+        options,
+    )
+    .err()
+    .expect("admission must reject before producing a Program");
+    assert!(
+        matches!(&moved, vm::SourceError::Parse(error) if error.code.as_deref() == Some("E_LOCAL_MOVED")),
+        "{moved:?}"
+    );
+    // Compilation has no VM/initializer authority. No failed admission result
+    // exposes a Program that an embedding can initialize or execute.
+}
+
 #[cfg(feature = "runtime")]
 #[test]
 fn repl_options_preserve_named_host_identity_and_runtime_values_between_snippets() {
