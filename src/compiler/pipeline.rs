@@ -1997,13 +1997,34 @@ pub fn compile_source_for_repl_with_locals(
     let source_owned = source.to_string();
     let predefined_locals = predefined_locals.to_vec();
     run_with_compiler_stack(move || {
-        compile_source_for_repl_with_locals_impl(&source_owned, &predefined_locals, &[])
+        compile_source_for_repl_with_locals_impl(
+            &source_owned,
+            &predefined_locals,
+            &[],
+            &CompileSourceFileOptions::default(),
+        )
     })
 }
 
 pub fn compile_source_for_repl_with_state(
     source: &str,
     predefined_locals: &[ReplLocalState],
+) -> Result<CompiledReplProgram, SourceError> {
+    compile_source_for_repl_with_state_and_options(
+        source,
+        predefined_locals,
+        CompileSourceFileOptions::default(),
+    )
+}
+
+/// Compile the supported RustScript REPL frontend with an explicit catalog.
+/// Persisted-local semantics and strict ownership admission are unchanged.
+/// Module overrides and source plugins are rejected: this entrypoint does not
+/// provide module loading or plugin REPL parsing.
+pub fn compile_source_for_repl_with_state_and_options(
+    source: &str,
+    predefined_locals: &[ReplLocalState],
+    options: CompileSourceFileOptions,
 ) -> Result<CompiledReplProgram, SourceError> {
     let source_owned = source.to_string();
     let predefined_locals = predefined_locals.to_vec();
@@ -2017,7 +2038,7 @@ pub fn compile_source_for_repl_with_state(
             .filter(|state| state.moved)
             .map(|state| state.binding.name.clone())
             .collect::<Vec<_>>();
-        compile_source_for_repl_with_locals_impl(&source_owned, &bindings, &moved_names)
+        compile_source_for_repl_with_locals_impl(&source_owned, &bindings, &moved_names, &options)
     })
 }
 
@@ -2067,15 +2088,19 @@ fn compile_source_for_repl_with_locals_impl(
     source: &str,
     predefined_locals: &[ReplLocalBinding],
     moved_names: &[String],
+    options: &CompileSourceFileOptions,
 ) -> Result<CompiledReplProgram, SourceError> {
+    if options.has_module_overrides() || options.has_source_plugins() {
+        return Err(SourceError::Parse(ParseError::new(
+            "RustScript REPL supports host catalogs, but not module overrides or source plugins",
+        )));
+    }
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
     // REPL parsing/compiler entry state is separate from normal program compilation so
     // persisted locals do not leak into the generic frontend or IR surface.
-    #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
-    let repl_catalog = Some(crate::builtins::runtime::http::http_host_catalog());
-    #[cfg(not(all(feature = "http-client", not(target_family = "wasm"))))]
-    let repl_catalog = None;
+    let effective = default_http_compile_catalog_options(SourceFlavor::RustScript, options);
+    let repl_catalog = effective.host_api_catalog().cloned();
     let parsed = frontends::parse_rustscript_repl_source_with_catalog(
         source,
         predefined_locals,
