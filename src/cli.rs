@@ -1858,6 +1858,264 @@ mod tests {
     }
 
     #[test]
+    fn root_expression_effects_conditional_float_binding_session_and_next_snippet() {
+        let source =
+            "let mut x = 1; let ignored = if true => { x = 2.5; 0 } else => { x = 2.5; 0 };";
+        let mut session = super::ReplSession::default();
+        let compiled = super::compile_repl_snippet(source, &session.locals).unwrap();
+        let binding = compiled.bindings.iter().find(|b| b.name == "x").unwrap();
+        let schema = binding.schema.clone();
+        #[cfg(all(feature = "cranelift-jit", target_arch = "x86_64"))]
+        {
+            let mut native = Vm::new(compiled.compiled.program.clone());
+            native.compile_aot().unwrap();
+            assert!(native.has_aot_program());
+            assert_eq!(native.run().unwrap(), VmStatus::Halted);
+            let slot = native.debug_info().unwrap().local_index("x").unwrap() as usize;
+            assert_eq!(native.locals()[slot], Value::Float(2.5));
+            assert!(native.aot_exec_count() > 0);
+        }
+        let moved =
+            super::repl_locals_moved_by_rebinding(&compiled.compiled.program, &session.locals);
+        let mut machine = Vm::new(compiled.compiled.program);
+        assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+        let slot = machine.debug_info().unwrap().local_index("x").unwrap() as usize;
+        assert_eq!(machine.locals()[slot], Value::Float(2.5));
+        super::sync_repl_session(&machine, &compiled.bindings, &moved, &mut session);
+        let next = super::compile_repl_snippet("let y: float = x; y;", &session.locals);
+        println!(
+            "root expression effects: returned={schema:?}, synced={:?}, value={:?}, next={:?}",
+            session.locals["x"].schema,
+            session.locals["x"].value,
+            next.as_ref()
+                .map(|_| "compiled")
+                .map_err(|e| format!("{e:?}"))
+        );
+        assert_eq!(schema, Some(crate::TypeSchema::Float));
+        assert_eq!(session.locals["x"].schema, Some(crate::TypeSchema::Float));
+        assert!(!session.locals["x"].optional);
+        assert!(session.locals["x"].mutable);
+        assert!(!session.locals["x"].moved);
+        assert!(next.is_ok());
+        let next_vm = run_repl_snippet_and_sync(&mut session, "let y: float = x; y;");
+        assert_eq!(next_vm.stack(), &[Value::Float(2.5)]);
+        assert_eq!(session.locals["y"].value, Value::Float(2.5));
+    }
+
+    #[test]
+    fn root_expression_effects_nested_blocks_and_shadow_slots() {
+        for (source, expected) in [
+            (
+                "let mut x = 1; let ignored = if true => { let inner = if true => { x = 2.5; 0 } else => { x = 2.5; 0 }; 0 } else => { x = 2.5; 0 };",
+                crate::TypeSchema::Float,
+            ),
+            (
+                "let mut x = 1; let ignored = if true => { let inner = 0; if true => { x = 2.5; 0 } else => { x = 2.5; 0 } } else => { x = 2.5; 0 };",
+                crate::TypeSchema::Float,
+            ),
+            (
+                "let mut x = 1; let ignored = if true => { let mut local = 2.0; local = 2.5; 0 } else => { 0 };",
+                crate::TypeSchema::Int,
+            ),
+        ] {
+            let mut session = super::ReplSession::default();
+            let compiled = super::compile_repl_snippet(source, &session.locals).unwrap();
+            let x = compiled.bindings.iter().find(|b| b.name == "x").unwrap();
+            assert_eq!(x.schema, Some(expected.clone()), "{source}");
+            // Scope-local observations must not change the existing root.
+            run_repl_snippet_and_sync(&mut session, source);
+            assert_eq!(session.locals["x"].schema, Some(expected.clone()));
+            let next = if expected == crate::TypeSchema::Float {
+                "let y: float = x; y;"
+            } else {
+                "let y: int = x; y;"
+            };
+            let machine = run_repl_snippet_and_sync(&mut session, next);
+            let value = if expected == crate::TypeSchema::Float {
+                Value::Float(2.5)
+            } else {
+                Value::Int(1)
+            };
+            assert_eq!(machine.stack(), &[value]);
+        }
+    }
+
+    #[test]
+    fn root_expression_effects_initializer_assignment_and_arguments_are_ordered() {
+        for source in [
+            "let mut x = 1; let y = if true => { x = 2.5; x } else => { x = 2.5; x };",
+            "let mut x = 1; let mut y = 0.5; y = if true => { x = 2.5; x } else => { x = 2.5; x };",
+            "let mut x = 1; fn f(a: int, b: int) -> int { a + b } let ignored = f(if true => { x = 2.5; 0 } else => { x = 2.5; 0 }, if true => { x = 3.5; 0 } else => { x = 3.5; 0 }); let y = if true => { x = 2.5; x } else => { x = 2.5; x };",
+        ] {
+            let mut session = super::ReplSession::default();
+            let compiled = super::compile_repl_snippet(source, &session.locals).unwrap();
+            for name in ["x", "y"] {
+                assert_eq!(
+                    compiled
+                        .bindings
+                        .iter()
+                        .find(|b| b.name == name)
+                        .unwrap()
+                        .schema,
+                    Some(crate::TypeSchema::Float),
+                    "{source}: {name}"
+                );
+            }
+            run_repl_snippet_and_sync(&mut session, source);
+            assert_eq!(session.locals["x"].value, Value::Float(2.5));
+            assert_eq!(session.locals["y"].value, Value::Float(2.5));
+            let machine = run_repl_snippet_and_sync(&mut session, "let z: float = y; z;");
+            assert_eq!(machine.stack(), &[Value::Float(2.5)]);
+        }
+    }
+
+    #[test]
+    fn root_expression_effects_preserve_evaluated_operands_before_later_writes() {
+        let source =
+            "let mut x = 1; let y = x + (if true => { x = 2.5; 1 } else => { x = 2.5; 1 });";
+        let mut session = super::ReplSession::default();
+        let compiled = super::compile_repl_snippet(source, &session.locals).unwrap();
+        assert_eq!(
+            compiled
+                .bindings
+                .iter()
+                .find(|b| b.name == "x")
+                .unwrap()
+                .schema,
+            Some(crate::TypeSchema::Float)
+        );
+        assert_eq!(
+            compiled
+                .bindings
+                .iter()
+                .find(|b| b.name == "y")
+                .unwrap()
+                .schema,
+            Some(crate::TypeSchema::Int)
+        );
+        run_repl_snippet_and_sync(&mut session, source);
+        assert_eq!(session.locals["x"].value, Value::Float(2.5));
+        assert_eq!(session.locals["y"].value, Value::Int(2));
+        let machine = run_repl_snippet_and_sync(&mut session, "let z: int = y; z;");
+        assert_eq!(machine.stack(), &[Value::Int(2)]);
+    }
+
+    #[test]
+    fn root_expression_effects_optional_named_alternatives_remain_checked() {
+        for assign in [
+            "let ignored = if true => { x = 2.5; 0 } else => { x = 2.5; 0 };",
+            "let ignored = if true => { x = 2.5; 0 } else => { 0 };",
+            "let ignored = if false => { x = 2.5; 0 } else => { 0 };",
+        ] {
+            let source = format!("let mut x: float? = null; {assign}");
+            let mut session = super::ReplSession::default();
+            let compiled = super::compile_repl_snippet(&source, &session.locals).unwrap();
+            let x = compiled.bindings.iter().find(|b| b.name == "x").unwrap();
+            assert_eq!(x.schema, Some(crate::TypeSchema::Float));
+            assert!(x.optional);
+            run_repl_snippet_and_sync(&mut session, &source);
+            assert_eq!(session.locals["x"].schema, Some(crate::TypeSchema::Float));
+            assert!(session.locals["x"].optional);
+            let value = session.locals["x"].value.clone();
+            run_repl_snippet_and_sync(&mut session, "let y: float? = x;");
+            assert_eq!(session.locals["y"].value, value);
+        }
+        for condition in ["true", "false"] {
+            let source = format!(
+                "struct EffectRoot {{ value: int }} let mut x: EffectRoot? = null; let ignored = if {condition} => {{ x = {{ value: 41 }}; 0 }} else => {{ 0 }};"
+            );
+            let mut session = super::ReplSession::default();
+            let compiled = super::compile_repl_snippet(&source, &session.locals).unwrap();
+            let x = compiled.bindings.iter().find(|b| b.name == "x").unwrap();
+            let control = super::compile_repl_snippet(
+                "struct EffectRoot { value: int } let mut x: EffectRoot? = null;",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            let checked_named = control
+                .bindings
+                .iter()
+                .find(|b| b.name == "x")
+                .unwrap()
+                .schema
+                .clone();
+            assert!(
+                matches!(&checked_named, Some(crate::TypeSchema::Named(name, args)) if !name.is_empty() && args.is_empty())
+            );
+            assert_eq!(x.schema, checked_named);
+            assert!(x.optional);
+            run_repl_snippet_and_sync(&mut session, &source);
+            assert_eq!(session.locals["x"].schema, x.schema);
+            assert!(session.locals["x"].optional);
+            run_repl_snippet_and_sync(&mut session, "x == null;");
+        }
+    }
+
+    #[test]
+    fn root_expression_effects_keep_named_field_literal_key_schema() {
+        let source = "struct EffectRoot { value: int } let root: EffectRoot = { value: 41 }; let field = root?.value;";
+        let mut session = super::ReplSession::default();
+        let compiled = super::compile_repl_snippet(source, &session.locals).unwrap();
+        let field = compiled
+            .bindings
+            .iter()
+            .find(|b| b.name == "field")
+            .unwrap();
+        assert_eq!(
+            field.schema.as_ref().map(|s| s.split_optional().0),
+            Some(crate::TypeSchema::Int)
+        );
+        assert!(field.optional);
+        run_repl_snippet_and_sync(&mut session, source);
+        assert_eq!(session.locals["field"].value, Value::Int(41));
+        assert!(session.locals["field"].optional);
+        let machine =
+            run_repl_snippet_and_sync(&mut session, "let y: int? = field; y.unwrap_or(0);");
+        assert_eq!(machine.stack(), &[Value::Int(41)]);
+    }
+
+    #[test]
+    fn root_expression_effects_declared_violation_denies_guest_effects() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn hit(_: &mut Vm, _: &[Value]) -> crate::VmResult<crate::CallOutcome> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::CallOutcome::Return(crate::return_one(Value::Int(0))))
+        }
+        let mut builder = crate::HostApiBuilder::new();
+        builder.function(crate::HostFunctionSchema::with_return(
+            "effects::hit",
+            vec![],
+            crate::HostTypeSchema::Int,
+        ));
+        let catalog = Arc::new(builder.build().unwrap());
+        let options =
+            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+        let mut registry = crate::HostFunctionRegistry::new();
+        registry
+            .register_catalog_static(
+                crate::catalog_import_schemas(&catalog, "effects::hit").remove(0),
+                hit,
+            )
+            .unwrap();
+        let source = "let mut x: int = 1; let ignored = if true => { effects::hit(); x = 2.5; 0 } else => { effects::hit(); x = 2.5; 0 };";
+        let result = super::compile_repl_snippet_with_options(source, &BTreeMap::new(), &options);
+        if let Ok(compiled) = &result {
+            let mut machine = Vm::new(compiled.compiled.program.clone());
+            registry.bind_vm_cached(&mut machine).unwrap();
+            machine.run().unwrap();
+        }
+        assert!(
+            result.is_err(),
+            "declared schema violation must reject compilation"
+        );
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn final_layout_repl_sync_preserves_checked_named_optional_state() {
         use crate::{
             HostApiBuilder, HostFunctionRegistry, HostFunctionSchema, HostStructField,

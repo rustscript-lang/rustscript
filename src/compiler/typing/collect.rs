@@ -14,6 +14,331 @@ use super::state::{
 };
 use super::validate::refine_state_for_condition;
 
+// This private replay publishes final root facts only. It never records into
+// aggregate slot vectors and never executes/inlines callable bodies.
+pub(super) fn collect_root_stmt_state(
+    stmts: &[Stmt],
+    state: &mut LocalTypeState,
+    entry_slots: &[LocalSlot],
+    context: &mut TypeContext<'_>,
+) {
+    let mut visible = entry_slots.iter().copied().collect();
+    collect_root_stmts(stmts, state, &mut visible, context);
+}
+
+fn commit_root_scope(
+    state: &mut LocalTypeState,
+    nested: &LocalTypeState,
+    visible: &std::collections::HashSet<LocalSlot>,
+) {
+    for &slot in visible {
+        state.copy_exact_binding_from(nested, slot, slot);
+    }
+}
+
+fn collect_root_stmts(
+    stmts: &[Stmt],
+    state: &mut LocalTypeState,
+    visible: &mut std::collections::HashSet<LocalSlot>,
+    context: &mut TypeContext<'_>,
+) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Let {
+                index,
+                declared_schema,
+                expr,
+                ..
+            } => {
+                let value = collect_root_expr(expr, state, visible, context);
+                bind_root_value(state, *index, declared_schema.as_ref(), &value, context);
+                visible.insert(*index);
+            }
+            Stmt::Assign { index, expr, .. } => {
+                let value = collect_root_expr(expr, state, visible, context);
+                bind_root_value(state, *index, None, &value, context);
+            }
+            Stmt::Expr { expr, .. } => {
+                collect_root_expr(expr, state, visible, context);
+            }
+            Stmt::Drop { index, .. } => state.set(*index, BoundType::Null),
+            Stmt::IfElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_root_expr(condition, state, visible, context);
+                let mut then_state = refine_state_for_condition(state, condition, true);
+                let mut else_state = refine_state_for_condition(state, condition, false);
+                collect_root_stmts(then_branch, &mut then_state, &mut visible.clone(), context);
+                collect_root_stmts(else_branch, &mut else_state, &mut visible.clone(), context);
+                let mut joined = LocalTypeState::default();
+                joined.merge_from_branches(&then_state, &else_state);
+                commit_root_scope(state, &joined, visible);
+            }
+            Stmt::For {
+                init,
+                condition,
+                post,
+                body,
+                ..
+            } => {
+                let mut nested = state.clone();
+                let mut loop_scope = visible.clone();
+                collect_root_stmts(
+                    std::slice::from_ref(init),
+                    &mut nested,
+                    &mut loop_scope,
+                    context,
+                );
+                // The condition runs even on the zero-body path.
+                collect_root_expr(condition, &mut nested, &loop_scope, context);
+                stabilize_loop_state(&mut nested, |iteration| {
+                    let mut scope = loop_scope.clone();
+                    collect_root_stmts(body, iteration, &mut scope, context);
+                    collect_root_stmts(std::slice::from_ref(post), iteration, &mut scope, context);
+                    collect_root_expr(condition, iteration, &loop_scope, context);
+                });
+                commit_root_scope(state, &nested, visible);
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                collect_root_expr(condition, state, visible, context);
+                let mut nested = state.clone();
+                stabilize_loop_state(&mut nested, |iteration| {
+                    collect_root_stmts(body, iteration, &mut visible.clone(), context);
+                    collect_root_expr(condition, iteration, visible, context);
+                });
+                commit_root_scope(state, &nested, visible);
+            }
+            Stmt::FuncDecl { .. } => {
+                // Retain the existing capture-copy rules without visiting bodies.
+                collect_stmt_types(
+                    std::slice::from_ref(stmt),
+                    state,
+                    &mut [],
+                    &mut [],
+                    &mut [],
+                    &mut [],
+                    &mut [],
+                    context,
+                );
+            }
+            Stmt::ClosureLet { .. }
+            | Stmt::Noop { .. }
+            | Stmt::Break { .. }
+            | Stmt::Continue { .. } => {}
+        }
+    }
+}
+
+// Expression values occupy slot zero in a standalone facts state. Operand
+// snapshots use inference-only slots, never allocated IR/runtime slots, so a
+// later operand cannot change the checked value of an earlier operand.
+fn root_expr_value(
+    expr: &Expr,
+    state: &LocalTypeState,
+    context: &mut TypeContext<'_>,
+) -> LocalTypeState {
+    let mut inferred = LocalTypeState::default();
+    let temporary = root_operand_slot(state, None);
+    let ty = context.infer_expr_type(expr, state);
+    bind_expr_result_to_slot(&mut inferred, temporary, None, expr, state, ty, context);
+    let mut value = LocalTypeState::default();
+    value.copy_exact_binding_from(&inferred, temporary, 0);
+    value
+}
+
+fn bind_root_value(
+    state: &mut LocalTypeState,
+    slot: LocalSlot,
+    declared: Option<&TypeSchema>,
+    value: &LocalTypeState,
+    context: &mut TypeContext<'_>,
+) {
+    if declared.is_none() && !state.has_declared_schema(slot) {
+        state.copy_exact_binding_from(value, 0, slot);
+        return;
+    }
+    let mut expr_state = state.clone();
+    let temporary = root_operand_slot(&expr_state, Some(slot));
+    expr_state.copy_exact_binding_from(value, 0, temporary);
+    bind_expr_result_to_slot(
+        state,
+        slot,
+        declared,
+        &Expr::Var(temporary),
+        &expr_state,
+        value.get(0),
+        context,
+    );
+}
+
+fn root_operand_slot(state: &LocalTypeState, excluded: Option<LocalSlot>) -> LocalSlot {
+    (0..=LocalSlot::MAX)
+        .rev()
+        .find(|&slot| Some(slot) != excluded && !state.has_binding(slot))
+        .expect("private expression facts require a free inference slot")
+}
+
+fn collect_root_expr(
+    expr: &Expr,
+    state: &mut LocalTypeState,
+    visible: &std::collections::HashSet<LocalSlot>,
+    context: &mut TypeContext<'_>,
+) -> LocalTypeState {
+    match expr {
+        Expr::Block { stmts, expr } => {
+            let mut nested = state.clone();
+            let mut scope = visible.clone();
+            collect_root_stmts(stmts, &mut nested, &mut scope, context);
+            let value = collect_root_expr(expr, &mut nested, &scope, context);
+            commit_root_scope(state, &nested, visible);
+            return value;
+        }
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_root_expr(condition, state, visible, context);
+            let mut then_state = refine_state_for_condition(state, condition, true);
+            let mut else_state = refine_state_for_condition(state, condition, false);
+            let then_value = collect_root_expr(then_expr, &mut then_state, visible, context);
+            let else_value = collect_root_expr(else_expr, &mut else_state, visible, context);
+            let mut joined = LocalTypeState::default();
+            joined.merge_from_branches(&then_state, &else_state);
+            commit_root_scope(state, &joined, visible);
+            let mut value = LocalTypeState::default();
+            value.merge_from_branches(&then_value, &else_value);
+            return value;
+        }
+        Expr::Match {
+            value_slot,
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            let value = collect_root_expr(value, state, visible, context);
+            let mut nested = state.clone();
+            bind_root_value(&mut nested, *value_slot, None, &value, context);
+            let mut scope = visible.clone();
+            scope.insert(*value_slot);
+            let mut default_state = nested.clone();
+            let mut result = collect_root_expr(default, &mut default_state, &scope, context);
+            let mut joined = default_state;
+            for (pattern, expr) in arms {
+                let mut arm_state = refine_state_for_match_pattern(&nested, pattern, *value_slot);
+                let mut arm_scope = scope.clone();
+                if let Some(slot) = pattern.binding_slot() {
+                    arm_scope.insert(slot);
+                }
+                let arm_value = collect_root_expr(expr, &mut arm_state, &arm_scope, context);
+                let previous = joined.clone();
+                joined.merge_from_branches(&previous, &arm_state);
+                let previous = result.clone();
+                result.merge_from_branches(&previous, &arm_value);
+            }
+            commit_root_scope(state, &joined, visible);
+            return result;
+        }
+        _ => {}
+    }
+    let mut inferred_expr = expr.clone();
+    let mut operand_state = state.clone();
+    let mut operand_slots = std::collections::HashSet::new();
+    // Only children evaluated by this expression are visited. A callable's
+    // declaration/body is not a root effect, even when inference examines it.
+    let mut operand = |child: &mut Expr, conditional: bool| {
+        let incoming = state.clone();
+        let value = collect_root_expr(child, state, visible, context);
+        if conditional {
+            let executed = state.clone();
+            state.merge_from_branches(&incoming, &executed);
+        }
+        // Literal keys retain their structural/nominal meaning for existing
+        // get/set/container inference. Later operands cannot change them.
+        if matches!(
+            child,
+            Expr::Null
+                | Expr::Int(_)
+                | Expr::Float(_)
+                | Expr::Bool(_)
+                | Expr::Bytes(_)
+                | Expr::String(_)
+                | Expr::FunctionRef(..)
+        ) {
+            return;
+        }
+        let slot = (0..=LocalSlot::MAX)
+            .rev()
+            .find(|slot| !operand_state.has_binding(*slot) && !operand_slots.contains(slot))
+            .expect("private expression operands require a free inference slot");
+        operand_slots.insert(slot);
+        operand_state.copy_exact_binding_from(&value, 0, slot);
+        *child = Expr::Var(slot);
+    };
+    match &mut inferred_expr {
+        Expr::OptionalGet { container, key, .. } => {
+            operand(container, false);
+            operand(key, true);
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            operand(value, false);
+            operand(fallback, true);
+        }
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+            operand(lhs, false);
+            operand(rhs, true);
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            operand(lhs, false);
+            operand(rhs, false);
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => operand(inner, false),
+        Expr::Call(_, _, args, _, _)
+        | Expr::LocalCall(_, _, args, _)
+        | Expr::ModuleCall(_, _, args, _)
+        | Expr::ClosureCall(_, args) => {
+            for arg in args {
+                operand(arg, false);
+            }
+        }
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::Bytes(_)
+        | Expr::String(_)
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. }
+        | Expr::FunctionRef(..)
+        | Expr::ModuleFunctionRef(..)
+        | Expr::UnresolvedFunctionRef { .. }
+        | Expr::Closure(_) => {}
+        Expr::IfElse { .. } | Expr::Match { .. } | Expr::Block { .. } => unreachable!(),
+    }
+    root_expr_value(&inferred_expr, &operand_state, context)
+}
+
 pub(super) fn observed_function_param_slice(
     observed: &HashMap<u16, Vec<BoundType>>,
     function_index: u16,
