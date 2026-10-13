@@ -75,6 +75,19 @@ struct PreparedTypedUnits {
     catalog: Arc<HostApiCatalog>,
     module_graph: Option<ModuleGraph>,
     analysis_errors: Vec<CompileError>,
+    entry_local_types: Vec<typing::EntryLocalType>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct EntryLocalContext<'a> {
+    types: &'a [typing::EntryLocalType],
+    availability: &'a [lifetime::EntryLocalAvailability],
+}
+
+struct UnitPreparation<'a> {
+    behavior: CompileBehavior,
+    module_graph: Option<ModuleGraph>,
+    repl: Option<(&'a [ReplLocalBinding], &'a [String])>,
 }
 
 fn prepare_typed_units(
@@ -86,6 +99,33 @@ fn prepare_typed_units(
     behavior: CompileBehavior,
     module_graph: Option<ModuleGraph>,
 ) -> Result<PreparedTypedUnits, SourcePathError> {
+    prepare_typed_units_with_entry(
+        units,
+        sources,
+        policy,
+        flavor,
+        options,
+        UnitPreparation {
+            behavior,
+            module_graph,
+            repl: None,
+        },
+    )
+}
+
+fn prepare_typed_units_with_entry(
+    units: Vec<ParsedUnit>,
+    sources: SourceMap,
+    policy: FrontendPolicy,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+    preparation: UnitPreparation<'_>,
+) -> Result<PreparedTypedUnits, SourcePathError> {
+    let UnitPreparation {
+        behavior,
+        module_graph,
+        repl,
+    } = preparation;
     let diagnostic_path = units
         .iter()
         .find(|unit| !unit.parsed.unknown_type_spans.is_empty())
@@ -117,18 +157,36 @@ fn prepare_typed_units(
         .then(|| merge_units(units.clone()))
         .transpose()?;
     let parsed = merge_admission_units(units)?;
-    let (ir, type_info, admission_owned, analysis_errors) =
-        prepare_owned_typed_ir(parsed, &owners, options, behavior, &sources).map_err(|error| {
-            SourcePathError::SourceWithMap {
-                error: preserve_strict_diagnostic_path(error, diagnostic_path.as_deref()),
-                sources: sources.clone(),
-            }
-        })?;
-    let owned_ir = if let Some(runtime) = runtime {
+    let entry_local_types = repl
+        .map(|(locals, _)| build_entry_local_types(&parsed, locals))
+        .unwrap_or_default();
+    let entry_availability = repl
+        .map(|(locals, moved)| build_entry_local_availability(&parsed, locals, moved))
+        .unwrap_or_default();
+    let entry = EntryLocalContext {
+        types: &entry_local_types,
+        availability: &entry_availability,
+    };
+    let (ir, type_info, admission_owned, analysis_errors) = prepare_owned_typed_ir(
+        parsed, &owners, options, behavior, &sources, entry,
+    )
+    .map_err(|error| SourcePathError::SourceWithMap {
+        error: preserve_strict_diagnostic_path(error, diagnostic_path.as_deref()),
+        sources: sources.clone(),
+    })?;
+    let (owned_ir, entry_local_types) = if let Some(runtime) = runtime {
         // Admission has already checked every source and invoked each hook once.
         // Link/codegen authority is independently restricted to Value paths.
+        // Removing semantic-only units changes linked local-slot offsets. Seed
+        // the runtime IR from its own binding table, never admission slot IDs.
+        let runtime_types = repl
+            .map(|(locals, _)| build_entry_local_types(&runtime, locals))
+            .unwrap_or_default();
+        let runtime_availability = repl
+            .map(|(locals, moved)| build_entry_local_availability(&runtime, locals, moved))
+            .unwrap_or_default();
         let (runtime, error) =
-            typing::legalize_for_admission(runtime, TypingMode::DynamicHints, &[]);
+            typing::legalize_for_admission(runtime, TypingMode::DynamicHints, &runtime_types);
         if !behavior.recover_host_errors
             && let Some(error) = error
         {
@@ -137,15 +195,22 @@ fn prepare_typed_units(
                 sources,
             });
         }
-        let facts = typing::infer_types(&runtime, TypingMode::DynamicHints, &[]);
-        enforce_owned_sources(runtime, &facts, &owners, behavior, &sources).map_err(|error| {
-            SourcePathError::SourceWithMap {
-                error: SourceError::Parse(error),
-                sources: sources.clone(),
-            }
-        })?
+        let facts = typing::infer_types(&runtime, TypingMode::DynamicHints, &runtime_types);
+        let owned = enforce_owned_sources(
+            runtime,
+            &facts,
+            &owners,
+            behavior,
+            &sources,
+            &runtime_availability,
+        )
+        .map_err(|error| SourcePathError::SourceWithMap {
+            error: SourceError::Parse(error),
+            sources: sources.clone(),
+        })?;
+        (owned, runtime_types)
     } else {
-        admission_owned
+        (admission_owned, entry_local_types)
     };
     let catalog = options
         .host_api_catalog()
@@ -159,6 +224,7 @@ fn prepare_typed_units(
         catalog,
         module_graph,
         analysis_errors,
+        entry_local_types,
     })
 }
 
@@ -191,8 +257,15 @@ fn prepare_typed_ir(
         policy,
         plugin,
     }];
-    prepare_owned_typed_ir(parsed, &owners, options, behavior, sources)
-        .map(|(ir, facts, owned, _)| (ir, facts, owned))
+    prepare_owned_typed_ir(
+        parsed,
+        &owners,
+        options,
+        behavior,
+        sources,
+        EntryLocalContext::default(),
+    )
+    .map(|(ir, facts, owned, _)| (ir, facts, owned))
 }
 
 struct TypedSourceOwner<'a> {
@@ -254,6 +327,7 @@ fn prepare_owned_typed_ir(
     options: &CompileSourceFileOptions,
     behavior: CompileBehavior,
     sources: &SourceMap,
+    entry: EntryLocalContext<'_>,
 ) -> Result<
     (
         FrontendIr,
@@ -273,9 +347,9 @@ fn prepare_owned_typed_ir(
     // Legalization and inference do not impose the root's language policy on
     // dependencies. Admission below uses each producer's own descriptor.
     let (legalized, host_error) =
-        typing::legalize_for_admission(parsed, TypingMode::DynamicHints, &[]);
+        typing::legalize_for_admission(parsed, TypingMode::DynamicHints, entry.types);
     parsed = legalized;
-    let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, &[]);
+    let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, entry.types);
     let mut analysis_errors = Vec::new();
     let mut deferred_resolution_error = None;
     for owner in owners {
@@ -288,7 +362,7 @@ fn prepare_owned_typed_ir(
                 typing::analyze_source_type_consistency(
                     &parsed,
                     owner.policy.typing_mode,
-                    &[],
+                    entry.types,
                     source_name,
                     host_error.as_ref(),
                 )
@@ -298,7 +372,7 @@ fn prepare_owned_typed_ir(
             typing::validate_source_type_consistency(
                 &parsed,
                 owner.policy.typing_mode,
-                &[],
+                entry.types,
                 source_name,
             )
             .map_err(SourceError::Compile)?;
@@ -323,22 +397,28 @@ fn prepare_owned_typed_ir(
     }
     let logical_schemas = type_info.logical_schemas();
     parsed.semantic_index = Some(SemanticIndex::build(logical_schemas.clone(), &parsed));
-    let owned_ir =
-        match enforce_owned_sources(parsed.clone(), &type_info, owners, behavior, sources) {
-            Ok(owned) => owned,
-            Err(error)
-                if !behavior.recover_host_errors
-                    && host_error.as_ref().is_some_and(|host| {
-                        resource_copy_duplicates_host_call(&parsed, host, &error)
-                    }) =>
-            {
-                // The resolver already rejected this exact call's argument passing.
-                // Retain its primary diagnostic without bypassing source hooks. This
-                // admission-only IR cannot reach codegen: host_error is returned below.
-                parsed.clone()
-            }
-            Err(error) => return Err(SourceError::Parse(error)),
-        };
+    let owned_ir = match enforce_owned_sources(
+        parsed.clone(),
+        &type_info,
+        owners,
+        behavior,
+        sources,
+        entry.availability,
+    ) {
+        Ok(owned) => owned,
+        Err(error)
+            if !behavior.recover_host_errors
+                && host_error.as_ref().is_some_and(|host| {
+                    resource_copy_duplicates_host_call(&parsed, host, &error)
+                }) =>
+        {
+            // The resolver already rejected this exact call's argument passing.
+            // Retain its primary diagnostic without bypassing source hooks. This
+            // admission-only IR cannot reach codegen: host_error is returned below.
+            parsed.clone()
+        }
+        Err(error) => return Err(SourceError::Parse(error)),
+    };
     for owner in owners {
         if let Some(plugin) = owner.plugin {
             let typed = FrontendTypedIr {
@@ -412,6 +492,7 @@ fn enforce_owned_sources(
     owners: &[TypedSourceOwner<'_>],
     behavior: CompileBehavior,
     sources: &SourceMap,
+    entry_locals: &[lifetime::EntryLocalAvailability],
 ) -> Result<FrontendIr, ParseError> {
     let owned_slots = facts
         .local_schemas
@@ -426,8 +507,9 @@ fn enforce_owned_sources(
         .iter()
         .map(|owner| (owner.source_name.clone(), owner.policy.ownership_checking))
         .collect();
-    lifetime::enforce_source_availability(
+    lifetime::enforce_source_availability_with_entry_locals(
         ir,
+        entry_locals,
         behavior.clear_dead_locals,
         &owned_slots,
         &policies,
@@ -1454,6 +1536,7 @@ fn analyze_parsed_output(
         &options,
         CompileBehavior::ANALYZE,
         &source_map,
+        EntryLocalContext::default(),
     )?;
 
     Ok(match module_graph {
@@ -1997,13 +2080,36 @@ pub fn compile_source_for_repl_with_locals(
     let source_owned = source.to_string();
     let predefined_locals = predefined_locals.to_vec();
     run_with_compiler_stack(move || {
-        compile_source_for_repl_with_locals_impl(&source_owned, &predefined_locals, &[])
+        compile_source_for_repl_with_locals_impl(
+            &source_owned,
+            &predefined_locals,
+            &[],
+            &CompileSourceFileOptions::default(),
+        )
     })
 }
 
 pub fn compile_source_for_repl_with_state(
     source: &str,
     predefined_locals: &[ReplLocalState],
+) -> Result<CompiledReplProgram, SourceError> {
+    compile_source_for_repl_with_state_and_options(
+        source,
+        predefined_locals,
+        CompileSourceFileOptions::default(),
+    )
+}
+
+/// Compile the supported RustScript REPL frontend with an explicit catalog.
+/// Persisted-local semantics and strict ownership admission are unchanged.
+/// Module overrides and selected module producers use the generic checked
+/// admission pipeline. The executable snippet root remains native RustScript;
+/// registration alone never selects a file producer. Guest callables remain
+/// program-owned and resource handles remain scoped to their VM arena.
+pub fn compile_source_for_repl_with_state_and_options(
+    source: &str,
+    predefined_locals: &[ReplLocalState],
+    options: CompileSourceFileOptions,
 ) -> Result<CompiledReplProgram, SourceError> {
     let source_owned = source.to_string();
     let predefined_locals = predefined_locals.to_vec();
@@ -2017,7 +2123,7 @@ pub fn compile_source_for_repl_with_state(
             .filter(|state| state.moved)
             .map(|state| state.binding.name.clone())
             .collect::<Vec<_>>();
-        compile_source_for_repl_with_locals_impl(&source_owned, &bindings, &moved_names)
+        compile_source_for_repl_with_locals_impl(&source_owned, &bindings, &moved_names, &options)
     })
 }
 
@@ -2067,41 +2173,51 @@ fn compile_source_for_repl_with_locals_impl(
     source: &str,
     predefined_locals: &[ReplLocalBinding],
     moved_names: &[String],
+    options: &CompileSourceFileOptions,
 ) -> Result<CompiledReplProgram, SourceError> {
-    let mut source_map = SourceMap::new();
-    let source_id = source_map.add_source("<source>", source.to_string());
-    // REPL parsing/compiler entry state is separate from normal program compilation so
-    // persisted locals do not leak into the generic frontend or IR surface.
-    #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
-    let repl_catalog = Some(crate::builtins::runtime::http::http_host_catalog());
-    #[cfg(not(all(feature = "http-client", not(target_family = "wasm"))))]
-    let repl_catalog = None;
-    let parsed = frontends::parse_rustscript_repl_source_with_catalog(
-        source,
-        predefined_locals,
-        repl_catalog,
-    )
-    .map_err(|err| SourceError::Parse(err.with_line_span_from_source(&source_map, source_id)))?;
-    let entry_local_types = build_entry_local_types(&parsed.ir, predefined_locals);
-    let entry_availability =
-        build_entry_local_availability(&parsed.ir, predefined_locals, moved_names);
-    let compiled = match compile_parsed_output_with_entry_locals(
-        source.to_string(),
-        parsed.ir,
-        &entry_availability,
-        &entry_local_types,
-        CompileBehavior::REPL,
-        TypingMode::Strict,
-        true,
-    ) {
-        Err(SourceError::Parse(err)) => Err(SourceError::Parse(
-            err.with_line_span_from_source(&source_map, source_id),
-        )),
-        other => other,
-    }?;
-    Ok(CompiledReplProgram {
-        compiled,
-        bindings: parsed.bindings,
+    let effective = default_http_compile_catalog_options(SourceFlavor::RustScript, options);
+    let compile = || -> Result<CompiledReplProgram, SourcePathError> {
+        let path = virtual_inmemory_entry_path(SourceFlavor::RustScript, &effective)?;
+        let loaded = super::source_loader::load_units_with_entry_locals(
+            &path,
+            SourceFlavor::RustScript,
+            source,
+            &effective,
+            None,
+            Some(predefined_locals),
+        )?;
+        let bindings = loaded.repl_bindings;
+        let policy = frontend_policy_for_flavor(SourceFlavor::RustScript, &effective)?;
+        let prepared = prepare_typed_units_with_entry(
+            loaded.units,
+            loaded.sources,
+            policy,
+            SourceFlavor::RustScript,
+            &effective,
+            UnitPreparation {
+                behavior: CompileBehavior::REPL,
+                module_graph: Some(loaded.module_graph),
+                repl: Some((predefined_locals, moved_names)),
+            },
+        )?;
+        let debug_ranges = collect_named_local_debug_ranges(&prepared.ir);
+        let compiled = compile_owned_ir_output(
+            source.to_string(),
+            prepared.owned_ir,
+            &prepared.entry_local_types,
+            policy.typing_mode,
+            policy.ownership_checking,
+            debug_ranges,
+        )
+        .map_err(|error| SourcePathError::SourceWithMap {
+            error,
+            sources: prepared.sources,
+        })?;
+        Ok(CompiledReplProgram { compiled, bindings })
+    };
+    compile().map_err(|error| match error {
+        SourcePathError::Source(error) | SourcePathError::SourceWithMap { error, .. } => error,
+        other => SourceError::Parse(ParseError::new(other.to_string())),
     })
 }
 

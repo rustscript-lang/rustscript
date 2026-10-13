@@ -32,6 +32,91 @@ impl Default for CliRuntime {
     }
 }
 
+type VmInitializer<'a> = Box<dyn Fn(&mut Vm) -> crate::VmResult<()> + 'a>;
+
+/// Embedding-owned compiler catalog and fresh registry factory.
+///
+/// The factory is called once for each VM. Return a fresh registry to keep its
+/// binding-plan cache scoped to that VM; cloning a shared registry deliberately
+/// retains the caller's existing cache and handler captures. Initialization runs
+/// after exact binding and before any guest code. Failure drops the entire VM,
+/// including partially initialized resources. This configuration owns no global state.
+pub struct CliHostServices<'a> {
+    catalog: Option<std::sync::Arc<crate::HostApiCatalog>>,
+    registry_factory: Box<dyn Fn() -> crate::VmResult<HostFunctionRegistry> + 'a>,
+    vm_init: VmInitializer<'a>,
+    legacy: bool,
+}
+
+impl<'a> CliHostServices<'a> {
+    pub fn new(
+        catalog: std::sync::Arc<crate::HostApiCatalog>,
+        registry_factory: impl Fn() -> crate::VmResult<HostFunctionRegistry> + 'a,
+    ) -> Self {
+        Self {
+            catalog: Some(catalog),
+            registry_factory: Box::new(registry_factory),
+            vm_init: Box::new(|_| Ok(())),
+            legacy: false,
+        }
+    }
+
+    pub fn with_vm_init(mut self, init: impl Fn(&mut Vm) -> crate::VmResult<()> + 'a) -> Self {
+        self.vm_init = Box::new(init);
+        self
+    }
+
+    /// Explicit options must describe the same catalog; they are never merged or replaced.
+    pub fn compile_options(
+        &self,
+        mut options: CompileSourceFileOptions,
+    ) -> Result<CompileSourceFileOptions, io::Error> {
+        if let Some(catalog) = &self.catalog {
+            if let Some(explicit) = options.host_api_catalog()
+                && explicit.as_ref() != catalog.as_ref()
+            {
+                return Err(io::Error::other(
+                    "CLI compiler catalog conflicts with host services",
+                ));
+            }
+            options.set_host_api_catalog(std::sync::Arc::clone(catalog));
+        }
+        Ok(options)
+    }
+
+    fn initialize_vm(&self, vm: &mut Vm) -> Result<(), io::Error> {
+        if self.legacy {
+            let imports = vm.program().imports.clone();
+            register_imports(vm, &imports)?;
+        } else {
+            if let Some(catalog) = &self.catalog {
+                for schema in vm.program().host_import_schemas.iter().flatten() {
+                    if !crate::catalog_import_schemas(catalog, &schema.name).contains(schema) {
+                        return Err(io::Error::other(format!(
+                            "host import '{}' conflicts with CLI services catalog",
+                            schema.name
+                        )));
+                    }
+                }
+            }
+            let registry = (self.registry_factory)().map_err(io::Error::other)?;
+            registry.bind_vm_cached(vm).map_err(io::Error::other)?;
+        }
+        (self.vm_init)(vm).map_err(io::Error::other)
+    }
+}
+
+impl Default for CliHostServices<'_> {
+    fn default() -> Self {
+        Self {
+            catalog: None,
+            registry_factory: Box::new(|| Ok(cli_host_registry().clone())),
+            vm_init: Box::new(|_| Ok(())),
+            legacy: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CliConfig {
     source: Option<String>,
@@ -94,16 +179,29 @@ impl Default for CliConfig {
 }
 
 pub fn main(runtime: CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
-    if let Err(err) = run_main(&runtime) {
+    main_with_services(runtime, CliHostServices::default())
+}
+
+/// Process entrypoint with embedding-owned host services; retains CLI exit behavior.
+pub fn main_with_services(
+    runtime: CliRuntime,
+    services: CliHostServices<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Err(err) = run_with_args(&runtime, &args, &services) {
         eprintln!("{err}");
         std::process::exit(1);
     }
     Ok(())
 }
 
-fn run_main(runtime: &CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let cli = parse_cli_args(&args).map_err(io::Error::other)?;
+/// Run explicit CLI arguments without terminating the embedding process.
+pub fn run_with_args(
+    runtime: &CliRuntime,
+    args: &[String],
+    services: &CliHostServices<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cli = parse_cli_args(args).map_err(io::Error::other)?;
     if cli.version {
         println!("{}", binary_version_text(runtime.binary_name));
         return Ok(());
@@ -112,11 +210,12 @@ fn run_main(runtime: &CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
         print_usage(runtime.binary_name);
         return Ok(());
     }
+    let options = services.compile_options((runtime.compile_options)())?;
     if cli.fmt {
-        return run_fmt(&cli, runtime);
+        return run_fmt(&cli, runtime, &options);
     }
     if cli.repl {
-        return run_repl();
+        return run_repl_with_options(options, services);
     }
     if let Some(input_path) = cli.disasm_vmbc_path.as_ref() {
         let bytes = std::fs::read(input_path)?;
@@ -135,7 +234,7 @@ fn run_main(runtime: &CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if let Some(mut vm) = try_new_cli_vm_from_standalone_aot(&cli)? {
+    if let Some(mut vm) = try_new_cli_vm_from_standalone_aot_with_services(&cli, services)? {
         if let Some(output_path) = cli.emit_vmbc_path.as_ref() {
             let encoded = encode_program(vm.program())?;
             std::fs::write(output_path, &encoded)?;
@@ -143,7 +242,6 @@ fn run_main(runtime: &CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
 
-        apply_runtime_flags(&mut vm, &cli)?;
         run_vm_loop(&mut vm, None, cli.fuel)?;
         if cli.aot_dump {
             println!("{}", vm.dump_aot_info());
@@ -158,19 +256,32 @@ fn run_main(runtime: &CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let source_path = resolve_source_path(cli.source.as_deref(), runtime.default_source)?;
-    let compiled = compile_source_file_with_options(&source_path, (runtime.compile_options)())
-        .map_err(|err| io::Error::other(render_source_path_error(&source_path, &err)))?;
-    if let Some(output_path) = cli.emit_vmbc_path.as_ref() {
-        let encoded = encode_program(&compiled.program)?;
+    let program = if source_path.extension().is_some_and(|ext| ext == "vmbc") {
+        crate::decode_program(&std::fs::read(&source_path)?)?
+    } else {
+        let compiled = compile_source_file_with_options(&source_path, options)
+            .map_err(|err| io::Error::other(render_source_path_error(&source_path, &err)))?;
+        compiled.program.with_local_count(compiled.locals)
+    };
+    // Legacy emit is compilation-only and does not require runtime adapters.
+    if services.legacy
+        && let Some(output_path) = cli.emit_vmbc_path.as_ref()
+    {
+        let encoded = encode_program(&program)?;
         std::fs::write(output_path, &encoded)?;
         println!("wrote {} bytes to {}", encoded.len(), output_path);
         return Ok(());
     }
-    let recording_program = cli.record_path.as_ref().map(|_| compiled.program.clone());
-    let mut vm = new_cli_vm(compiled.program.with_local_count(compiled.locals), &cli);
+    let recording_program = cli.record_path.as_ref().map(|_| program.clone());
+    let mut vm = new_cli_vm(program, &cli);
     apply_runtime_flags(&mut vm, &cli)?;
-    let imports = vm.program().imports.clone();
-    register_imports(&mut vm, &imports)?;
+    services.initialize_vm(&mut vm)?;
+    if let Some(output_path) = cli.emit_vmbc_path.as_ref() {
+        let encoded = encode_program(vm.program())?;
+        std::fs::write(output_path, &encoded)?;
+        println!("wrote {} bytes to {}", encoded.len(), output_path);
+        return Ok(());
+    }
     prepare_aot_for_cli(&mut vm, &cli)?;
 
     if let Some(record_path) = cli.record_path.as_ref() {
@@ -217,7 +328,15 @@ fn run_main(runtime: &CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(test)]
 fn try_new_cli_vm_from_standalone_aot(cli: &CliConfig) -> Result<Option<Vm>, io::Error> {
+    try_new_cli_vm_from_standalone_aot_with_services(cli, &CliHostServices::default())
+}
+
+fn try_new_cli_vm_from_standalone_aot_with_services(
+    cli: &CliConfig,
+    services: &CliHostServices<'_>,
+) -> Result<Option<Vm>, io::Error> {
     let Some(path) = cli.aot_load_path.as_deref() else {
         return Ok(None);
     };
@@ -228,8 +347,8 @@ fn try_new_cli_vm_from_standalone_aot(cli: &CliConfig) -> Result<Option<Vm>, io:
     let mut vm = Vm::new_from_aot_artifact_file_with_jit_config(path, cli_jit_config(cli))
         .map_err(io::Error::other)?;
     configure_cli_vm(&mut vm);
-    let imports = vm.program().imports.clone();
-    register_imports(&mut vm, &imports)?;
+    apply_runtime_flags(&mut vm, cli)?;
+    services.initialize_vm(&mut vm)?;
 
     if let Some(save_path) = cli.aot_save_path.as_deref() {
         vm.save_aot_artifact_to_file(save_path)
@@ -405,7 +524,11 @@ fn render_format_path_error(source_path: &Path, source: &str, err: &vm::FormatEr
     }
 }
 
-fn run_fmt(cli: &CliConfig, runtime: &CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
+fn run_fmt(
+    cli: &CliConfig,
+    runtime: &CliRuntime,
+    options: &CompileSourceFileOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
     let source_arg = cli
         .source
         .as_deref()
@@ -413,8 +536,7 @@ fn run_fmt(cli: &CliConfig, runtime: &CliRuntime) -> Result<(), Box<dyn std::err
     let source_path = resolve_source_path(Some(source_arg), runtime.default_source)?;
     let flavor = source_flavor_from_path(&source_path)?;
     let source = std::fs::read_to_string(&source_path)?;
-    let options = (runtime.compile_options)();
-    let formatted = format_source_with_flavor_and_options(&source, flavor, &options)
+    let formatted = format_source_with_flavor_and_options(&source, flavor, options)
         .map_err(|err| io::Error::other(render_format_path_error(&source_path, &source, &err)))?;
 
     if cli.fmt_check {
@@ -962,7 +1084,13 @@ fn binary_version_text(binary: &str) -> String {
     }
 }
 
-fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
+/// Run the supported RustScript REPL with caller options and per-VM host services.
+/// Guest callable locals retain the existing program-replacement invalidation rule.
+pub fn run_repl_with_options(
+    options: CompileSourceFileOptions,
+    services: &CliHostServices<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let options = services.compile_options(options)?;
     println!("pd-vm REPL (RustScript)");
     println!("features: {}", cli_build_feature_summary());
     println!("history: up/down arrows, commands: .help, .quit, .cancel");
@@ -1010,13 +1138,14 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let _ = editor.add_history_entry(&snippet);
-                let compiled = match compile_repl_snippet(&snippet, &session.locals) {
-                    Ok(compiled) => compiled,
-                    Err(err) => {
-                        println!("{}", render_repl_compile_error(&snippet, &err));
-                        continue;
-                    }
-                };
+                let compiled =
+                    match compile_repl_snippet_with_options(&snippet, &session.locals, &options) {
+                        Ok(compiled) => compiled,
+                        Err(err) => {
+                            println!("{}", render_repl_compile_error(&snippet, &err));
+                            continue;
+                        }
+                    };
                 let moved_by_rebinding =
                     repl_locals_moved_by_rebinding(&compiled.compiled.program, &session.locals);
                 let no_repl_moves = BTreeSet::new();
@@ -1028,8 +1157,7 @@ fn run_repl() -> Result<(), Box<dyn std::error::Error>> {
                     JitConfig::default(),
                 );
                 configure_cli_vm(&mut vm);
-                let imports = vm.program().imports.clone();
-                if let Err(err) = register_imports(&mut vm, &imports) {
+                if let Err(err) = services.initialize_vm(&mut vm) {
                     println!("{err}");
                     continue;
                 }
@@ -1289,9 +1417,18 @@ fn handle_repl_command(line: &str) -> Option<ReplAction> {
     }
 }
 
+#[cfg(test)]
 fn compile_repl_snippet(
     input: &str,
     locals: &BTreeMap<String, ReplSessionLocal>,
+) -> Result<vm::CompiledReplProgram, vm::SourceError> {
+    compile_repl_snippet_with_options(input, locals, &CompileSourceFileOptions::default())
+}
+
+fn compile_repl_snippet_with_options(
+    input: &str,
+    locals: &BTreeMap<String, ReplSessionLocal>,
+    options: &CompileSourceFileOptions,
 ) -> Result<vm::CompiledReplProgram, vm::SourceError> {
     let trimmed = input.trim_end();
     let bindings = locals
@@ -1306,14 +1443,22 @@ fn compile_repl_snippet(
             moved: local.moved,
         })
         .collect::<Vec<_>>();
-    match vm::compiler::compile_source_for_repl_with_state(trimmed, &bindings) {
+    match vm::compiler::compile_source_for_repl_with_state_and_options(
+        trimmed,
+        &bindings,
+        options.clone(),
+    ) {
         Ok(compiled) => Ok(compiled),
         Err(first_err) => {
             if trimmed.ends_with(';') {
                 return Err(first_err);
             }
             let fallback = format!("{trimmed};");
-            match vm::compiler::compile_source_for_repl_with_state(&fallback, &bindings) {
+            match vm::compiler::compile_source_for_repl_with_state_and_options(
+                &fallback,
+                &bindings,
+                options.clone(),
+            ) {
                 Ok(compiled) => Ok(compiled),
                 Err(err @ vm::SourceError::Parse(vm::ParseError { code: Some(_), .. })) => Err(err),
                 Err(err @ vm::SourceError::Compile(_)) => Err(err),
