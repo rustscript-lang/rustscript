@@ -428,16 +428,21 @@ pub(super) fn infer_types_with_capture_origins(
         &mut callable_slots,
         &mut optional_slots,
     );
-    collect_stmt_types(
-        &ir.stmts,
-        &mut top_state,
-        &mut local_types,
-        &mut local_schemas,
-        &mut local_schema_labels,
-        &mut callable_slots,
-        &mut optional_slots,
-        &mut context,
-    );
+    for (index, stmt) in ir.stmts.iter().enumerate() {
+        context.capture_owner = Some(super::capture_certification::CaptureOwner::RootStatement(
+            index,
+        ));
+        collect_stmt_types(
+            std::slice::from_ref(stmt),
+            &mut top_state,
+            &mut local_types,
+            &mut local_schemas,
+            &mut local_schema_labels,
+            &mut callable_slots,
+            &mut optional_slots,
+            &mut context,
+        );
+    }
     // The backend collector intentionally summarizes expressions without
     // exporting their writes. Replay only the requested root view with mutable
     // expression state and a separate context, leaving backend observations intact.

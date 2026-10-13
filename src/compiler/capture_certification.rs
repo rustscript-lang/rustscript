@@ -42,9 +42,54 @@ pub(super) struct DeclarationCaptures {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CaptureDeclaration {
     Named(u16),
-    AnonymousIn(Option<u16>),
+    AnonymousIn(Option<CaptureOwner>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CaptureOwner {
+    Function(u16),
+    RootStatement(usize),
+}
+
+/// The standalone parser registers exactly one producer; linked compilation
+/// instead requires the preserved per-declaration/per-statement source map.
+/// Neither variant supplies a fallback owner for linked IR.
+#[derive(Clone, Copy)]
+pub(super) enum CaptureProducerPolicies<'a> {
+    Linked(&'a std::collections::HashMap<String, bool>),
+    Standalone {
+        source: &'a str,
+        policies: &'a std::collections::HashMap<String, bool>,
+    },
 }
 impl DeclarationCaptures {
+    pub(super) fn retain_admitted_producers(
+        &mut self,
+        ir: &super::FrontendIr,
+        admission: CaptureProducerPolicies<'_>,
+    ) {
+        self.observations.retain(|(declaration, _)| {
+            let source = match declaration {
+                CaptureDeclaration::Named(index)
+                | CaptureDeclaration::AnonymousIn(Some(CaptureOwner::Function(index))) => {
+                    ir.function_sources.get(index).map(String::as_str)
+                }
+                CaptureDeclaration::AnonymousIn(Some(CaptureOwner::RootStatement(index))) => ir
+                    .stmt_sources
+                    .get(*index)
+                    .and_then(|source| source.as_deref()),
+                CaptureDeclaration::AnonymousIn(None) => return false,
+            };
+            let (source, policies) = match admission {
+                CaptureProducerPolicies::Linked(policies) => (source, policies),
+                CaptureProducerPolicies::Standalone { source, policies } => {
+                    (Some(source), policies)
+                }
+            };
+            source.and_then(|source| policies.get(source)).copied() == Some(true)
+        });
+    }
+
     pub(super) fn observe(&mut self, declaration: CaptureDeclaration, facts: Vec<CaptureFact>) {
         if facts.is_empty() {
             return;
@@ -113,6 +158,74 @@ impl DeclarationCaptures {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_producer_or_policy_cannot_certify_named_or_root_captures() {
+        struct Dialect;
+        impl crate::ParserDialect for Dialect {}
+        let parsed = crate::parse_source_with_dialect(
+            "let value=41; fn named()->int {value} let anonymous=||value; named(); anonymous();",
+            &Dialect,
+            crate::SharedParserOptions::default(),
+        )
+        .unwrap();
+        let policies = std::collections::HashMap::from([("producer".to_owned(), true)]);
+        let mut ir = parsed.clone();
+        ir.stmt_sources = vec![Some("producer".to_owned()); ir.stmts.len()];
+        ir.function_sources = ir
+            .function_impls
+            .keys()
+            .map(|index| (*index, "producer".to_owned()))
+            .collect();
+        let infer = |ir: &crate::FrontendIr| {
+            super::super::typing::infer_types_with_capture_origins(
+                ir,
+                super::super::TypingMode::DynamicHints,
+                &[],
+                &[],
+            )
+            .2
+        };
+        let mut known = infer(&ir);
+        known.retain_admitted_producers(&ir, super::CaptureProducerPolicies::Linked(&policies));
+        assert!(
+            known
+                .observations
+                .iter()
+                .any(|(id, _)| matches!(id, super::CaptureDeclaration::Named(_)))
+        );
+        assert!(
+            known
+                .observations
+                .iter()
+                .any(|(id, _)| matches!(id, super::CaptureDeclaration::AnonymousIn(_)))
+        );
+        let mut unknown = infer(&parsed);
+        unknown
+            .retain_admitted_producers(&parsed, super::CaptureProducerPolicies::Linked(&policies));
+        assert!(unknown.observations.is_empty());
+        for policies in [
+            std::collections::HashMap::new(),
+            std::collections::HashMap::from([("producer".to_owned(), false)]),
+        ] {
+            let mut denied = infer(&ir);
+            denied
+                .retain_admitted_producers(&ir, super::CaptureProducerPolicies::Linked(&policies));
+            assert!(denied.observations.is_empty());
+        }
+        ir.function_sources.clear();
+        let mut root_only = infer(&ir);
+        root_only.retain_admitted_producers(&ir, super::CaptureProducerPolicies::Linked(&policies));
+        assert!(!root_only.observations.is_empty());
+        assert!(root_only.observations.iter().all(|(id, _)| matches!(
+            id,
+            super::CaptureDeclaration::AnonymousIn(Some(super::CaptureOwner::RootStatement(_)))
+        )));
+        ir.stmt_sources.clear();
+        let mut absent = infer(&ir);
+        absent.retain_admitted_producers(&ir, super::CaptureProducerPolicies::Linked(&policies));
+        assert!(absent.observations.is_empty());
+    }
+
     #[test]
     fn ordinary_conversion_preserves_source_program_and_errors() {
         let source = "let value = 41; value + 1;";

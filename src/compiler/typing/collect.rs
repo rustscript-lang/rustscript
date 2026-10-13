@@ -541,7 +541,9 @@ pub(super) fn collect_function_types(
         TypingMode::DynamicHints,
         None,
     );
-    context.capture_owner = Some(function_index);
+    context.capture_owner = Some(super::super::capture_certification::CaptureOwner::Function(
+        function_index,
+    ));
     seed_function_param_state(
         &mut state,
         &function_impl.param_slots,

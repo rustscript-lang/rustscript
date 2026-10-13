@@ -58,8 +58,8 @@ pub struct Compiler {
     script_functions: Vec<ScriptFunction>,
     callable_prototypes: Vec<CallablePrototype>,
     capture_creation_sites: Vec<(usize, u32)>,
-    capture_owner: Option<u16>,
-    closure_capture_owners: HashMap<u32, Option<u16>>,
+    capture_owner: Option<super::capture_certification::CaptureOwner>,
+    closure_capture_owners: HashMap<u32, Option<super::capture_certification::CaptureOwner>>,
     function_regions: Vec<FunctionRegion>,
     root_callable_bindings: Vec<RootCallableBinding>,
     pending_closures: Vec<(u32, ClosureExpr)>,
@@ -235,7 +235,13 @@ impl Compiler {
         )>,
     ) -> Result<Program, CompileError> {
         let named_functions = self.prepare_named_callables()?;
-        self.compile_stmts(stmts)?;
+        for (index, stmt) in stmts.iter().enumerate() {
+            self.capture_owner = Some(super::capture_certification::CaptureOwner::RootStatement(
+                index,
+            ));
+            self.compile_stmt(stmt)?;
+        }
+        self.capture_owner = None;
         self.assembler.ret();
         let root_end = self.assembler.position();
         if root_end > 0 {
@@ -467,7 +473,11 @@ impl Compiler {
     }
 
     fn compile_named_function_body(&mut self, function_index: u16) -> Result<(), CompileError> {
-        let owner_snapshot = self.capture_owner.replace(function_index);
+        let owner_snapshot =
+            self.capture_owner
+                .replace(super::capture_certification::CaptureOwner::Function(
+                    function_index,
+                ));
         let function_impl = self
             .function_impls
             .get(&function_index)

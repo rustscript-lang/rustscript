@@ -113,7 +113,7 @@ pub(super) struct TypeContext<'a> {
     pub(super) observed_function_param_capture_states: HashMap<u16, Vec<Option<LocalTypeState>>>,
     pub(super) observed_function_capture_states: HashMap<u16, LocalTypeState>,
     pub(super) capture_origins: super::super::capture_certification::DeclarationCaptures,
-    pub(super) capture_owner: Option<u16>,
+    pub(super) capture_owner: Option<super::super::capture_certification::CaptureOwner>,
     pub(super) function_param_conflicts: HashMap<u16, String>,
     observed_return_types: HashMap<(u16, Vec<String>), BoundType>,
     observed_return_schemas: HashMap<(u16, Vec<String>), Option<TypeSchema>>,

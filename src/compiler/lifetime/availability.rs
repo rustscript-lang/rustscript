@@ -183,6 +183,7 @@ pub(super) fn enforce_source_availability(
 
     let mut state = FlowState::reachable_with_entry_locals(ir.locals, entry_locals);
     let mut rewritten_stmts = Vec::new();
+    let mut rewritten_sources = Vec::new();
     let mut start = 0;
     while start < ir.stmts.len() {
         let source = ir
@@ -213,11 +214,13 @@ pub(super) fn enforce_source_availability(
         let (stmts, next) = analyzer
             .analyze_block(&ir.stmts[start..end], state, true)
             .map_err(|error| attach_owner(error, source))?;
+        rewritten_sources.extend(std::iter::repeat_n(source.map(str::to_owned), stmts.len()));
         rewritten_stmts.extend(stmts);
         state = next;
         start = end;
     }
     ir.stmts = rewritten_stmts;
+    ir.stmt_sources = rewritten_sources;
     ir.function_impls = rewritten_impls;
 
     if clear_dead_locals {
@@ -228,7 +231,8 @@ pub(super) fn enforce_source_availability(
             &owned_slots,
         );
         let persistent_slots = persistent_capture_slots(&ir.stmts, &ir.function_impls);
-        ir.stmts = liveness.rewrite_program_block(&ir.stmts);
+        (ir.stmts, ir.stmt_sources) =
+            liveness.rewrite_program_block_with_sources(&ir.stmts, &ir.stmt_sources);
         for function_impl in ir.function_impls.values_mut() {
             *function_impl =
                 liveness.rewrite_function_impl(function_impl.clone(), &persistent_slots);
