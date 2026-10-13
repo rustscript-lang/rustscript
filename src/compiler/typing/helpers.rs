@@ -735,6 +735,22 @@ pub(super) fn validate_stmts(
                     context,
                     strict_function_add_types,
                 )?;
+                if matches!(expr, Expr::Closure(_))
+                    && let Some(schema @ TypeSchema::Callable { .. }) = declared_schema.as_ref()
+                {
+                    validate_callable_expr_against_schema(
+                        "local",
+                        schema,
+                        expr,
+                        &expr_state,
+                        DiagnosticSite {
+                            line: Some(*line),
+                            source_name,
+                            span: context.stmt_span(*line),
+                        },
+                        context,
+                    )?;
+                }
                 let actual_schema = inferred_expr_assignment_schema(expr, &expr_state, context);
                 validate_declared_local_schema(
                     declared_schema.as_ref(),
@@ -787,6 +803,22 @@ pub(super) fn validate_stmts(
                     .has_declared_schema(*index)
                     .then(|| state.schema(*index).cloned())
                     .flatten();
+                if matches!(expr, Expr::Closure(_))
+                    && let Some(schema @ TypeSchema::Callable { .. }) = declared_schema.as_ref()
+                {
+                    validate_callable_expr_against_schema(
+                        "local",
+                        schema,
+                        expr,
+                        &expr_state,
+                        DiagnosticSite {
+                            line: Some(*line),
+                            source_name,
+                            span: context.stmt_span(*line),
+                        },
+                        context,
+                    )?;
+                }
                 let actual_schema = inferred_expr_assignment_schema(expr, &expr_state, context);
                 validate_declared_local_schema(
                     declared_schema.as_ref(),
@@ -1197,6 +1229,15 @@ fn find_declared_schema_mismatch_with_recursion(
             };
         }
         TypeSchema::Named(name, type_args) => {
+            if let Some(declaration) = context.struct_schemas.get(name)
+                && declaration.type_params.len() != type_args.len()
+            {
+                return Some(format!(
+                    "named type '{name}' expects {} type argument(s), got {}",
+                    declaration.type_params.len(),
+                    type_args.len()
+                ));
+            }
             let instance = render_schema_path_segment(name, type_args);
             let is_recursive = !recursive_named.insert(instance.clone());
             let resolved = context.resolve_schema(expected);
@@ -1334,6 +1375,9 @@ fn find_declared_schema_mismatch_with_recursion(
                 for (name, expected_field) in expected_fields {
                     let field_path = extend_schema_path(&path, name);
                     let Some(actual_field) = actual_fields.get(name) else {
+                        if matches!(expected_field, TypeSchema::Optional(_)) {
+                            continue;
+                        }
                         return Some(format!(
                             "field '{}' is required by the declared schema but is missing",
                             field_path
@@ -2334,10 +2378,80 @@ mod tests {
             &names,
             &host_returns,
             &host_sigs,
-            TypingMode::StrictRustScript,
+            TypingMode::Strict,
             None,
         );
         find_declared_schema_mismatch(expected, actual, &mut context, String::new())
+    }
+
+    #[test]
+    fn omitted_optional_object_field_is_compatible() {
+        let expected = TypeSchema::Object(HashMap::from([
+            ("count".to_string(), TypeSchema::Int),
+            (
+                "note".to_string(),
+                TypeSchema::Optional(Box::new(TypeSchema::String)),
+            ),
+        ]));
+        let actual = TypeSchema::Object(HashMap::from([("count".to_string(), TypeSchema::Int)]));
+        assert_eq!(schema_mismatch(&expected, &actual), None);
+    }
+
+    #[test]
+    fn optional_object_field_does_not_hide_missing_required_resource() {
+        let expected = TypeSchema::Object(HashMap::from([
+            ("handle".to_string(), sqlite()),
+            (
+                "note".to_string(),
+                TypeSchema::Optional(Box::new(TypeSchema::String)),
+            ),
+        ]));
+        let actual = TypeSchema::Object(HashMap::new());
+        assert_eq!(
+            schema_mismatch(&expected, &actual).as_deref(),
+            Some("field 'handle' is required by the declared schema but is missing")
+        );
+    }
+
+    #[test]
+    fn optional_resource_object_field_accepts_absence_null_and_exact_key_only() {
+        let expected = TypeSchema::Object(HashMap::from([(
+            "handle".to_string(),
+            TypeSchema::Optional(Box::new(sqlite())),
+        )]));
+        assert_eq!(
+            schema_mismatch(&expected, &TypeSchema::Object(HashMap::new())),
+            None
+        );
+        for valid in [TypeSchema::Null, sqlite()] {
+            let actual = TypeSchema::Object(HashMap::from([("handle".to_string(), valid)]));
+            assert_eq!(schema_mismatch(&expected, &actual), None);
+        }
+        for invalid in [io_file(), TypeSchema::Int] {
+            let actual = TypeSchema::Object(HashMap::from([("handle".to_string(), invalid)]));
+            let detail = schema_mismatch(&expected, &actual).expect("present resource must match");
+            assert!(detail.contains("field 'handle'"), "{detail}");
+            assert!(detail.contains("resource<sqlite.connection>"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn optional_object_field_keeps_present_nested_required_diagnostic() {
+        let expected = TypeSchema::Object(HashMap::from([(
+            "parcel".to_string(),
+            TypeSchema::Optional(Box::new(TypeSchema::Object(HashMap::from([(
+                "count".to_string(),
+                TypeSchema::Int,
+            )])))),
+        )]));
+        let actual = TypeSchema::Object(HashMap::from([(
+            "parcel".to_string(),
+            TypeSchema::Object(HashMap::new()),
+        )]));
+        assert_eq!(
+            schema_mismatch(&expected, &actual).as_deref(),
+            Some("field 'parcel.count' is required by the declared schema but is missing")
+        );
     }
 
     #[test]

@@ -1429,6 +1429,7 @@ impl Parser {
             false,
         );
         Ok(Expr::OptionalGet {
+            field_projection: false,
             container: Box::new(container),
             key: Box::new(key),
             container_slot: self.allocate_hidden_local()?,

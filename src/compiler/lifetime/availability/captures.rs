@@ -91,6 +91,18 @@ impl AvailabilityAnalyzer {
             self.require_local_not_partially_moved(*source_slot, state, line)?;
         }
 
+        let closure_state = self.closure_flow_state(closure, state, line)?;
+        self.analyze_expr(&closure.body, &closure_state, line)?;
+        Ok(())
+    }
+
+    /// Reuse the exact capture/parameter facts for nested ownership lowering.
+    pub(super) fn closure_flow_state(
+        &self,
+        closure: &ClosureExpr,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<FlowState, ParseError> {
         let mut closure_state = FlowState::reachable(self.local_count);
         for slot in &closure.param_slots {
             self.mark_available(&mut closure_state, *slot, line)?;
@@ -145,8 +157,7 @@ impl AvailabilityAnalyzer {
                 });
             }
         }
-        self.analyze_expr(&closure.body, &closure_state, line)?;
-        Ok(())
+        Ok(closure_state)
     }
 
     #[allow(clippy::too_many_arguments)]

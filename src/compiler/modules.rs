@@ -24,12 +24,12 @@
 //! text is registered in the compilation-wide `SourceMap` at its graph
 //! `SourceId`, so spans survive unit merge with their owning source.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::SourcePathError;
 use super::frontends::{is_ident_continue, is_ident_start};
-use super::source_loader::ImportClause;
+use super::source_loader::{DeclarationNamespace, ImportClause};
 use super::source_map::Span;
 
 /// Deterministic identity of one module within a single compilation.
@@ -109,6 +109,7 @@ pub struct ResolvedImport {
     /// Normalized module specifier (e.g. `./nested.rss`).
     pub spec: String,
     pub clause: ImportClause,
+    pub namespace: DeclarationNamespace,
     pub span: Span,
     pub line: usize,
     pub target: Option<ModuleId>,
@@ -124,6 +125,7 @@ pub struct ResolvedImport {
 pub struct DeclSymbol {
     pub symbol: SymbolId,
     pub name: String,
+    pub namespace: DeclarationNamespace,
     /// `true` when the declaration is marked `pub` and appears in the module's
     /// public export table.
     pub public: bool,
@@ -139,6 +141,7 @@ pub struct DeclSymbol {
 pub struct ExportEntry {
     pub name: String,
     pub symbol: SymbolId,
+    pub namespace: DeclarationNamespace,
 }
 
 /// A binding introduced into a module by a resolved import edge.
@@ -151,6 +154,7 @@ pub struct ExportEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportedBinding {
     pub local_name: String,
+    pub namespace: DeclarationNamespace,
     pub source_module: ModuleId,
     pub source_symbol: SymbolId,
     pub source_name: String,
@@ -177,6 +181,7 @@ pub struct ModuleNode {
     pub exports: Vec<ExportEntry>,
     /// Bindings introduced by import edges, separate from local declarations.
     pub imported_bindings: Vec<ImportedBinding>,
+    next_symbol_index: u32,
 }
 
 /// The module graph for one compilation.
@@ -190,6 +195,8 @@ pub struct ModuleNode {
 pub struct ModuleGraph {
     nodes: Vec<ModuleNode>,
     by_identity: HashMap<PathBuf, ModuleId>,
+    guest_named_types: HashSet<SymbolId>,
+    guest_type_aliases: HashMap<SymbolId, SymbolId>,
     next_source: u32,
 }
 
@@ -225,6 +232,7 @@ impl ModuleGraph {
             declarations: Vec::new(),
             exports: Vec::new(),
             imported_bindings: Vec::new(),
+            next_symbol_index: 0,
         });
         module
     }
@@ -272,8 +280,22 @@ impl ModuleGraph {
         name: &str,
         public: bool,
     ) -> Result<SymbolId, String> {
+        self.add_declaration_in_namespace(module, DeclarationNamespace::Value, name, public)
+    }
+
+    pub fn add_declaration_in_namespace(
+        &mut self,
+        module: ModuleId,
+        namespace: DeclarationNamespace,
+        name: &str,
+        public: bool,
+    ) -> Result<SymbolId, String> {
         let node = self.node_mut(module)?;
-        if node.declarations.iter().any(|decl| decl.name == name) {
+        if node
+            .declarations
+            .iter()
+            .any(|decl| decl.namespace == namespace && decl.name == name)
+        {
             return Err(format!(
                 "duplicate local declaration '{name}' in module '{}'",
                 node.source_name
@@ -282,28 +304,43 @@ impl ModuleGraph {
         if node
             .imported_bindings
             .iter()
-            .any(|binding| binding.local_name == name)
+            .any(|binding| binding.namespace == namespace && binding.local_name == name)
         {
             return Err(format!(
                 "local declaration '{name}' conflicts with an imported binding in module '{}'",
                 node.source_name
             ));
         }
-        let index = u32::try_from(node.declarations.len())
-            .map_err(|_| format!("too many declarations in module '{}'", node.source_name))?;
+        let index = node.next_symbol_index;
+        node.next_symbol_index = index
+            .checked_add(1)
+            .ok_or_else(|| format!("too many symbols in module '{}'", node.source_name))?;
         let symbol = SymbolId { module, index };
         node.declarations.push(DeclSymbol {
             symbol,
             name: name.to_string(),
+            namespace,
             public,
         });
         if public {
             node.exports.push(ExportEntry {
                 name: name.to_string(),
                 symbol,
+                namespace,
             });
         }
         Ok(symbol)
+    }
+
+    /// Allocate a symbol for a catalog-owned value import without inserting
+    /// it into guest declaration or export tables.
+    pub fn add_catalog_import_symbol(&mut self, module: ModuleId) -> Result<SymbolId, String> {
+        let node = self.node_mut(module)?;
+        let index = node.next_symbol_index;
+        node.next_symbol_index = index
+            .checked_add(1)
+            .ok_or_else(|| format!("too many symbols in module '{}'", node.source_name))?;
+        Ok(SymbolId { module, index })
     }
 
     /// Record one binding introduced by an import edge of `module`.
@@ -322,10 +359,20 @@ impl ModuleGraph {
         if node
             .declarations
             .iter()
-            .any(|decl| decl.name == binding.local_name)
+            .any(|decl| decl.namespace == binding.namespace && decl.name == binding.local_name)
         {
             return Err(format!(
                 "imported binding '{}' conflicts with a local declaration in module '{}'",
+                binding.local_name, node.source_name
+            ));
+        }
+        if binding.namespace == DeclarationNamespace::Type
+            && node.imported_bindings.iter().any(|existing| {
+                existing.namespace == binding.namespace && existing.local_name == binding.local_name
+            })
+        {
+            return Err(format!(
+                "ambiguous imported type '{}' in module '{}'",
                 binding.local_name, node.source_name
             ));
         }
@@ -333,33 +380,110 @@ impl ModuleGraph {
         Ok(())
     }
 
+    pub(crate) fn mark_guest_named_type(&mut self, symbol: SymbolId) -> Result<(), String> {
+        let declaration = self
+            .node(symbol.module)
+            .and_then(|node| node.declarations.iter().find(|decl| decl.symbol == symbol))
+            .ok_or_else(|| format!("unknown type declaration symbol {symbol:?}"))?;
+        if declaration.namespace != DeclarationNamespace::Type {
+            return Err(format!("symbol {symbol:?} is not a type declaration"));
+        }
+        self.guest_named_types.insert(symbol);
+        Ok(())
+    }
+
+    pub(crate) fn is_guest_named_type(&self, symbol: SymbolId) -> bool {
+        self.guest_named_types.contains(&symbol)
+    }
+
+    pub(crate) fn bind_guest_type_alias(&mut self, alias: SymbolId, declaration: SymbolId) {
+        self.guest_type_aliases.insert(alias, declaration);
+    }
+
+    /// Export bindings may rename a type without changing its nominal owner.
+    pub fn canonical_guest_type_symbol(&self, symbol: SymbolId) -> Option<SymbolId> {
+        self.is_guest_named_type(symbol).then(|| {
+            self.guest_type_aliases
+                .get(&symbol)
+                .copied()
+                .unwrap_or(symbol)
+        })
+    }
+
     pub fn declaration(&self, module: ModuleId, name: &str) -> Option<&DeclSymbol> {
+        self.declaration_in_namespace(module, DeclarationNamespace::Value, name)
+    }
+
+    pub fn declaration_in_namespace(
+        &self,
+        module: ModuleId,
+        namespace: DeclarationNamespace,
+        name: &str,
+    ) -> Option<&DeclSymbol> {
         self.node(module)?
             .declarations
             .iter()
-            .find(|decl| decl.name == name)
+            .find(|decl| decl.namespace == namespace && decl.name == name)
     }
 
     pub fn declaration_symbol(&self, module: ModuleId, name: &str) -> Option<SymbolId> {
         self.declaration(module, name).map(|decl| decl.symbol)
     }
 
+    pub fn declaration_symbol_in_namespace(
+        &self,
+        module: ModuleId,
+        namespace: DeclarationNamespace,
+        name: &str,
+    ) -> Option<SymbolId> {
+        self.declaration_in_namespace(module, namespace, name)
+            .map(|decl| decl.symbol)
+    }
+
     pub fn export(&self, module: ModuleId, name: &str) -> Option<&ExportEntry> {
+        self.export_in_namespace(module, DeclarationNamespace::Value, name)
+    }
+
+    pub fn export_in_namespace(
+        &self,
+        module: ModuleId,
+        namespace: DeclarationNamespace,
+        name: &str,
+    ) -> Option<&ExportEntry> {
         self.node(module)?
             .exports
             .iter()
-            .find(|entry| entry.name == name)
+            .find(|entry| entry.namespace == namespace && entry.name == name)
     }
 
     pub fn symbol_for_export(&self, module: ModuleId, name: &str) -> Option<SymbolId> {
         self.export(module, name).map(|entry| entry.symbol)
     }
 
+    pub fn symbol_for_export_in_namespace(
+        &self,
+        module: ModuleId,
+        namespace: DeclarationNamespace,
+        name: &str,
+    ) -> Option<SymbolId> {
+        self.export_in_namespace(module, namespace, name)
+            .map(|entry| entry.symbol)
+    }
+
     pub fn imported_binding(&self, module: ModuleId, name: &str) -> Option<&ImportedBinding> {
+        self.imported_binding_in_namespace(module, DeclarationNamespace::Value, name)
+    }
+
+    pub fn imported_binding_in_namespace(
+        &self,
+        module: ModuleId,
+        namespace: DeclarationNamespace,
+        name: &str,
+    ) -> Option<&ImportedBinding> {
         self.node(module)?
             .imported_bindings
             .iter()
-            .find(|binding| binding.local_name == name)
+            .find(|binding| binding.namespace == namespace && binding.local_name == name)
     }
 
     fn node_mut(&mut self, module: ModuleId) -> Result<&mut ModuleNode, String> {
@@ -514,7 +638,7 @@ mod tests {
         ImportTargetKind, ImportedBinding, ModuleGraph, ModuleId, ResolvedImport, SourceId,
         SymbolId, UsePathSegment, use_path_string_to_spec, use_path_to_spec,
     };
-    use crate::compiler::source_loader::ImportClause;
+    use crate::compiler::source_loader::{DeclarationNamespace, ImportClause};
     use crate::compiler::source_map::Span;
     use std::path::PathBuf;
 
@@ -713,6 +837,7 @@ mod tests {
                 kind: ImportTargetKind::FileModule,
                 spec: "./nested.rss".to_string(),
                 clause: ImportClause::Namespace("nested".to_string()),
+                namespace: super::DeclarationNamespace::Value,
                 span: Span::new(0, 0, 0),
                 line: 1,
                 target: Some(nested),
@@ -724,6 +849,7 @@ mod tests {
                 kind: ImportTargetKind::BuiltinNamespace,
                 spec: "json.rss".to_string(),
                 clause: ImportClause::AllPublic,
+                namespace: super::DeclarationNamespace::Value,
                 span: Span::new(0, 0, 0),
                 line: 2,
                 target: None,
@@ -896,6 +1022,7 @@ mod tests {
                 importer,
                 ImportedBinding {
                     local_name: "helper".to_string(),
+                    namespace: DeclarationNamespace::Value,
                     source_module: source,
                     source_symbol: exported,
                     source_name: "helper".to_string(),
@@ -1007,6 +1134,7 @@ mod tests {
                     importer,
                     ImportedBinding {
                         local_name: source_name.to_string(),
+                        namespace: DeclarationNamespace::Value,
                         source_module: source,
                         source_symbol,
                         source_name: source_name.to_string(),
@@ -1071,6 +1199,7 @@ mod tests {
                 importer,
                 ImportedBinding {
                     local_name: "helper".to_string(),
+                    namespace: DeclarationNamespace::Value,
                     source_module: source,
                     source_symbol: exported,
                     source_name: "helper".to_string(),
@@ -1115,6 +1244,7 @@ mod tests {
                 importer,
                 ImportedBinding {
                     local_name: "helper".to_string(),
+                    namespace: DeclarationNamespace::Value,
                     source_module: first,
                     source_symbol: first_helper,
                     source_name: "helper".to_string(),
@@ -1126,6 +1256,7 @@ mod tests {
                 importer,
                 ImportedBinding {
                     local_name: "helper".to_string(),
+                    namespace: DeclarationNamespace::Value,
                     source_module: second,
                     source_symbol: second_helper,
                     source_name: "helper".to_string(),

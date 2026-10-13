@@ -430,24 +430,14 @@ impl SemanticModel {
                 .functions
                 .iter()
                 .find(|decl| decl.index == function_index)?;
-            let params = decl
-                .arg_schemas
-                .iter()
-                .enumerate()
-                .map(|(i, schema)| {
-                    schema.clone().unwrap_or_else(|| {
-                        decl.args
-                            .get(i)
-                            .map(|_| TypeSchema::Unknown)
-                            .unwrap_or(TypeSchema::Unknown)
-                    })
-                })
-                .collect::<Vec<_>>();
-            let result = decl.return_schema.clone().unwrap_or(TypeSchema::Unknown);
-            return Some(TypeSchema::Callable {
-                params,
-                result: Box::new(result),
-            });
+            let typed = super::FrontendTypedIr {
+                source_id: Some(position.source_id),
+                ir: &self.ir,
+                local_schemas: &index.slot_schemas,
+                host_api_catalog: None,
+                source_map: None,
+            };
+            return typed.schema_of_function(decl.index);
         }
         None
     }
