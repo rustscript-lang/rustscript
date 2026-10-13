@@ -1,3 +1,5 @@
+mod callable_identity;
+
 use super::*;
 use crate::BuiltinFunction;
 use crate::bytecode::TypeMap;
