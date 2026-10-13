@@ -181,6 +181,19 @@ pub(crate) fn compile_program(program: &Program) -> VmResult<CompiledProgram> {
     compile_program_inner(program).map_err(|err| VmError::JitNative(err.to_string()))
 }
 
+// Artifact flag1 explicitly requests the existing boundary mode; regenerate
+// its process-local stub without making ordinary flag0 rebuilds fall back.
+pub(crate) fn compile_artifact_interpreter_boundary() -> VmResult<CompiledProgram> {
+    #[cfg(feature = "cranelift-jit")]
+    {
+        compile_interpreter_boundary_program().map_err(|err| VmError::JitNative(err.to_string()))
+    }
+    #[cfg(not(feature = "cranelift-jit"))]
+    {
+        compile_program(&Program::new(Vec::new(), Vec::new()))
+    }
+}
+
 #[cfg(feature = "cranelift-jit")]
 fn compile_program_inner(program: &Program) -> Result<CompiledProgram, AotCompileError> {
     let ssa = build_aot_ssa(program)?;
