@@ -826,13 +826,20 @@ impl LocalSlotAllocator {
         }
     }
 
-    pub(super) fn allocate(mut self, mut ir: FrontendIr) -> Result<FrontendIr, ParseError> {
+    pub(super) fn allocate(
+        mut self,
+        mut ir: FrontendIr,
+        root_slots: &[LocalSlot],
+    ) -> Result<super::LocalSlotAllocation, ParseError> {
         let persistent_slots = persistent_capture_slots(&ir.stmts, &ir.function_impls);
         let mut live_out = self.liveness.empty_set();
-        for slot in &persistent_slots {
+        for slot in persistent_slots.iter().chain(root_slots) {
             self.liveness.mark_live(&mut live_out, *slot);
         }
-        let _ = self.collect_block(&ir.stmts, &live_out, &[])?;
+        // Session bindings are observable after the snippet, including unused
+        // entries and first-snippet definitions. Protect them throughout ROOT
+        // execution; function/closure frames retain only their own constraints.
+        let _ = self.collect_block(&ir.stmts, &live_out, root_slots)?;
         for function_impl in ir.function_impls.values() {
             let mut live_after = self.liveness.function_body_live_out_precise(
                 &function_impl.body_expr,
@@ -907,7 +914,7 @@ impl LocalSlotAllocator {
 
         let (mapping, compacted_local_count) = self.color_slots()?;
         remap_frontend_ir(&mut ir, &mapping, compacted_local_count)?;
-        Ok(ir)
+        Ok(super::LocalSlotAllocation { ir, mapping })
     }
 
     fn collect_block(
@@ -922,10 +929,9 @@ impl LocalSlotAllocator {
             let mut live_before = self
                 .liveness
                 .compute_live_before_stmt_precise(stmt, &live_after);
-            // Parameter slots stay live for the whole body no matter what the
-            // statement does to them (see `allocate`); re-mark them so the
-            // interference invariants never depend on def-use precision for
-            // caller-written frame-entry state.
+            // Frame parameters or persistent ROOT slots stay live throughout
+            // their own block, regardless of assignments or drops. Re-mark
+            // them so protection never depends on def-use precision.
             for slot in protected_slots {
                 self.liveness.mark_live(&mut live_before, *slot);
             }

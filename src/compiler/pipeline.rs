@@ -887,7 +887,17 @@ fn compile_parsed_output_with_entry_locals(
         typing_mode,
         enable_local_move_semantics,
         local_debug_ranges,
+        LocalLayoutPolicy::Compact,
     )
+}
+
+/// Final layout belongs to the compilation owner, not current-snippet liveness.
+/// REPL root bindings remain observable by later snippets, even on the first
+/// compilation or when no persisted entry is referenced in this snippet.
+#[derive(Clone, Copy)]
+enum LocalLayoutPolicy<'a> {
+    Compact,
+    PersistentRoots(&'a [ReplLocalBinding]),
 }
 
 fn compile_owned_ir_output(
@@ -897,7 +907,29 @@ fn compile_owned_ir_output(
     typing_mode: TypingMode,
     enable_local_move_semantics: bool,
     local_debug_ranges: HashMap<String, LocalDebugRange>,
+    local_layout: LocalLayoutPolicy<'_>,
 ) -> Result<CompiledProgram, SourceError> {
+    compile_owned_ir_with_root_projection(
+        source,
+        parsed,
+        entry_local_types,
+        typing_mode,
+        enable_local_move_semantics,
+        local_debug_ranges,
+        local_layout,
+    )
+    .map(|(compiled, _)| compiled)
+}
+
+fn compile_owned_ir_with_root_projection(
+    source: String,
+    parsed: FrontendIr,
+    entry_local_types: &[typing::EntryLocalType],
+    typing_mode: TypingMode,
+    enable_local_move_semantics: bool,
+    local_debug_ranges: HashMap<String, LocalDebugRange>,
+    local_layout: LocalLayoutPolicy<'_>,
+) -> Result<(CompiledProgram, Vec<typing::EntryLocalType>), SourceError> {
     // Classify named callable materialization on the final merged IR
     // (post-lifetime, so capture metadata and rewritten uses are
     // authoritative). Codegen consumes `requires_callable_slot` to omit
@@ -910,8 +942,66 @@ fn compile_owned_ir_output(
     // value identities, so the classification is strictly more precise on
     // the unallocated IR.
     let callable_use_facts = materialization::classify_named_callables(&parsed);
-    let parsed = lifetime::allocate_local_slots(parsed).map_err(SourceError::Parse)?;
-    let type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
+    let (parsed, entry_local_types, root_slots) = match local_layout {
+        LocalLayoutPolicy::Compact => (
+            lifetime::allocate_local_slots(parsed).map_err(SourceError::Parse)?,
+            entry_local_types.to_vec(),
+            Vec::new(),
+        ),
+        LocalLayoutPolicy::PersistentRoots(bindings) => {
+            // The parser/session owner identifies observable root bindings.
+            // The frontend's cumulative locals count also contains callee
+            // locals and must never be used as the persistent root set.
+            let root_slots = bindings
+                .iter()
+                .map(|binding| {
+                    parsed
+                        .local_bindings
+                        .iter()
+                        .find(|(name, _)| name == &binding.name)
+                        .map(|(_, slot)| *slot)
+                        .ok_or_else(|| {
+                            SourceError::Parse(ParseError::new(format!(
+                                "missing persistent root binding '{}'",
+                                binding.name
+                            )))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let allocation = lifetime::allocate_local_slots_with_root_slots(parsed, &root_slots)
+                .map_err(SourceError::Parse)?;
+            let remapped_types = entry_local_types
+                .iter()
+                .map(|entry| {
+                    let slot = allocation
+                        .mapping
+                        .get(entry.slot as usize)
+                        .copied()
+                        .ok_or_else(|| {
+                            SourceError::Parse(ParseError::new(
+                                "entry local slot remap out of range",
+                            ))
+                        })?;
+                    Ok(typing::EntryLocalType {
+                        slot,
+                        schema: entry.schema.clone(),
+                        optional: entry.optional,
+                    })
+                })
+                .collect::<Result<Vec<_>, SourceError>>()?;
+            let root_slots = root_slots
+                .iter()
+                .map(|slot| allocation.mapping[*slot as usize])
+                .collect();
+            (allocation.ir, remapped_types, root_slots)
+        }
+    };
+    let (type_info, root_projection) = typing::infer_types_with_root_projection(
+        &parsed,
+        typing_mode,
+        &entry_local_types,
+        &root_slots,
+    );
     let FrontendIr {
         stmts,
         locals,
@@ -1015,13 +1105,16 @@ fn compile_owned_ir_output(
         .map_err(SourceError::Compile)?;
     program.local_count = program.local_count.max(locals);
     let runtime_locals = program.local_count;
-    Ok(CompiledProgram {
-        program,
-        locals: runtime_locals,
-        functions: visible_runtime_import_functions,
-        #[cfg(test)]
-        callable_use_facts: callable_use_observations,
-    })
+    Ok((
+        CompiledProgram {
+            program,
+            locals: runtime_locals,
+            functions: visible_runtime_import_functions,
+            #[cfg(test)]
+            callable_use_facts: callable_use_observations,
+        },
+        root_projection,
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -2201,18 +2294,40 @@ fn compile_source_for_repl_with_locals_impl(
             },
         )?;
         let debug_ranges = collect_named_local_debug_ranges(&prepared.ir);
-        let compiled = compile_owned_ir_output(
+        let (compiled, root_projection) = compile_owned_ir_with_root_projection(
             source.to_string(),
             prepared.owned_ir,
             &prepared.entry_local_types,
             policy.typing_mode,
             policy.ownership_checking,
             debug_ranges,
+            LocalLayoutPolicy::PersistentRoots(&bindings),
         )
         .map_err(|error| SourcePathError::SourceWithMap {
             error,
             sources: prepared.sources,
         })?;
+        let mut bindings = bindings;
+        for binding in &mut bindings {
+            let fact = compiled
+                .program
+                .debug
+                .as_ref()
+                .and_then(|debug| debug.local_index(&binding.name))
+                .and_then(|slot| {
+                    root_projection
+                        .iter()
+                        .find(|fact| fact.slot == u16::from(slot))
+                })
+                .ok_or_else(|| {
+                    SourcePathError::Source(SourceError::Parse(ParseError::new(format!(
+                        "missing final root projection for '{}'",
+                        binding.name
+                    ))))
+                })?;
+            binding.schema = fact.schema.clone();
+            binding.optional = fact.optional;
+        }
         Ok(CompiledReplProgram { compiled, bindings })
     };
     compile().map_err(|error| match error {
@@ -2350,6 +2465,7 @@ fn compile_loaded_units(
         policy.typing_mode,
         policy.ownership_checking,
         local_debug_ranges,
+        LocalLayoutPolicy::Compact,
     )
     .map_err(|error| SourcePathError::SourceWithMap { error, sources })
 }
