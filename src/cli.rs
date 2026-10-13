@@ -1366,7 +1366,13 @@ fn sync_repl_session(
         if repl_value_contains_callable(value) {
             continue;
         }
-        let (schema, optional) = repl_local_schema_from_vm(vm, index as usize, value);
+        let (schema, optional) = if binding.schema.is_some() {
+            (binding.schema.clone(), binding.optional)
+        } else {
+            // Legacy callers can supply bindings without checked schema facts.
+            let (schema, optional) = repl_local_schema_from_vm(vm, index as usize, value);
+            (schema, optional || binding.optional)
+        };
         let moved = moved_by_rebinding.contains(&binding.name)
             || (!optional
                 && value == &Value::Null
@@ -1849,6 +1855,567 @@ mod tests {
         }
         super::sync_repl_session(&vm, &compiled.bindings, &moved_by_rebinding, session);
         vm
+    }
+
+    #[test]
+    fn root_result_join_float_production_sync_and_nullable_effects() {
+        for (source, value, effect) in [
+            (
+                "let maybe: float? = 2.5; let y = if true => { maybe } else => { null };",
+                Value::Float(2.5),
+                false,
+            ),
+            (
+                "let flag = true; let mut x = 1; let maybe: float? = 3.5; let y = if flag => { x = 2.5; maybe } else => { x = 2.5; null };",
+                Value::Float(3.5),
+                true,
+            ),
+            (
+                "let flag = false; let mut x = 1; let maybe: float? = 3.5; let y = if flag => { x = 2.5; maybe } else => { x = 2.5; null };",
+                Value::Null,
+                true,
+            ),
+        ] {
+            let mut session = super::ReplSession::default();
+            run_repl_snippet_and_sync(&mut session, source);
+            assert_eq!(session.locals["y"].schema, Some(crate::TypeSchema::Float));
+            assert!(session.locals["y"].optional);
+            assert_eq!(session.locals["y"].value, value);
+            if effect {
+                assert_eq!(session.locals["x"].schema, Some(crate::TypeSchema::Float));
+                assert!(!session.locals["x"].optional);
+                let next =
+                    run_repl_snippet_and_sync(&mut session, "let checked: float = x; checked;");
+                assert_eq!(next.stack(), &[Value::Float(2.5)]);
+            }
+            let next = run_repl_snippet_and_sync(&mut session, "let following = y; following;");
+            assert_eq!(next.stack(), &[value]);
+            assert_eq!(
+                session.locals["following"].schema,
+                Some(crate::TypeSchema::Float)
+            );
+            assert!(session.locals["following"].optional);
+        }
+    }
+
+    #[test]
+    fn root_result_join_named_production_sync_keeps_host_identity() {
+        let named = crate::HostStructSchema::new(
+            "ResultJoinRoot",
+            vec![crate::HostStructField::new(
+                "value",
+                crate::HostTypeSchema::Int,
+            )],
+        );
+        let mut builder = crate::HostApiBuilder::new();
+        builder.named_struct(named.clone());
+        builder.function(crate::HostFunctionSchema::with_return(
+            "resultjoin::origin",
+            vec![],
+            crate::HostTypeSchema::Optional(Box::new(named.as_type())),
+        ));
+        let catalog = std::sync::Arc::new(builder.build().unwrap());
+        let options = CompileSourceFileOptions::default()
+            .with_host_api_catalog(std::sync::Arc::clone(&catalog));
+        fn origin(_: &mut Vm, _: &[Value]) -> crate::VmResult<crate::CallOutcome> {
+            Ok(crate::CallOutcome::Return(crate::return_one(Value::map(
+                vec![(Value::string("value"), Value::Int(42))],
+            ))))
+        }
+        let mut registry = crate::HostFunctionRegistry::new();
+        registry
+            .register_catalog_static(
+                crate::catalog_import_schemas(&catalog, "resultjoin::origin").remove(0),
+                origin,
+            )
+            .unwrap();
+        for (expression, flag, is_null) in [
+            ("if flag => { maybe } else => { null }", true, false),
+            ("if flag => { null } else => { maybe }", false, false),
+            ("if flag => { maybe } else => { null }", false, true),
+            ("if flag => { null } else => { maybe }", true, true),
+            ("match choice { 1 => maybe, _ => null }", true, false),
+            ("match choice { 1 => null, _ => maybe }", false, false),
+        ] {
+            let source = format!(
+                "let flag = {flag}; let choice = if flag => {{ 1 }} else => {{ 2 }}; let maybe: ResultJoinRoot? = resultjoin::origin(); let y = {expression};"
+            );
+            let mut session = super::ReplSession::default();
+            for snippet in [&source, "let following = y; following == null;"] {
+                let compiled =
+                    super::compile_repl_snippet_with_options(snippet, &session.locals, &options)
+                        .unwrap();
+                let moved = super::repl_locals_moved_by_rebinding(
+                    &compiled.compiled.program,
+                    &session.locals,
+                );
+                let mut machine = Vm::new(compiled.compiled.program);
+                registry.bind_vm_cached(&mut machine).unwrap();
+                super::seed_repl_vm_locals(&mut machine, &session.locals).unwrap();
+                assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+                super::sync_repl_session(&machine, &compiled.bindings, &moved, &mut session);
+                let name = if snippet == source { "y" } else { "following" };
+                assert_eq!(
+                    session.locals[name].schema,
+                    Some(crate::TypeSchema::Named("ResultJoinRoot".into(), vec![]))
+                );
+                assert!(session.locals[name].optional);
+                assert_eq!(session.locals[name].value == Value::Null, is_null);
+                if name == "following" {
+                    assert_eq!(machine.stack(), &[Value::Bool(is_null)]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn root_expression_effects_conditional_float_binding_session_and_next_snippet() {
+        let source =
+            "let mut x = 1; let ignored = if true => { x = 2.5; 0 } else => { x = 2.5; 0 };";
+        let mut session = super::ReplSession::default();
+        let compiled = super::compile_repl_snippet(source, &session.locals).unwrap();
+        let binding = compiled.bindings.iter().find(|b| b.name == "x").unwrap();
+        let schema = binding.schema.clone();
+        #[cfg(all(feature = "cranelift-jit", target_arch = "x86_64"))]
+        {
+            let mut native = Vm::new(compiled.compiled.program.clone());
+            native.compile_aot().unwrap();
+            assert!(native.has_aot_program());
+            assert_eq!(native.run().unwrap(), VmStatus::Halted);
+            let slot = native.debug_info().unwrap().local_index("x").unwrap() as usize;
+            assert_eq!(native.locals()[slot], Value::Float(2.5));
+            assert!(native.aot_exec_count() > 0);
+        }
+        let moved =
+            super::repl_locals_moved_by_rebinding(&compiled.compiled.program, &session.locals);
+        let mut machine = Vm::new(compiled.compiled.program);
+        assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+        let slot = machine.debug_info().unwrap().local_index("x").unwrap() as usize;
+        assert_eq!(machine.locals()[slot], Value::Float(2.5));
+        super::sync_repl_session(&machine, &compiled.bindings, &moved, &mut session);
+        let next = super::compile_repl_snippet("let y: float = x; y;", &session.locals);
+        println!(
+            "root expression effects: returned={schema:?}, synced={:?}, value={:?}, next={:?}",
+            session.locals["x"].schema,
+            session.locals["x"].value,
+            next.as_ref()
+                .map(|_| "compiled")
+                .map_err(|e| format!("{e:?}"))
+        );
+        assert_eq!(schema, Some(crate::TypeSchema::Float));
+        assert_eq!(session.locals["x"].schema, Some(crate::TypeSchema::Float));
+        assert!(!session.locals["x"].optional);
+        assert!(session.locals["x"].mutable);
+        assert!(!session.locals["x"].moved);
+        assert!(next.is_ok());
+        let next_vm = run_repl_snippet_and_sync(&mut session, "let y: float = x; y;");
+        assert_eq!(next_vm.stack(), &[Value::Float(2.5)]);
+        assert_eq!(session.locals["y"].value, Value::Float(2.5));
+    }
+
+    #[test]
+    fn root_expression_effects_nested_blocks_and_shadow_slots() {
+        for (source, expected) in [
+            (
+                "let mut x = 1; let ignored = if true => { let inner = if true => { x = 2.5; 0 } else => { x = 2.5; 0 }; 0 } else => { x = 2.5; 0 };",
+                crate::TypeSchema::Float,
+            ),
+            (
+                "let mut x = 1; let ignored = if true => { let inner = 0; if true => { x = 2.5; 0 } else => { x = 2.5; 0 } } else => { x = 2.5; 0 };",
+                crate::TypeSchema::Float,
+            ),
+            (
+                "let mut x = 1; let ignored = if true => { let mut local = 2.0; local = 2.5; 0 } else => { 0 };",
+                crate::TypeSchema::Int,
+            ),
+        ] {
+            let mut session = super::ReplSession::default();
+            let compiled = super::compile_repl_snippet(source, &session.locals).unwrap();
+            let x = compiled.bindings.iter().find(|b| b.name == "x").unwrap();
+            assert_eq!(x.schema, Some(expected.clone()), "{source}");
+            // Scope-local observations must not change the existing root.
+            run_repl_snippet_and_sync(&mut session, source);
+            assert_eq!(session.locals["x"].schema, Some(expected.clone()));
+            let next = if expected == crate::TypeSchema::Float {
+                "let y: float = x; y;"
+            } else {
+                "let y: int = x; y;"
+            };
+            let machine = run_repl_snippet_and_sync(&mut session, next);
+            let value = if expected == crate::TypeSchema::Float {
+                Value::Float(2.5)
+            } else {
+                Value::Int(1)
+            };
+            assert_eq!(machine.stack(), &[value]);
+        }
+    }
+
+    #[test]
+    fn root_expression_effects_initializer_assignment_and_arguments_are_ordered() {
+        for source in [
+            "let mut x = 1; let y = if true => { x = 2.5; x } else => { x = 2.5; x };",
+            "let mut x = 1; let mut y = 0.5; y = if true => { x = 2.5; x } else => { x = 2.5; x };",
+            "let mut x = 1; fn f(a: int, b: int) -> int { a + b } let ignored = f(if true => { x = 2.5; 0 } else => { x = 2.5; 0 }, if true => { x = 3.5; 0 } else => { x = 3.5; 0 }); let y = if true => { x = 2.5; x } else => { x = 2.5; x };",
+        ] {
+            let mut session = super::ReplSession::default();
+            let compiled = super::compile_repl_snippet(source, &session.locals).unwrap();
+            for name in ["x", "y"] {
+                assert_eq!(
+                    compiled
+                        .bindings
+                        .iter()
+                        .find(|b| b.name == name)
+                        .unwrap()
+                        .schema,
+                    Some(crate::TypeSchema::Float),
+                    "{source}: {name}"
+                );
+            }
+            run_repl_snippet_and_sync(&mut session, source);
+            assert_eq!(session.locals["x"].value, Value::Float(2.5));
+            assert_eq!(session.locals["y"].value, Value::Float(2.5));
+            let machine = run_repl_snippet_and_sync(&mut session, "let z: float = y; z;");
+            assert_eq!(machine.stack(), &[Value::Float(2.5)]);
+        }
+    }
+
+    #[test]
+    fn root_expression_effects_preserve_evaluated_operands_before_later_writes() {
+        let source =
+            "let mut x = 1; let y = x + (if true => { x = 2.5; 1 } else => { x = 2.5; 1 });";
+        let mut session = super::ReplSession::default();
+        let compiled = super::compile_repl_snippet(source, &session.locals).unwrap();
+        assert_eq!(
+            compiled
+                .bindings
+                .iter()
+                .find(|b| b.name == "x")
+                .unwrap()
+                .schema,
+            Some(crate::TypeSchema::Float)
+        );
+        assert_eq!(
+            compiled
+                .bindings
+                .iter()
+                .find(|b| b.name == "y")
+                .unwrap()
+                .schema,
+            Some(crate::TypeSchema::Int)
+        );
+        run_repl_snippet_and_sync(&mut session, source);
+        assert_eq!(session.locals["x"].value, Value::Float(2.5));
+        assert_eq!(session.locals["y"].value, Value::Int(2));
+        let machine = run_repl_snippet_and_sync(&mut session, "let z: int = y; z;");
+        assert_eq!(machine.stack(), &[Value::Int(2)]);
+    }
+
+    #[test]
+    fn root_expression_effects_optional_named_alternatives_remain_checked() {
+        for assign in [
+            "let ignored = if true => { x = 2.5; 0 } else => { x = 2.5; 0 };",
+            "let ignored = if true => { x = 2.5; 0 } else => { 0 };",
+            "let ignored = if false => { x = 2.5; 0 } else => { 0 };",
+        ] {
+            let source = format!("let mut x: float? = null; {assign}");
+            let mut session = super::ReplSession::default();
+            let compiled = super::compile_repl_snippet(&source, &session.locals).unwrap();
+            let x = compiled.bindings.iter().find(|b| b.name == "x").unwrap();
+            assert_eq!(x.schema, Some(crate::TypeSchema::Float));
+            assert!(x.optional);
+            run_repl_snippet_and_sync(&mut session, &source);
+            assert_eq!(session.locals["x"].schema, Some(crate::TypeSchema::Float));
+            assert!(session.locals["x"].optional);
+            let value = session.locals["x"].value.clone();
+            run_repl_snippet_and_sync(&mut session, "let y: float? = x;");
+            assert_eq!(session.locals["y"].value, value);
+        }
+        for condition in ["true", "false"] {
+            let source = format!(
+                "struct EffectRoot {{ value: int }} let mut x: EffectRoot? = null; let ignored = if {condition} => {{ x = {{ value: 41 }}; 0 }} else => {{ 0 }};"
+            );
+            let mut session = super::ReplSession::default();
+            let compiled = super::compile_repl_snippet(&source, &session.locals).unwrap();
+            let x = compiled.bindings.iter().find(|b| b.name == "x").unwrap();
+            let control = super::compile_repl_snippet(
+                "struct EffectRoot { value: int } let mut x: EffectRoot? = null;",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            let checked_named = control
+                .bindings
+                .iter()
+                .find(|b| b.name == "x")
+                .unwrap()
+                .schema
+                .clone();
+            assert!(
+                matches!(&checked_named, Some(crate::TypeSchema::Named(name, args)) if !name.is_empty() && args.is_empty())
+            );
+            assert_eq!(x.schema, checked_named);
+            assert!(x.optional);
+            run_repl_snippet_and_sync(&mut session, &source);
+            assert_eq!(session.locals["x"].schema, x.schema);
+            assert!(session.locals["x"].optional);
+            run_repl_snippet_and_sync(&mut session, "x == null;");
+        }
+    }
+
+    #[test]
+    fn root_expression_effects_keep_named_field_literal_key_schema() {
+        let source = "struct EffectRoot { value: int } let root: EffectRoot = { value: 41 }; let field = root?.value;";
+        let mut session = super::ReplSession::default();
+        let compiled = super::compile_repl_snippet(source, &session.locals).unwrap();
+        let field = compiled
+            .bindings
+            .iter()
+            .find(|b| b.name == "field")
+            .unwrap();
+        assert_eq!(
+            field.schema.as_ref().map(|s| s.split_optional().0),
+            Some(crate::TypeSchema::Int)
+        );
+        assert!(field.optional);
+        run_repl_snippet_and_sync(&mut session, source);
+        assert_eq!(session.locals["field"].value, Value::Int(41));
+        assert!(session.locals["field"].optional);
+        let machine =
+            run_repl_snippet_and_sync(&mut session, "let y: int? = field; y.unwrap_or(0);");
+        assert_eq!(machine.stack(), &[Value::Int(41)]);
+    }
+
+    #[test]
+    fn root_expression_effects_declared_violation_denies_guest_effects() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn hit(_: &mut Vm, _: &[Value]) -> crate::VmResult<crate::CallOutcome> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::CallOutcome::Return(crate::return_one(Value::Int(0))))
+        }
+        let mut builder = crate::HostApiBuilder::new();
+        builder.function(crate::HostFunctionSchema::with_return(
+            "effects::hit",
+            vec![],
+            crate::HostTypeSchema::Int,
+        ));
+        let catalog = Arc::new(builder.build().unwrap());
+        let options =
+            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+        let mut registry = crate::HostFunctionRegistry::new();
+        registry
+            .register_catalog_static(
+                crate::catalog_import_schemas(&catalog, "effects::hit").remove(0),
+                hit,
+            )
+            .unwrap();
+        let source = "let mut x: int = 1; let ignored = if true => { effects::hit(); x = 2.5; 0 } else => { effects::hit(); x = 2.5; 0 };";
+        let result = super::compile_repl_snippet_with_options(source, &BTreeMap::new(), &options);
+        if let Ok(compiled) = &result {
+            let mut machine = Vm::new(compiled.compiled.program.clone());
+            registry.bind_vm_cached(&mut machine).unwrap();
+            machine.run().unwrap();
+        }
+        assert!(
+            result.is_err(),
+            "declared schema violation must reject compilation"
+        );
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn final_layout_repl_sync_preserves_checked_named_optional_state() {
+        use crate::{
+            HostApiBuilder, HostFunctionRegistry, HostFunctionSchema, HostStructField,
+            HostStructSchema, HostTypeSchema,
+        };
+        let named = HostStructSchema::new(
+            "RootNamedOptional",
+            vec![HostStructField::new("value", HostTypeSchema::Int)],
+        );
+        let mut builder = HostApiBuilder::new();
+        builder.named_struct(named.clone());
+        builder.function(HostFunctionSchema::with_return(
+            "layout::root",
+            vec![],
+            named.as_type(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "layout::maybe",
+            vec![],
+            HostTypeSchema::Optional(Box::new(named.as_type())),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "layout::read",
+            vec![crate::HostParamSchema::value("root", named.as_type())],
+            HostTypeSchema::Int,
+        ));
+        let catalog = std::sync::Arc::new(builder.build().unwrap());
+        let options = CompileSourceFileOptions::default().with_host_api_catalog(std::sync::Arc::clone(&catalog))
+            .with_module_override_source("calibration.rss", "let a = 101; let b = 102; let c = 103; let d = 104; let e = 105; let f = 106; let g = 107; let h = 108; let i = 109; pub fn value() -> int { 1 }");
+        fn root(_: &mut Vm, _: &[Value]) -> crate::VmResult<crate::CallOutcome> {
+            Ok(crate::CallOutcome::Return(crate::return_one(Value::map(
+                vec![(Value::string("value"), Value::Int(41))],
+            ))))
+        }
+        fn maybe(_: &mut Vm, _: &[Value]) -> crate::VmResult<crate::CallOutcome> {
+            Ok(crate::CallOutcome::Return(crate::return_one(Value::Null)))
+        }
+        fn read(_: &mut Vm, args: &[Value]) -> crate::VmResult<crate::CallOutcome> {
+            let Value::Map(fields) = &args[0] else {
+                return Err(crate::VmError::TypeMismatch("RootNamedOptional"));
+            };
+            Ok(crate::CallOutcome::Return(crate::return_one(
+                fields.get(&Value::string("value")).unwrap().clone(),
+            )))
+        }
+        let mut registry = HostFunctionRegistry::new();
+        for (name, handler) in [
+            ("layout::root", root as crate::StaticHostFunction),
+            ("layout::maybe", maybe),
+            ("layout::read", read),
+        ] {
+            registry
+                .register_catalog_static(
+                    crate::catalog_import_schemas(&catalog, name).remove(0),
+                    handler,
+                )
+                .unwrap();
+        }
+        let large_callee = format!(
+            "use calibration; fn f() -> int {{ {} t256 }} f();",
+            (0..257)
+                .map(|i| format!("let t{i} = {i};"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let first_combined = format!(
+            "let mut root = layout::root(); let mut maybe = layout::maybe(); {large_callee}"
+        );
+        let recursive_capture = format!(
+            "use calibration; fn recurse(n: int) -> int {{ if n == 0 => {{ 0 }} else => {{ 1 + recurse(n - 1) }} }} fn large() -> int {{ let delta = layout::read(root); let add = |value| value + delta; {} add(t256) + recurse(3) }} large();",
+            (0..257)
+                .map(|i| format!("let t{i} = {i};"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for (initial, mutable) in [
+            (
+                "let root = layout::root(); let maybe = layout::maybe();",
+                false,
+            ),
+            (first_combined.as_str(), true),
+        ] {
+            let mut session = super::ReplSession::default();
+            for source in [
+                initial,
+                "use calibration; layout::read(root); maybe == null; calibration::value();",
+                "use calibration; calibration::value();",
+                large_callee.as_str(),
+                recursive_capture.as_str(),
+                if mutable {
+                    "root = layout::root();"
+                } else {
+                    "layout::read(root); maybe == null;"
+                },
+                "layout::read(root); maybe == null;",
+            ] {
+                let first_snippet = session.locals.is_empty();
+                let compiled =
+                    super::compile_repl_snippet_with_options(source, &session.locals, &options)
+                        .unwrap();
+                let moved = super::repl_locals_moved_by_rebinding(
+                    &compiled.compiled.program,
+                    &session.locals,
+                );
+                let mut machine = Vm::new(compiled.compiled.program);
+                registry.bind_vm_cached(&mut machine).unwrap();
+                super::seed_repl_vm_locals(&mut machine, &session.locals).unwrap();
+                assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+                assert_ne!(
+                    machine.debug_info().unwrap().local_index("root"),
+                    machine.debug_info().unwrap().local_index("maybe"),
+                    "independent persistent roots require distinct physical slots"
+                );
+                if source == large_callee {
+                    assert_eq!(machine.stack(), &[Value::Int(256)]);
+                    assert!(
+                        machine
+                            .program()
+                            .callable_prototypes
+                            .iter()
+                            .all(|p| p.frame_local_count < 257)
+                    );
+                }
+                let map = machine.program().type_map.as_ref().unwrap();
+                println!("backend-map source={source:?} map={map:?}");
+                let mut expected = Vec::new();
+                for (name, optional, value) in [
+                    (
+                        "root",
+                        false,
+                        Value::map(vec![(Value::string("value"), Value::Int(41))]),
+                    ),
+                    ("maybe", true, Value::Null),
+                ] {
+                    let slot = machine.debug_info().unwrap().local_index(name).unwrap() as usize;
+                    let schema = crate::TypeSchema::Named("RootNamedOptional".into(), vec![]);
+                    // New optional host results retain their Optional wrapper;
+                    // entry reseeding uses the base schema plus the optional bit.
+                    let schema = if optional && first_snippet {
+                        crate::TypeSchema::Optional(Box::new(schema))
+                    } else {
+                        schema
+                    };
+                    let binding = compiled
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.name == name)
+                        .unwrap();
+                    assert_eq!(
+                        binding.schema,
+                        Some(schema.clone()),
+                        "{source}: projected {name} at final debug slot {slot}"
+                    );
+                    assert_eq!(
+                        binding.optional, optional,
+                        "{source}: projected {name} at {slot}"
+                    );
+                    if source == large_callee && name == "maybe" {
+                        // The same physical index also summarizes an Int callee
+                        // local. Backend observations remain frame-aggregate.
+                        assert_eq!(map.local_schemas[slot], Some(crate::TypeSchema::Int));
+                        assert!(map.optional_slots[slot]);
+                    }
+                    assert_eq!(machine.locals()[slot], value, "{source}: {name} at {slot}");
+                    println!(
+                        "final-layout source={source:?} name={name} slot={slot} locals={} schema={:?} optional={} value={:?}",
+                        machine.locals().len(),
+                        binding.schema,
+                        binding.optional,
+                        machine.locals()[slot]
+                    );
+                    expected.push((
+                        name,
+                        super::ReplSessionLocal {
+                            value,
+                            mutable,
+                            schema: Some(schema),
+                            optional,
+                            moved: false,
+                        },
+                    ));
+                }
+                super::sync_repl_session(&machine, &compiled.bindings, &moved, &mut session);
+                for (name, state) in expected {
+                    assert_eq!(session.locals[name], state, "{source}: {name}");
+                    println!("final-layout synced {name}={:?}", session.locals[name]);
+                }
+            }
+        }
     }
 
     #[test]

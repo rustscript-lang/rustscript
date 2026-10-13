@@ -752,6 +752,65 @@ fn native_repl_accepts_unused_file_registration_with_default_and_configured_serv
     }
 }
 
+#[test]
+fn final_layout_cli_preserves_unused_entry_and_first_snippet_with_both_services() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let module = "let a = 101; let b = 102; let c = 103; let d = 104; let e = 105; let f = 106; let g = 107; let h = 108; let i = 109; pub fn value() -> int { 1 }";
+    let cases = [
+        (
+            "let x = 41;\nuse calibration; calibration::value();\nx\n.quit\n",
+            vec![41],
+        ),
+        (
+            "let a = 11; let b = 12; let c = 13; let d = 14; let e = 15; let f = 16; let g = 17; let h = 18; let i = 19;\na\nb\nc\nd\ne\nf\ng\nh\ni\n.quit\n",
+            (11..=19).collect(),
+        ),
+    ];
+    for default_services in [false, true] {
+        for (input, expected) in &cases {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "embedding_repl_child",
+                    "--nocapture",
+                ])
+                .env("EMBEDDING_NINE_LOCAL_MODULE", module)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if default_services {
+                command.env("EMBEDDING_DEFAULT_SERVICES", "1");
+            }
+            let mut child = command.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            let result = child.wait_with_output().unwrap();
+            let out = String::from_utf8(result.stdout).unwrap();
+            let err = String::from_utf8(result.stderr).unwrap();
+            assert!(result.status.success(), "{out}\n{err}");
+            assert!(err.trim().is_empty(), "{out}\n{err}");
+            let actual = out
+                .lines()
+                .filter_map(|line| {
+                    line.split_once("=> ")
+                        .and_then(|(_, value)| value.trim().parse::<i64>().ok())
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                actual.ends_with(expected),
+                "default={default_services}: {actual:?}\n{out}"
+            );
+        }
+    }
+}
+
 // Subprocess harness only; never counted as a business test.
 #[test]
 #[ignore]
@@ -775,6 +834,14 @@ fn embedding_repl_child() {
                     "calibration.rss",
                     std::env::var("EMBEDDING_SELECTED_MODULE").unwrap(),
                 )
+        };
+    }
+    if std::env::var_os("EMBEDDING_NINE_LOCAL_MODULE").is_some() {
+        runtime.compile_options = || {
+            CompileSourceFileOptions::default().with_module_override_source(
+                "calibration.rss",
+                std::env::var("EMBEDDING_NINE_LOCAL_MODULE").unwrap(),
+            )
         };
     }
     if std::env::var_os("EMBEDDING_DEFAULT_SERVICES").is_some() {

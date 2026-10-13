@@ -89,4 +89,10 @@ pub(super) fn enforce_source_availability_with_entry_locals(
     )
 }
 
-pub(super) use availability::allocate_local_slots;
+pub(super) struct LocalSlotAllocation {
+    pub(super) ir: FrontendIr,
+    /// Logical pre-allocation slot to physical slot, shared by IR and entry seeds.
+    pub(super) mapping: Vec<LocalSlot>,
+}
+
+pub(super) use availability::{allocate_local_slots, allocate_local_slots_with_root_slots};
