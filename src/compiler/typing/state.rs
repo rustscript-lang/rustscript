@@ -348,6 +348,32 @@ impl LocalTypeState {
         }
     }
 
+    /// Copy checked facts without losing a callable's authored schema/optionality.
+    pub(super) fn copy_exact_binding_from(
+        &mut self,
+        source: &LocalTypeState,
+        source_slot: LocalSlot,
+        slot: LocalSlot,
+    ) {
+        if let Some(callable) = source.callable(source_slot).cloned() {
+            self.bind_callable_with_schema(
+                slot,
+                callable,
+                source.schema(source_slot).cloned(),
+                source.has_declared_schema(source_slot),
+                source.is_optional(source_slot),
+            );
+        } else {
+            self.set_with_optional_schema_origin(
+                slot,
+                source.get(source_slot),
+                source.schema(source_slot).cloned(),
+                source.has_declared_schema(source_slot),
+                source.is_optional(source_slot),
+            );
+        }
+    }
+
     pub(crate) fn merge_from_branches(&mut self, lhs: &LocalTypeState, rhs: &LocalTypeState) {
         self.by_slot.clear();
         self.schemas.clear();
