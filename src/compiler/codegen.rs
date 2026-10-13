@@ -57,6 +57,9 @@ pub struct Compiler {
     callable_use_facts: HashMap<u16, CallableUseFacts>,
     script_functions: Vec<ScriptFunction>,
     callable_prototypes: Vec<CallablePrototype>,
+    capture_creation_sites: Vec<(usize, u32)>,
+    capture_owner: Option<u16>,
+    closure_capture_owners: HashMap<u32, Option<u16>>,
     function_regions: Vec<FunctionRegion>,
     root_callable_bindings: Vec<RootCallableBinding>,
     pending_closures: Vec<(u32, ClosureExpr)>,
@@ -112,6 +115,9 @@ impl Compiler {
             callable_use_facts: HashMap::new(),
             script_functions: Vec::new(),
             callable_prototypes: Vec::new(),
+            capture_creation_sites: Vec::new(),
+            capture_owner: None,
+            closure_capture_owners: HashMap::new(),
             function_regions: Vec::new(),
             root_callable_bindings: Vec::new(),
             pending_closures: Vec::new(),
@@ -207,7 +213,27 @@ impl Compiler {
         self.function_schemas = type_info.function_schemas;
     }
 
-    pub fn compile_program(mut self, stmts: &[Stmt]) -> Result<Program, CompileError> {
+    pub fn compile_program(self, stmts: &[Stmt]) -> Result<Program, CompileError> {
+        self.compile_program_impl(stmts, None)
+    }
+
+    pub(super) fn compile_program_certified(
+        self,
+        stmts: &[Stmt],
+        origins: &super::capture_certification::DeclarationCaptures,
+        output: &mut super::capture_certification::CaptureCertification,
+    ) -> Result<Program, CompileError> {
+        self.compile_program_impl(stmts, Some((origins, output)))
+    }
+
+    fn compile_program_impl(
+        mut self,
+        stmts: &[Stmt],
+        certification: Option<(
+            &super::capture_certification::DeclarationCaptures,
+            &mut super::capture_certification::CaptureCertification,
+        )>,
+    ) -> Result<Program, CompileError> {
         let named_functions = self.prepare_named_callables()?;
         self.compile_stmts(stmts)?;
         self.assembler.ret();
@@ -231,6 +257,33 @@ impl Compiler {
         }
         for prototype in &mut self.callable_prototypes {
             prototype.frame_local_count = self.frame_local_count;
+        }
+        if let Some((origins, output)) = certification {
+            output.prototypes = self
+                .callable_prototypes
+                .iter()
+                .enumerate()
+                .map(|(id, prototype)| {
+                    let declaration = self
+                        .function_prototype_ids
+                        .iter()
+                        .find_map(|(index, candidate)| {
+                            (*candidate as usize == id).then_some(
+                                super::capture_certification::CaptureDeclaration::Named(*index),
+                            )
+                        })
+                        .unwrap_or(
+                            super::capture_certification::CaptureDeclaration::AnonymousIn(
+                                self.closure_capture_owners
+                                    .get(&(id as u32))
+                                    .copied()
+                                    .flatten(),
+                            ),
+                        );
+                    origins.for_prototype(declaration, prototype)
+                })
+                .collect();
+            output.creation_sites = self.capture_creation_sites;
         }
         let mut exported_callables = self
             .function_decls
@@ -414,6 +467,7 @@ impl Compiler {
     }
 
     fn compile_named_function_body(&mut self, function_index: u16) -> Result<(), CompileError> {
+        let owner_snapshot = self.capture_owner.replace(function_index);
         let function_impl = self
             .function_impls
             .get(&function_index)
@@ -450,6 +504,7 @@ impl Compiler {
         self.callable_bindings = callable_snapshot;
         self.type_state = type_snapshot;
         let end_ip = self.assembler.position();
+        self.capture_owner = owner_snapshot;
         self.script_functions
             .push(ScriptFunction { entry_ip, end_ip });
         self.function_regions.push(FunctionRegion {
@@ -465,6 +520,12 @@ impl Compiler {
         prototype_id: u32,
         closure: &ClosureExpr,
     ) -> Result<(), CompileError> {
+        let owner_snapshot = self.capture_owner;
+        self.capture_owner = self
+            .closure_capture_owners
+            .get(&prototype_id)
+            .copied()
+            .flatten();
         let entry_ip = self.assembler.position();
         let callable_snapshot = self.callable_bindings.clone();
         let type_snapshot = self.type_state.clone();
@@ -487,6 +548,7 @@ impl Compiler {
             .push(ScriptFunction { entry_ip, end_ip });
         self.callable_prototypes[prototype_id as usize].target =
             CallableTarget::ScriptFunction(function_id);
+        self.capture_owner = owner_snapshot;
         self.function_regions.push(FunctionRegion {
             start_ip: entry_ip,
             end_ip,
@@ -1740,6 +1802,8 @@ impl Compiler {
         binding_slot: Option<LocalSlot>,
     ) -> Result<u32, CompileError> {
         let prototype_id = self.callable_prototypes.len() as u32;
+        self.closure_capture_owners
+            .insert(prototype_id, self.capture_owner);
         self.callable_prototypes.push(CallablePrototype {
             kind: CallableKind::Closure,
             target: CallableTarget::ScriptFunction(u32::MAX),
@@ -1811,6 +1875,8 @@ impl Compiler {
         }
         self.assembler
             .call(BuiltinFunction::BindCallable.call_index(), 2);
+        self.capture_creation_sites
+            .push((self.assembler.position() as usize, prototype_id));
         Ok(())
     }
 

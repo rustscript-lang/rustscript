@@ -112,6 +112,8 @@ pub(super) struct TypeContext<'a> {
     pub(super) observed_function_param_callables: HashMap<u16, Vec<Option<InferredCallable>>>,
     pub(super) observed_function_param_capture_states: HashMap<u16, Vec<Option<LocalTypeState>>>,
     pub(super) observed_function_capture_states: HashMap<u16, LocalTypeState>,
+    pub(super) capture_origins: super::super::capture_certification::DeclarationCaptures,
+    pub(super) capture_owner: Option<u16>,
     pub(super) function_param_conflicts: HashMap<u16, String>,
     observed_return_types: HashMap<(u16, Vec<String>), BoundType>,
     observed_return_schemas: HashMap<(u16, Vec<String>), Option<TypeSchema>>,
@@ -159,6 +161,8 @@ impl<'a> TypeContext<'a> {
             observed_function_param_callables: HashMap::new(),
             observed_function_param_capture_states: HashMap::new(),
             observed_function_capture_states: HashMap::new(),
+            capture_origins: Default::default(),
+            capture_owner: None,
             function_param_conflicts: HashMap::new(),
             observed_return_types: HashMap::new(),
             observed_return_schemas: HashMap::new(),
@@ -1001,6 +1005,22 @@ impl<'a> TypeContext<'a> {
         capture_copies: &[(LocalSlot, LocalSlot)],
         state: &LocalTypeState,
     ) {
+        let modes = self.function_impls.get(&index).map(|implementation| {
+            capture_copies
+                .iter()
+                .map(|(_, target)| {
+                    super::super::lifetime::function_capture_binding_mode(implementation, *target)
+                })
+                .collect::<Vec<_>>()
+        });
+        if let Some(modes) = modes {
+            self.observe_capture_origin(
+                super::super::capture_certification::CaptureDeclaration::Named(index),
+                capture_copies,
+                &modes,
+                state,
+            );
+        }
         let mut observed = LocalTypeState::default();
         for (source_slot, captured_slot) in capture_copies {
             observed.copy_binding_from(state, *source_slot, *captured_slot, None, false);
@@ -1014,6 +1034,54 @@ impl<'a> TypeContext<'a> {
             self.observed_function_capture_states
                 .insert(index, observed);
         }
+    }
+
+    pub(super) fn observe_closure_origin(&mut self, closure: &ClosureExpr, state: &LocalTypeState) {
+        let modes = closure
+            .capture_copies
+            .iter()
+            .map(|(_, target)| {
+                super::super::lifetime::closure_capture_binding_mode(closure, *target)
+            })
+            .collect::<Vec<_>>();
+        self.observe_capture_origin(
+            super::super::capture_certification::CaptureDeclaration::AnonymousIn(
+                self.capture_owner,
+            ),
+            &closure.capture_copies,
+            &modes,
+            state,
+        );
+    }
+
+    fn observe_capture_origin(
+        &mut self,
+        declaration: super::super::capture_certification::CaptureDeclaration,
+        captures: &[(LocalSlot, LocalSlot)],
+        modes: &[crate::CaptureBindingMode],
+        state: &LocalTypeState,
+    ) {
+        let facts = captures
+            .iter()
+            .zip(modes)
+            .map(|((source, target), mode)| {
+                let schema = if state.is_optional(*source) {
+                    None
+                } else {
+                    state
+                        .schema(*source)
+                        .cloned()
+                        .or_else(|| super::scalar_schema_from_bound_type(state.get(*source)))
+                };
+                super::super::capture_certification::CaptureFact {
+                    source: *source,
+                    target: *target,
+                    mode: *mode,
+                    schema,
+                }
+            })
+            .collect();
+        self.capture_origins.observe(declaration, facts);
     }
 
     fn callable_capture_state_from_expr(

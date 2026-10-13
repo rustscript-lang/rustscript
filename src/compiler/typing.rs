@@ -382,6 +382,21 @@ pub(super) fn infer_types_with_root_projection(
     entry_local_types: &[EntryLocalType],
     root_slots: &[LocalSlot],
 ) -> (TypeInferenceResult, Vec<EntryLocalType>) {
+    let (facts, roots, _) =
+        infer_types_with_capture_origins(ir, typing_mode, entry_local_types, root_slots);
+    (facts, roots)
+}
+
+pub(super) fn infer_types_with_capture_origins(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    root_slots: &[LocalSlot],
+) -> (
+    TypeInferenceResult,
+    Vec<EntryLocalType>,
+    super::capture_certification::DeclarationCaptures,
+) {
     let function_names = build_function_names(&ir.functions);
     let function_decls = build_function_decl_map(&ir.functions);
     let host_import_return_types =
@@ -482,6 +497,7 @@ pub(super) fn infer_types_with_root_projection(
         observed_function_capture_states: &observed_function_capture_states,
     };
 
+    let mut origins = context.capture_origins.clone();
     for decl in &ir.functions {
         let Some(function_impl) = ir.function_impls.get(&decl.index) else {
             continue;
@@ -493,7 +509,13 @@ pub(super) fn infer_types_with_root_projection(
             callable_slots: &mut callable_slots,
             optional_slots: &mut optional_slots,
         };
-        collect_function_types(decl.index, function_impl, decl, &mut outputs, &env);
+        origins.extend(collect_function_types(
+            decl.index,
+            function_impl,
+            decl,
+            &mut outputs,
+            &env,
+        ));
     }
 
     let mut facts = TypeInferenceResult {
@@ -521,7 +543,7 @@ pub(super) fn infer_types_with_root_projection(
                 .map(|schema| (decl.index, schema))
         })
         .collect();
-    (facts, root_projection)
+    (facts, root_projection, origins)
 }
 
 pub(super) fn validate_if_else_type_consistency(

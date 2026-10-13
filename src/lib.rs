@@ -134,6 +134,12 @@ pub use compiler::{
     lint_unknown_inferred_local_types_with_options, lint_unknown_type_annotations,
     parse_source_with_dialect,
 };
+pub use compiler::{
+    CertifiedCompilation, compile_source_file_with_capture_certification,
+    compile_source_file_with_capture_certification_and_options,
+    compile_source_with_capture_certification,
+    compile_source_with_flavor_and_options_with_capture_certification,
+};
 pub use debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 #[cfg(feature = "runtime")]
 pub use debugger::{
@@ -178,6 +184,11 @@ pub use vm::{
     execution_scope, host_context, host_extension, operation, register_catalog_function,
     register_catalog_static_function, register_host_extension, resource,
     validate_catalog_import_schemas, validate_catalog_import_schemas_with_fingerprints,
+};
+#[cfg(feature = "runtime")]
+pub use vm::{
+    CaptureCertificationStats, CaptureQueryError, CaptureRootState, CheckedResourceCapture,
+    ResourceCaptureRoot,
 };
 #[cfg(feature = "runtime")]
 pub use vmbc::{

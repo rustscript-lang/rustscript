@@ -529,7 +529,7 @@ pub(super) fn collect_function_types(
     function_decl: &FunctionDecl,
     outputs: &mut CollectFunctionTypeOutputs<'_>,
     env: &CollectFunctionTypesEnv<'_>,
-) {
+) -> super::super::capture_certification::DeclarationCaptures {
     let mut state = LocalTypeState::default();
     let mut context = TypeContext::new(
         env.function_impls,
@@ -541,6 +541,7 @@ pub(super) fn collect_function_types(
         TypingMode::DynamicHints,
         None,
     );
+    context.capture_owner = Some(function_index);
     seed_function_param_state(
         &mut state,
         &function_impl.param_slots,
@@ -617,6 +618,7 @@ pub(super) fn collect_function_types(
         &mut context,
     );
     let _ = context.infer_expr_type(&function_impl.body_expr, &state);
+    context.capture_origins
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -640,6 +642,7 @@ pub(super) fn collect_stmt_types(
                 state.set(*index, BoundType::Null);
             }
             Stmt::ClosureLet { closure, .. } => {
+                context.observe_closure_origin(closure, state);
                 collect_closure_capture_types(
                     closure,
                     state,
@@ -912,6 +915,7 @@ fn collect_contextual_expr_types(
             expected.map(|schema| context.substitute_schema_generics(schema))
         && params.len() == closure.param_slots.len()
     {
+        context.observe_closure_origin(closure, state);
         let params = params.into_iter().map(Some).collect::<Vec<_>>();
         if let Some(nested) = context.build_callable_state(
             &closure.param_slots,
@@ -1074,6 +1078,7 @@ fn collect_expr_types(
             let _ = context.infer_expr_type(expr, state);
         }
         Expr::Closure(closure) => {
+            context.observe_closure_origin(closure, state);
             if let Some(nested) = context.build_callable_state(
                 &closure.param_slots,
                 None,
@@ -1096,6 +1101,7 @@ fn collect_expr_types(
             }
         }
         Expr::ClosureCall(closure, args) => {
+            context.observe_closure_origin(closure, state);
             for arg in args {
                 collect_expr_types(
                     arg,
