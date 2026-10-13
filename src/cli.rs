@@ -16,6 +16,10 @@ use crate::{HostFunctionRegistry, HostImport};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
+#[cfg(test)]
+#[path = "cli_capture_certification_tests.rs"]
+mod capture_certification_tests;
+
 pub struct CliRuntime {
     pub binary_name: &'static str,
     pub default_source: &'static str,
@@ -46,6 +50,7 @@ pub struct CliHostServices<'a> {
     registry_factory: Box<dyn Fn() -> crate::VmResult<HostFunctionRegistry> + 'a>,
     vm_init: VmInitializer<'a>,
     legacy: bool,
+    source_capture_certification: bool,
 }
 
 impl<'a> CliHostServices<'a> {
@@ -58,11 +63,24 @@ impl<'a> CliHostServices<'a> {
             registry_factory: Box::new(registry_factory),
             vm_init: Box::new(|_| Ok(())),
             legacy: false,
+            source_capture_certification: false,
         }
     }
 
     pub fn with_vm_init(mut self, init: impl Fn(&mut Vm) -> crate::VmResult<()> + 'a) -> Self {
         self.vm_init = Box::new(init);
+        self
+    }
+
+    /// Retain compiler-issued capture facts when executing source files.
+    ///
+    /// Admission still follows each source producer's ownership policy. REPL,
+    /// VMBC and standalone AOT remain uncertified; successful companion AOT
+    /// loading retains its existing authority revocation. A native frame may
+    /// still lack a checked capture relation; retaining source facts never
+    /// fabricates runtime owner authority. Defaults are unchanged.
+    pub fn with_capture_certification(mut self) -> Self {
+        self.source_capture_certification = true;
         self
     }
 
@@ -113,6 +131,7 @@ impl Default for CliHostServices<'_> {
             registry_factory: Box::new(|| Ok(cli_host_registry().clone())),
             vm_init: Box::new(|_| Ok(())),
             legacy: true,
+            source_capture_certification: false,
         }
     }
 }
@@ -256,24 +275,32 @@ pub fn run_with_args(
     }
 
     let source_path = resolve_source_path(cli.source.as_deref(), runtime.default_source)?;
-    let program = if source_path.extension().is_some_and(|ext| ext == "vmbc") {
-        crate::decode_program(&std::fs::read(&source_path)?)?
-    } else {
-        let compiled = compile_source_file_with_options(&source_path, options)
-            .map_err(|err| io::Error::other(render_source_path_error(&source_path, &err)))?;
-        compiled.program.with_local_count(compiled.locals)
-    };
     // Legacy emit is compilation-only and does not require runtime adapters.
     if services.legacy
         && let Some(output_path) = cli.emit_vmbc_path.as_ref()
     {
+        let program = load_ordinary_cli_program(&source_path, options)?;
         let encoded = encode_program(&program)?;
         std::fs::write(output_path, &encoded)?;
         println!("wrote {} bytes to {}", encoded.len(), output_path);
         return Ok(());
     }
-    let recording_program = cli.record_path.as_ref().map(|_| program.clone());
-    let mut vm = new_cli_vm(program, &cli);
+    let mut vm = if services.source_capture_certification
+        && source_path.extension().is_none_or(|ext| ext != "vmbc")
+    {
+        let issued = crate::compile_source_file_with_capture_certification_and_options(
+            &source_path,
+            options,
+        )
+        .map_err(|err| io::Error::other(render_source_path_error(&source_path, &err)))?;
+        let mut vm = issued.into_vm().map_err(io::Error::other)?;
+        vm.set_jit_config(cli_jit_config(&cli));
+        configure_cli_vm(&mut vm);
+        vm
+    } else {
+        new_cli_vm(load_ordinary_cli_program(&source_path, options)?, &cli)
+    };
+    let recording_program = cli.record_path.as_ref().map(|_| vm.program().clone());
     apply_runtime_flags(&mut vm, &cli)?;
     services.initialize_vm(&mut vm)?;
     if let Some(output_path) = cli.emit_vmbc_path.as_ref() {
@@ -326,6 +353,19 @@ pub fn run_with_args(
         );
     }
     Ok(())
+}
+
+fn load_ordinary_cli_program(
+    source_path: &Path,
+    options: CompileSourceFileOptions,
+) -> Result<Program, io::Error> {
+    if source_path.extension().is_some_and(|ext| ext == "vmbc") {
+        crate::decode_program(&std::fs::read(source_path)?).map_err(io::Error::other)
+    } else {
+        let compiled = compile_source_file_with_options(source_path, options)
+            .map_err(|err| io::Error::other(render_source_path_error(source_path, &err)))?;
+        Ok(compiled.program.with_local_count(compiled.locals))
+    }
 }
 
 #[cfg(test)]
