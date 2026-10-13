@@ -1249,7 +1249,8 @@ pub(crate) extern "C" fn pd_vm_native_synchronize_active_exit_state(
     locals_len: usize,
     ip: usize,
 ) -> i32 {
-    run_step(vm, "synchronize_active_exit_state", |vm| {
+    // Preserve the existing dense-restore diagnostic family for scalar callers.
+    run_step(vm, "restore_active_exit_state", |vm| {
         let stack_base = vm.active_operand_stack_base();
         let local_base = vm.active_local_base();
         let expected_locals_len = local_base
