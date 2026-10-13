@@ -5,7 +5,8 @@ use crate::builtins::is_builtin_namespace;
 use super::super::frontends::{is_ident_continue, is_ident_start};
 use super::super::modules::{UseDecl, use_path_to_spec};
 use super::super::{
-    CompileSourceFileOptions, SourceError, SourceFlavor, SourcePathError, frontends,
+    CompileSourceFileOptions, ParsePhase, SourceError, SourceFlavor, SourceFrontendContext,
+    SourcePathError, frontends,
 };
 use super::model::ModuleImport;
 
@@ -16,8 +17,33 @@ pub(super) fn parse_module_imports(
     options: &CompileSourceFileOptions,
     original_source_id: u32,
 ) -> Result<Vec<ModuleImport>, SourcePathError> {
-    scan_module_imports(source, flavor, path, options, original_source_id)
-        .map(|(imports, _)| imports)
+    parse_module_imports_with_context(
+        source,
+        flavor,
+        path,
+        options,
+        original_source_id,
+        Some(path),
+    )
+}
+
+pub(super) fn parse_module_imports_with_context(
+    source: &str,
+    flavor: SourceFlavor,
+    path: &Path,
+    options: &CompileSourceFileOptions,
+    original_source_id: u32,
+    original_path: Option<&Path>,
+) -> Result<Vec<ModuleImport>, SourcePathError> {
+    scan_module_imports_with_context(
+        source,
+        flavor,
+        path,
+        options,
+        original_source_id,
+        original_path,
+    )
+    .map(|(imports, _)| imports)
 }
 
 /// Scan the module imports of one source.
@@ -36,6 +62,46 @@ pub(super) fn scan_module_imports(
     options: &CompileSourceFileOptions,
     original_source_id: u32,
 ) -> Result<(Vec<ModuleImport>, Vec<UseDecl>), SourcePathError> {
+    scan_module_imports_with_context(
+        source,
+        flavor,
+        path,
+        options,
+        original_source_id,
+        Some(path),
+    )
+}
+
+pub(super) fn scan_module_imports_with_entry_locals(
+    source: &str,
+    path: &Path,
+    options: &CompileSourceFileOptions,
+    source_id: u32,
+    locals: &[super::super::ReplLocalBinding],
+) -> Result<(Vec<ModuleImport>, Vec<UseDecl>), SourcePathError> {
+    if locals.is_empty() {
+        return scan_module_imports(source, SourceFlavor::RustScript, path, options, source_id);
+    }
+    let parsed = frontends::parse_rustscript_repl_source_with_context(
+        source,
+        locals,
+        options.host_api_catalog().cloned(),
+        source_id,
+        true,
+    )
+    .map_err(|error| SourcePathError::Source(SourceError::Parse(error)))?;
+    let decls = parsed.ir.use_declarations;
+    Ok((use_declarations_to_module_imports(path, &decls)?, decls))
+}
+
+fn scan_module_imports_with_context(
+    source: &str,
+    flavor: SourceFlavor,
+    path: &Path,
+    options: &CompileSourceFileOptions,
+    original_source_id: u32,
+    original_path: Option<&Path>,
+) -> Result<(Vec<ModuleImport>, Vec<UseDecl>), SourcePathError> {
     match flavor {
         SourceFlavor::RustScript => {
             let decls =
@@ -43,11 +109,18 @@ pub(super) fn scan_module_imports(
             let imports = use_declarations_to_module_imports(path, &decls)?;
             Ok((imports, decls))
         }
-        SourceFlavor::JavaScript | SourceFlavor::Lua => {
-            let imports = options
+        SourceFlavor::Plugin(_) => {
+            let plugin = options
                 .source_plugin_for_flavor(flavor)
-                .ok_or(SourcePathError::MissingFrontendPlugin(flavor))?
-                .parse_module_imports(source, path)?;
+                .ok_or(SourcePathError::MissingFrontendPlugin(flavor))?;
+            let context = SourceFrontendContext {
+                source_id: original_source_id,
+                original_path,
+                phase: ParsePhase::ImportDiscovery,
+                host_api_catalog: options.host_api_catalog().map(|catalog| catalog.as_ref()),
+                imports: &[],
+            };
+            let imports = plugin.parse_module_imports(source, path, &context)?;
             Ok((imports, Vec::new()))
         }
     }
@@ -93,6 +166,8 @@ fn use_declarations_to_module_imports(
                 spec,
                 clause: decl.clause.clone(),
                 line: decl.line,
+                namespace: super::model::DeclarationNamespace::Value,
+                span: Some(decl.span),
             })
         })
         .collect()
@@ -130,9 +205,6 @@ pub(super) fn resolve_module_path(
                 .ok_or_else(|| SourcePathError::ImportWithoutParent(base_path.to_path_buf()))?;
             parent.join(override_path)
         };
-        if path.extension().and_then(|value| value.to_str()) != Some("rss") {
-            return Err(SourcePathError::NonRustScriptModule(path));
-        }
         return Ok(module_identity(path));
     }
     if options.module_override_source(spec).is_some() {
@@ -147,9 +219,6 @@ pub(super) fn resolve_module_path(
         if path.extension().is_none() {
             path.set_extension("rss");
         }
-        if path.extension().and_then(|value| value.to_str()) != Some("rss") {
-            return Err(SourcePathError::NonRustScriptModule(path));
-        }
         return Ok(module_identity(path));
     }
 
@@ -163,9 +232,6 @@ pub(super) fn resolve_module_path(
     };
     if path.extension().is_none() {
         path.set_extension("rss");
-    }
-    if path.extension().and_then(|value| value.to_str()) != Some("rss") {
-        return Err(SourcePathError::NonRustScriptModule(path));
     }
     Ok(module_identity(path))
 }
@@ -223,7 +289,7 @@ pub(super) fn strip_import_directives(
 ) -> Result<String, SourcePathError> {
     match flavor {
         SourceFlavor::RustScript => Ok(source.to_string()),
-        SourceFlavor::JavaScript | SourceFlavor::Lua => Ok(options
+        SourceFlavor::Plugin(_) => Ok(options
             .source_plugin_for_flavor(flavor)
             .ok_or(SourcePathError::MissingFrontendPlugin(flavor))?
             .strip_import_directives(source)),

@@ -4,7 +4,7 @@ mod helpers;
 mod state;
 mod validate;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::ValueType;
 
@@ -24,10 +24,135 @@ pub(crate) use self::state::{
     BoundType, HostCallableSignature, LocalTypeState, TypeInferenceResult,
 };
 use super::CompileError;
+use super::FrontendTypedIr;
 use super::TypingMode;
 use super::ir::{
     Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, StructDecl, TypeSchema,
 };
+
+impl FrontendTypedIr<'_> {
+    /// Returns the compiler's existing logical schema inference for `expression`.
+    pub fn schema_of_expr(&self, expression: &Expr) -> Option<TypeSchema> {
+        let state = local_state_from_schemas(self.local_schemas);
+        let function_names = build_function_names(&self.ir.functions);
+        let function_decls = build_function_decl_map(&self.ir.functions);
+        let host_import_return_types =
+            build_host_import_return_types(&self.ir.functions, &self.ir.function_impls);
+        let host_import_signatures =
+            build_host_import_signatures(&self.ir.functions, &self.ir.function_impls);
+        let mut context = TypeContext::new(
+            &self.ir.function_impls,
+            &function_decls,
+            &self.ir.struct_schemas,
+            &function_names,
+            &host_import_return_types,
+            &host_import_signatures,
+            TypingMode::DynamicHints,
+            self.ir.parsed_semantic_index.as_ref(),
+        );
+        let schema = context
+            .infer_expr_schema(expression, &state)
+            .or_else(|| scalar_schema_from_bound_type(context.infer_expr_type(expression, &state)));
+        schema.map(|schema| {
+            if context.expr_is_optional(expression, &state)
+                && !matches!(schema, TypeSchema::Optional(_))
+            {
+                TypeSchema::Optional(Box::new(schema))
+            } else {
+                schema
+            }
+        })
+    }
+
+    /// Returns the complete logical callable schema for a declared function.
+    pub fn schema_of_function(&self, index: u16) -> Option<TypeSchema> {
+        let declaration = self.ir.functions.iter().find(|decl| decl.index == index)?;
+        let state = local_state_from_schemas(self.local_schemas);
+        let function_names = build_function_names(&self.ir.functions);
+        let function_decls = build_function_decl_map(&self.ir.functions);
+        let host_import_return_types =
+            build_host_import_return_types(&self.ir.functions, &self.ir.function_impls);
+        let host_import_signatures =
+            build_host_import_signatures(&self.ir.functions, &self.ir.function_impls);
+        let mut context = TypeContext::new(
+            &self.ir.function_impls,
+            &function_decls,
+            &self.ir.struct_schemas,
+            &function_names,
+            &host_import_return_types,
+            &host_import_signatures,
+            TypingMode::DynamicHints,
+            self.ir.parsed_semantic_index.as_ref(),
+        );
+        let type_args = declaration
+            .type_params
+            .iter()
+            .cloned()
+            .map(TypeSchema::GenericParam)
+            .collect::<Vec<_>>();
+        let result = match context.infer_expr_schema(&Expr::FunctionRef(index, type_args), &state) {
+            Some(TypeSchema::Callable { result, .. }) => *result,
+            _ => TypeSchema::Unknown,
+        };
+        let params = declaration
+            .args
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                declaration
+                    .arg_schemas
+                    .get(index)
+                    .cloned()
+                    .flatten()
+                    // Body-local observations are inference hints, not a
+                    // declaration-wide argument contract. Keep unannotated
+                    // parameters dynamic, as FunctionRef does.
+                    .unwrap_or(TypeSchema::Unknown)
+            })
+            .collect();
+        Some(TypeSchema::Callable {
+            params,
+            result: Box::new(result),
+        })
+    }
+}
+
+fn scalar_schema_from_bound_type(bound_type: BoundType) -> Option<TypeSchema> {
+    match bound_type {
+        BoundType::Null => Some(TypeSchema::Null),
+        BoundType::Int => Some(TypeSchema::Int),
+        BoundType::Float => Some(TypeSchema::Float),
+        BoundType::Number => Some(TypeSchema::Number),
+        BoundType::Bool => Some(TypeSchema::Bool),
+        BoundType::String => Some(TypeSchema::String),
+        BoundType::Bytes => Some(TypeSchema::Bytes),
+        BoundType::Unknown
+        | BoundType::Array
+        | BoundType::ArrayOf(_)
+        | BoundType::Map
+        | BoundType::MapOf(_)
+        | BoundType::Callable => None,
+    }
+}
+
+fn local_state_from_schemas(local_schemas: &[Option<TypeSchema>]) -> LocalTypeState {
+    let entry_local_types = local_schemas
+        .iter()
+        .enumerate()
+        .filter_map(|(index, schema)| {
+            Some(EntryLocalType {
+                slot: u16::try_from(index).ok()?,
+                schema: schema.clone(),
+                optional: false,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut state = LocalTypeState::default();
+    seed_entry_local_state(&mut state, &entry_local_types);
+    state
+}
+
+pub(crate) use self::context::render_schema_label;
 
 #[derive(Clone, Debug)]
 pub(super) struct EntryLocalType {
@@ -98,10 +223,24 @@ fn record_entry_local_types(
 }
 
 pub(super) fn legalize_builtins_and_bind_types(
-    mut ir: FrontendIr,
+    ir: FrontendIr,
     typing_mode: TypingMode,
     entry_local_types: &[EntryLocalType],
 ) -> Result<FrontendIr, CompileError> {
+    let (ir, error) = legalize_for_admission(ir, typing_mode, entry_local_types);
+    match error {
+        Some(error) => Err(error),
+        None => Ok(ir),
+    }
+}
+
+// Retain all successfully resolved facts even when another host call fails.
+// This view is admission/diagnostic-only until the error is discharged.
+pub(super) fn legalize_for_admission(
+    mut ir: FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+) -> (FrontendIr, Option<CompileError>) {
     // Exact callee spans for every parsed call site, keyed by the
     // [`SemanticNodeId`] carried on the typed [`Expr::Call`] nodes. The
     // host-call resolver attaches these to its failure diagnostic so the
@@ -122,7 +261,7 @@ pub(super) fn legalize_builtins_and_bind_types(
         let mut pass = HostCallResolutionPass::new(None, HostCallResolutionPhase::Disabled)
             .with_call_site_spans(&call_site_spans);
         run_legalize_round(&mut ir, typing_mode, entry_local_types, &mut pass);
-        return Ok(ir);
+        return (ir, None);
     };
 
     loop {
@@ -134,7 +273,7 @@ pub(super) fn legalize_builtins_and_bind_types(
             continue;
         }
         if refine.unresolved() == 0 {
-            return Ok(ir);
+            return (ir, None);
         }
 
         let mut final_pass =
@@ -145,11 +284,16 @@ pub(super) fn legalize_builtins_and_bind_types(
             continue;
         }
         if final_pass.unresolved() == 0 {
-            return Ok(ir);
+            return (ir, None);
         }
-        return Err(final_pass
-            .take_error()
-            .expect("a final unresolved catalog call must record a compile error"));
+        return (
+            ir,
+            Some(
+                final_pass
+                    .take_error()
+                    .expect("a final unresolved catalog call must record a compile error"),
+            ),
+        );
     }
 }
 
@@ -227,6 +371,32 @@ pub(super) fn infer_types(
     typing_mode: TypingMode,
     entry_local_types: &[EntryLocalType],
 ) -> TypeInferenceResult {
+    infer_types_with_root_projection(ir, typing_mode, entry_local_types, &[]).0
+}
+
+/// Root bindings describe the final checked root state. The aggregate result
+/// continues to summarize physical slots across root and callee frames.
+pub(super) fn infer_types_with_root_projection(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    root_slots: &[LocalSlot],
+) -> (TypeInferenceResult, Vec<EntryLocalType>) {
+    let (facts, roots, _) =
+        infer_types_with_capture_origins(ir, typing_mode, entry_local_types, root_slots);
+    (facts, roots)
+}
+
+pub(super) fn infer_types_with_capture_origins(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    root_slots: &[LocalSlot],
+) -> (
+    TypeInferenceResult,
+    Vec<EntryLocalType>,
+    super::capture_certification::DeclarationCaptures,
+) {
     let function_names = build_function_names(&ir.functions);
     let function_decls = build_function_decl_map(&ir.functions);
     let host_import_return_types =
@@ -258,16 +428,60 @@ pub(super) fn infer_types(
         &mut callable_slots,
         &mut optional_slots,
     );
-    collect_stmt_types(
-        &ir.stmts,
-        &mut top_state,
-        &mut local_types,
-        &mut local_schemas,
-        &mut local_schema_labels,
-        &mut callable_slots,
-        &mut optional_slots,
-        &mut context,
-    );
+    for (index, stmt) in ir.stmts.iter().enumerate() {
+        context.capture_owner = Some(super::capture_certification::CaptureOwner::RootStatement(
+            index,
+        ));
+        collect_stmt_types(
+            std::slice::from_ref(stmt),
+            &mut top_state,
+            &mut local_types,
+            &mut local_schemas,
+            &mut local_schema_labels,
+            &mut callable_slots,
+            &mut optional_slots,
+            &mut context,
+        );
+    }
+    // The backend collector intentionally summarizes expressions without
+    // exporting their writes. Replay only the requested root view with mutable
+    // expression state and a separate context, leaving backend observations intact.
+    let root_projection = if root_slots.is_empty() {
+        Vec::new()
+    } else {
+        let mut root_state = LocalTypeState::default();
+        seed_entry_local_state(&mut root_state, entry_local_types);
+        let mut root_context = TypeContext::new(
+            &ir.function_impls,
+            &function_decls,
+            &ir.struct_schemas,
+            &function_names,
+            &host_import_return_types,
+            &host_import_signatures,
+            typing_mode,
+            ir.parsed_semantic_index.as_ref(),
+        );
+        let entry_slots = entry_local_types
+            .iter()
+            .map(|entry| entry.slot)
+            .collect::<Vec<_>>();
+        collect::collect_root_stmt_state(
+            &ir.stmts,
+            &mut root_state,
+            &entry_slots,
+            &mut root_context,
+        );
+        root_slots
+            .iter()
+            .map(|&slot| EntryLocalType {
+                slot,
+                schema: root_context
+                    .infer_expr_schema(&Expr::Var(slot), &root_state)
+                    .or_else(|| scalar_schema_from_bound_type(root_state.get(slot))),
+                optional: root_state.is_optional(slot),
+            })
+            .collect()
+    };
     let observed_function_param_types = context.observed_function_param_types.clone();
     let observed_function_param_schemas = context.observed_function_param_schemas.clone();
     let observed_function_param_callables = context.observed_function_param_callables.clone();
@@ -288,6 +502,7 @@ pub(super) fn infer_types(
         observed_function_capture_states: &observed_function_capture_states,
     };
 
+    let mut origins = context.capture_origins.clone();
     for decl in &ir.functions {
         let Some(function_impl) = ir.function_impls.get(&decl.index) else {
             continue;
@@ -299,16 +514,41 @@ pub(super) fn infer_types(
             callable_slots: &mut callable_slots,
             optional_slots: &mut optional_slots,
         };
-        collect_function_types(decl.index, function_impl, decl, &mut outputs, &env);
+        origins.extend(collect_function_types(
+            decl.index,
+            function_impl,
+            decl,
+            &mut outputs,
+            &env,
+        ));
     }
 
-    TypeInferenceResult {
+    let mut facts = TypeInferenceResult {
         local_types,
         local_schemas,
         local_schema_labels,
         callable_slots,
         optional_slots,
-    }
+        function_schemas: HashMap::new(),
+    };
+    let schemas = facts.logical_schemas();
+    let typed = FrontendTypedIr {
+        source_id: None,
+        ir,
+        local_schemas: &schemas,
+        host_api_catalog: None,
+        source_map: None,
+    };
+    facts.function_schemas = ir
+        .functions
+        .iter()
+        .filter_map(|decl| {
+            typed
+                .schema_of_function(decl.index)
+                .map(|schema| (decl.index, schema))
+        })
+        .collect();
+    (facts, root_projection, origins)
 }
 
 pub(super) fn validate_if_else_type_consistency(
@@ -316,6 +556,41 @@ pub(super) fn validate_if_else_type_consistency(
     typing_mode: TypingMode,
     entry_local_types: &[EntryLocalType],
 ) -> Result<(), CompileError> {
+    validate_source_type_consistency(ir, typing_mode, entry_local_types, None)
+}
+
+pub(super) fn validate_source_type_consistency(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    owner: Option<&str>,
+) -> Result<(), CompileError> {
+    check_source_type_consistency(ir, typing_mode, entry_local_types, owner, false, None)
+        .map(|_| ())
+}
+
+pub(super) fn analyze_source_type_consistency(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    owner: Option<&str>,
+    host_error: Option<&CompileError>,
+) -> Result<Vec<CompileError>, CompileError> {
+    check_source_type_consistency(ir, typing_mode, entry_local_types, owner, true, host_error)
+}
+
+fn check_source_type_consistency(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    owner: Option<&str>,
+    recover_typing_diagnostics: bool,
+    host_error: Option<&CompileError>,
+) -> Result<Vec<CompileError>, CompileError> {
+    let mut diagnostics = Vec::new();
+    let dependent_host_returns = host_error
+        .map(|error| host_error_dependent_returns(ir, error))
+        .unwrap_or_default();
     let function_names = build_function_names(&ir.functions);
     let function_decls = build_function_decl_map(&ir.functions);
     let host_import_return_types =
@@ -334,7 +609,16 @@ pub(super) fn validate_if_else_type_consistency(
         ir.parsed_semantic_index.as_ref(),
     );
     for (index, stmt) in ir.stmts.iter().enumerate() {
-        validate_stmts(
+        if owner.is_some_and(|owner| {
+            ir.stmt_sources
+                .get(index)
+                .and_then(|source| source.as_deref())
+                != Some(owner)
+        }) {
+            context.apply_stmts(std::slice::from_ref(stmt), &mut top_state);
+            continue;
+        }
+        if let Err(error) = validate_stmts(
             std::slice::from_ref(stmt),
             &mut top_state,
             None,
@@ -343,22 +627,116 @@ pub(super) fn validate_if_else_type_consistency(
                 .and_then(|source| source.as_deref()),
             &mut context,
             false,
-        )?;
+        ) {
+            retain_native_typing_diagnostic(error, recover_typing_diagnostics, &mut diagnostics)?;
+            // A failed statement still contributes its real type flow to later
+            // validation sites; an earlier diagnostic cannot mask a hard error.
+            context.apply_stmts(std::slice::from_ref(stmt), &mut top_state);
+        }
     }
 
     for decl in &ir.functions {
         let Some(function_impl) = ir.function_impls.get(&decl.index) else {
             continue;
         };
-        validate_function_impl(
+        if owner.is_some_and(|owner| {
+            ir.function_sources.get(&decl.index).map(String::as_str) != Some(owner)
+        }) {
+            continue;
+        }
+        if let Err(error) = validate_function_impl(
             decl.index,
             function_impl,
             ir.function_sources.get(&decl.index).map(String::as_str),
             &mut context,
-        )?;
+        ) {
+            // Only the final inferred-return error of a provenance-proven
+            // direct call chain is fallout from this rejected host call.
+            // Body validation already ran; independent Strict slot admission
+            // and source hooks still run in the shared pipeline afterwards.
+            if recover_typing_diagnostics
+                && dependent_host_returns.contains(&decl.index)
+                && matches!(&error, CompileError::StrictTypingRequired {
+                    line: Some(line), span: Some(span), ..
+                } if *line == function_impl.body_expr_line
+                    && ir.parsed_semantic_index.as_ref().is_some_and(|index| {
+                        index.func_decls.iter().any(|site| {
+                            site.function_index == decl.index && site.ident_span == *span
+                        })
+                    }))
+            {
+                // Its unresolved facts remain unchanged; the exact host error
+                // is retained by the pipeline instead of a return cascade.
+                continue;
+            }
+            retain_native_typing_diagnostic(error, recover_typing_diagnostics, &mut diagnostics)?;
+        }
     }
 
-    Ok(())
+    Ok(diagnostics)
+}
+
+fn host_error_dependent_returns(ir: &FrontendIr, error: &CompileError) -> HashSet<u16> {
+    let CompileError::HostCallResolve {
+        span: Some(callee), ..
+    } = error
+    else {
+        return HashSet::new();
+    };
+    let Some(index) = ir.parsed_semantic_index.as_ref() else {
+        return HashSet::new();
+    };
+    let mut affected = HashSet::new();
+    loop {
+        let before = affected.len();
+        for declaration in &ir.functions {
+            if declaration.return_schema.is_some() || affected.contains(&declaration.index) {
+                continue;
+            }
+            let Some(implementation) = ir.function_impls.get(&declaration.index) else {
+                continue;
+            };
+            let Expr::Call(target, _, _, None, Some(id)) = &implementation.body_expr else {
+                continue;
+            };
+            let Some(site) = index.call_sites.iter().find(|site| site.id == *id) else {
+                continue;
+            };
+            let failed_host = site.callee_span == *callee
+                && ir
+                    .host_api_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.candidates(*target))
+                    .is_some();
+            if failed_host || affected.contains(target) {
+                affected.insert(declaration.index);
+            }
+        }
+        if before == affected.len() {
+            break;
+        }
+    }
+    affected
+}
+
+fn retain_native_typing_diagnostic(
+    error: CompileError,
+    recover: bool,
+    diagnostics: &mut Vec<CompileError>,
+) -> Result<(), CompileError> {
+    if recover
+        && matches!(
+            error,
+            CompileError::BinaryOperandTypeMismatch { .. }
+                | CompileError::IfElseBranchTypeMismatch { .. }
+                | CompileError::CallableArgumentTypeMismatch { .. }
+        )
+    {
+        diagnostics.push(error);
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 pub(crate) fn infer_expr_type(expr: &Expr, state: &LocalTypeState) -> BoundType {
@@ -574,6 +952,324 @@ mod catalog_call_resolution_tests {
 
     fn stmt_exprs(ir: &FrontendIr) -> Vec<&Expr> {
         ir.stmts.iter().filter_map(stmt_expr).collect()
+    }
+
+    #[test]
+    fn root_result_join_preserves_context_guards_and_aggregate() {
+        for (source, expected, optional) in [
+            (
+                "let maybe: float? = 2.5; let y = if true => { maybe } else => { null };",
+                Some(TypeSchema::Float),
+                true,
+            ),
+            (
+                "let maybe: float? = 2.5; let y = match 1 { 1 => maybe, _ => null };",
+                Some(TypeSchema::Float),
+                true,
+            ),
+            // Match keeps its existing explicit-arm disagreement rule.
+            (
+                "let maybe: float? = 2.5; let y = match 1 { 1 => maybe, 2 => null, _ => maybe };",
+                None,
+                true,
+            ),
+            (
+                "struct Left { value: int } struct Right { value: int } let left: Left? = { value: 1 }; let right: Right? = { value: 2 }; let y = if true => { left } else => { right };",
+                None,
+                true,
+            ),
+            (
+                "struct Left { value: int } struct Right { value: int } let left: Left? = { value: 1 }; let right: Right? = { value: 2 }; let y = match 1 { 1 => left, _ => right };",
+                None,
+                true,
+            ),
+            (
+                "let y = if true => { null } else => { null };",
+                Some(TypeSchema::Null),
+                false,
+            ),
+        ] {
+            let ir = parse(source, catalog(vec![], vec![]));
+            let slot = ir
+                .local_bindings
+                .iter()
+                .find(|(name, _)| name == "y")
+                .unwrap()
+                .1;
+            let before = format!("{ir:?}");
+            let aggregate = infer_types(&ir, TypingMode::DynamicHints, &[]);
+            let (projected, roots) =
+                infer_types_with_root_projection(&ir, TypingMode::DynamicHints, &[], &[slot]);
+            assert_eq!(aggregate, projected, "{source}");
+            assert_eq!(before, format!("{ir:?}"));
+            let declarations = HashMap::new();
+            let names = HashMap::new();
+            let returns = HashMap::new();
+            let signatures = HashMap::new();
+            let mut reference = TypeContext::new(
+                &ir.function_impls,
+                &declarations,
+                &ir.struct_schemas,
+                &names,
+                &returns,
+                &signatures,
+                TypingMode::DynamicHints,
+                None,
+            );
+            let mut reference_state = LocalTypeState::default();
+            reference.apply_stmts(&ir.stmts, &mut reference_state);
+            let reference_schema = reference
+                .infer_expr_schema(&Expr::Var(slot), &reference_state)
+                .or_else(|| scalar_schema_from_bound_type(reference_state.get(slot)));
+            assert_eq!(
+                roots[0].schema, reference_schema,
+                "existing context: {source}"
+            );
+            assert_eq!(roots[0].optional, reference_state.is_optional(slot));
+            assert_eq!(roots[0].schema, expected, "{source}");
+            assert_eq!(roots[0].optional, optional, "{source}");
+        }
+    }
+
+    #[test]
+    fn root_result_join_unknown_snapshot_is_not_null_or_a_reused_slot() {
+        for reverse in [false, true] {
+            let mut ir = parse(
+                "let maybe: float? = 2.5; let y = if true => { maybe } else => { null };",
+                catalog(vec![], vec![]),
+            );
+            let Stmt::Let { index, expr, .. } = &mut ir.stmts[1] else {
+                panic!("result binding")
+            };
+            let result_slot = *index;
+            let Expr::IfElse {
+                then_expr,
+                else_expr,
+                ..
+            } = expr
+            else {
+                panic!("conditional")
+            };
+            // An unbound inference-only value carries schema=None, not Null.
+            **else_expr = Expr::Var(60000);
+            if reverse {
+                std::mem::swap(then_expr, else_expr);
+            }
+            let aggregate = infer_types(&ir, TypingMode::DynamicHints, &[]);
+            let (projected, roots) = infer_types_with_root_projection(
+                &ir,
+                TypingMode::DynamicHints,
+                &[],
+                &[result_slot],
+            );
+            assert_eq!(aggregate, projected);
+            assert_eq!(roots[0].schema, None);
+            assert!(roots[0].optional);
+        }
+    }
+
+    #[test]
+    fn root_expression_effects_block_local_shadow_is_a_distinct_slot() {
+        use crate::compiler::ir::AssignmentKind;
+        let mut ir = parse("let mut x = 1; let ignored = 0;", catalog(vec![], vec![]));
+        ir.locals = 3;
+        let shadow = 2;
+        let Expr::Int(_) = stmt_expr(&ir.stmts[1]).unwrap() else {
+            panic!("literal initializer");
+        };
+        let Stmt::Let { expr, .. } = &mut ir.stmts[1] else {
+            panic!("let initializer");
+        };
+        *expr = Expr::Block {
+            stmts: vec![
+                Stmt::Let {
+                    index: shadow,
+                    declared_schema: None,
+                    expr: Expr::Int(2),
+                    line: 1,
+                },
+                Stmt::Assign {
+                    index: shadow,
+                    kind: AssignmentKind::Set,
+                    expr: Expr::Float(2.5),
+                    line: 1,
+                },
+            ],
+            expr: Box::new(Expr::Int(0)),
+        };
+        // A frontend can attach the same spelling to distinct lexical slots.
+        ir.local_bindings.push(("x".into(), shadow));
+        let aggregate = infer_types(&ir, TypingMode::DynamicHints, &[]);
+        let (projected, roots) =
+            infer_types_with_root_projection(&ir, TypingMode::DynamicHints, &[], &[0, shadow]);
+        assert_eq!(aggregate, projected);
+        assert_eq!(roots[0].schema, Some(TypeSchema::Int));
+        assert_eq!(
+            roots[1].schema, None,
+            "a block-only slot must not enter final root state"
+        );
+    }
+
+    #[test]
+    fn root_expression_effects_preserve_aggregate_and_conservative_paths() {
+        for (source, expected) in [
+            (
+                "let mut x = 1; let ignored = if true => { x = 2.5; 0 } else => { x = 2.5; 0 };",
+                Some(TypeSchema::Float),
+            ),
+            (
+                "let mut x = 1; let ignored = if (if true => { x = 2.5; true } else => { x = 2.5; true }) => { 0 } else => { 0 };",
+                Some(TypeSchema::Float),
+            ),
+            (
+                "let mut x = 1; let ignored = if true => { x = 2.5; 0 } else => { 0 };",
+                None,
+            ),
+            (
+                "let mut x = 1; let ignored = if false => { x = 2.5; 0 } else => { 0 };",
+                None,
+            ),
+            (
+                "let mut x = 1; let ignored = false && (if true => { x = 2.5; true } else => { x = 2.5; true });",
+                None,
+            ),
+            (
+                "let mut x = 1; let ignored = true || (if true => { x = 2.5; false } else => { x = 2.5; false });",
+                None,
+            ),
+            (
+                "let mut x = 1; while false { let ignored = if true => { x = 2.5; 0 } else => { x = 2.5; 0 }; }",
+                None,
+            ),
+            (
+                "let mut x = 1; let f = |n| if true => { let mut local = x; local = 2.5; n } else => { n };",
+                Some(TypeSchema::Int),
+            ),
+            (
+                "let mut x = 1; fn f() -> int { let mut x = 1; x = 2.5; 0 }",
+                Some(TypeSchema::Int),
+            ),
+        ] {
+            println!("root expression effects probe source={source}");
+            let ir = parse(source, catalog(vec![], vec![]));
+            let ir = legalize_builtins_and_bind_types(ir, TypingMode::DynamicHints, &[]).unwrap();
+            validate_if_else_type_consistency(&ir, TypingMode::DynamicHints, &[]).unwrap();
+            let root = ir
+                .local_bindings
+                .iter()
+                .find(|(name, _)| name == "x")
+                .unwrap()
+                .1;
+            let allocated =
+                crate::compiler::lifetime::allocate_local_slots_with_root_slots(ir, &[root])
+                    .unwrap();
+            let root = allocated.mapping[root as usize];
+            let before = allocated.ir.clone();
+            let aggregate = infer_types(&allocated.ir, TypingMode::DynamicHints, &[]);
+            let (projected_aggregate, projection) = infer_types_with_root_projection(
+                &allocated.ir,
+                TypingMode::DynamicHints,
+                &[],
+                &[root],
+            );
+            assert_eq!(aggregate, projected_aggregate, "{source}");
+            assert_eq!(
+                format!("{before:?}"),
+                format!("{:?}", allocated.ir),
+                "projection must not rewrite backend IR"
+            );
+            assert_eq!(projection[0].schema, expected, "{source}");
+            assert!(!projection[0].optional, "{source}");
+            if source.contains("else => { x = 2.5;") {
+                // Both executed alternatives update the root, but aggregate
+                // observations still use the original physical-slot merge.
+                assert_eq!(
+                    aggregate.local_schemas[root as usize],
+                    Some(TypeSchema::Float)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn root_projection_preserves_aggregate_callee_and_closure_facts() {
+        let named = crate::HostStructSchema::new(
+            "ProjectionRoot",
+            vec![crate::HostStructField::new("value", HostTypeSchema::Int)],
+        );
+        let mut builder = HostApiBuilder::new();
+        builder.named_struct(named.clone());
+        builder.function(HostFunctionSchema::with_return(
+            "layout::root",
+            vec![],
+            named.as_type(),
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "layout::maybe",
+            vec![],
+            HostTypeSchema::Optional(Box::new(named.as_type())),
+        ));
+        let catalog = Arc::new(builder.build().unwrap());
+        let locals = (0..257)
+            .map(|i| format!("let t{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for body in [
+            format!("fn f() -> int {{ {locals} t256 }} f();"),
+            format!("let f = |n| if n > 0 => {{ {locals} t256 + n }} else => {{ n }}; f(1);"),
+        ] {
+            let ir = parse(
+                &format!(
+                    "use layout; let root = layout::root(); let maybe = layout::maybe(); {body}"
+                ),
+                Arc::clone(&catalog),
+            );
+            let ir = legalize_builtins_and_bind_types(ir, TypingMode::DynamicHints, &[]).unwrap();
+            let roots = ["root", "maybe"]
+                .map(|name| ir.local_bindings.iter().find(|(n, _)| n == name).unwrap().1);
+            let allocated =
+                crate::compiler::lifetime::allocate_local_slots_with_root_slots(ir, &roots)
+                    .unwrap();
+            let roots = roots.map(|slot| allocated.mapping[slot as usize]);
+            let aggregate = infer_types(&allocated.ir, TypingMode::DynamicHints, &[]);
+            let (projected_aggregate, projection) = infer_types_with_root_projection(
+                &allocated.ir,
+                TypingMode::DynamicHints,
+                &[],
+                &roots,
+            );
+            assert_eq!(aggregate.local_types, projected_aggregate.local_types);
+            assert_eq!(aggregate.local_schemas, projected_aggregate.local_schemas);
+            assert_eq!(
+                aggregate.local_schema_labels,
+                projected_aggregate.local_schema_labels
+            );
+            assert_eq!(aggregate.callable_slots, projected_aggregate.callable_slots);
+            assert_eq!(aggregate.optional_slots, projected_aggregate.optional_slots);
+            assert_eq!(
+                aggregate.function_schemas,
+                projected_aggregate.function_schemas
+            );
+            let schema = TypeSchema::Named("ProjectionRoot".into(), vec![]);
+            assert_eq!(projection[0].slot, roots[0]);
+            assert_eq!(projection[0].schema, Some(schema.clone()));
+            assert!(!projection[0].optional);
+            assert_eq!(projection[1].slot, roots[1]);
+            assert_eq!(
+                projection[1].schema,
+                Some(TypeSchema::Optional(Box::new(schema)))
+            );
+            assert!(projection[1].optional);
+            let expected_backend = if body.starts_with("fn ") {
+                TypeSchema::Int
+            } else {
+                TypeSchema::Named("ProjectionRoot".into(), vec![])
+            };
+            assert_eq!(
+                aggregate.local_schemas[roots[0] as usize],
+                Some(expected_backend)
+            );
+        }
     }
 
     #[test]
@@ -796,23 +1492,101 @@ mod catalog_call_resolution_tests {
         let hint_error = crate::compiler::collect_inferred_local_type_hints_with_options(
             source,
             SourceFlavor::RustScript,
-            CompileSourceFileOptions::default().with_host_api_catalog(catalog),
+            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog)),
         )
         .expect_err("hint collection must return the resolver error");
 
-        for error in [compile_error, hint_error] {
+        for (entrypoint, error) in [("compile", compile_error), ("hint", hint_error)] {
             let source_error = match error {
                 crate::compiler::SourcePathError::Source(error) => error,
                 crate::compiler::SourcePathError::SourceWithMap { error, .. } => error,
                 other => panic!("unexpected path error: {other}"),
             };
-            assert!(matches!(
-                source_error,
-                crate::compiler::SourceError::Compile(CompileError::HostCallResolve {
-                    line: Some(3),
+            assert!(
+                matches!(
+                    source_error,
+                    crate::compiler::SourceError::Compile(CompileError::HostCallResolve {
+                        line: Some(3),
+                        ..
+                    })
+                ),
+                "{entrypoint}: {source_error:?}"
+            );
+        }
+
+        let configured =
+            || CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+        let valid = "use acme;\nlet file = acme::open(\"x\");\nacme::consume(file);\n";
+        crate::compiler::compile_source_with_flavor_and_options(
+            valid,
+            SourceFlavor::RustScript,
+            configured(),
+        )
+        .expect("the original owned resource remains admissible");
+        let hints = crate::compiler::collect_inferred_local_type_hints_with_options(
+            valid,
+            SourceFlavor::RustScript,
+            configured(),
+        )
+        .unwrap();
+        assert!(hints.iter().any(|hint| {
+            hint.name == "file"
+                && hint.schema
+                    == Some(TypeSchema::Resource(
+                        ResourceTypeKey::new("acme.file").unwrap(),
+                    ))
+        }));
+
+        // Recovery still runs ownership admission. A standalone copy or a
+        // use-after-move is independent of an invalid catalog call, including
+        // when the independent statement shares the same source line.
+        for invalid in [
+            source,
+            "use acme;\nlet file = acme::open(\"x\");\nfile.copy(); acme::consume(42);\n",
+            "use acme;\nlet file = acme::open(\"x\");\nacme::consume(42); file.copy();\n",
+            "use acme;\nlet file = acme::open(\"x\");\nacme::consume(file);\nfile;\nacme::consume(42);\n",
+        ] {
+            let analyzed = crate::compiler::analyze_source_from_string_with_options(
+                "main.rss",
+                invalid,
+                configured(),
+            )
+            .err()
+            .expect("host recovery must retain ownership rejection");
+            let mut errors = vec![analyzed];
+            if invalid != source {
+                errors.push(
+                    crate::compiler::compile_source_with_flavor_and_options(
+                        invalid,
+                        SourceFlavor::RustScript,
+                        configured(),
+                    )
+                    .err()
+                    .expect("independent ownership rejection in compile"),
+                );
+                errors.push(
+                    crate::compiler::collect_inferred_local_type_hints_with_options(
+                        invalid,
+                        SourceFlavor::RustScript,
+                        configured(),
+                    )
+                    .expect_err("independent ownership rejection in hints"),
+                );
+            }
+            for error in errors {
+                let crate::compiler::SourcePathError::SourceWithMap {
+                    error: crate::compiler::SourceError::Parse(error),
                     ..
-                })
-            ));
+                } = error
+                else {
+                    panic!("independent ownership diagnostic required: {error:?}");
+                };
+                assert!(
+                    error.code.as_deref() == Some("E_OWNERSHIP_COPY_RESOURCE")
+                        || error.message.contains("moved"),
+                    "{error:?}"
+                );
+            }
         }
     }
 

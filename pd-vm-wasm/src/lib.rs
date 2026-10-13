@@ -6,6 +6,10 @@ mod stdlib;
 
 use std::path::Path;
 
+#[cfg(test)]
+#[path = "../tests/fixtures/coherent_typehint.rs"]
+mod coherent_typehint;
+
 use serde::{Deserialize, Serialize};
 use vm::{
     CompileSourceFileOptions, InferredLocalTypeHint, SourceFlavor,
@@ -32,6 +36,8 @@ struct LintResponse {
 #[derive(Serialize)]
 struct LocalTypeHintsResponse {
     hints: Vec<LocalTypeHintJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -60,10 +66,57 @@ struct LintSpanJson {
 
 #[derive(Serialize)]
 struct LocalTypeHintJson {
+    source_name: Option<String>,
+    schema: Option<serde_json::Value>,
+    span: Option<SourceByteSpanJson>,
     name: String,
     inferred_type: String,
     declared_line: Option<u32>,
     last_line: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct SourceByteSpanJson {
+    source_id: u32,
+    lo: usize,
+    hi: usize,
+}
+
+fn type_schema_to_json(schema: &vm::TypeSchema) -> serde_json::Value {
+    use serde_json::json;
+    use vm::TypeSchema;
+    match schema {
+        TypeSchema::Unknown => json!({"kind": "unknown"}),
+        TypeSchema::Null => json!({"kind": "null"}),
+        TypeSchema::Int => json!({"kind": "int"}),
+        TypeSchema::Float => json!({"kind": "float"}),
+        TypeSchema::Number => json!({"kind": "number"}),
+        TypeSchema::Bool => json!({"kind": "bool"}),
+        TypeSchema::String => json!({"kind": "string"}),
+        TypeSchema::Bytes => json!({"kind": "bytes"}),
+        TypeSchema::GenericParam(name) => json!({"kind": "generic_param", "name": name}),
+        TypeSchema::Resource(key) => json!({"kind": "resource", "key": key.as_str()}),
+        TypeSchema::Optional(inner) => {
+            json!({"kind": "optional", "inner": type_schema_to_json(inner)})
+        }
+        TypeSchema::Array(item) => json!({"kind": "array", "item": type_schema_to_json(item)}),
+        TypeSchema::Map(item) => json!({"kind": "map", "item": type_schema_to_json(item)}),
+        TypeSchema::Named(name, args) => {
+            json!({"kind": "named", "name": name, "args": args.iter().map(type_schema_to_json).collect::<Vec<_>>()})
+        }
+        TypeSchema::ArrayTuple(items) => {
+            json!({"kind": "tuple", "items": items.iter().map(type_schema_to_json).collect::<Vec<_>>()})
+        }
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            json!({"kind": "tuple_rest", "prefix": prefix.iter().map(type_schema_to_json).collect::<Vec<_>>(), "rest": type_schema_to_json(rest)})
+        }
+        TypeSchema::Object(fields) => {
+            json!({"kind": "object", "fields": fields.iter().map(|(name, schema)| (name.clone(), type_schema_to_json(schema))).collect::<serde_json::Map<_, _>>()})
+        }
+        TypeSchema::Callable { params, result } => {
+            json!({"kind": "callable", "params": params.iter().map(type_schema_to_json).collect::<Vec<_>>(), "result": type_schema_to_json(result)})
+        }
+    }
 }
 
 #[cfg(feature = "runtime")]
@@ -112,11 +165,10 @@ struct ModuleOverrideInput {
     source: String,
 }
 
-fn parse_flavor(raw: &str) -> SourceFlavor {
+fn parse_flavor(raw: &str) -> Result<SourceFlavor, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "javascript" | "js" => SourceFlavor::JavaScript,
-        "lua" => SourceFlavor::Lua,
-        _ => SourceFlavor::RustScript,
+        "" | "default" | "rss" | "rustscript" => Ok(SourceFlavor::RustScript),
+        _ => Err(format!("unsupported frontend selector: {}", raw.trim())),
     }
 }
 
@@ -171,6 +223,7 @@ fn lint_response_to_json(report: LintReport) -> Vec<u8> {
 fn local_type_hints_to_json(hints: Vec<InferredLocalTypeHint>) -> Vec<u8> {
     let response = LocalTypeHintsResponse {
         hints: hints.into_iter().map(local_type_hint_to_json).collect(),
+        error: None,
     };
     serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"hints\":[]}".to_vec())
 }
@@ -193,13 +246,16 @@ fn format_response_to_json(result: Result<String, vm::FormatError>) -> Vec<u8> {
     })
 }
 
-fn local_type_hints_with_flavor(source: &str, flavor: SourceFlavor) -> Vec<InferredLocalTypeHint> {
+fn local_type_hints_with_flavor(
+    source: &str,
+    flavor: SourceFlavor,
+) -> Result<Vec<InferredLocalTypeHint>, String> {
     collect_inferred_local_type_hints_with_options(
         source,
         flavor,
         stdlib::embedded_stdlib_compile_options(),
     )
-    .unwrap_or_default()
+    .map_err(|err| err.to_string())
 }
 
 fn local_type_hints_with_flavor_at_path(
@@ -207,9 +263,108 @@ fn local_type_hints_with_flavor_at_path(
     path: &Path,
     flavor: SourceFlavor,
     options: CompileSourceFileOptions,
-) -> Vec<InferredLocalTypeHint> {
+) -> Result<Vec<InferredLocalTypeHint>, String> {
     collect_inferred_local_type_hints_at_path_with_options(path, source, flavor, options)
-        .unwrap_or_default()
+        .map_err(|err| err.to_string())
+}
+
+fn lint_error_response(message: String) -> Vec<u8> {
+    let response = LintResponse {
+        diagnostics: vec![LintDiagnosticJson {
+            line: 1,
+            severity: "error",
+            rendered: message.clone(),
+            message,
+            span: None,
+        }],
+    };
+    serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"diagnostics\":[]}".to_vec())
+}
+
+fn format_error_response(message: String) -> Vec<u8> {
+    serde_json::to_vec(&FormatResponse {
+        ok: false,
+        formatted: None,
+        error: Some(message),
+    })
+    .unwrap_or_else(|_| b"{\"ok\":false,\"formatted\":null,\"error\":\"format failed\"}".to_vec())
+}
+
+fn local_type_hints_error_response(message: String) -> Vec<u8> {
+    serde_json::to_vec(&LocalTypeHintsResponse {
+        hints: Vec::new(),
+        error: Some(message),
+    })
+    .unwrap_or_else(|_| b"{\"hints\":[],\"error\":\"type hints failed\"}".to_vec())
+}
+
+fn lint_source_json_response(source: &str, flavor_raw: &str) -> Vec<u8> {
+    let flavor = match parse_flavor(flavor_raw) {
+        Ok(flavor) => flavor,
+        Err(error) => return lint_error_response(error),
+    };
+    lint_response_to_json(lint_source_with_flavor(source, flavor))
+}
+
+fn lint_source_json_with_context_response(
+    source: &str,
+    flavor_raw: &str,
+    path_raw: &str,
+    overrides_raw: &str,
+) -> Vec<u8> {
+    let flavor = match parse_flavor(flavor_raw) {
+        Ok(flavor) => flavor,
+        Err(error) => return lint_error_response(error),
+    };
+    let options = parse_module_overrides(overrides_raw);
+    let report = if path_raw.trim().is_empty() {
+        lint_source_with_flavor(source, flavor)
+    } else {
+        lint_source_with_flavor_at_path(source, Path::new(path_raw), flavor, options)
+    };
+    lint_response_to_json(report)
+}
+
+fn format_source_json_response(source: &str, flavor_raw: &str) -> Vec<u8> {
+    let flavor = match parse_flavor(flavor_raw) {
+        Ok(flavor) => flavor,
+        Err(error) => return format_error_response(error),
+    };
+    format_response_to_json(format_source_with_flavor(source, flavor))
+}
+
+fn local_type_hints_json_response(source: &str, flavor_raw: &str) -> Vec<u8> {
+    let flavor = match parse_flavor(flavor_raw) {
+        Ok(flavor) => flavor,
+        Err(error) => return local_type_hints_error_response(error),
+    };
+    match local_type_hints_with_flavor(source, flavor) {
+        Ok(hints) => local_type_hints_to_json(hints),
+        Err(error) => local_type_hints_error_response(error),
+    }
+}
+
+fn local_type_hints_json_with_context_response(
+    source: &str,
+    flavor_raw: &str,
+    path_raw: &str,
+    overrides_raw: &str,
+) -> Vec<u8> {
+    let flavor = match parse_flavor(flavor_raw) {
+        Ok(flavor) => flavor,
+        Err(error) => return local_type_hints_error_response(error),
+    };
+    let options = parse_module_overrides(overrides_raw);
+    let result = if path_raw.trim().is_empty() {
+        collect_inferred_local_type_hints_with_options(source, flavor, options)
+            .map_err(|err| err.to_string())
+    } else {
+        local_type_hints_with_flavor_at_path(source, Path::new(path_raw), flavor, options)
+    };
+    match result {
+        Ok(hints) => local_type_hints_to_json(hints),
+        Err(error) => local_type_hints_error_response(error),
+    }
 }
 
 #[cfg(feature = "runtime")]
@@ -258,6 +413,70 @@ fn debug_response_to_json(report: DebugReport) -> Vec<u8> {
 }
 
 #[cfg(feature = "runtime")]
+fn frontend_run_error_response(message: String) -> Vec<u8> {
+    let response = RunResponse {
+        ok: false,
+        diagnostics: vec![LintDiagnosticJson {
+            line: 1,
+            severity: "error",
+            message: message.clone(),
+            span: None,
+            rendered: message.clone(),
+        }],
+        output: Vec::new(),
+        stack: Vec::new(),
+        error: Some(message),
+        halted: true,
+        yielded: false,
+        command_output: String::new(),
+        fuel: fuel_state_to_json(FuelState {
+            enabled: false,
+            mode: InterruptModeState::None,
+            remaining: None,
+            check_interval: 1,
+            epoch_current: 0,
+            epoch_deadline: None,
+            epoch_slice: None,
+        }),
+    };
+    serde_json::to_vec(&response).unwrap_or_else(|_| {
+        b"{\"ok\":false,\"diagnostics\":[],\"output\":[],\"stack\":[],\"halted\":true,\"yielded\":false,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
+    })
+}
+
+#[cfg(feature = "runtime")]
+fn frontend_debug_error_response(message: String) -> Vec<u8> {
+    let response = DebugResponse {
+        diagnostics: vec![LintDiagnosticJson {
+            line: 1,
+            severity: "error",
+            message: message.clone(),
+            span: None,
+            rendered: message.clone(),
+        }],
+        output: Vec::new(),
+        stack: Vec::new(),
+        error: Some(message),
+        current_line: None,
+        breakpoints: Vec::new(),
+        halted: true,
+        command_output: String::new(),
+        fuel: fuel_state_to_json(FuelState {
+            enabled: false,
+            mode: InterruptModeState::None,
+            remaining: None,
+            check_interval: 1,
+            epoch_current: 0,
+            epoch_deadline: None,
+            epoch_slice: None,
+        }),
+    };
+    serde_json::to_vec(&response).unwrap_or_else(|_| {
+        b"{\"diagnostics\":[],\"output\":[],\"stack\":[],\"breakpoints\":[],\"halted\":true,\"command_output\":\"\",\"fuel\":{\"enabled\":false,\"remaining\":null,\"check_interval\":1}}".to_vec()
+    })
+}
+
+#[cfg(feature = "runtime")]
 fn fuel_state_to_json(fuel: FuelState) -> FuelStateJson {
     FuelStateJson {
         enabled: fuel.enabled,
@@ -281,6 +500,13 @@ fn completion_catalog_to_json(catalog: CompletionCatalog) -> Vec<u8> {
 
 fn local_type_hint_to_json(hint: InferredLocalTypeHint) -> LocalTypeHintJson {
     LocalTypeHintJson {
+        source_name: hint.source_name,
+        schema: hint.schema.as_ref().map(type_schema_to_json),
+        span: hint.span.map(|span| SourceByteSpanJson {
+            source_id: span.source_id,
+            lo: span.lo,
+            hi: span.hi,
+        }),
         name: hint.name,
         inferred_type: hint.inferred_type,
         declared_line: hint.declared_line,
@@ -300,6 +526,46 @@ fn parse_module_overrides(raw: &str) -> CompileSourceFileOptions {
     options
 }
 
+#[cfg(feature = "runtime")]
+fn run_source_json_response(source: &str, flavor_raw: &str, options_json: Option<&str>) -> Vec<u8> {
+    let flavor = match parse_flavor(flavor_raw) {
+        Ok(flavor) => flavor,
+        Err(error) => return frontend_run_error_response(error),
+    };
+    let fuel_config = match options_json {
+        None => FuelConfig::default(),
+        Some(options_json) => match serde_json::from_str::<FuelConfig>(options_json) {
+            Ok(value) => value,
+            Err(err) => {
+                return invalid_run_options_response(options_json, &err.to_string());
+            }
+        },
+    };
+    run_response_to_json(start_run_source_with_flavor(source, flavor, fuel_config))
+}
+
+#[cfg(feature = "runtime")]
+fn debug_start_json_response(
+    source: &str,
+    flavor_raw: &str,
+    options_json: Option<&str>,
+) -> Vec<u8> {
+    let flavor = match parse_flavor(flavor_raw) {
+        Ok(flavor) => flavor,
+        Err(error) => return frontend_debug_error_response(error),
+    };
+    let fuel_config = match options_json {
+        None => FuelConfig::default(),
+        Some(options_json) => match serde_json::from_str::<FuelConfig>(options_json) {
+            Ok(value) => value,
+            Err(err) => {
+                return invalid_debug_options_response(options_json, &err.to_string());
+            }
+        },
+    };
+    debug_response_to_json(start_debug_source_with_flavor(source, flavor, fuel_config))
+}
+
 fn invalid_utf8_lint_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> {
     let response = LintResponse {
         diagnostics: vec![LintDiagnosticJson {
@@ -314,9 +580,7 @@ fn invalid_utf8_lint_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8>
 }
 
 fn invalid_utf8_local_type_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> {
-    let response = LocalTypeHintsResponse { hints: Vec::new() };
-    let _ = (label, err);
-    serde_json::to_vec(&response).unwrap_or_else(|_| b"{\"hints\":[]}".to_vec())
+    local_type_hints_error_response(format!("invalid utf-8 {label}: {err}"))
 }
 
 fn invalid_utf8_format_response(label: &str, err: &std::str::Utf8Error) -> Vec<u8> {
@@ -539,8 +803,7 @@ pub extern "C" fn lint_source_json(
         Ok(value) => value,
         Err(err) => return leak_bytes(invalid_utf8_lint_response("flavor", &err)),
     };
-    let report = lint_source_with_flavor(source, parse_flavor(flavor_raw));
-    leak_bytes(lint_response_to_json(report))
+    leak_bytes(lint_source_json_response(source, flavor_raw))
 }
 
 #[unsafe(no_mangle)]
@@ -558,10 +821,7 @@ pub extern "C" fn format_source_json(
         Ok(value) => value,
         Err(err) => return leak_bytes(invalid_utf8_format_response("flavor", &err)),
     };
-    leak_bytes(format_response_to_json(format_source_with_flavor(
-        source,
-        parse_flavor(flavor_raw),
-    )))
+    leak_bytes(format_source_json_response(source, flavor_raw))
 }
 
 #[unsafe(no_mangle)]
@@ -579,23 +839,19 @@ pub extern "C" fn lint_source_json_with_context(
         Ok(value) => value,
         Err(err) => return leak_bytes(invalid_utf8_lint_response("source", &err)),
     };
-    let flavor_raw = std::str::from_utf8(unpack_input(flavor_ptr, flavor_len)).unwrap_or("rss");
+    let flavor_raw = match std::str::from_utf8(unpack_input(flavor_ptr, flavor_len)) {
+        Ok(value) => value,
+        Err(err) => return leak_bytes(invalid_utf8_lint_response("flavor", &err)),
+    };
     let path_raw = std::str::from_utf8(unpack_input(path_ptr, path_len)).unwrap_or("");
     let overrides_raw =
         std::str::from_utf8(unpack_input(overrides_ptr, overrides_len)).unwrap_or("[]");
-    let options = parse_module_overrides(overrides_raw);
-
-    let report = if path_raw.trim().is_empty() {
-        lint_source_with_flavor(source, parse_flavor(flavor_raw))
-    } else {
-        lint_source_with_flavor_at_path(
-            source,
-            Path::new(path_raw),
-            parse_flavor(flavor_raw),
-            options,
-        )
-    };
-    leak_bytes(lint_response_to_json(report))
+    leak_bytes(lint_source_json_with_context_response(
+        source,
+        flavor_raw,
+        path_raw,
+        overrides_raw,
+    ))
 }
 
 #[unsafe(no_mangle)]
@@ -613,8 +869,7 @@ pub extern "C" fn local_type_hints_json(
         Ok(value) => value,
         Err(err) => return leak_bytes(invalid_utf8_local_type_response("flavor", &err)),
     };
-    let hints = local_type_hints_with_flavor(source, parse_flavor(flavor_raw));
-    leak_bytes(local_type_hints_to_json(hints))
+    leak_bytes(local_type_hints_json_response(source, flavor_raw))
 }
 
 #[unsafe(no_mangle)]
@@ -632,25 +887,19 @@ pub extern "C" fn local_type_hints_json_with_context(
         Ok(value) => value,
         Err(err) => return leak_bytes(invalid_utf8_local_type_response("source", &err)),
     };
-    let flavor_raw = std::str::from_utf8(unpack_input(flavor_ptr, flavor_len)).unwrap_or("rss");
+    let flavor_raw = match std::str::from_utf8(unpack_input(flavor_ptr, flavor_len)) {
+        Ok(value) => value,
+        Err(err) => return leak_bytes(invalid_utf8_local_type_response("flavor", &err)),
+    };
     let path_raw = std::str::from_utf8(unpack_input(path_ptr, path_len)).unwrap_or("");
     let overrides_raw =
         std::str::from_utf8(unpack_input(overrides_ptr, overrides_len)).unwrap_or("[]");
-    let options = parse_module_overrides(overrides_raw);
-
-    let hints = if path_raw.trim().is_empty() {
-        collect_inferred_local_type_hints_with_options(source, parse_flavor(flavor_raw), options)
-            .unwrap_or_default()
-    } else {
-        local_type_hints_with_flavor_at_path(
-            source,
-            Path::new(path_raw),
-            parse_flavor(flavor_raw),
-            options,
-        )
-    };
-
-    leak_bytes(local_type_hints_to_json(hints))
+    leak_bytes(local_type_hints_json_with_context_response(
+        source,
+        flavor_raw,
+        path_raw,
+        overrides_raw,
+    ))
 }
 
 #[cfg(feature = "runtime")]
@@ -671,22 +920,17 @@ pub extern "C" fn run_source_json(
         Ok(value) => value,
         Err(err) => return leak_bytes(invalid_utf8_run_response("flavor", &err)),
     };
-    let fuel_config = if options_len == 0 {
-        FuelConfig::default()
+    let options_json = if options_len == 0 {
+        None
     } else {
-        let options_json = match std::str::from_utf8(unpack_input(options_ptr, options_len)) {
-            Ok(value) => value,
-            Err(err) => return leak_bytes(invalid_utf8_run_response("options", &err)),
-        };
-        match serde_json::from_str::<FuelConfig>(options_json) {
-            Ok(value) => value,
-            Err(err) => {
-                return leak_bytes(invalid_run_options_response(options_json, &err.to_string()));
-            }
-        }
+        Some(
+            match std::str::from_utf8(unpack_input(options_ptr, options_len)) {
+                Ok(value) => value,
+                Err(err) => return leak_bytes(invalid_utf8_run_response("options", &err)),
+            },
+        )
     };
-    let report = start_run_source_with_flavor(source, parse_flavor(flavor_raw), fuel_config);
-    leak_bytes(run_response_to_json(report))
+    leak_bytes(run_source_json_response(source, flavor_raw, options_json))
 }
 
 #[cfg(feature = "runtime")]
@@ -707,25 +951,17 @@ pub extern "C" fn debug_start_json(
         Ok(value) => value,
         Err(err) => return leak_bytes(invalid_utf8_debug_response("flavor", &err)),
     };
-    let fuel_config = if options_len == 0 {
-        FuelConfig::default()
+    let options_json = if options_len == 0 {
+        None
     } else {
-        let options_json = match std::str::from_utf8(unpack_input(options_ptr, options_len)) {
-            Ok(value) => value,
-            Err(err) => return leak_bytes(invalid_utf8_debug_response("options", &err)),
-        };
-        match serde_json::from_str::<FuelConfig>(options_json) {
-            Ok(value) => value,
-            Err(err) => {
-                return leak_bytes(invalid_debug_options_response(
-                    options_json,
-                    &err.to_string(),
-                ));
-            }
-        }
+        Some(
+            match std::str::from_utf8(unpack_input(options_ptr, options_len)) {
+                Ok(value) => value,
+                Err(err) => return leak_bytes(invalid_utf8_debug_response("options", &err)),
+            },
+        )
     };
-    let report = start_debug_source_with_flavor(source, parse_flavor(flavor_raw), fuel_config);
-    leak_bytes(debug_response_to_json(report))
+    leak_bytes(debug_start_json_response(source, flavor_raw, options_json))
 }
 
 #[cfg(feature = "runtime")]
@@ -784,6 +1020,209 @@ mod lint_tests {
     use crate::analyzer::{lint_source_with_flavor, lint_source_with_flavor_at_path};
     use serde_json::Value;
     use vm::{SourceFlavor, collect_inferred_local_type_hints};
+
+    #[test]
+    fn frontend_request_helpers_preserve_rss_results_and_reject_unknown_selectors() {
+        let source = "let value = 1;";
+
+        let lint: Value = serde_json::from_slice(&super::lint_source_json_response(source, "rss"))
+            .expect("RSS lint response should be JSON");
+        assert!(lint["diagnostics"].is_array());
+        assert!(
+            lint["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["severity"] != "error")
+        );
+
+        let formatted: Value =
+            serde_json::from_slice(&super::format_source_json_response(source, "rustscript"))
+                .expect("RSS format response should be JSON");
+        assert_eq!(formatted["ok"], true);
+        assert!(formatted["formatted"].as_str().is_some());
+        let default_formatted: Value =
+            serde_json::from_slice(&super::format_source_json_response(source, "default"))
+                .expect("default frontend format response should be JSON");
+        assert_eq!(default_formatted["ok"], true);
+
+        let hints: Value =
+            serde_json::from_slice(&super::local_type_hints_json_response(source, ""))
+                .expect("RSS hints response should be JSON");
+        assert!(
+            hints["hints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hint| hint["name"] == "value")
+        );
+
+        let contextual_lint: Value = serde_json::from_slice(
+            &super::lint_source_json_with_context_response(source, "rss", "", "[]"),
+        )
+        .expect("contextual RSS lint response should be JSON");
+        assert!(contextual_lint["diagnostics"].is_array());
+        let lint_at_path: Value =
+            serde_json::from_slice(&super::lint_source_json_with_context_response(
+                source,
+                "rss",
+                "/virtual/main.rss",
+                "[]",
+            ))
+            .expect("path-aware RSS lint response should be JSON");
+        assert!(lint_at_path["diagnostics"].is_array());
+
+        let contextual_hints: Value = serde_json::from_slice(
+            &super::local_type_hints_json_with_context_response(source, "rss", "", "[]"),
+        )
+        .expect("contextual RSS hints response should be JSON");
+        assert!(
+            contextual_hints["hints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hint| hint["name"] == "value")
+        );
+        let hints_at_path: Value =
+            serde_json::from_slice(&super::local_type_hints_json_with_context_response(
+                source,
+                "rss",
+                "/virtual/main.rss",
+                "[]",
+            ))
+            .expect("path-aware RSS hints response should be JSON");
+        assert!(
+            hints_at_path["hints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hint| hint["name"] == "value")
+        );
+
+        let rejected_lint: Value =
+            serde_json::from_slice(&super::lint_source_json_response(source, "opaque-frontend"))
+                .expect("rejected lint response should be JSON");
+        assert!(
+            rejected_lint["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["severity"] == "error"
+                        && item["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("unsupported frontend")
+                })
+        );
+
+        let rejected_contextual_lint: Value = serde_json::from_slice(
+            &super::lint_source_json_with_context_response(source, "opaque-frontend", "", "[]"),
+        )
+        .expect("rejected contextual lint response should be JSON");
+        assert!(
+            rejected_contextual_lint["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["severity"] == "error")
+        );
+
+        let rejected_format: Value = serde_json::from_slice(&super::format_source_json_response(
+            source,
+            "opaque-frontend",
+        ))
+        .expect("rejected format response should be JSON");
+        assert_eq!(rejected_format["ok"], false);
+        assert!(
+            rejected_format["error"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported frontend")
+        );
+
+        let rejected_hints: Value = serde_json::from_slice(&super::local_type_hints_json_response(
+            source,
+            "opaque-frontend",
+        ))
+        .expect("rejected hints response should be JSON");
+        assert!(rejected_hints["hints"].as_array().unwrap().is_empty());
+        assert!(
+            rejected_hints["error"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported frontend")
+        );
+
+        let rejected_contextual_hints: Value =
+            serde_json::from_slice(&super::local_type_hints_json_with_context_response(
+                source,
+                "opaque-frontend",
+                "/virtual/main.rss",
+                "[]",
+            ))
+            .expect("rejected contextual hints response should be JSON");
+        assert!(
+            rejected_contextual_hints["hints"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            rejected_contextual_hints["error"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported frontend")
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn runtime_request_helpers_execute_rss_and_reject_unknown_frontends_before_execution() {
+        let run: Value = serde_json::from_slice(&super::run_source_json_response(
+            "print(\"wasm-runtime-output\");",
+            "rss",
+            None,
+        ))
+        .expect("RSS run response should be JSON");
+        assert_eq!(run["ok"], true);
+        assert!(
+            run["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| line == "wasm-runtime-output")
+        );
+
+        let rejected_run: Value = serde_json::from_slice(&super::run_source_json_response(
+            "print(\"must-not-run\");",
+            "opaque-frontend",
+            None,
+        ))
+        .expect("rejected run response should be JSON");
+        assert_eq!(rejected_run["ok"], false);
+        assert!(
+            rejected_run["error"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported frontend")
+        );
+        assert!(rejected_run["output"].as_array().unwrap().is_empty());
+
+        let rejected_debug: Value = serde_json::from_slice(&super::debug_start_json_response(
+            "print(\"must-not-debug\");",
+            "opaque-frontend",
+            None,
+        ))
+        .expect("rejected debug response should be JSON");
+        assert!(
+            rejected_debug["error"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported frontend")
+        );
+        assert!(rejected_debug["output"].as_array().unwrap().is_empty());
+    }
 
     #[test]
     fn lint_accepts_bytes_literals_and_native_bytes_helpers() {
@@ -849,7 +1288,8 @@ mod lint_tests {
             label;
         "#;
 
-        let hints = super::local_type_hints_with_flavor(source, SourceFlavor::RustScript);
+        let hints = super::local_type_hints_with_flavor(source, SourceFlavor::RustScript)
+            .expect("type hints should succeed");
         let label = hints
             .iter()
             .find(|hint| hint.name == "label")

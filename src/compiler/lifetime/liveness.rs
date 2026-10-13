@@ -46,12 +46,23 @@ impl LivenessRewriter {
         }
     }
 
-    pub(super) fn rewrite_program_block(&self, stmts: &[Stmt]) -> Vec<Stmt> {
+    #[cfg(test)]
+    fn rewrite_program_block(&self, stmts: &[Stmt]) -> Vec<Stmt> {
+        self.rewrite_program_block_with_sources(stmts, &[]).0
+    }
+
+    pub(super) fn rewrite_program_block_with_sources(
+        &self,
+        stmts: &[Stmt],
+        sources: &[Option<String>],
+    ) -> (Vec<Stmt>, Vec<Option<String>>) {
         let mut live_out = self.empty_set();
         for slot in persistent_capture_slots(stmts, &self.function_impls) {
             self.mark_live(&mut live_out, slot);
         }
-        self.rewrite_block(stmts, &live_out, false).0
+        let (stmts, _, sources) =
+            self.rewrite_block_with_sources(stmts, &live_out, false, Some(sources));
+        (stmts, sources)
     }
 
     pub(super) fn rewrite_function_impl(
@@ -83,9 +94,26 @@ impl LivenessRewriter {
         live_out: &LiveSet,
         suppress_clears: bool,
     ) -> (Vec<Stmt>, LiveSet) {
+        let (stmts, live, _) =
+            self.rewrite_block_with_sources(stmts, live_out, suppress_clears, None);
+        (stmts, live)
+    }
+
+    fn rewrite_block_with_sources(
+        &self,
+        stmts: &[Stmt],
+        live_out: &LiveSet,
+        suppress_clears: bool,
+        sources: Option<&[Option<String>]>,
+    ) -> (Vec<Stmt>, LiveSet, Vec<Option<String>>) {
         let mut live_after = live_out.clone();
         let mut rewritten_rev = Vec::<Stmt>::new();
-        for stmt in stmts.iter().rev() {
+        let mut sources_rev = Vec::new();
+        for (index, stmt) in stmts.iter().enumerate().rev() {
+            let source = sources
+                .and_then(|sources| sources.get(index))
+                .cloned()
+                .flatten();
             let (rewritten_stmt, live_before, defs) =
                 self.rewrite_stmt(stmt, &live_after, suppress_clears);
             let clear_slots = if suppress_clears {
@@ -103,12 +131,19 @@ impl LivenessRewriter {
                     index: *slot,
                     line: clear_line,
                 });
+                if sources.is_some() {
+                    sources_rev.push(source.clone());
+                }
             }
             rewritten_rev.push(rewritten_stmt);
+            if sources.is_some() {
+                sources_rev.push(source);
+            }
             live_after = live_before;
         }
         rewritten_rev.reverse();
-        (rewritten_rev, live_after)
+        sources_rev.reverse();
+        (rewritten_rev, live_after, sources_rev)
     }
 
     fn rewrite_stmt(
@@ -525,6 +560,7 @@ impl LivenessRewriter {
                 self.mark_live(live, *root)
             }
             Expr::OptionalGet {
+                field_projection: _,
                 container,
                 key,
                 container_slot,
@@ -825,13 +861,20 @@ impl LocalSlotAllocator {
         }
     }
 
-    pub(super) fn allocate(mut self, mut ir: FrontendIr) -> Result<FrontendIr, ParseError> {
+    pub(super) fn allocate(
+        mut self,
+        mut ir: FrontendIr,
+        root_slots: &[LocalSlot],
+    ) -> Result<super::LocalSlotAllocation, ParseError> {
         let persistent_slots = persistent_capture_slots(&ir.stmts, &ir.function_impls);
         let mut live_out = self.liveness.empty_set();
-        for slot in &persistent_slots {
+        for slot in persistent_slots.iter().chain(root_slots) {
             self.liveness.mark_live(&mut live_out, *slot);
         }
-        let _ = self.collect_block(&ir.stmts, &live_out, &[])?;
+        // Session bindings are observable after the snippet, including unused
+        // entries and first-snippet definitions. Protect them throughout ROOT
+        // execution; function/closure frames retain only their own constraints.
+        let _ = self.collect_block(&ir.stmts, &live_out, root_slots)?;
         for function_impl in ir.function_impls.values() {
             let mut live_after = self.liveness.function_body_live_out_precise(
                 &function_impl.body_expr,
@@ -906,7 +949,7 @@ impl LocalSlotAllocator {
 
         let (mapping, compacted_local_count) = self.color_slots()?;
         remap_frontend_ir(&mut ir, &mapping, compacted_local_count)?;
-        Ok(ir)
+        Ok(super::LocalSlotAllocation { ir, mapping })
     }
 
     fn collect_block(
@@ -921,10 +964,9 @@ impl LocalSlotAllocator {
             let mut live_before = self
                 .liveness
                 .compute_live_before_stmt_precise(stmt, &live_after);
-            // Parameter slots stay live for the whole body no matter what the
-            // statement does to them (see `allocate`); re-mark them so the
-            // interference invariants never depend on def-use precision for
-            // caller-written frame-entry state.
+            // Frame parameters or persistent ROOT slots stay live throughout
+            // their own block, regardless of assignments or drops. Re-mark
+            // them so protection never depends on def-use precision.
             for slot in protected_slots {
                 self.liveness.mark_live(&mut live_before, *slot);
             }
@@ -1065,6 +1107,7 @@ impl LocalSlotAllocator {
                 self.add_slot_live_edges(*root, &live_during);
             }
             Expr::OptionalGet {
+                field_projection: _,
                 container,
                 key,
                 container_slot,
@@ -1340,6 +1383,7 @@ impl LocalSlotAllocator {
                 self.mark_set_slot(set, *root);
             }
             Expr::OptionalGet {
+                field_projection: _,
                 container,
                 key,
                 container_slot,
@@ -1934,6 +1978,7 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
             *root = remap_slot(*root, mapping)?;
         }
         Expr::OptionalGet {
+            field_projection: _,
             container,
             key,
             container_slot,
@@ -2038,6 +2083,57 @@ mod loop_owned_drop_tests {
     use super::LivenessRewriter;
     use crate::compiler::ir::{Expr, Stmt};
     use std::collections::HashMap;
+
+    #[test]
+    fn root_sources_preserve_cross_module_last_use_and_drop_order() {
+        let stmts = vec![
+            Stmt::Let {
+                index: 0,
+                declared_schema: None,
+                expr: Expr::Int(20),
+                line: 1,
+            },
+            Stmt::Let {
+                index: 1,
+                declared_schema: None,
+                expr: Expr::Int(21),
+                line: 2,
+            },
+            Stmt::Expr {
+                expr: Expr::Add(Box::new(Expr::Var(0)), Box::new(Expr::Var(1))),
+                line: 3,
+            },
+        ];
+        let sources = vec![
+            Some("dependency".to_owned()),
+            Some("dependency".to_owned()),
+            Some("entry".to_owned()),
+        ];
+        let rewriter = LivenessRewriter::new(2, &[], &HashMap::new(), &[false, false]);
+        let (rewritten, origins) = rewriter.rewrite_program_block_with_sources(&stmts, &sources);
+        let legacy = rewriter
+            .rewrite_block(&stmts, &rewriter.empty_set(), false)
+            .0;
+        assert_eq!(format!("{rewritten:?}"), format!("{legacy:?}"));
+        assert_eq!(rewritten.len(), 5);
+        assert!(matches!(rewritten[0], Stmt::Let { index: 0, .. }));
+        assert!(matches!(rewritten[1], Stmt::Let { index: 1, .. }));
+        assert!(matches!(rewritten[2], Stmt::Expr { line: 3, .. }));
+        assert!(matches!(rewritten[3], Stmt::Drop { index: 0, line: 3 }));
+        assert!(matches!(rewritten[4], Stmt::Drop { index: 1, line: 3 }));
+        assert_eq!(
+            origins,
+            vec![
+                sources[0].clone(),
+                sources[1].clone(),
+                sources[2].clone(),
+                sources[2].clone(),
+                sources[2].clone()
+            ]
+        );
+        let (_, missing) = rewriter.rewrite_program_block_with_sources(&stmts, &sources[..1]);
+        assert_eq!(missing, vec![sources[0].clone(), None, None, None, None]);
+    }
 
     /// A resource-owned local defined and last-used inside a loop body must
     /// get a `Stmt::Drop` at its per-iteration last death, even though loop

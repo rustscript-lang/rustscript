@@ -1,14 +1,16 @@
 mod rustscript;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::compiler::source_map::{LoweredSource, SourceMap, Span};
-use crate::host_api::HostApiCatalog;
+use crate::host_api::{HostApiCatalog, HostFunctionSchema, HostTypeSchema};
 
 use super::{
-    CompileSourceFileOptions, ParseError, ReplLocalBinding, SharedParserOptions, SourceFlavor,
-    ir::FrontendIr,
+    CompileSourceFileOptions, FrontendImportedDeclaration, ParseError, ParsePhase,
+    ReplLocalBinding, SharedParserOptions, SourceFlavor, SourceFrontendContext,
+    ir::{FrontendIr, FunctionDecl, HostApiIrMetadata, StructDecl, StructDeclOrigin, TypeSchema},
     parser::{Parser, ParserDialect},
 };
 
@@ -16,6 +18,262 @@ use super::{
 pub(super) struct ParsedRustScriptReplSource {
     pub ir: FrontendIr,
     pub bindings: Vec<ReplLocalBinding>,
+}
+
+impl<'a> SourceFrontendContext<'a> {
+    /// Installs the complete catalog candidate family for one logical host
+    /// function name and arity, returning its frontend IR function index.
+    /// Source aliases stay in the plugin's binding environment.
+    pub fn install_host_function(
+        &self,
+        ir: &mut FrontendIr,
+        catalog_name: &str,
+        arity: u8,
+    ) -> Result<u16, ParseError> {
+        let catalog = self.host_api_catalog.ok_or_else(|| {
+            ParseError::new("host function installation requires the caller catalog")
+        })?;
+        let candidates = catalog_function_candidates(catalog, catalog_name, arity)?;
+        let fingerprint = catalog.fingerprint();
+        if let Some(metadata) = &ir.host_api_metadata {
+            if metadata.fingerprint() != fingerprint {
+                return Err(ParseError::new(
+                    "frontend IR host metadata belongs to a different caller catalog",
+                ));
+            }
+            for index in metadata.function_indices() {
+                let mut declarations = ir
+                    .functions
+                    .iter()
+                    .filter(|function| function.index == index);
+                let Some(function) = declarations.next() else {
+                    return Err(ParseError::new(format!(
+                        "host metadata references missing function index {index}"
+                    )));
+                };
+                if declarations.next().is_some() || ir.function_impls.contains_key(&index) {
+                    return Err(ParseError::new(format!(
+                        "host metadata index {index} is not a unique host import"
+                    )));
+                }
+                metadata.validate_binding(index, catalog, &function.name, function.arity)?;
+            }
+        }
+
+        // A matching spelling/arity does not confer host authority. Reuse
+        // only a slot already bound to this complete catalog family.
+        if let Some(metadata) = ir.host_api_metadata.as_ref() {
+            for function in &ir.functions {
+                if function.name == catalog_name
+                    && function.arity == arity
+                    && metadata.candidates(function.index).is_some()
+                {
+                    metadata.validate_binding(function.index, catalog, catalog_name, arity)?;
+                    return Ok(function.index);
+                }
+            }
+        }
+        let index = next_available_function_index(ir)?;
+        if ir.host_api_metadata.is_none() {
+            ir.host_api_metadata = Some(HostApiIrMetadata::new(fingerprint));
+        }
+        ir.host_api_metadata
+            .as_mut()
+            .expect("catalog metadata initialized above")
+            .record_candidates(index, candidates)?;
+
+        if let Some(function) = ir
+            .functions
+            .iter_mut()
+            .find(|function| function.index == index)
+        {
+            function.args = (0..arity).map(|slot| format!("arg{slot}")).collect();
+            function.arg_schemas = vec![None; usize::from(arity)];
+            function.return_schema = None;
+            function.type_params.clear();
+            function.exported = false;
+            function.return_type = crate::ValueType::Unknown;
+            function.symbol = None;
+        } else {
+            ir.functions.push(FunctionDecl {
+                name: catalog_name.to_string(),
+                arity,
+                index,
+                args: (0..arity).map(|slot| format!("arg{slot}")).collect(),
+                arg_schemas: vec![None; usize::from(arity)],
+                return_schema: None,
+                type_params: Vec::new(),
+                exported: false,
+                return_type: crate::ValueType::Unknown,
+                symbol: None,
+            });
+        }
+        ir.host_api_metadata
+            .as_ref()
+            .expect("catalog metadata initialized above")
+            .validate_binding(index, catalog, catalog_name, arity)?;
+        Ok(index)
+    }
+
+    /// Installs a catalog named type and its recursively referenced named
+    /// declarations, returning the nominal compiler schema.
+    pub fn install_host_type(
+        &self,
+        ir: &mut FrontendIr,
+        catalog_type_name: &str,
+    ) -> Result<TypeSchema, ParseError> {
+        let catalog = self
+            .host_api_catalog
+            .ok_or_else(|| ParseError::new("host type installation requires the caller catalog"))?;
+        if ir
+            .host_api_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.fingerprint() != catalog.fingerprint())
+        {
+            return Err(ParseError::new(
+                "frontend IR host metadata belongs to a different caller catalog",
+            ));
+        }
+        let root = catalog.struct_named(catalog_type_name).ok_or_else(|| {
+            ParseError::new(format!(
+                "host type '{catalog_type_name}' is not declared in the caller catalog"
+            ))
+        })?;
+        let mut pending = Vec::new();
+        let mut visited = HashSet::new();
+        collect_catalog_struct(catalog_type_name, catalog, &mut visited, &mut pending)?;
+        for declaration in &pending {
+            if let Some(existing) = ir.struct_schemas.get(&declaration.name) {
+                if existing.origin == StructDeclOrigin::Guest {
+                    return Err(ParseError::new(format!(
+                        "catalog host type '{}' conflicts with a guest declaration",
+                        declaration.name
+                    )));
+                }
+                if existing != declaration {
+                    return Err(ParseError::new(format!(
+                        "catalog host type '{}' conflicts with an installed catalog declaration",
+                        declaration.name
+                    )));
+                }
+            }
+        }
+        for declaration in pending {
+            ir.struct_schemas
+                .entry(declaration.name.clone())
+                .or_insert(declaration);
+        }
+        Ok(root.as_type().to_compiler_schema())
+    }
+}
+
+fn catalog_function_candidates(
+    catalog: &HostApiCatalog,
+    name: &str,
+    arity: u8,
+) -> Result<Vec<HostFunctionSchema>, ParseError> {
+    let declared = catalog.functions_named(name);
+    if declared.is_empty() {
+        return Err(ParseError::new(format!(
+            "host function '{name}' is not declared in the caller catalog"
+        )));
+    }
+    let candidates = declared
+        .iter()
+        .copied()
+        .filter(|function| function.params.len() == usize::from(arity))
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        let mut arities = declared
+            .iter()
+            .map(|function| function.params.len())
+            .collect::<Vec<_>>();
+        arities.sort_unstable();
+        arities.dedup();
+        return Err(ParseError::new(format!(
+            "host function '{name}' has no overload with {arity} argument(s); declared arities: {}",
+            arities
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(candidates)
+}
+
+fn next_available_function_index(ir: &FrontendIr) -> Result<u16, ParseError> {
+    let mut used = ir
+        .functions
+        .iter()
+        .map(|function| function.index)
+        .chain(ir.function_impls.keys().copied())
+        .collect::<HashSet<_>>();
+    if let Some(metadata) = &ir.host_api_metadata {
+        used.extend(metadata.function_indices());
+    }
+    used.extend(ir.stmts.iter().filter_map(|stmt| match stmt {
+        super::ir::Stmt::FuncDecl { index, .. } => Some(*index),
+        _ => None,
+    }));
+    (0..=u16::MAX)
+        .find(|index| !used.contains(index))
+        .ok_or_else(|| ParseError::new("function index overflow"))
+}
+
+fn collect_catalog_struct(
+    name: &str,
+    catalog: &HostApiCatalog,
+    visited: &mut HashSet<String>,
+    pending: &mut Vec<StructDecl>,
+) -> Result<(), ParseError> {
+    if !visited.insert(name.to_string()) {
+        return Ok(());
+    }
+    let declaration = catalog.struct_named(name).ok_or_else(|| {
+        ParseError::new(format!(
+            "host type '{name}' referenced by the caller catalog is not declared"
+        ))
+    })?;
+    for field in &declaration.fields {
+        collect_named_host_types(&field.ty, catalog, visited, pending)?;
+    }
+    pending.push(declaration.to_struct_decl());
+    Ok(())
+}
+
+fn collect_named_host_types(
+    schema: &HostTypeSchema,
+    catalog: &HostApiCatalog,
+    visited: &mut HashSet<String>,
+    pending: &mut Vec<StructDecl>,
+) -> Result<(), ParseError> {
+    match schema {
+        HostTypeSchema::Named { name, .. } => {
+            collect_catalog_struct(name, catalog, visited, pending)
+        }
+        HostTypeSchema::Array(inner)
+        | HostTypeSchema::Map(inner)
+        | HostTypeSchema::Optional(inner) => {
+            collect_named_host_types(inner, catalog, visited, pending)
+        }
+        HostTypeSchema::Callable { params, result } => {
+            for param in params {
+                collect_named_host_types(param, catalog, visited, pending)?;
+            }
+            collect_named_host_types(result, catalog, visited, pending)
+        }
+        HostTypeSchema::Unknown
+        | HostTypeSchema::Null
+        | HostTypeSchema::Int
+        | HostTypeSchema::Float
+        | HostTypeSchema::Number
+        | HostTypeSchema::Bool
+        | HostTypeSchema::String
+        | HostTypeSchema::Bytes
+        | HostTypeSchema::Resource(_) => Ok(()),
+    }
 }
 
 fn effective_host_api_catalog(options: &CompileSourceFileOptions) -> Option<Arc<HostApiCatalog>> {
@@ -52,13 +310,21 @@ pub(super) fn parse_source_for_compile(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<FrontendIr, ParseError> {
+    let host_catalog = explicit_host_api_catalog(options);
+    let context = SourceFrontendContext {
+        source_id: 0,
+        original_path: None,
+        phase: ParsePhase::Standalone,
+        host_api_catalog: host_catalog.as_deref(),
+        imports: &[],
+    };
     parse_source_with_source_id_and_externs_with_catalog(
         source,
         flavor,
         options,
-        0,
         false,
-        explicit_host_api_catalog(options),
+        host_catalog.clone(),
+        &context,
     )
 }
 
@@ -92,14 +358,25 @@ pub(super) fn parse_module_source_with_source_id(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
     original_source_id: u32,
+    original_path: Option<&Path>,
+    phase: ParsePhase,
+    imports: &[FrontendImportedDeclaration],
 ) -> Result<FrontendIr, ParseError> {
+    let host_catalog = explicit_host_api_catalog(options);
+    let context = SourceFrontendContext {
+        source_id: original_source_id,
+        original_path,
+        phase,
+        host_api_catalog: host_catalog.as_deref(),
+        imports,
+    };
     parse_source_with_source_id_and_externs_with_catalog(
         source,
         flavor,
         options,
-        original_source_id,
         true,
-        explicit_host_api_catalog(options),
+        host_catalog.clone(),
+        &context,
     )
 }
 
@@ -110,13 +387,21 @@ pub(super) fn parse_source_with_source_id_and_externs(
     original_source_id: u32,
     allow_implicit_externs: bool,
 ) -> Result<FrontendIr, ParseError> {
+    let host_catalog = effective_host_api_catalog(options);
+    let context = SourceFrontendContext {
+        source_id: original_source_id,
+        original_path: None,
+        phase: ParsePhase::Standalone,
+        host_api_catalog: host_catalog.as_deref(),
+        imports: &[],
+    };
     parse_source_with_source_id_and_externs_with_catalog(
         source,
         flavor,
         options,
-        original_source_id,
         allow_implicit_externs,
-        effective_host_api_catalog(options),
+        host_catalog.clone(),
+        &context,
     )
 }
 
@@ -124,9 +409,9 @@ fn parse_source_with_source_id_and_externs_with_catalog(
     source: &str,
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
-    original_source_id: u32,
     allow_implicit_externs: bool,
     host_catalog: Option<Arc<HostApiCatalog>>,
+    context: &SourceFrontendContext<'_>,
 ) -> Result<FrontendIr, ParseError> {
     match flavor {
         SourceFlavor::RustScript => {
@@ -137,18 +422,39 @@ fn parse_source_with_source_id_and_externs_with_catalog(
                 allow_implicit_externs,
                 false,
                 true,
-                original_source_id,
+                context.source_id,
                 false,
                 host_catalog,
             )
         }
-        SourceFlavor::JavaScript | SourceFlavor::Lua => {
+        SourceFlavor::Plugin(_) => {
             let Some(plugin) = options.source_plugin_for_flavor(flavor) else {
                 return Err(ParseError::new(format!(
                     "no frontend plugin registered for {flavor:?} source"
                 )));
             };
-            plugin.parse_source(source)
+            let mut ir = plugin.parse_source(source, context)?;
+            match context.host_api_catalog {
+                Some(catalog) => {
+                    HostApiIrMetadata::validate_catalog_bindings(
+                        ir.host_api_metadata.as_ref(),
+                        &ir.functions,
+                        &ir.function_impls,
+                        catalog,
+                    )?;
+                    // Bind host-free/type-only producers after validation so
+                    // unbound catalog calls cannot acquire authority here.
+                    ir.host_api_metadata
+                        .get_or_insert_with(|| HostApiIrMetadata::new(catalog.fingerprint()));
+                }
+                None if ir.host_api_metadata.is_some() => {
+                    return Err(ParseError::new(
+                        "frontend IR carries host metadata without a caller catalog",
+                    ));
+                }
+                None => {}
+            }
+            Ok(ir)
         }
     }
 }
@@ -159,7 +465,7 @@ pub(crate) fn parser_dialect_for_flavor(
 ) -> Option<&'static dyn ParserDialect> {
     match flavor {
         SourceFlavor::RustScript => Some(rustscript::parser_dialect()),
-        SourceFlavor::JavaScript | SourceFlavor::Lua => options
+        SourceFlavor::Plugin(_) => options
             .source_plugin_for_flavor(flavor)
             .and_then(|plugin| plugin.parser_dialect()),
     }
@@ -193,17 +499,28 @@ pub(super) fn parse_rustscript_repl_source(
 /// REPL parse with an optional catalog snapshot: when `Some`, the parsed IR
 /// carries `host_api_metadata` so standard host calls compile to exact V13
 /// `HostImport` schemas (never a name-only fallback).
+#[cfg(test)]
 pub(super) fn parse_rustscript_repl_source_with_catalog(
     source: &str,
     predefined_locals: &[ReplLocalBinding],
     host_catalog: Option<Arc<HostApiCatalog>>,
+) -> Result<ParsedRustScriptReplSource, ParseError> {
+    parse_rustscript_repl_source_with_context(source, predefined_locals, host_catalog, 0, false)
+}
+
+pub(super) fn parse_rustscript_repl_source_with_context(
+    source: &str,
+    predefined_locals: &[ReplLocalBinding],
+    host_catalog: Option<Arc<HostApiCatalog>>,
+    source_id: u32,
+    allow_implicit_externs: bool,
 ) -> Result<ParsedRustScriptReplSource, ParseError> {
     let lowered = rustscript::lower(source)?;
     parse_lowered_repl_with_mapping(
         source,
         lowered,
         predefined_locals,
-        false,
+        (source_id, allow_implicit_externs),
         false,
         true,
         host_catalog,
@@ -426,13 +743,14 @@ fn parse_lowered_repl_with_mapping(
     original_source: &str,
     lowered: LoweredSource,
     predefined_locals: &[ReplLocalBinding],
-    allow_implicit_externs: bool,
+    entry_context: (u32, bool),
     allow_implicit_semicolons: bool,
     enforce_mutable_bindings: bool,
     host_catalog: Option<Arc<HostApiCatalog>>,
 ) -> Result<ParsedRustScriptReplSource, ParseError> {
     let mut source_map = SourceMap::new();
-    let original_source_id = source_map.add_source("<source>", original_source.to_string());
+    let (original_source_id, allow_implicit_externs) = entry_context;
+    source_map.add_source_at(original_source_id, "<source>", original_source.to_string());
     let lowered_source_id = source_map.add_source("<lowered>", lowered.text.clone());
 
     match parse_repl_with_parser(

@@ -19,8 +19,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use vm::compiler::{
-    CompileSourceFileOptions, SemanticModel, SourcePosition, TypeSchema, analyze_source,
-    analyze_source_file_with_options,
+    CompileError, CompileSourceFileOptions, SemanticModel, SourceError, SourceFlavor,
+    SourcePosition, TypeSchema, analyze_source, analyze_source_file_with_options,
+    analyze_source_from_string_with_options,
+    collect_inferred_local_type_hints_at_path_with_options,
+    compile_source_at_path_with_flavor_and_options,
 };
 use vm::host_api::{
     HostApiBuilder, HostApiCatalog, HostFunctionSchema, HostParamSchema, HostTypeSchema,
@@ -678,4 +681,241 @@ fn binary_operand_mismatch_diagnostic_carries_exact_statement_span() {
         &file.text[span.lo..span.hi]
     );
     assert!(span.hi > span.lo, "statement span has positive length");
+}
+
+#[test]
+fn native_diagnostic_models_do_not_authorize_compile_or_type_hints() {
+    let cases = [
+        (
+            "fn f(a: int, b: bool) -> int { a + b }\nlet r = f(1, true);\n",
+            "E004",
+        ),
+        (
+            "let mut x = 1;\nif true { x = \"a\"; } else { x = 2; }\n",
+            "E005",
+        ),
+        (
+            "fn tag(s: string) -> int { 1 }\nlet a = 42;\nlet b = tag(a);\n",
+            "E003",
+        ),
+    ];
+    let dir = temp_module_root("native_diagnostic_admission");
+    let path = dir.join("main.rss");
+    for (source, code) in cases {
+        let options = CompileSourceFileOptions::new().with_host_api_catalog(provenance_catalog());
+        let model = analyze_source_from_string_with_options(&path, source, options.clone())
+            .expect("native analysis retains a diagnostic model");
+        let diagnostic = model
+            .diagnostics()
+            .into_iter()
+            .find(|diagnostic| diagnostic.code.as_deref() == Some(code))
+            .unwrap_or_else(|| panic!("missing {code}: {:?}", model.diagnostics()));
+        let compiled = match compile_source_at_path_with_flavor_and_options(
+            &path,
+            source,
+            SourceFlavor::RustScript,
+            options.clone(),
+        ) {
+            Ok(_) => panic!("diagnosed source cannot compile"),
+            Err(error) => error,
+        };
+        let hints = collect_inferred_local_type_hints_at_path_with_options(
+            &path,
+            source,
+            SourceFlavor::RustScript,
+            options,
+        )
+        .expect_err("diagnosed source cannot produce admitted hints");
+        for error in [compiled, hints] {
+            let vm::compiler::SourcePathError::SourceWithMap {
+                error: SourceError::Compile(error),
+                ..
+            } = error
+            else {
+                panic!("expected typed error with source map: {error:?}");
+            };
+            let span = match (&error, code) {
+                (CompileError::BinaryOperandTypeMismatch { span, .. }, "E004")
+                | (CompileError::IfElseBranchTypeMismatch { span, .. }, "E005")
+                | (CompileError::CallableArgumentTypeMismatch { span, .. }, "E003") => *span,
+                _ => panic!("unexpected typed error: {error:?}"),
+            };
+            assert_eq!(span, diagnostic.span);
+            assert_eq!(error.diagnostic_message(), diagnostic.message);
+            assert!(span.is_some());
+        }
+    }
+    std::fs::remove_dir_all(dir).expect("remove diagnostic fixture");
+}
+
+#[test]
+fn native_typing_diagnostics_preserve_independent_hard_rejections() {
+    let prefix = "fn tag(s: string) -> int { 1 }\nlet a = 42;\nlet b = tag(a);\n";
+    let cases = [
+        (
+            "fn unresolved(value) -> int { 1 }\n",
+            "concrete compile-time type",
+        ),
+        ("fn annotated(value: unknown) -> int { 1 }\n", "unknown"),
+        (
+            "struct User { name: string }\nlet user: User = { name: \"Ada\" };\nuser.age;\n",
+            "field 'age' is not declared",
+        ),
+        (
+            "use prov;\nlet c = prov::make(\"db\");\nlet duplicate = c.copy();\n",
+            "resource",
+        ),
+    ];
+    let dir = temp_module_root("native_independent_admission");
+    let path = dir.join("main.rss");
+    for (suffix, expected) in cases {
+        let source = format!("{prefix}{suffix}");
+        let options = CompileSourceFileOptions::new().with_host_api_catalog(provenance_catalog());
+        let error = match analyze_source_from_string_with_options(&path, &source, options) {
+            Ok(_) => panic!("independent failure cannot become a diagnostic model: {suffix}"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    // The string entry uses the same admission, without a permissive fallback.
+    assert!(analyze_source(&format!("{prefix}fn unresolved(value) -> int {{ 1 }}\n")).is_err());
+    assert!(
+        analyze_source(&format!(
+            "{prefix}fn annotated(value: unknown) -> int {{ 1 }}\n"
+        ))
+        .is_err()
+    );
+    std::fs::remove_dir_all(dir).expect("remove independent fixture");
+}
+
+#[test]
+fn linked_native_diagnostic_model_keeps_imported_signature_and_local_hover() {
+    let root = "use a::util;\nlet a = 42;\nlet b = tag(a);\n";
+    let model = analyze_with_modules(
+        root,
+        &[("a/util.rss", "pub fn tag(s: string) -> int { 1 }\n")],
+    );
+    let argument = offset_of(root, "tag(a)") + 4;
+    assert_eq!(
+        model.inferred_schema_at(SourcePosition::new(0, argument)),
+        Some(TypeSchema::Int)
+    );
+    let callee = offset_of(root, "tag(a)");
+    let definition = model
+        .definition_at(SourcePosition::new(0, callee))
+        .expect("linked declaration");
+    assert_eq!(definition.span.source_id, 1);
+    assert_slice(&model, definition.span, "tag");
+    let diagnostic = model
+        .diagnostics()
+        .into_iter()
+        .find(|diagnostic| diagnostic.code.as_deref() == Some("E003"))
+        .expect("linked signature rejects integer argument");
+    let span = diagnostic.span.expect("exact linked diagnostic span");
+    assert_eq!(span.source_id, 0);
+    assert_slice(&model, span, "tag(a)");
+}
+
+struct DiagnosticAdmissionPlugin;
+static DIAGNOSTIC_PLUGIN: DiagnosticAdmissionPlugin = DiagnosticAdmissionPlugin;
+static DIAGNOSTIC_HOOKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+impl vm::SourcePlugin for DiagnosticAdmissionPlugin {
+    fn descriptor(&self) -> vm::SourceFrontendDescriptor {
+        vm::SourceFrontendDescriptor {
+            id: vm::FrontendId::new("neutral-diagnostic-admission"),
+            extensions: &["checked"],
+            typing_policy: vm::FrontendTypingPolicy::Strict,
+            supports_ownership_checking: true,
+        }
+    }
+    fn parse_source(
+        &self,
+        source: &str,
+        context: &vm::SourceFrontendContext<'_>,
+    ) -> Result<vm::FrontendIr, vm::ParseError> {
+        struct Dialect;
+        impl vm::compiler::ParserDialect for Dialect {}
+        vm::parse_source_with_dialect(
+            source,
+            &Dialect,
+            vm::SharedParserOptions {
+                source_id: context.source_id,
+                ..Default::default()
+            },
+        )
+    }
+    fn validate_typed_ir(&self, typed: &vm::FrontendTypedIr<'_>) -> Result<(), CompileError> {
+        DIAGNOSTIC_HOOKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let owner = typed.source_id.expect("source-owned hook");
+        let declaration = typed
+            .ir
+            .parsed_semantic_index
+            .as_ref()
+            .unwrap()
+            .func_decls
+            .iter()
+            .find(|declaration| declaration.ident_span.source_id == owner)
+            .expect("own linked function");
+        assert_eq!(
+            typed.schema_of_function(declaration.function_index),
+            Some(TypeSchema::Callable {
+                params: vec![],
+                result: Box::new(TypeSchema::Int),
+            })
+        );
+        Err(CompileError::StrictTypingRequired {
+            line: Some(1),
+            source_name: None,
+            detail: "independent diagnostic admission hook".to_string(),
+            span: Some(declaration.ident_span),
+        })
+    }
+}
+
+#[test]
+fn native_diagnostic_recovery_does_not_bypass_linked_plugin_hook_or_policy() {
+    let dir = temp_module_root("native_plugin_admission");
+    let path = dir.join("main.rss");
+    let dependency = dir.join("helper.checked");
+    std::fs::write(&dependency, "pub fn helper() -> int { 1 }\n").unwrap();
+    let source =
+        "use a::util;\nfn tag(s: string) -> int { 1 }\nlet a = 42;\nlet b = tag(a);\nhelper();\n";
+    let options = CompileSourceFileOptions::new()
+        .with_host_api_catalog(provenance_catalog())
+        .with_source_plugin(&DIAGNOSTIC_PLUGIN)
+        .with_module_override_path("a/util.rss", &dependency);
+    let error = match analyze_source_from_string_with_options(&path, source, options.clone()) {
+        Ok(_) => panic!("diagnostic model cannot bypass linked plugin hook"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("independent diagnostic admission hook"),
+        "{error}"
+    );
+    assert_eq!(
+        DIAGNOSTIC_HOOKS.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let error = match analyze_source_from_string_with_options(
+        &dependency,
+        "fn f(a: int, b: bool) -> int { a + b }\nlet r = f(1, true);\n",
+        options,
+    ) {
+        Ok(_) => panic!("plugin consistency rejection is not recoverable native analysis"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        vm::SourcePathError::SourceWithMap {
+            error: SourceError::Compile(CompileError::BinaryOperandTypeMismatch { .. }),
+            ..
+        }
+    ));
+    assert_eq!(
+        DIAGNOSTIC_HOOKS.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    std::fs::remove_dir_all(dir).expect("remove plugin fixture");
 }

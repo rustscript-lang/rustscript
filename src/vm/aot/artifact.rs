@@ -8,7 +8,7 @@ use crate::vm::native::{
 use crate::vm::{Vm, VmError};
 
 use super::super::jit::JitConfig;
-use super::compile::CompiledProgram;
+use super::compile::{CompiledProgram, compile_artifact_interpreter_boundary, compile_program};
 
 const MAGIC: [u8; 4] = *b"PAT\0";
 const VERSION: u16 = 8;
@@ -129,13 +129,19 @@ impl Vm {
     }
 
     pub fn load_aot_artifact(&mut self, bytes: &[u8]) -> Result<(), AotArtifactError> {
-        let expected_program_hash = self.ensure_program_cache_key();
-        let decoded = decode_artifact(bytes, Some(expected_program_hash))?;
-        let compiled = if decoded.interpreter_boundary_only {
-            CompiledProgram::from_interpreter_boundary_code(decoded.code, decoded.resume_ips)?
+        // Do not populate even the cache-key fields until materialization has
+        // succeeded: a rejected artifact must leave the entire engine intact.
+        let expected_program_hash = if self.engine.program_cache_key_ready {
+            self.engine.program_cache_key
         } else {
-            CompiledProgram::from_code(decoded.code, decoded.resume_ips)?
+            super::super::compute_program_cache_key(self.program())
         };
+        let decoded = decode_artifact(bytes, Some(expected_program_hash))?;
+        let compiled = materialize_native_program(&decoded)?;
+        // Rebuilding native code from persisted metadata issues no source
+        // certificate and cannot authenticate one from a cache key alone.
+        self.revoke_capture_certification();
+        self.ensure_program_cache_key();
         self.engine.aot_program = Some(compiled);
         self.engine.aot_exec_count = 0;
         Ok(())
@@ -154,12 +160,8 @@ impl Vm {
         jit_config: JitConfig,
     ) -> Result<Self, AotArtifactError> {
         let decoded = decode_artifact(bytes, None)?;
+        let compiled = materialize_native_program(&decoded)?;
         let mut vm = Vm::new_with_jit_config(decoded.program, jit_config);
-        let compiled = if decoded.interpreter_boundary_only {
-            CompiledProgram::from_interpreter_boundary_code(decoded.code, decoded.resume_ips)?
-        } else {
-            CompiledProgram::from_code(decoded.code, decoded.resume_ips)?
-        };
         vm.engine.aot_program = Some(compiled);
         vm.engine.aot_exec_count = 0;
         Ok(vm)
@@ -176,9 +178,34 @@ impl Vm {
 
 struct DecodedArtifact {
     program: Program,
-    code: Vec<u8>,
-    resume_ips: Vec<usize>,
+    // Keep decoding the v8 payload in full for wire validation. These bytes
+    // contain writer-process helper addresses and must never be executable.
+    _code: Vec<u8>,
+    _resume_ips: Vec<usize>,
     interpreter_boundary_only: bool,
+}
+
+fn materialize_native_program(
+    decoded: &DecodedArtifact,
+) -> Result<CompiledProgram, AotArtifactError> {
+    // Preserve the executable-buffer length rejection without mapping any
+    // persisted bytes. The full decoder validation has already completed.
+    #[cfg(any(windows, unix))]
+    if decoded._code.is_empty() {
+        return Err(AotArtifactError::Vm(VmError::JitNative(
+            "native trace produced empty machine code".to_string(),
+        )));
+    }
+    if decoded.interpreter_boundary_only {
+        return compile_artifact_interpreter_boundary().map_err(AotArtifactError::Vm);
+    }
+    let compiled = compile_program(&decoded.program)?;
+    if compiled.interpreter_boundary_only {
+        return Err(AotArtifactError::Vm(VmError::JitNative(
+            "native AOT artifact rebuild produced an interpreter boundary".to_string(),
+        )));
+    }
+    Ok(compiled)
 }
 
 fn encode_artifact(
@@ -339,8 +366,8 @@ fn decode_artifact(
 
     Ok(DecodedArtifact {
         program,
-        code,
-        resume_ips,
+        _code: code,
+        _resume_ips: resume_ips,
         interpreter_boundary_only,
     })
 }
@@ -459,6 +486,465 @@ mod tests {
         Ok(CallOutcome::Return(CallReturn::one(Value::string(
             "string",
         ))))
+    }
+
+    #[cfg(not(feature = "cranelift-jit"))]
+    #[test]
+    fn artifact_disabled_backend_rejects_both_modes_without_installation() {
+        let mut bc = BytecodeBuilder::new();
+        bc.ret();
+        let program = Program::new(Vec::new(), bc.finish());
+        // Process-local storage is permitted; these fixture bytes are never run.
+        let mut native = CompiledProgram::from_code(vec![0], vec![0]).unwrap();
+        for boundary in [false, true] {
+            native.interpreter_boundary_only = boundary;
+            let bytes = encode_artifact(
+                &program,
+                &native,
+                super::super::super::compute_program_cache_key(&program),
+            )
+            .unwrap();
+            let mut vm = Vm::new(program.clone());
+            assert!(
+                matches!(vm.load_aot_artifact(&bytes), Err(AotArtifactError::Vm(VmError::JitNative(message))) if message.contains("disabled"))
+            );
+            assert!(!vm.has_aot_program());
+            assert!(!vm.engine.program_cache_key_ready);
+            assert_eq!(vm.aot_exec_count(), 0);
+            assert!(
+                matches!(Vm::new_from_aot_artifact_with_jit_config(&bytes, JitConfig::default()), Err(AotArtifactError::Vm(VmError::JitNative(message))) if message.contains("disabled"))
+            );
+        }
+    }
+
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn artifact_same_process_callable_and_fuel_match_source_native() {
+        let compiled =
+            crate::compile_source_for_repl("pub fn add_one(value: int) -> int { value + 1 }")
+                .unwrap();
+        let program = compiled.program.with_local_count(compiled.locals);
+        for fuel in [0, 1, 100000] {
+            let mut source = Vm::new(program.clone());
+            source.compile_aot().unwrap();
+            let bytes = source.encode_aot_artifact().unwrap();
+            let mut companion = Vm::new(program.clone());
+            companion.load_aot_artifact(&bytes).unwrap();
+            let standalone = Vm::new_from_aot_artifact_with_jit_config(
+                &bytes,
+                JitConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut observations = Vec::new();
+            for mut vm in [source, companion, standalone] {
+                assert_eq!(vm.aot_exec_count(), 0);
+                vm.set_fuel(fuel);
+                let root = vm.run().unwrap();
+                let callable = vm.resolve_exported_callable("add_one").unwrap();
+                let result = vm.invoke_callable(callable, &[Value::Int(41)]);
+                observations.push((
+                    root,
+                    format!("{result:?}"),
+                    vm.get_fuel(),
+                    vm.aot_exec_count(),
+                ));
+                assert!(
+                    !vm.engine
+                        .aot_program
+                        .as_ref()
+                        .unwrap()
+                        .interpreter_boundary_only
+                );
+                assert_eq!(
+                    std::sync::Arc::strong_count(&vm.engine.aot_program.as_ref().unwrap().code),
+                    1
+                );
+            }
+            assert_eq!(observations[0], observations[1], "companion fuel={fuel}");
+            assert_eq!(observations[0], observations[2], "standalone fuel={fuel}");
+            if fuel == 100000 {
+                assert_eq!(observations[0].1, "Ok(Int(42))");
+                assert!(observations[0].3 > 0);
+            }
+        }
+    }
+
+    #[cfg(feature = "cranelift-jit")]
+    fn yield_once(vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        let calls = vm
+            .host_context()
+            .module_state::<usize>()
+            .copied()
+            .unwrap_or(0);
+        vm.host_context().set_module_state(calls + 1);
+        if calls == 0 {
+            Ok(CallOutcome::Yield)
+        } else {
+            Ok(CallOutcome::Return(CallReturn::one(Value::Int(42))))
+        }
+    }
+
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn artifact_native_host_yield_resumes_with_existing_replay_semantics() {
+        let compiled = crate::compile_source_for_repl(
+            "fn pause() -> int; fn body() -> int { pause() } body();",
+        )
+        .unwrap();
+        let program = compiled.program.with_local_count(compiled.locals);
+        let mut source = Vm::new(program.clone());
+        source.compile_aot().unwrap();
+        let bytes = source.encode_aot_artifact().unwrap();
+        let mut companion = Vm::new(program);
+        companion.load_aot_artifact(&bytes).unwrap();
+        let standalone = Vm::new_from_aot_artifact_with_jit_config(
+            &bytes,
+            JitConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut counts = Vec::new();
+        for mut vm in [source, companion, standalone] {
+            vm.bind_static_stack_function("pause", yield_once);
+            vm.set_fuel(100000);
+            assert_eq!(vm.run().unwrap(), VmStatus::Yielded);
+            assert_eq!(vm.last_yield_reason(), Some(crate::VmYieldReason::Host));
+            assert_eq!(vm.resume().unwrap(), VmStatus::Halted);
+            assert_eq!(vm.stack(), &[Value::Int(42)]);
+            assert_eq!(vm.host_context().module_state::<usize>(), Some(&2));
+            counts.push(vm.aot_exec_count());
+        }
+        assert!(counts[0] > 0);
+        assert_eq!(counts[0], counts[1]);
+        assert_eq!(counts[0], counts[2]);
+    }
+
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn artifact_runtime_error_matches_native_source_without_claiming_interpreter_parity() {
+        let compiled = crate::compile_source_for_repl(
+            "let numerator = 1; let denominator = 0; numerator / denominator;",
+        )
+        .unwrap();
+        let program = compiled.program.with_local_count(compiled.locals);
+        let mut source = Vm::new(program.clone());
+        source.compile_aot().unwrap();
+        let bytes = source.encode_aot_artifact().unwrap();
+        let mut companion = Vm::new(program.clone());
+        companion.load_aot_artifact(&bytes).unwrap();
+        let standalone =
+            Vm::new_from_aot_artifact_with_jit_config(&bytes, JitConfig::default()).unwrap();
+        let mut errors = Vec::new();
+        for mut vm in [source, companion, standalone] {
+            vm.set_fuel(100000);
+            errors.push(vm.run().unwrap_err().to_string());
+            assert_eq!(
+                vm.aot_exec_count(),
+                1,
+                "native error status returned once; no successful guest result"
+            );
+        }
+        assert_eq!(errors[0], errors[1]);
+        assert_eq!(errors[0], errors[2]);
+        let mut interpreted = Vm::new_with_jit_config(
+            program,
+            JitConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        interpreted.set_fuel(100000);
+        assert!(matches!(interpreted.run(), Err(VmError::DivisionByZero)));
+        eprintln!(
+            "KNOWN native error={}; interpreter error={}",
+            errors[0],
+            VmError::DivisionByZero
+        );
+    }
+
+    #[cfg(feature = "cranelift-jit")]
+    fn native_fixture() -> (Program, CompiledProgram) {
+        let compiled = crate::compile_source_for_repl("let value = 1 + 2; value;").unwrap();
+        let program = compiled.program.with_local_count(compiled.locals);
+        let native = compile_program(&program).unwrap();
+        assert!(!native.interpreter_boundary_only);
+        (program, native)
+    }
+
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn artifact_empty_native_payload_keeps_legacy_rejection_in_both_modes() {
+        let (program, mut native) = native_fixture();
+        native.code = std::sync::Arc::from([]);
+        for boundary in [false, true] {
+            native.interpreter_boundary_only = boundary;
+            let bytes = encode_artifact(
+                &program,
+                &native,
+                super::super::super::compute_program_cache_key(&program),
+            )
+            .unwrap();
+            assert!(decode_artifact(&bytes, None).is_ok());
+            let mut vm = Vm::new(program.clone());
+            assert!(matches!(vm.load_aot_artifact(&bytes),
+                Err(AotArtifactError::Vm(VmError::JitNative(message))) if message == "native trace produced empty machine code"));
+            assert!(
+                matches!(Vm::new_from_aot_artifact_with_jit_config(&bytes, JitConfig::default()),
+                Err(AotArtifactError::Vm(VmError::JitNative(message))) if message == "native trace produced empty machine code")
+            );
+            assert!(!vm.has_aot_program());
+            assert!(!vm.engine.program_cache_key_ready);
+            assert_eq!(vm.aot_exec_count(), 0);
+        }
+    }
+
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn artifact_rebuild_failure_preserves_engine_state_and_source_authority() {
+        // This is the remaining unsupported dynamic Number addition boundary,
+        // not a synthetic failure marker. Its valid Program survives wire decoding.
+        let issued = crate::compile_source_with_flavor_and_options_with_capture_certification(
+            "fn successor(n: number) -> number { n + 1 } successor(6);",
+            crate::SourceFlavor::RustScript,
+            crate::CompileSourceFileOptions::new(),
+        )
+        .unwrap();
+        let mut vm = issued.into_vm().unwrap();
+        assert!(matches!(
+            compile_program(vm.program()),
+            Err(VmError::JitNative(_))
+        ));
+        vm.set_fuel(100000);
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+        let (_, native) = native_fixture();
+        let bytes = encode_artifact(
+            vm.program(),
+            &native,
+            super::super::super::compute_program_cache_key(vm.program()),
+        )
+        .unwrap();
+        assert!(decode_artifact(&bytes, None).is_ok());
+        // A previously installed real boundary engine must remain owned on error.
+        vm.engine.aot_program = Some(compile_artifact_interpreter_boundary().unwrap());
+        let entry = vm.engine.aot_program.as_ref().unwrap().entry as usize;
+        let program = vm.program.clone();
+        let ip = vm.instance.ip;
+        let stack = vm.stack().to_vec();
+        let locals = vm.instance.locals.clone();
+        let cert = vm.capture_certification_stats().unwrap();
+        let cache = (
+            vm.engine.program_cache_key,
+            vm.engine.program_cache_key_ready,
+        );
+        let native_count = vm.aot_exec_count();
+        let fuel = vm.fuel_checkpoint();
+        let mut incompatible = bytes.clone();
+        incompatible[10] ^= 0x40;
+        assert!(matches!(
+            vm.load_aot_artifact(&incompatible),
+            Err(AotArtifactError::IncompatibleRuntime {
+                field: "pointer width",
+                ..
+            })
+        ));
+        assert_eq!(vm.capture_certification_stats().unwrap(), cert);
+        assert_eq!(
+            vm.engine.aot_program.as_ref().unwrap().entry as usize,
+            entry
+        );
+        let error = vm.load_aot_artifact(&bytes).unwrap_err();
+        assert!(
+            matches!(error, AotArtifactError::Vm(VmError::JitNative(_))),
+            "{error}"
+        );
+        assert!(std::sync::Arc::ptr_eq(&vm.program, &program));
+        assert_eq!(
+            vm.engine.aot_program.as_ref().unwrap().entry as usize,
+            entry
+        );
+        assert_eq!(vm.instance.ip, ip);
+        assert_eq!(vm.stack(), stack);
+        assert_eq!(vm.instance.locals, locals);
+        assert_eq!(vm.capture_certification_stats().unwrap(), cert);
+        assert_eq!(
+            (
+                vm.engine.program_cache_key,
+                vm.engine.program_cache_key_ready
+            ),
+            cache
+        );
+        assert_eq!(vm.aot_exec_count(), native_count);
+        assert_eq!(vm.fuel_checkpoint(), fuel);
+        assert!(matches!(
+            Vm::new_from_aot_artifact_with_jit_config(&bytes, JitConfig::default()),
+            Err(AotArtifactError::Vm(VmError::JitNative(_)))
+        ));
+    }
+
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn artifact_explicit_boundary_regenerates_ignoring_persisted_instructions() {
+        let (program, mut boundary) = native_fixture();
+        // Legacy flag1 can carry SSA bytes, but its declared boundary semantics
+        // must be regenerated. These same-process bytes are safe as a control.
+        let persisted_code = boundary.code_bytes().to_vec();
+        boundary.interpreter_boundary_only = true;
+        let bytes = encode_artifact(
+            &program,
+            &boundary,
+            super::super::super::compute_program_cache_key(&program),
+        )
+        .unwrap();
+        let mut companion = Vm::new(program);
+        companion.load_aot_artifact(&bytes).unwrap();
+        let standalone = Vm::new_from_aot_artifact_with_jit_config(
+            &bytes,
+            JitConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for mut vm in [companion, standalone] {
+            assert!(
+                vm.engine
+                    .aot_program
+                    .as_ref()
+                    .unwrap()
+                    .interpreter_boundary_only
+            );
+            assert_ne!(
+                vm.engine.aot_program.as_ref().unwrap().code_bytes(),
+                persisted_code
+            );
+            vm.set_fuel(100000);
+            assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+            assert_eq!(vm.stack(), &[Value::Int(3)]);
+            assert_eq!(
+                vm.aot_exec_count(),
+                1,
+                "only the regenerated boundary stub returns natively"
+            );
+        }
+    }
+
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn artifact_flag_zero_rejects_real_oversized_boundary_rebuild() {
+        let (mut program, native) = native_fixture();
+        // The real compiler budget includes frame locals in block parameters.
+        // Exercise its actual boundary result without replacing compiler logic.
+        program.local_count = 1_000_001;
+        let rebuilt = compile_program(&program).unwrap();
+        assert!(rebuilt.interpreter_boundary_only);
+        let bytes = encode_artifact(
+            &program,
+            &native,
+            super::super::super::compute_program_cache_key(&program),
+        )
+        .unwrap();
+        assert!(
+            matches!(Vm::new_from_aot_artifact_with_jit_config(&bytes, JitConfig::default()),
+            Err(AotArtifactError::Vm(VmError::JitNative(message))) if message.contains("interpreter boundary"))
+        );
+        let mut vm = Vm::new(program);
+        assert!(matches!(
+            vm.load_aot_artifact(&bytes),
+            Err(AotArtifactError::Vm(VmError::JitNative(_)))
+        ));
+        assert!(!vm.has_aot_program());
+        assert!(!vm.engine.program_cache_key_ready);
+        assert_eq!(vm.aot_exec_count(), 0);
+    }
+
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn artifact_validation_precedes_rebuild_and_preserves_uninitialized_cache() {
+        let (program, native) = native_fixture();
+        let bytes = encode_artifact(
+            &program,
+            &native,
+            super::super::super::compute_program_cache_key(&program),
+        )
+        .unwrap();
+        let mut cursor = Cursor::new(&bytes);
+        cursor.read_exact(11).unwrap();
+        let mut runtime_offsets = vec![(10, "pointer width")];
+        for field in ["arch", "os", "backend"] {
+            let len = cursor.read_u32().unwrap() as usize;
+            runtime_offsets.push((cursor.offset, field));
+            cursor.read_exact(len).unwrap();
+        }
+        for field in [
+            "vm ip offset",
+            "native helper offset",
+            "interrupt helper offset",
+        ] {
+            runtime_offsets.push((cursor.offset, field));
+            cursor.read_u32().unwrap();
+        }
+        let integrity_offset = cursor.offset;
+        cursor.read_u64().unwrap();
+        cursor.read_u32().unwrap();
+        let program_length_offset = cursor.offset;
+        let len = cursor.read_u32().unwrap() as usize;
+        cursor.read_exact(len).unwrap();
+        let resumes = cursor.read_u32().unwrap() as usize;
+        cursor.read_exact(resumes * 4).unwrap();
+        let code_length_offset = cursor.offset;
+        let mut vm = Vm::new(program);
+        for (offset, field) in runtime_offsets {
+            let mut bad = bytes.clone();
+            bad[offset] ^= 0x40;
+            assert!(
+                matches!(vm.load_aot_artifact(&bad), Err(AotArtifactError::IncompatibleRuntime { field: found, .. }) if found == field)
+            );
+            assert!(matches!(
+                Vm::new_from_aot_artifact_with_jit_config(&bad, JitConfig::default()),
+                Err(AotArtifactError::IncompatibleRuntime { .. })
+            ));
+        }
+        let mut invalid_flags = bytes.clone();
+        invalid_flags[8..10].copy_from_slice(&2u16.to_le_bytes());
+        assert!(matches!(
+            vm.load_aot_artifact(&invalid_flags),
+            Err(AotArtifactError::UnsupportedFlags(2))
+        ));
+        let mut integrity = bytes.clone();
+        integrity[integrity_offset] ^= 1;
+        assert!(matches!(
+            vm.load_aot_artifact(&integrity),
+            Err(AotArtifactError::EmbeddedProgramHashMismatch { .. })
+        ));
+        let mut missing = bytes.clone();
+        missing[program_length_offset..program_length_offset + 4].fill(0);
+        assert!(matches!(
+            vm.load_aot_artifact(&missing),
+            Err(AotArtifactError::Wire(_))
+        ));
+        let mut oversized = bytes.clone();
+        oversized[code_length_offset..code_length_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            vm.load_aot_artifact(&oversized),
+            Err(AotArtifactError::UnexpectedEof)
+        ));
+        for end in 0..bytes.len() {
+            assert!(
+                vm.load_aot_artifact(&bytes[..end]).is_err(),
+                "truncation {end}"
+            );
+        }
+        assert!(!vm.engine.program_cache_key_ready);
+        assert!(!vm.has_aot_program());
+        assert_eq!(vm.aot_exec_count(), 0);
+        assert!(vm.stack().is_empty());
+        assert_eq!(vm.instance.ip, 0);
     }
 
     #[test]

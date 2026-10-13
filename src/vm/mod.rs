@@ -6,6 +6,12 @@ use std::task::{Context, Poll, Waker};
 
 pub(crate) mod aot;
 pub mod async_host;
+mod callable_maintenance;
+mod capture_origin;
+pub use capture_origin::{
+    CaptureCertificationStats, CaptureQueryError, CaptureRootState, CheckedResourceCapture,
+    ResourceCaptureRoot,
+};
 mod capability;
 pub mod diagnostics;
 mod engine;
@@ -36,6 +42,9 @@ mod tests;
 pub use self::aot::AotArtifactError;
 use self::async_host::preserve_stream_cleanup;
 pub use self::async_host::{CaptureAsyncHostContext, HostFuture, HostFutureOutput};
+pub use self::callable_maintenance::{
+    CallableIdentityMaintenanceConfig, CallableIdentityMaintenanceStats,
+};
 pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder};
 use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
@@ -1149,13 +1158,16 @@ impl Vm {
     pub fn new_shared_with_jit_config(program: Arc<Program>, jit_config: jit::JitConfig) -> Self {
         let engine = Engine::new(jit_config, &program);
         let mut instance = Instance::new(&program);
-        instance.initialize_root_callable_bindings(&program);
+        let mut host = HostRuntime::with_standard_composition(crate::standard_composition());
+        instance.initialize_root_callable_bindings(&program, |entries| {
+            callable_maintenance::after_registration(entries, &mut host.module_state_store);
+        });
         Self {
             program,
             engine,
             instance,
             run_ctx: RunContext::default(),
-            host: HostRuntime::with_standard_composition(crate::standard_composition()),
+            host,
         }
     }
 
@@ -1268,6 +1280,7 @@ impl Vm {
     /// `poll_reset_for_reuse` to obtain the deterministic completion result
     /// before observing an empty scope or reusing the VM.
     pub fn reset_for_reuse(&mut self) -> VmResult<()> {
+        self.revoke_capture_certification();
         if self.stream_completion_running() {
             return Err(VmError::InvalidFrameState(
                 "callable stream completion is running",
@@ -1296,7 +1309,10 @@ impl Vm {
             return Err(error);
         }
         self.run_ctx.reset_for_reuse();
-        self.instance.reset(&self.program);
+        callable_maintenance::identities_cleared(&mut self.host.module_state_store);
+        self.instance.reset(&self.program, |entries| {
+            callable_maintenance::after_registration(entries, &mut self.host.module_state_store);
+        });
         self.engine.reset_runtime_state(&self.program);
         Ok(())
     }
@@ -1777,9 +1793,12 @@ impl Vm {
             kind: prototype.kind,
             env,
         });
-        self.instance
-            .owned_callables
-            .push(Arc::downgrade(&callable));
+        callable_maintenance::register(
+            &mut self.instance.owned_callables,
+            &mut self.host.module_state_store,
+            Arc::downgrade(&callable),
+        );
+        self.certify_capture_cells(&callable);
         Ok(Value::Callable(callable))
     }
 
@@ -1979,9 +1998,11 @@ impl Vm {
                         kind,
                         env: None,
                     });
-                    self.instance
-                        .owned_callables
-                        .push(Arc::downgrade(&callable));
+                    callable_maintenance::register(
+                        &mut self.instance.owned_callables,
+                        &mut self.host.module_state_store,
+                        Arc::downgrade(&callable),
+                    );
                     self.instance.locals[local_base + relative] = Value::Callable(callable);
                 }
                 for (slot, value) in inherited_callables {
@@ -2041,6 +2062,7 @@ impl Vm {
                         }
                     }
                 }
+                self.certify_capture_frame(local_base, callable.as_ref(), prototype_id);
                 if let Some(slot) = prototype.self_slot {
                     let relative = slot as usize;
                     if relative >= local_count {
@@ -2099,6 +2121,7 @@ impl Vm {
             .execution_frames
             .pop()
             .ok_or(VmError::InvalidFrameState("missing active frame"))?;
+        self.release_capture_frame(frame.local_base);
         self.instance.active_local_base_cache = self
             .instance
             .execution_frames
@@ -2626,6 +2649,38 @@ impl Vm {
         Ok(value as u32)
     }
 
+    // SSA synchronization is not a new guest write. Genuine native stores
+    // invalidate capture authority at their original semantic instruction.
+    pub(super) fn synchronize_native_local(&mut self, index: u8, value: Value) -> VmResult<()> {
+        let absolute = self.absolute_local_index(index)?;
+        if let Some(cell) = self.instance.capture_cells.get(&absolute).cloned() {
+            if Self::value_references_capture_cell(&value, &cell, &mut HashSet::new())? {
+                return Err(VmError::InvalidFrameState(
+                    "callable capture ownership cycle is unsupported",
+                ));
+            }
+            let previous = {
+                let mut captured = cell
+                    .lock()
+                    .map_err(|_| VmError::InvalidFrameState("capture cell lock is poisoned"))?;
+                std::mem::replace(&mut *captured, value.clone())
+            };
+            self.instance.locals[absolute] = value;
+            self.drop_value_with_contract(previous);
+            Ok(())
+        } else {
+            self.store_local_absolute_with_drop_contract(absolute, index, value)
+        }
+    }
+
+    pub(super) fn note_native_semantic_local_write(&mut self, index: u8) -> VmResult<()> {
+        let absolute = self.absolute_local_index(index)?;
+        if let Some(cell) = self.instance.capture_cells.get(&absolute).cloned() {
+            self.invalidate_capture_cell(&cell);
+        }
+        Ok(())
+    }
+
     #[inline(always)]
     pub(super) fn store_local_with_drop_contract(
         &mut self,
@@ -2670,6 +2725,7 @@ impl Vm {
                     "callable capture ownership cycle is unsupported",
                 ));
             }
+            self.invalidate_capture_cell(&cell);
             let previous = {
                 let mut captured = cell
                     .lock()
@@ -2743,6 +2799,9 @@ impl Vm {
 
     pub(crate) fn detach_local_with_drop_contract(&mut self, index: u8) -> VmResult<()> {
         let absolute = self.absolute_local_index(index)?;
+        if let Some(cell) = self.instance.capture_cells.get(&absolute).cloned() {
+            self.invalidate_capture_cell(&cell);
+        }
         self.instance.capture_cells.remove(&absolute);
         let slot = self
             .instance
@@ -3483,6 +3542,8 @@ impl Vm {
     }
 
     pub fn set_local(&mut self, index: u8, value: Value) -> VmResult<()> {
+        self.absolute_local_index(index)?;
+        self.revoke_capture_certification();
         self.store_local_with_drop_contract(index, value)?;
         let config = *self.engine.jit.config();
         self.set_jit_config(config);
@@ -3706,6 +3767,7 @@ impl Vm {
         if self.stream_completion_running() {
             return;
         }
+        self.revoke_capture_certification();
         self.invalidate_callback_registries();
         let _ = self.cancel_waiting_host_op_with_reason(
             crate::vm::operation::OperationCancelReason::VmDrop,
@@ -3731,6 +3793,7 @@ impl Vm {
         self.instance.queued_callables.clear();
         self.instance.completed_callable_results.clear();
         self.instance.owned_callables.clear();
+        callable_maintenance::identities_cleared(&mut self.host.module_state_store);
         self.instance.draining_queued_callables = false;
         self.clear_stack_with_drop_contract();
         self.instance.capture_cells.clear();
@@ -3847,6 +3910,7 @@ impl Vm {
             let Some(frame) = self.instance.execution_frames.pop() else {
                 break;
             };
+            self.release_capture_frame(frame.local_base);
             let frame_end = match frame.local_base.checked_add(frame.local_count) {
                 Some(end) => end,
                 None => self.instance.locals.len(),

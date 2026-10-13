@@ -44,7 +44,7 @@ fn observe_direct_function_call_types(
     let function_index = match expr {
         Expr::Call(index, _, _, _, _) if context.function_impls.contains_key(index) => Some(*index),
         Expr::LocalCall(slot, _, _, _) => match state.callable(*slot).cloned() {
-            Some(InferredCallable::Function(index))
+            Some(InferredCallable::Function(index, _))
                 if context.function_impls.contains_key(&index) =>
             {
                 Some(index)
@@ -1285,6 +1285,35 @@ fn validate_optional_get_access(
         return Ok(());
     };
     let span = semantic_id.and_then(|id| context.node_span(id));
+    if let Expr::OptionalGet {
+        field_projection: true,
+        ..
+    } = expr
+        && (!matches!(container.as_ref(), Expr::Var(_))
+            || !matches!(key.as_ref(), Expr::String(_) | Expr::Int(_)))
+    {
+        return Err(CompileError::InvalidFieldAccess {
+            line: line_context,
+            source_name: owned_source_name(source_name),
+            detail: "optional field projection requires a direct local and a literal key"
+                .to_string(),
+            span,
+        });
+    }
+    if let Expr::OptionalGet {
+        field_projection: true,
+        ..
+    } = expr
+    {
+        ensure_expr_not_optional(
+            container,
+            state,
+            line_context,
+            source_name,
+            context,
+            "field projection receiver",
+        )?;
+    }
     if context.is_strict() && !context.expr_has_declared_schema(container, state) {
         return Err(CompileError::InvalidFieldAccess {
             line: line_context,

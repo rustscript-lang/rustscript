@@ -177,6 +177,7 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
         Expr::Var(index) | Expr::MoveVar(index) => *index == slot,
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => *root == slot,
         Expr::OptionalGet {
+            field_projection: _,
             container,
             key,
             container_slot,

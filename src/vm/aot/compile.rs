@@ -23,12 +23,12 @@ use crate::vm::native::{
     enter_call_value_signature, entry_signature, frame_state_entry_address, frame_state_signature,
     free_buffer_signature, helper_entry_offset, helper_signature,
     init_null_value_slot_entry_address, jump_with_status, leave_frame_entry_address,
-    leave_frame_signature, pack_shared_signature, resolve_offsets,
+    leave_frame_signature, note_local_write_entry_address, pack_shared_signature, resolve_offsets,
     restore_active_exit_state_entry_address, restore_exit_signature,
     restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
     shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
-    value_eq_entry_address, value_eq_signature, value_slot_signature,
-    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    synchronize_active_exit_state_entry_address, value_eq_entry_address, value_eq_signature,
+    value_slot_signature, write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
 use crate::vm::{Program, Value, Vm, VmError, VmResult};
 #[cfg(feature = "cranelift-jit")]
@@ -181,6 +181,19 @@ pub(crate) fn compile_program(program: &Program) -> VmResult<CompiledProgram> {
     compile_program_inner(program).map_err(|err| VmError::JitNative(err.to_string()))
 }
 
+// Artifact flag1 explicitly requests the existing boundary mode; regenerate
+// its process-local stub without making ordinary flag0 rebuilds fall back.
+pub(crate) fn compile_artifact_interpreter_boundary() -> VmResult<CompiledProgram> {
+    #[cfg(feature = "cranelift-jit")]
+    {
+        compile_interpreter_boundary_program().map_err(|err| VmError::JitNative(err.to_string()))
+    }
+    #[cfg(not(feature = "cranelift-jit"))]
+    {
+        compile_program(&Program::new(Vec::new(), Vec::new()))
+    }
+}
+
 #[cfg(feature = "cranelift-jit")]
 fn compile_program_inner(program: &Program) -> Result<CompiledProgram, AotCompileError> {
     let ssa = build_aot_ssa(program)?;
@@ -293,6 +306,7 @@ struct AotDeoptHelperRefs {
     array_push_ref: cranelift_codegen::ir::SigRef,
     collection_set_ref: cranelift_codegen::ir::SigRef,
     restore_exit_ref: cranelift_codegen::ir::SigRef,
+    local_write_ref: cranelift_codegen::ir::SigRef,
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -311,6 +325,7 @@ struct AotDeoptHelperAddrs {
     array_push: usize,
     collection_set: usize,
     restore_exit: usize,
+    local_write: usize,
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -479,7 +494,8 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
         box_heap_value: write_heap_value_to_slot_entry_address(),
         array_push: array_push_entry_address(),
         collection_set: collection_set_entry_address(),
-        restore_exit: restore_active_exit_state_entry_address(),
+        restore_exit: synchronize_active_exit_state_entry_address(),
+        local_write: note_local_write_entry_address(),
     };
     let layout = detect_native_stack_layout().map_err(|err| {
         AotCompileError::Codegen(format!("detect native stack layout failed: {err}"))
@@ -522,10 +538,12 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
             enter_call_value_ref: b.import_signature(enter_call_value_sig),
             enter_call_script_ref: b.import_signature(enter_call_script_sig),
             leave_frame_ref: b.import_signature(leave_frame_sig),
-            clone_value_ref: b.import_signature(clone_value_sig),
+            clone_value_ref: b.import_signature(clone_value_sig.clone()),
             value_eq_ref: b.import_signature(value_eq_sig),
             init_null_slot_ref: b.import_signature(value_slot_sig.clone()),
             clear_value_slot_ref: b.import_signature(value_slot_sig),
+            // Both private helpers take two pointer-width arguments and return status.
+            local_write_ref: b.import_signature(clone_value_sig),
             box_heap_value_ref: b.import_signature(box_heap_sig),
             array_push_ref: b.import_signature(array_push_sig),
             collection_set_ref: b.import_signature(collection_set_sig),
@@ -908,6 +926,18 @@ fn lower_aot_ssa_inst(
         ..
     } = ctx;
     let value = match &inst.kind {
+        AotSsaInstKind::LocalWrite { index } => {
+            let local = b.ins().iconst(pointer_type, i64::from(*index));
+            call_status_helper(
+                b,
+                ctx.exit_block,
+                pointer_type,
+                ctx.helper_refs.local_write_ref,
+                ctx.helper_addrs.local_write,
+                &[vm_ptr, local],
+            )?;
+            b.ins().iconst(types::I8, 0)
+        }
         AotSsaInstKind::IntConst(value) => b.ins().iconst(types::I64, *value),
         AotSsaInstKind::FloatConst(value) => b.ins().f64const(*value),
         AotSsaInstKind::BoolConst(value) => b.ins().iconst(types::I8, i64::from(*value as u8)),
@@ -1100,6 +1130,21 @@ fn lower_aot_ssa_inst(
             value_reprs,
         )?,
         AotSsaInstKind::IntAdd { lhs, rhs } => b.ins().iadd(values[lhs], values[rhs]),
+        AotSsaInstKind::TaggedNumberSub { lhs, rhs }
+        | AotSsaInstKind::TaggedNumberMul { lhs, rhs } => {
+            let lhs = aot_box_numeric_operand(b, ctx, values[lhs], value_reprs[lhs])?;
+            let rhs = aot_box_numeric_operand(b, ctx, values[rhs], value_reprs[rhs])?;
+            aot_lower_tagged_number_arithmetic(
+                b,
+                ctx,
+                AotBinaryOp {
+                    ip: inst.ip,
+                    lhs,
+                    rhs,
+                },
+                matches!(inst.kind, AotSsaInstKind::TaggedNumberMul { .. }),
+            )?
+        }
         AotSsaInstKind::IntSub { lhs, rhs } => b.ins().isub(values[lhs], values[rhs]),
         AotSsaInstKind::IntMul { lhs, rhs } => b.ins().imul(values[lhs], values[rhs]),
         AotSsaInstKind::IntDiv { lhs, rhs } => aot_lower_int_divrem(
@@ -1170,6 +1215,21 @@ fn lower_aot_ssa_inst(
         }
         AotSsaInstKind::BoolCmpEq { lhs, rhs } => {
             b.ins().icmp(IntCC::Equal, values[lhs], values[rhs])
+        }
+        AotSsaInstKind::TaggedNumberCmpLt { lhs, rhs }
+        | AotSsaInstKind::TaggedNumberCmpGt { lhs, rhs } => {
+            let lhs = aot_box_numeric_operand(b, ctx, values[lhs], value_reprs[lhs])?;
+            let rhs = aot_box_numeric_operand(b, ctx, values[rhs], value_reprs[rhs])?;
+            aot_lower_tagged_number_compare(
+                b,
+                ctx,
+                AotBinaryOp {
+                    ip: inst.ip,
+                    lhs,
+                    rhs,
+                },
+                matches!(inst.kind, AotSsaInstKind::TaggedNumberCmpLt { .. }),
+            )?
         }
         AotSsaInstKind::TaggedCmpEq { lhs, rhs } => aot_lower_tagged_eq(
             b,
@@ -2169,6 +2229,166 @@ fn aot_lower_int_divrem(
 
     b.switch_to_block(cont);
     b.block_params(cont)[0]
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_box_numeric_operand(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    value: cranelift_codegen::ir::Value,
+    repr: AotSsaValueRepr,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    if repr == AotSsaValueRepr::Tagged {
+        return Ok(value);
+    }
+    let slot = alloc_single_value_slot(b, ctx.pointer_type, ctx.layout.value.size)?;
+    match repr {
+        AotSsaValueRepr::I64 => ssa_store_int_in_value(b, ctx.layout.value, slot, value),
+        AotSsaValueRepr::F64 => ssa_store_float_in_value(b, ctx.layout.value, slot, value),
+        _ => {
+            return Err(AotCompileError::Codegen(
+                "non-numeric operand representation".into(),
+            ));
+        }
+    }
+    Ok(slot)
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_tagged_number_dispatch(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    op: AotBinaryOp,
+) -> Result<(Block, Block), AotCompileError> {
+    let AotBinaryOp { ip, lhs, rhs } = op;
+    let layout = ctx.layout.value;
+    let lhs_tag = ssa_load_tag_i32(b, layout, lhs);
+    let rhs_tag = ssa_load_tag_i32(b, layout, rhs);
+    let lhs_int = b
+        .ins()
+        .icmp_imm(IntCC::Equal, lhs_tag, i64::from(layout.int_tag));
+    let rhs_int = b
+        .ins()
+        .icmp_imm(IntCC::Equal, rhs_tag, i64::from(layout.int_tag));
+    let lhs_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, lhs_tag, i64::from(layout.float_tag));
+    let rhs_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, rhs_tag, i64::from(layout.float_tag));
+    let lhs_numeric = b.ins().bor(lhs_int, lhs_float);
+    let rhs_numeric = b.ins().bor(rhs_int, rhs_float);
+    let valid = b.ins().band(lhs_numeric, rhs_numeric);
+    let dispatch = b.create_block();
+    let fail = b.create_block();
+    let ints = b.create_block();
+    let floats = b.create_block();
+    b.ins().brif(valid, dispatch, &[], fail, &[]);
+
+    b.switch_to_block(fail);
+    aot_emit_error_status(
+        b,
+        ctx.vm_ptr,
+        ctx.exit_block,
+        ctx.pointer_type,
+        ctx.offsets,
+        ip,
+    )?;
+
+    b.switch_to_block(dispatch);
+    let both_int = b.ins().band(lhs_int, rhs_int);
+    b.ins().brif(both_int, ints, &[], floats, &[]);
+    Ok((ints, floats))
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_lower_tagged_number_arithmetic(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    op: AotBinaryOp,
+    is_mul: bool,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotBinaryOp { ip, lhs, rhs } = op;
+    let layout = ctx.layout.value;
+    // The result can only hold Int or Float, so this private scratch Value
+    // has no resource ownership to initialize, clone, or release.
+    let out = alloc_single_value_slot(b, ctx.pointer_type, layout.size)?;
+    let (ints, floats) = aot_tagged_number_dispatch(b, ctx, op)?;
+    let done = b.create_block();
+
+    b.switch_to_block(ints);
+    let lhs_value = b
+        .ins()
+        .load(types::I64, MemFlags::new(), lhs, layout.int_payload_offset);
+    let rhs_value = b
+        .ins()
+        .load(types::I64, MemFlags::new(), rhs, layout.int_payload_offset);
+    let result = if is_mul {
+        b.ins().imul(lhs_value, rhs_value)
+    } else {
+        b.ins().isub(lhs_value, rhs_value)
+    };
+    ssa_store_int_in_value(b, layout, out, result);
+    b.ins().jump(done, &[]);
+
+    b.switch_to_block(floats);
+    let lhs_value = aot_lower_tagged_number_to_float(b, ctx, AotTaggedValueOp { ip, value: lhs })?;
+    let rhs_value = aot_lower_tagged_number_to_float(b, ctx, AotTaggedValueOp { ip, value: rhs })?;
+    let result = if is_mul {
+        b.ins().fmul(lhs_value, rhs_value)
+    } else {
+        b.ins().fsub(lhs_value, rhs_value)
+    };
+    ssa_store_float_in_value(b, layout, out, result);
+    b.ins().jump(done, &[]);
+
+    b.switch_to_block(done);
+    Ok(out)
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_lower_tagged_number_compare(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    op: AotBinaryOp,
+    is_lt: bool,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotBinaryOp { ip, lhs, rhs } = op;
+    let layout = ctx.layout.value;
+    let (ints, floats) = aot_tagged_number_dispatch(b, ctx, op)?;
+    let done = b.create_block();
+    b.append_block_param(done, types::I8);
+
+    // Payloads are read only after both existing tags have been checked.
+    // Int/Int must not lose precision through an f64 conversion.
+    b.switch_to_block(ints);
+    let lhs_value = b
+        .ins()
+        .load(types::I64, MemFlags::new(), lhs, layout.int_payload_offset);
+    let rhs_value = b
+        .ins()
+        .load(types::I64, MemFlags::new(), rhs, layout.int_payload_offset);
+    let cc = if is_lt {
+        IntCC::SignedLessThan
+    } else {
+        IntCC::SignedGreaterThan
+    };
+    let result = b.ins().icmp(cc, lhs_value, rhs_value);
+    b.ins().jump(done, &[BlockArg::Value(result)]);
+
+    b.switch_to_block(floats);
+    let lhs_value = aot_lower_tagged_number_to_float(b, ctx, AotTaggedValueOp { ip, value: lhs })?;
+    let rhs_value = aot_lower_tagged_number_to_float(b, ctx, AotTaggedValueOp { ip, value: rhs })?;
+    let cc = if is_lt {
+        cranelift_codegen::ir::condcodes::FloatCC::LessThan
+    } else {
+        cranelift_codegen::ir::condcodes::FloatCC::GreaterThan
+    };
+    let result = b.ins().fcmp(cc, lhs_value, rhs_value);
+    b.ins().jump(done, &[BlockArg::Value(result)]);
+
+    b.switch_to_block(done);
+    Ok(b.block_params(done)[0])
 }
 
 #[cfg(feature = "cranelift-jit")]

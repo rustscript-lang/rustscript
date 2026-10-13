@@ -11,15 +11,15 @@ use super::frontends;
 use super::ir::{
     Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, SemanticIndex, Stmt, TypeSchema,
 };
-use super::linker::{ParsedUnit, merge_units};
+use super::linker::{ParsedUnit, merge_admission_units, merge_units};
 use super::modules::ModuleGraph;
 use super::semantic_model::SemanticModel;
-use super::source_loader::load_units_for_source_file;
+use super::source_loader::{load_units_for_source_file, load_units_for_source_file_with_context};
 use super::source_map::SourceMap;
 use super::{
-    CompileError, CompileSourceFileOptions, CompiledProgram, CompiledReplProgram, ParseError,
-    ReplLocalBinding, SourceError, SourceFlavor, SourcePathError, TypingMode, lifetime,
-    materialization, parser, typing,
+    CompileError, CompileSourceFileOptions, CompiledProgram, CompiledReplProgram, FrontendPolicy,
+    FrontendTypedIr, ParseError, ReplLocalBinding, SourceError, SourceFlavor, SourcePathError,
+    TypingMode, lifetime, materialization, parser, typing,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -37,24 +37,492 @@ pub struct UnknownInferredLocal {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferredLocalTypeHint {
+    pub source_name: Option<String>,
     pub name: String,
     pub inferred_type: String,
     pub declared_line: Option<u32>,
     pub last_line: Option<u32>,
+    pub schema: Option<TypeSchema>,
+    pub span: Option<crate::compiler::source_map::Span>,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct CompileBehavior {
     clear_dead_locals: bool,
+    recover_host_errors: bool,
 }
 
 impl CompileBehavior {
     const DEFAULT: Self = Self {
         clear_dead_locals: true,
+        recover_host_errors: false,
+    };
+    const ANALYZE: Self = Self {
+        recover_host_errors: true,
+        ..Self::DEFAULT
     };
     const REPL: Self = Self {
         clear_dead_locals: false,
+        recover_host_errors: false,
     };
+}
+
+struct PreparedTypedUnits {
+    ir: FrontendIr,
+    type_info: typing::TypeInferenceResult,
+    owned_ir: FrontendIr,
+    sources: SourceMap,
+    catalog: Arc<HostApiCatalog>,
+    module_graph: Option<ModuleGraph>,
+    analysis_errors: Vec<CompileError>,
+    entry_local_types: Vec<typing::EntryLocalType>,
+    capture_source_policies: HashMap<String, bool>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct EntryLocalContext<'a> {
+    types: &'a [typing::EntryLocalType],
+    availability: &'a [lifetime::EntryLocalAvailability],
+}
+
+struct UnitPreparation<'a> {
+    behavior: CompileBehavior,
+    module_graph: Option<ModuleGraph>,
+    repl: Option<(&'a [ReplLocalBinding], &'a [String])>,
+}
+
+fn prepare_typed_units(
+    units: Vec<ParsedUnit>,
+    sources: SourceMap,
+    policy: FrontendPolicy,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+    behavior: CompileBehavior,
+    module_graph: Option<ModuleGraph>,
+) -> Result<PreparedTypedUnits, SourcePathError> {
+    prepare_typed_units_with_entry(
+        units,
+        sources,
+        policy,
+        flavor,
+        options,
+        UnitPreparation {
+            behavior,
+            module_graph,
+            repl: None,
+        },
+    )
+}
+
+fn prepare_typed_units_with_entry(
+    units: Vec<ParsedUnit>,
+    sources: SourceMap,
+    policy: FrontendPolicy,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+    preparation: UnitPreparation<'_>,
+) -> Result<PreparedTypedUnits, SourcePathError> {
+    let UnitPreparation {
+        behavior,
+        module_graph,
+        repl,
+    } = preparation;
+    let diagnostic_path = units
+        .iter()
+        .find(|unit| !unit.parsed.unknown_type_spans.is_empty())
+        .map(|unit| PathBuf::from(&unit.source_name));
+    // Capture admission ownership before flattening. Source identity and policy
+    // are independent of runtime reachability and of the root frontend.
+    let mut owners = Vec::new();
+    for unit in &units {
+        let producer = if unit.module.0 == 0 {
+            flavor
+        } else {
+            SourceFlavor::from_path_with_options(Path::new(&unit.source_name), options)?
+        };
+        let producer_policy = if unit.module.0 == 0 {
+            policy
+        } else {
+            frontend_policy_for_flavor(producer, options)?
+        };
+        let plugin = options.source_plugin_for_flavor(producer);
+        owners.push(TypedSourceOwner {
+            source_id: unit.source_id,
+            source_name: unit.source_name.clone(),
+            policy: producer_policy,
+            plugin,
+        });
+    }
+    let has_semantic_only = units.iter().any(|unit| !unit.runtime_reachable);
+    let runtime = has_semantic_only
+        .then(|| merge_units(units.clone()))
+        .transpose()?;
+    let parsed = merge_admission_units(units)?;
+    let entry_local_types = repl
+        .map(|(locals, _)| build_entry_local_types(&parsed, locals))
+        .unwrap_or_default();
+    let entry_availability = repl
+        .map(|(locals, moved)| build_entry_local_availability(&parsed, locals, moved))
+        .unwrap_or_default();
+    let entry = EntryLocalContext {
+        types: &entry_local_types,
+        availability: &entry_availability,
+    };
+    let (ir, type_info, admission_owned, analysis_errors) = prepare_owned_typed_ir(
+        parsed, &owners, options, behavior, &sources, entry,
+    )
+    .map_err(|error| SourcePathError::SourceWithMap {
+        error: preserve_strict_diagnostic_path(error, diagnostic_path.as_deref()),
+        sources: sources.clone(),
+    })?;
+    let (owned_ir, entry_local_types) = if let Some(runtime) = runtime {
+        // Admission has already checked every source and invoked each hook once.
+        // Link/codegen authority is independently restricted to Value paths.
+        // Removing semantic-only units changes linked local-slot offsets. Seed
+        // the runtime IR from its own binding table, never admission slot IDs.
+        let runtime_types = repl
+            .map(|(locals, _)| build_entry_local_types(&runtime, locals))
+            .unwrap_or_default();
+        let runtime_availability = repl
+            .map(|(locals, moved)| build_entry_local_availability(&runtime, locals, moved))
+            .unwrap_or_default();
+        let (runtime, error) =
+            typing::legalize_for_admission(runtime, TypingMode::DynamicHints, &runtime_types);
+        if !behavior.recover_host_errors
+            && let Some(error) = error
+        {
+            return Err(SourcePathError::SourceWithMap {
+                error: SourceError::Compile(error),
+                sources,
+            });
+        }
+        let facts = typing::infer_types(&runtime, TypingMode::DynamicHints, &runtime_types);
+        let owned = enforce_owned_sources(
+            runtime,
+            &facts,
+            &owners,
+            behavior,
+            &sources,
+            &runtime_availability,
+        )
+        .map_err(|error| SourcePathError::SourceWithMap {
+            error: SourceError::Parse(error),
+            sources: sources.clone(),
+        })?;
+        (owned, runtime_types)
+    } else {
+        (admission_owned, entry_local_types)
+    };
+    let catalog = options
+        .host_api_catalog()
+        .cloned()
+        .unwrap_or_else(default_analyze_catalog);
+    Ok(PreparedTypedUnits {
+        ir,
+        type_info,
+        owned_ir,
+        sources,
+        catalog,
+        module_graph,
+        analysis_errors,
+        entry_local_types,
+        capture_source_policies: owners
+            .iter()
+            .map(|owner| (owner.source_name.clone(), owner.policy.ownership_checking))
+            .collect(),
+    })
+}
+
+fn preserve_strict_diagnostic_path(
+    error: SourceError,
+    diagnostic_path: Option<&Path>,
+) -> SourceError {
+    match (error, diagnostic_path) {
+        (SourceError::Parse(mut parse), Some(path))
+            if parse.code.as_deref() == Some("E_STRICT_UNKNOWN_TYPE") =>
+        {
+            parse.message = format!("{}: {}", path.display(), parse.message);
+            SourceError::Parse(parse)
+        }
+        (error, _) => error,
+    }
+}
+
+fn prepare_typed_ir(
+    parsed: FrontendIr,
+    policy: FrontendPolicy,
+    options: &CompileSourceFileOptions,
+    behavior: CompileBehavior,
+    plugin: Option<&dyn super::SourcePlugin>,
+    sources: &SourceMap,
+) -> Result<(FrontendIr, typing::TypeInferenceResult, FrontendIr), SourceError> {
+    let owners = [TypedSourceOwner {
+        source_id: 0,
+        source_name: String::new(),
+        policy,
+        plugin,
+    }];
+    prepare_owned_typed_ir(
+        parsed,
+        &owners,
+        options,
+        behavior,
+        sources,
+        EntryLocalContext::default(),
+    )
+    .map(|(ir, facts, owned, _)| (ir, facts, owned))
+}
+
+struct TypedSourceOwner<'a> {
+    source_id: u32,
+    source_name: String,
+    policy: FrontendPolicy,
+    plugin: Option<&'a dyn super::SourcePlugin>,
+}
+
+// Select admission sites only. The shared IR remains authoritative for all
+// inference, imported signatures, nominal bodies and validation queries.
+fn owned_admission_sites(ir: &FrontendIr, owner: &TypedSourceOwner<'_>) -> FrontendIr {
+    let mut owned = ir.clone();
+    if owner.source_name.is_empty() {
+        return owned;
+    }
+    let statements: Vec<_> = owned
+        .stmts
+        .into_iter()
+        .zip(&ir.stmt_sources)
+        .filter(|(_, source)| source.as_deref() == Some(owner.source_name.as_str()))
+        .collect();
+    owned.stmts = statements.iter().map(|(stmt, _)| stmt.clone()).collect();
+    owned.stmt_sources = statements
+        .into_iter()
+        .map(|(_, source)| source.clone())
+        .collect();
+    owned
+        .function_impls
+        .retain(|index, _| ir.function_sources.get(index) == Some(&owner.source_name));
+    owned
+        .functions
+        .retain(|decl| owned.function_impls.contains_key(&decl.index));
+    owned
+        .unknown_type_spans
+        .retain(|span| span.source_id == owner.source_id);
+    if let Some(index) = &ir.parsed_semantic_index {
+        owned.local_bindings.retain(|(_, slot)| {
+            index
+                .local_decls
+                .iter()
+                .any(|decl| decl.slot == *slot && decl.ident_span.source_id == owner.source_id)
+        });
+        owned.struct_schemas.retain(|name, decl| {
+            !decl.is_guest()
+                || index.type_provenance.iter().any(|site| {
+                    site.canonical_name == *name
+                        && site.source_id == owner.source_id
+                        && site.declaration_span.is_some()
+                })
+        });
+    }
+    owned
+}
+
+fn prepare_owned_typed_ir(
+    mut parsed: FrontendIr,
+    owners: &[TypedSourceOwner<'_>],
+    options: &CompileSourceFileOptions,
+    behavior: CompileBehavior,
+    sources: &SourceMap,
+    entry: EntryLocalContext<'_>,
+) -> Result<
+    (
+        FrontendIr,
+        typing::TypeInferenceResult,
+        FrontendIr,
+        Vec<CompileError>,
+    ),
+    SourceError,
+> {
+    for owner in owners
+        .iter()
+        .filter(|owner| owner.policy.typing_mode.is_strict())
+    {
+        let owned = owned_admission_sites(&parsed, owner);
+        reject_strict_unknown_annotations(&owned).map_err(SourceError::Parse)?;
+    }
+    // Legalization and inference do not impose the root's language policy on
+    // dependencies. Admission below uses each producer's own descriptor.
+    let (legalized, host_error) =
+        typing::legalize_for_admission(parsed, TypingMode::DynamicHints, entry.types);
+    parsed = legalized;
+    let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, entry.types);
+    let mut analysis_errors = Vec::new();
+    let mut deferred_resolution_error = None;
+    for owner in owners {
+        let source_name = (!owner.source_name.is_empty()).then_some(owner.source_name.as_str());
+        // Native analysis retains only positioned typing diagnostics from the
+        // same linked/legalized IR. Plugin admission errors remain fatal;
+        // recovery never admits unknown schemas, ownership or source hooks.
+        if behavior.recover_host_errors && owner.plugin.is_none() {
+            analysis_errors.extend(
+                typing::analyze_source_type_consistency(
+                    &parsed,
+                    owner.policy.typing_mode,
+                    entry.types,
+                    source_name,
+                    host_error.as_ref(),
+                )
+                .map_err(SourceError::Compile)?,
+            );
+        } else {
+            typing::validate_source_type_consistency(
+                &parsed,
+                owner.policy.typing_mode,
+                entry.types,
+                source_name,
+            )
+            .map_err(SourceError::Compile)?;
+        }
+        if owner.policy.typing_mode.is_strict()
+            && let Err(error) = enforce_strict_type_resolution_with_host_recovery(
+                &owned_admission_sites(&parsed, owner),
+                &type_info,
+                behavior.recover_host_errors && host_error.is_some(),
+            )
+        {
+            // A failed catalog call can leave its result local Unknown. For
+            // non-recovering entries retain the primary host diagnostic, but
+            // still run independent ownership and source-hook admission.
+            // Analysis must continue rejecting independent strict failures.
+            if host_error.is_some() && !behavior.recover_host_errors {
+                deferred_resolution_error.get_or_insert(error);
+            } else {
+                return Err(SourceError::Compile(error));
+            }
+        }
+    }
+    let logical_schemas = type_info.logical_schemas();
+    parsed.semantic_index = Some(SemanticIndex::build(logical_schemas.clone(), &parsed));
+    let owned_ir = match enforce_owned_sources(
+        parsed.clone(),
+        &type_info,
+        owners,
+        behavior,
+        sources,
+        entry.availability,
+    ) {
+        Ok(owned) => owned,
+        Err(error)
+            if !behavior.recover_host_errors
+                && host_error.as_ref().is_some_and(|host| {
+                    resource_copy_duplicates_host_call(&parsed, host, &error)
+                }) =>
+        {
+            // The resolver already rejected this exact call's argument passing.
+            // Retain its primary diagnostic without bypassing source hooks. This
+            // admission-only IR cannot reach codegen: host_error is returned below.
+            parsed.clone()
+        }
+        Err(error) => return Err(SourceError::Parse(error)),
+    };
+    for owner in owners {
+        if let Some(plugin) = owner.plugin {
+            let typed = FrontendTypedIr {
+                source_id: Some(owner.source_id),
+                ir: &parsed,
+                local_schemas: &logical_schemas,
+                host_api_catalog: options.host_api_catalog().map(Arc::as_ref),
+                source_map: Some(sources),
+            };
+            plugin
+                .validate_typed_ir(&typed)
+                .map_err(SourceError::Compile)?;
+        }
+    }
+    if let Some(error) = host_error {
+        if !behavior.recover_host_errors {
+            return Err(SourceError::Compile(error));
+        }
+        analysis_errors.push(error);
+    }
+    if let Some(error) = deferred_resolution_error {
+        return Err(SourceError::Compile(error));
+    }
+    Ok((parsed, type_info, owned_ir, analysis_errors))
+}
+
+fn resource_copy_duplicates_host_call(
+    ir: &FrontendIr,
+    host: &CompileError,
+    ownership: &ParseError,
+) -> bool {
+    let CompileError::HostCallResolve {
+        span: Some(callee), ..
+    } = host
+    else {
+        return false;
+    };
+    if ownership.code.as_deref() != Some("E_OWNERSHIP_COPY_RESOURCE") {
+        return false;
+    }
+    let Some(owned_span) = ownership.span else {
+        return false;
+    };
+    // Only a standalone failed call at the very same source site can duplicate
+    // the copy rejection. Line equality alone would alias independent calls,
+    // statements or module owners; missing provenance must remain fail-closed.
+    ir.parsed_semantic_index.as_ref().is_some_and(|index| {
+        // Availability can fall back to a statement span by source and line.
+        // Such a fallback is not exact enough to prioritize a call if more
+        // than one statement occupies that line.
+        index
+            .stmt_spans
+            .iter()
+            .filter(|site| {
+                site.span.source_id == owned_span.source_id && site.line as usize == ownership.line
+            })
+            .count()
+            == 1
+            && index.call_sites.iter().any(|site| {
+                site.callee_span == *callee
+                    && site.expr_span.source_id == owned_span.source_id
+                    && site.expr_span.lo == owned_span.lo
+                    && site.expr_span.hi <= owned_span.hi
+            })
+    })
+}
+
+fn enforce_owned_sources(
+    ir: FrontendIr,
+    facts: &typing::TypeInferenceResult,
+    owners: &[TypedSourceOwner<'_>],
+    behavior: CompileBehavior,
+    sources: &SourceMap,
+    entry_locals: &[lifetime::EntryLocalAvailability],
+) -> Result<FrontendIr, ParseError> {
+    let owned_slots = facts
+        .local_schemas
+        .iter()
+        .map(|schema| {
+            schema
+                .as_ref()
+                .is_some_and(|schema| schema.contains_resource_with_named_types(&ir.struct_schemas))
+        })
+        .collect::<Vec<_>>();
+    let policies = owners
+        .iter()
+        .map(|owner| (owner.source_name.clone(), owner.policy.ownership_checking))
+        .collect();
+    lifetime::enforce_source_availability_with_entry_locals(
+        ir,
+        entry_locals,
+        behavior.clear_dead_locals,
+        &owned_slots,
+        &policies,
+        owners
+            .first()
+            .is_some_and(|owner| owner.policy.ownership_checking),
+        sources,
+    )
 }
 
 fn collect_named_local_debug_ranges(parsed: &FrontendIr) -> HashMap<String, LocalDebugRange> {
@@ -189,6 +657,7 @@ fn record_expr_local_debug_ranges(
             note_local_use(ranges, *root, line);
         }
         Expr::OptionalGet {
+            field_projection: _,
             container,
             key,
             container_slot,
@@ -348,6 +817,16 @@ fn is_compiler_primitive_import(name: &str) -> bool {
     name.starts_with("__prim_")
 }
 
+fn frontend_policy_for_flavor(
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<FrontendPolicy, SourcePathError> {
+    options
+        .frontend_policy(flavor)
+        .ok_or(SourcePathError::MissingFrontendPlugin(flavor))
+}
+
+#[cfg(all(test, feature = "runtime"))]
 fn compile_parsed_output(
     source: String,
     parsed: FrontendIr,
@@ -366,6 +845,7 @@ fn compile_parsed_output(
     )
 }
 
+#[cfg(all(test, feature = "runtime"))]
 fn compile_parsed_output_with_entry_locals(
     source: String,
     parsed: FrontendIr,
@@ -374,6 +854,31 @@ fn compile_parsed_output_with_entry_locals(
     behavior: CompileBehavior,
     typing_mode: TypingMode,
     enable_local_move_semantics: bool,
+) -> Result<CompiledProgram, SourceError> {
+    compile_parsed_output_with_capture_output(
+        source,
+        parsed,
+        entry_locals,
+        entry_local_types,
+        behavior,
+        typing_mode,
+        enable_local_move_semantics,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_parsed_output_with_capture_output(
+    source: String,
+    parsed: FrontendIr,
+    entry_locals: &[lifetime::EntryLocalAvailability],
+    entry_local_types: &[typing::EntryLocalType],
+    behavior: CompileBehavior,
+    typing_mode: TypingMode,
+    enable_local_move_semantics: bool,
+    certification: Option<&mut super::capture_certification::CaptureCertification>,
+    capture_source_policies: Option<super::capture_certification::CaptureProducerPolicies<'_>>,
 ) -> Result<CompiledProgram, SourceError> {
     // Normal compilation passes no entry locals. The REPL uses this hook to treat
     // carried-over locals from prior entries as already available at snippet start.
@@ -385,19 +890,11 @@ fn compile_parsed_output_with_entry_locals(
         .map_err(SourceError::Compile)?;
     typing::validate_if_else_type_consistency(&parsed, typing_mode, entry_local_types)
         .map_err(SourceError::Compile)?;
-    // One strict inference run over the post-legalize IR: it feeds both the
-    // strict RustScript resolution gate and the resource-ownership metadata
-    // for the lifetime passes. Slot indices are the pre-compaction logical
-    // locals here, exactly the space availability/liveness analyze in.
     let pre_lifetime_type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
     if typing_mode.is_strict() {
-        enforce_strict_rustscript_type_resolution(&parsed, &pre_lifetime_type_info)
+        enforce_strict_type_resolution(&parsed, &pre_lifetime_type_info)
             .map_err(SourceError::Compile)?;
     }
-    // A local slot is resource-owned when its post-legalize logical schema
-    // contains a resource anywhere (direct or nested). These slots are the
-    // move-only contract for availability/liveness; plain programs carry no
-    // resource schemas, so their behavior is untouched.
     let owned_local_slots = pre_lifetime_type_info
         .local_schemas
         .iter()
@@ -415,6 +912,74 @@ fn compile_parsed_output_with_entry_locals(
         &owned_local_slots,
     )
     .map_err(SourceError::Parse)?;
+    compile_owned_ir_with_capture_output(
+        source,
+        parsed,
+        entry_local_types,
+        typing_mode,
+        enable_local_move_semantics,
+        local_debug_ranges,
+        LocalLayoutPolicy::Compact,
+        certification,
+        capture_source_policies,
+    )
+    .map(|(compiled, _)| compiled)
+}
+
+/// Final layout belongs to the compilation owner, not current-snippet liveness.
+/// REPL root bindings remain observable by later snippets, even on the first
+/// compilation or when no persisted entry is referenced in this snippet.
+#[derive(Clone, Copy)]
+enum LocalLayoutPolicy<'a> {
+    Compact,
+    PersistentRoots(&'a [ReplLocalBinding]),
+}
+
+fn compile_owned_ir_with_root_projection(
+    source: String,
+    parsed: FrontendIr,
+    entry_local_types: &[typing::EntryLocalType],
+    typing_mode: TypingMode,
+    enable_local_move_semantics: bool,
+    local_debug_ranges: HashMap<String, LocalDebugRange>,
+    local_layout: LocalLayoutPolicy<'_>,
+) -> Result<(CompiledProgram, Vec<typing::EntryLocalType>), SourceError> {
+    compile_owned_ir_with_capture_output(
+        source,
+        parsed,
+        entry_local_types,
+        typing_mode,
+        enable_local_move_semantics,
+        local_debug_ranges,
+        local_layout,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_owned_ir_with_capture_output(
+    source: String,
+    parsed: FrontendIr,
+    entry_local_types: &[typing::EntryLocalType],
+    typing_mode: TypingMode,
+    enable_local_move_semantics: bool,
+    local_debug_ranges: HashMap<String, LocalDebugRange>,
+    local_layout: LocalLayoutPolicy<'_>,
+    certification: Option<&mut super::capture_certification::CaptureCertification>,
+    capture_source_policies: Option<super::capture_certification::CaptureProducerPolicies<'_>>,
+) -> Result<(CompiledProgram, Vec<typing::EntryLocalType>), SourceError> {
+    // Authority follows each admitted producer, never the merged entry policy.
+    let mut origins = certification.as_ref().map(|_| {
+        let mut origins =
+            typing::infer_types_with_capture_origins(&parsed, typing_mode, entry_local_types, &[])
+                .2;
+        let Some(policies) = capture_source_policies else {
+            return Default::default();
+        };
+        origins.retain_admitted_producers(&parsed, policies);
+        origins
+    });
     // Classify named callable materialization on the final merged IR
     // (post-lifetime, so capture metadata and rewritten uses are
     // authoritative). Codegen consumes `requires_callable_slot` to omit
@@ -427,8 +992,77 @@ fn compile_parsed_output_with_entry_locals(
     // value identities, so the classification is strictly more precise on
     // the unallocated IR.
     let callable_use_facts = materialization::classify_named_callables(&parsed);
-    let parsed = lifetime::allocate_local_slots(parsed).map_err(SourceError::Parse)?;
-    let type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
+    let (parsed, entry_local_types, root_slots) = match local_layout {
+        LocalLayoutPolicy::Compact if origins.is_none() => (
+            lifetime::allocate_local_slots(parsed).map_err(SourceError::Parse)?,
+            entry_local_types.to_vec(),
+            Vec::new(),
+        ),
+        LocalLayoutPolicy::Compact => {
+            let allocation = lifetime::allocate_local_slots_with_root_slots(parsed, &[])
+                .map_err(SourceError::Parse)?;
+            if let Some(origins) = &mut origins {
+                origins.remap(&allocation.mapping);
+            }
+            (allocation.ir, entry_local_types.to_vec(), Vec::new())
+        }
+        LocalLayoutPolicy::PersistentRoots(bindings) => {
+            // The parser/session owner identifies observable root bindings.
+            // The frontend's cumulative locals count also contains callee
+            // locals and must never be used as the persistent root set.
+            let root_slots = bindings
+                .iter()
+                .map(|binding| {
+                    parsed
+                        .local_bindings
+                        .iter()
+                        .find(|(name, _)| name == &binding.name)
+                        .map(|(_, slot)| *slot)
+                        .ok_or_else(|| {
+                            SourceError::Parse(ParseError::new(format!(
+                                "missing persistent root binding '{}'",
+                                binding.name
+                            )))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let allocation = lifetime::allocate_local_slots_with_root_slots(parsed, &root_slots)
+                .map_err(SourceError::Parse)?;
+            if let Some(origins) = &mut origins {
+                origins.remap(&allocation.mapping);
+            }
+            let remapped_types = entry_local_types
+                .iter()
+                .map(|entry| {
+                    let slot = allocation
+                        .mapping
+                        .get(entry.slot as usize)
+                        .copied()
+                        .ok_or_else(|| {
+                            SourceError::Parse(ParseError::new(
+                                "entry local slot remap out of range",
+                            ))
+                        })?;
+                    Ok(typing::EntryLocalType {
+                        slot,
+                        schema: entry.schema.clone(),
+                        optional: entry.optional,
+                    })
+                })
+                .collect::<Result<Vec<_>, SourceError>>()?;
+            let root_slots = root_slots
+                .iter()
+                .map(|slot| allocation.mapping[*slot as usize])
+                .collect();
+            (allocation.ir, remapped_types, root_slots)
+        }
+    };
+    let (type_info, root_projection) = typing::infer_types_with_root_projection(
+        &parsed,
+        typing_mode,
+        &entry_local_types,
+        &root_slots,
+    );
     let FrontendIr {
         stmts,
         locals,
@@ -527,18 +1161,25 @@ fn compile_parsed_output_with_entry_locals(
             .add_local_debug(name, index, range.declared_line, range.last_line)
             .map_err(SourceError::Compile)?;
     }
-    let mut program = compiler
-        .compile_program(&stmts)
-        .map_err(SourceError::Compile)?;
+    let mut program = match (certification, origins) {
+        (Some(output), Some(origins)) => {
+            compiler.compile_program_certified(&stmts, &origins, output)
+        }
+        _ => compiler.compile_program(&stmts),
+    }
+    .map_err(SourceError::Compile)?;
     program.local_count = program.local_count.max(locals);
     let runtime_locals = program.local_count;
-    Ok(CompiledProgram {
-        program,
-        locals: runtime_locals,
-        functions: visible_runtime_import_functions,
-        #[cfg(test)]
-        callable_use_facts: callable_use_observations,
-    })
+    Ok((
+        CompiledProgram {
+            program,
+            locals: runtime_locals,
+            functions: visible_runtime_import_functions,
+            #[cfg(test)]
+            callable_use_facts: callable_use_observations,
+        },
+        root_projection,
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -556,16 +1197,24 @@ fn reject_strict_unknown_annotations(parsed: &FrontendIr) -> Result<(), ParseErr
     Err(ParseError {
         line: 1,
         message:
-            "RustScript requires concrete compile-time types; 'unknown' annotations are not allowed"
+            "strict frontends require concrete compile-time types; 'unknown' annotations are not allowed"
                 .to_string(),
         span: Some(span),
         code: Some("E_STRICT_UNKNOWN_TYPE".to_string()),
     })
 }
 
-fn enforce_strict_rustscript_type_resolution(
+fn enforce_strict_type_resolution(
     parsed: &FrontendIr,
     type_info: &typing::TypeInferenceResult,
+) -> Result<(), CompileError> {
+    enforce_strict_type_resolution_with_host_recovery(parsed, type_info, false)
+}
+
+fn enforce_strict_type_resolution_with_host_recovery(
+    parsed: &FrontendIr,
+    type_info: &typing::TypeInferenceResult,
+    recover_host_results: bool,
 ) -> Result<(), CompileError> {
     let parsed_index = parsed.parsed_semantic_index.as_ref();
     for schema in parsed.struct_schemas.values() {
@@ -576,14 +1225,20 @@ fn enforce_strict_rustscript_type_resolution(
             index
                 .struct_decls
                 .iter()
-                .find(|site| site.name == schema.name)
+                .find(|site| {
+                    site.name == schema.name
+                        || index.type_provenance.iter().any(|provenance| {
+                            provenance.canonical_name == schema.name
+                                && provenance.declaration_span == Some(site.ident_span)
+                        })
+                })
                 .map(|site| site.ident_span)
         });
         return Err(CompileError::StrictTypingRequired {
             line: None,
             source_name: None,
             detail: format!(
-                "struct '{}' contains non-concrete field types; RustScript requires concrete schemas",
+                "struct '{}' contains non-concrete field types; strict typing requires concrete schemas",
                 schema.name
             ),
             span,
@@ -606,7 +1261,7 @@ fn enforce_strict_rustscript_type_resolution(
                 line: function_decl_lines.get(&decl.index).copied(),
                 source_name: parsed.function_sources.get(&decl.index).cloned(),
                 detail: format!(
-                    "function '{}' uses a non-concrete return schema; RustScript requires concrete return types",
+                    "function '{}' uses a non-concrete return schema; strict typing requires concrete return types",
                     decl.name
                 ),
                 span,
@@ -616,6 +1271,18 @@ fn enforce_strict_rustscript_type_resolution(
 
     for (slot, site) in collect_strict_slot_sites(parsed) {
         if slot_is_fully_typed(slot, type_info) {
+            continue;
+        }
+        // Only a direct unresolved catalog-call result is diagnostic fallout.
+        // Keep its schema Unknown and all owner hooks/ownership checks intact;
+        // unrelated locals and parameters still require strict admission.
+        if recover_host_results
+            && site.kind == "local"
+            && (has_unresolved_host_initializer(&parsed.stmts, slot, parsed)
+                || parsed.function_impls.values().any(|implementation| {
+                    has_unresolved_host_initializer(&implementation.body_stmts, slot, parsed)
+                }))
+        {
             continue;
         }
         let span = parsed_index.and_then(|index| {
@@ -636,7 +1303,7 @@ fn enforce_strict_rustscript_type_resolution(
             line: site.line,
             source_name: site.source_name,
             detail: format!(
-                "{} '{}' does not resolve to a concrete compile-time type in RustScript",
+                "{} '{}' does not resolve to a concrete compile-time type under strict typing",
                 site.kind, site.name
             ),
             span,
@@ -644,6 +1311,38 @@ fn enforce_strict_rustscript_type_resolution(
     }
 
     Ok(())
+}
+
+fn has_unresolved_host_initializer(stmts: &[Stmt], slot: LocalSlot, ir: &FrontendIr) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Let {
+            index,
+            expr: Expr::Call(function, _, _, None, _),
+            declared_schema: None,
+            ..
+        } if *index == slot => ir
+            .host_api_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.candidates(*function))
+            .is_some(),
+        Stmt::IfElse {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            has_unresolved_host_initializer(then_branch, slot, ir)
+                || has_unresolved_host_initializer(else_branch, slot, ir)
+        }
+        Stmt::For {
+            init, post, body, ..
+        } => {
+            has_unresolved_host_initializer(std::slice::from_ref(init.as_ref()), slot, ir)
+                || has_unresolved_host_initializer(std::slice::from_ref(post.as_ref()), slot, ir)
+                || has_unresolved_host_initializer(body, slot, ir)
+        }
+        Stmt::While { body, .. } => has_unresolved_host_initializer(body, slot, ir),
+        _ => false,
+    })
 }
 
 fn slot_is_fully_typed(slot: LocalSlot, type_info: &typing::TypeInferenceResult) -> bool {
@@ -809,6 +1508,23 @@ fn record_local_source_names(
     }
 }
 
+/// Retains compiler capture authority while preserving ordinary source admission.
+pub fn compile_source_with_capture_certification(
+    source: &str,
+) -> Result<super::CertifiedCompilation, SourceError> {
+    let source = source.to_owned();
+    run_with_compiler_stack(move || {
+        let mut facts = Default::default();
+        let compiled = compile_source_with_flavor_capture_output(
+            &source,
+            SourceFlavor::RustScript,
+            CompileBehavior::DEFAULT,
+            Some(&mut facts),
+        )?;
+        Ok(super::CertifiedCompilation { compiled, facts })
+    })
+}
+
 pub fn compile_source(source: &str) -> Result<CompiledProgram, SourceError> {
     compile_source_with_flavor(source, SourceFlavor::RustScript)
 }
@@ -834,17 +1550,19 @@ pub fn analyze_source_with_flavor(
     source: &str,
     flavor: SourceFlavor,
 ) -> Result<SemanticModel, SourceError> {
-    let effective = default_standard_catalog_options(&CompileSourceFileOptions::default());
+    let effective = default_standard_catalog_options(flavor, &CompileSourceFileOptions::default());
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
     let parsed = frontends::parse_source(source, flavor, &effective).map_err(|err| {
         SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
     })?;
+    let policy = frontend_policy_for_flavor(flavor, &effective)
+        .map_err(|err| SourceError::Parse(ParseError::new(err.to_string())))?;
     analyze_parsed_output(
         source.to_string(),
         parsed,
         source_map,
-        flavor,
+        policy,
         effective.host_api_catalog().cloned(),
         None,
     )
@@ -922,121 +1640,85 @@ fn analyze_source_string_at_path(
     source: &str,
     options: &CompileSourceFileOptions,
 ) -> Result<SemanticModel, SourcePathError> {
-    let effective = default_standard_catalog_options(options);
-    // Module-graph, plugin, and custom-catalog compilations share the same
-    // frontend pipeline as the compile path: the loader parses every unit
-    // verbatim (no second parser), the linker merges the provenance carrier,
-    // and analysis builds the semantic index from the merged IR.
-    if effective.has_module_overrides() || effective.has_source_plugins() {
-        let loaded = load_units_for_source_file(path, flavor, source, &effective)?;
-        let catalog = effective.host_api_catalog().cloned();
-        return analyze_loaded_units(
-            source.to_string(),
-            loaded.units,
-            flavor,
-            loaded.sources,
-            catalog,
-            Some(loaded.module_graph),
-        );
-    }
-
-    let mut source_map = SourceMap::new();
-    let source_id = source_map.add_source(path.display().to_string(), source.to_string());
-    let parsed = frontends::parse_source(source, flavor, &effective).map_err(|err| {
-        SourcePathError::Source(SourceError::Parse(
-            err.with_line_span_from_source(&source_map, source_id),
-        ))
-    })?;
-
-    let catalog = effective.host_api_catalog().cloned();
-    analyze_parsed_output(
-        source.to_string(),
-        parsed,
-        source_map,
+    let effective = default_standard_catalog_options(flavor, options);
+    let policy = frontend_policy_for_flavor(flavor, &effective)?;
+    let loaded = load_units_for_source_file(path, flavor, source, &effective)?;
+    analyze_loaded_units(
+        loaded.units,
+        policy,
+        loaded.sources,
+        Some(loaded.module_graph),
         flavor,
-        catalog,
-        None,
+        &effective,
     )
-    .map_err(SourcePathError::Source)
 }
 
 /// Analyze the merged output of the module loader through the shared
 /// frontend pipeline: merge units, then legalize + type-check + build the
 /// provenance-driven semantic index. No second parser is involved.
 fn analyze_loaded_units(
-    source: String,
     units: Vec<ParsedUnit>,
-    flavor: SourceFlavor,
+    policy: FrontendPolicy,
     sources: SourceMap,
-    custom_catalog: Option<Arc<HostApiCatalog>>,
     module_graph: Option<ModuleGraph>,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
 ) -> Result<SemanticModel, SourcePathError> {
-    let merged = merge_units(units)?;
-    analyze_parsed_output(
-        source,
-        merged,
+    // Diagnostic recovery uses the same finalized owner admission as compile
+    // and hints. A host error grants no execution authority.
+    let mut prepared = prepare_typed_units(
+        units,
         sources,
+        policy,
         flavor,
-        custom_catalog,
-        module_graph,
-    )
-    .map_err(SourcePathError::Source)
+        options,
+        CompileBehavior::ANALYZE,
+        None,
+    )?;
+    let errors = std::mem::take(&mut prepared.analysis_errors);
+    prepared.module_graph = module_graph;
+    Ok(match prepared.module_graph {
+        Some(module_graph) => SemanticModel::new_with_module_graph(
+            prepared.ir,
+            prepared.sources,
+            prepared.catalog,
+            errors,
+            module_graph,
+        ),
+        None => SemanticModel::new(prepared.ir, prepared.sources, prepared.catalog, errors),
+    })
 }
 
 fn analyze_parsed_output(
     _source: String,
     parsed: FrontendIr,
     source_map: SourceMap,
-    flavor: SourceFlavor,
+    policy: FrontendPolicy,
     custom_catalog: Option<Arc<HostApiCatalog>>,
     module_graph: Option<ModuleGraph>,
 ) -> Result<SemanticModel, SourceError> {
-    let typing_mode = TypingMode::for_flavor(flavor);
     let catalog = custom_catalog.unwrap_or_else(default_analyze_catalog);
-
-    // Run legalize and type checking.
-    let legalize_result =
-        typing::legalize_builtins_and_bind_types(parsed.clone(), typing_mode, &[]);
-    let mut errors = Vec::new();
-
-    let (mut parsed_after_legalize, type_info) = match legalize_result {
-        Ok(legalized) => {
-            let type_info = typing::infer_types(&legalized, typing_mode, &[]);
-            (legalized, type_info)
-        }
-        Err(compile_err) => {
-            errors.push(compile_err);
-            // Even on error, run type inference on the original IR for partial results.
-            let type_info = typing::infer_types(&parsed, typing_mode, &[]);
-            (parsed, type_info)
-        }
-    };
-
-    // Run validation, collecting errors.
-    if let Err(compile_err) =
-        typing::validate_if_else_type_consistency(&parsed_after_legalize, typing_mode, &[])
-    {
-        errors.push(compile_err);
-    }
-
-    // Build the semantic index directly from the parser provenance carried
-    // on the legalized IR plus the typed/resolved IR keyed by SemanticNodeId.
-    // No source-text reconstruction is involved.
-    let semantic_index =
-        SemanticIndex::build(type_info.local_schemas.clone(), &parsed_after_legalize);
-
-    // Attach the semantic index to the IR.
-    parsed_after_legalize.semantic_index = Some(semantic_index);
+    let options = CompileSourceFileOptions::new().with_host_api_catalog(Arc::clone(&catalog));
+    let owners = [TypedSourceOwner {
+        source_id: 0,
+        source_name: String::new(),
+        policy,
+        plugin: None,
+    }];
+    let (ir, _, _, errors) = prepare_owned_typed_ir(
+        parsed,
+        &owners,
+        &options,
+        CompileBehavior::ANALYZE,
+        &source_map,
+        EntryLocalContext::default(),
+    )?;
 
     Ok(match module_graph {
-        Some(module_graph) => SemanticModel::new_with_module_graph(
-            parsed_after_legalize,
-            source_map,
-            catalog,
-            errors,
-            module_graph,
-        ),
-        None => SemanticModel::new(parsed_after_legalize, source_map, catalog, errors),
+        Some(module_graph) => {
+            SemanticModel::new_with_module_graph(ir, source_map, catalog, errors, module_graph)
+        }
+        None => SemanticModel::new(ir, source_map, catalog, errors),
     })
 }
 
@@ -1155,13 +1837,23 @@ fn collect_inferred_local_type_hints_impl(
     source: &str,
     flavor: SourceFlavor,
 ) -> Result<Vec<InferredLocalTypeHint>, SourceError> {
+    let options = CompileSourceFileOptions::default();
+    let policy = frontend_policy_for_flavor(flavor, &options)
+        .map_err(|error| SourceError::Parse(ParseError::new(error.to_string())))?;
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
-    let parsed = frontends::parse_source(source, flavor, &CompileSourceFileOptions::default())
-        .map_err(|err| {
-            SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
-        })?;
-    collect_named_local_type_hints(parsed).map_err(SourceError::Compile)
+    let parsed = frontends::parse_source(source, flavor, &options).map_err(|err| {
+        SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
+    })?;
+    let (ir, type_info, _) = prepare_typed_ir(
+        parsed,
+        policy,
+        &options,
+        CompileBehavior::DEFAULT,
+        None,
+        &source_map,
+    )?;
+    Ok(collect_named_local_type_hints(&ir, &type_info, &source_map))
 }
 
 fn lint_unknown_inferred_local_types_with_options_impl(
@@ -1177,7 +1869,7 @@ fn lint_unknown_inferred_local_types_with_options_impl(
             .map_err(SourcePathError::Source);
     }
 
-    let path = virtual_inmemory_entry_path(flavor);
+    let path = virtual_inmemory_entry_path(flavor, options)?;
     lint_unknown_inferred_local_types_at_path_with_options_impl(&path, source, flavor, options)
 }
 
@@ -1186,15 +1878,7 @@ fn collect_inferred_local_type_hints_with_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<Vec<InferredLocalTypeHint>, SourcePathError> {
-    if !options.has_module_overrides()
-        && !options.has_source_plugins()
-        && options.host_api_catalog().is_none()
-    {
-        return collect_inferred_local_type_hints_impl(source, flavor)
-            .map_err(SourcePathError::Source);
-    }
-
-    let path = virtual_inmemory_entry_path(flavor);
+    let path = virtual_inmemory_entry_path(flavor, options)?;
     collect_inferred_local_type_hints_at_path_with_options_impl(&path, source, flavor, options)
 }
 
@@ -1223,15 +1907,22 @@ fn collect_inferred_local_type_hints_at_path_with_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<Vec<InferredLocalTypeHint>, SourcePathError> {
+    let policy = frontend_policy_for_flavor(flavor, options)?;
     let loaded = load_units_for_source_file(path, flavor, source, options)?;
-    let parsed = loaded
-        .units
-        .into_iter()
-        .last()
-        .map(|unit| unit.parsed)
-        .expect("root parsed unit should always be present");
-    collect_named_local_type_hints(parsed)
-        .map_err(|error| SourcePathError::Source(SourceError::Compile(error)))
+    let prepared = prepare_typed_units(
+        loaded.units,
+        loaded.sources,
+        policy,
+        flavor,
+        options,
+        CompileBehavior::DEFAULT,
+        Some(loaded.module_graph),
+    )?;
+    Ok(collect_named_local_type_hints(
+        &prepared.ir,
+        &prepared.type_info,
+        &prepared.sources,
+    ))
 }
 
 fn collect_unknown_inferred_local_types(
@@ -1283,46 +1974,144 @@ fn collect_unknown_inferred_local_types(
 }
 
 fn collect_named_local_type_hints(
-    parsed: FrontendIr,
-) -> Result<Vec<InferredLocalTypeHint>, CompileError> {
+    parsed: &FrontendIr,
+    type_info: &typing::TypeInferenceResult,
+    source_map: &SourceMap,
+) -> Vec<InferredLocalTypeHint> {
+    let logical_schemas = type_info.logical_schemas();
     let slot_ranges = collect_local_debug_ranges(&parsed.stmts, &parsed.function_impls);
-    let function_decl_lines = collect_function_decl_lines(&parsed.stmts);
-    let parsed = typing::legalize_builtins_and_bind_types(parsed, TypingMode::DynamicHints, &[])?;
-    let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, &[]);
-
+    let semantic_index = parsed.semantic_index.as_ref();
+    let mut seen = std::collections::HashSet::new();
     let mut hints = Vec::new();
-    for (name, slot) in &parsed.local_bindings {
-        hints.push(InferredLocalTypeHint {
-            name: name.clone(),
-            inferred_type: inferred_slot_type_name(&type_info, *slot),
-            declared_line: slot_ranges.get(slot).and_then(|range| range.declared_line),
-            last_line: slot_ranges.get(slot).and_then(|range| range.last_line),
-        });
-    }
 
-    for decl in &parsed.functions {
-        let Some(function_impl) = parsed.function_impls.get(&decl.index) else {
-            continue;
-        };
-        let declared_line = function_decl_lines.get(&decl.index).copied();
-        let last_line = function_scope_last_line(function_impl).or(declared_line);
-        for (name, slot) in decl.args.iter().zip(function_impl.param_slots.iter()) {
+    if let Some(semantic_index) = semantic_index {
+        // Linked IR is merged in dependency order; editor hints follow source
+        // provenance instead, retaining every declaration from every owner.
+        let mut declarations = semantic_index.parsed.local_decls.iter().collect::<Vec<_>>();
+        declarations.sort_by_key(|decl| {
+            (
+                decl.ident_span.source_id,
+                decl.ident_span.lo,
+                decl.ident_span.hi,
+            )
+        });
+        for decl in declarations {
+            let declaration_identity = (
+                decl.ident_span.source_id,
+                decl.slot,
+                decl.ident_span.lo,
+                decl.ident_span.hi,
+            );
+            if !seen.insert(declaration_identity) {
+                continue;
+            }
+            let schema = logical_schemas
+                .get(usize::from(decl.slot))
+                .cloned()
+                .flatten();
+            let declaration_line = source_map
+                .line_col_for_offset(decl.ident_span.source_id, decl.ident_span.lo)
+                .and_then(|(line, _)| u32::try_from(line).ok());
+            let range = slot_ranges.get(&decl.slot);
             hints.push(InferredLocalTypeHint {
+                source_name: source_map
+                    .file_name(decl.ident_span.source_id)
+                    .map(str::to_string),
+                name: decl.name.clone(),
+                inferred_type: schema
+                    .as_ref()
+                    .map(|schema| {
+                        typing::render_schema_label(
+                            &parsed.source_schema(schema, decl.ident_span.source_id),
+                        )
+                    })
+                    .unwrap_or_else(|| inferred_slot_type_name(type_info, decl.slot)),
+                declared_line: declaration_line
+                    .or_else(|| range.and_then(|range| range.declared_line)),
+                last_line: range.and_then(|range| range.last_line),
+                schema,
+                span: source_map
+                    .span_text(decl.ident_span)
+                    .map(|_| decl.ident_span),
+            });
+        }
+
+        for function in &parsed.functions {
+            let Some(function_impl) = parsed.function_impls.get(&function.index) else {
+                continue;
+            };
+            let Some(function_site) = semantic_index
+                .parsed
+                .func_decls
+                .iter()
+                .find(|site| site.function_index == function.index)
+            else {
+                continue;
+            };
+            let declared_line = source_map
+                .line_col_for_offset(
+                    function_site.ident_span.source_id,
+                    function_site.ident_span.lo,
+                )
+                .and_then(|(line, _)| u32::try_from(line).ok());
+            let last_line = function_scope_last_line(function_impl).or(declared_line);
+            for (name, slot) in function.args.iter().zip(function_impl.param_slots.iter()) {
+                let parameter_has_site = semantic_index.parsed.local_decls.iter().any(|decl| {
+                    decl.ident_span.source_id == function_site.ident_span.source_id
+                        && decl.slot == *slot
+                        && decl.name == *name
+                        && (decl.decl_order as usize) < function.args.len()
+                });
+                if parameter_has_site {
+                    continue;
+                }
+                if !seen.insert((
+                    function_site.ident_span.source_id,
+                    *slot,
+                    usize::MAX,
+                    usize::MAX,
+                )) {
+                    continue;
+                }
+                let schema = logical_schemas.get(usize::from(*slot)).cloned().flatten();
+                let range = slot_ranges.get(slot);
+                hints.push(InferredLocalTypeHint {
+                    source_name: source_map
+                        .file_name(function_site.ident_span.source_id)
+                        .map(str::to_string),
+                    name: name.clone(),
+                    inferred_type: schema
+                        .as_ref()
+                        .map(typing::render_schema_label)
+                        .unwrap_or_else(|| inferred_slot_type_name(type_info, *slot)),
+                    declared_line: range
+                        .and_then(|range| range.declared_line)
+                        .or(declared_line),
+                    last_line: range.and_then(|range| range.last_line).or(last_line),
+                    schema,
+                    span: None,
+                });
+            }
+        }
+    } else {
+        for (name, slot) in &parsed.local_bindings {
+            let schema = logical_schemas.get(usize::from(*slot)).cloned().flatten();
+            let range = slot_ranges.get(slot);
+            hints.push(InferredLocalTypeHint {
+                source_name: None,
                 name: name.clone(),
-                inferred_type: inferred_slot_type_name(&type_info, *slot),
-                declared_line: slot_ranges
-                    .get(slot)
-                    .and_then(|range| range.declared_line)
-                    .or(declared_line),
-                last_line: slot_ranges
-                    .get(slot)
-                    .and_then(|range| range.last_line)
-                    .or(last_line),
+                inferred_type: schema
+                    .as_ref()
+                    .map(typing::render_schema_label)
+                    .unwrap_or_else(|| inferred_slot_type_name(type_info, *slot)),
+                declared_line: range.and_then(|range| range.declared_line),
+                last_line: range.and_then(|range| range.last_line),
+                schema,
+                span: None,
             });
         }
     }
-
-    Ok(hints)
+    hints
 }
 
 fn inferred_slot_type_name(type_info: &typing::TypeInferenceResult, slot: LocalSlot) -> String {
@@ -1466,13 +2255,36 @@ pub fn compile_source_for_repl_with_locals(
     let source_owned = source.to_string();
     let predefined_locals = predefined_locals.to_vec();
     run_with_compiler_stack(move || {
-        compile_source_for_repl_with_locals_impl(&source_owned, &predefined_locals, &[])
+        compile_source_for_repl_with_locals_impl(
+            &source_owned,
+            &predefined_locals,
+            &[],
+            &CompileSourceFileOptions::default(),
+        )
     })
 }
 
 pub fn compile_source_for_repl_with_state(
     source: &str,
     predefined_locals: &[ReplLocalState],
+) -> Result<CompiledReplProgram, SourceError> {
+    compile_source_for_repl_with_state_and_options(
+        source,
+        predefined_locals,
+        CompileSourceFileOptions::default(),
+    )
+}
+
+/// Compile the supported RustScript REPL frontend with an explicit catalog.
+/// Persisted-local semantics and strict ownership admission are unchanged.
+/// Module overrides and selected module producers use the generic checked
+/// admission pipeline. The executable snippet root remains native RustScript;
+/// registration alone never selects a file producer. Guest callables remain
+/// program-owned and resource handles remain scoped to their VM arena.
+pub fn compile_source_for_repl_with_state_and_options(
+    source: &str,
+    predefined_locals: &[ReplLocalState],
+    options: CompileSourceFileOptions,
 ) -> Result<CompiledReplProgram, SourceError> {
     let source_owned = source.to_string();
     let predefined_locals = predefined_locals.to_vec();
@@ -1486,7 +2298,7 @@ pub fn compile_source_for_repl_with_state(
             .filter(|state| state.moved)
             .map(|state| state.binding.name.clone())
             .collect::<Vec<_>>();
-        compile_source_for_repl_with_locals_impl(&source_owned, &bindings, &moved_names)
+        compile_source_for_repl_with_locals_impl(&source_owned, &bindings, &moved_names, &options)
     })
 }
 
@@ -1536,41 +2348,73 @@ fn compile_source_for_repl_with_locals_impl(
     source: &str,
     predefined_locals: &[ReplLocalBinding],
     moved_names: &[String],
+    options: &CompileSourceFileOptions,
 ) -> Result<CompiledReplProgram, SourceError> {
-    let mut source_map = SourceMap::new();
-    let source_id = source_map.add_source("<source>", source.to_string());
-    // REPL parsing/compiler entry state is separate from normal program compilation so
-    // persisted locals do not leak into the generic frontend or IR surface.
-    #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
-    let repl_catalog = Some(crate::builtins::runtime::http::http_host_catalog());
-    #[cfg(not(all(feature = "http-client", not(target_family = "wasm"))))]
-    let repl_catalog = None;
-    let parsed = frontends::parse_rustscript_repl_source_with_catalog(
-        source,
-        predefined_locals,
-        repl_catalog,
-    )
-    .map_err(|err| SourceError::Parse(err.with_line_span_from_source(&source_map, source_id)))?;
-    let entry_local_types = build_entry_local_types(&parsed.ir, predefined_locals);
-    let entry_availability =
-        build_entry_local_availability(&parsed.ir, predefined_locals, moved_names);
-    let compiled = match compile_parsed_output_with_entry_locals(
-        source.to_string(),
-        parsed.ir,
-        &entry_availability,
-        &entry_local_types,
-        CompileBehavior::REPL,
-        TypingMode::StrictRustScript,
-        true,
-    ) {
-        Err(SourceError::Parse(err)) => Err(SourceError::Parse(
-            err.with_line_span_from_source(&source_map, source_id),
-        )),
-        other => other,
-    }?;
-    Ok(CompiledReplProgram {
-        compiled,
-        bindings: parsed.bindings,
+    let effective = default_http_compile_catalog_options(SourceFlavor::RustScript, options);
+    let compile = || -> Result<CompiledReplProgram, SourcePathError> {
+        let path = virtual_inmemory_entry_path(SourceFlavor::RustScript, &effective)?;
+        let loaded = super::source_loader::load_units_with_entry_locals(
+            &path,
+            SourceFlavor::RustScript,
+            source,
+            &effective,
+            None,
+            Some(predefined_locals),
+        )?;
+        let bindings = loaded.repl_bindings;
+        let policy = frontend_policy_for_flavor(SourceFlavor::RustScript, &effective)?;
+        let prepared = prepare_typed_units_with_entry(
+            loaded.units,
+            loaded.sources,
+            policy,
+            SourceFlavor::RustScript,
+            &effective,
+            UnitPreparation {
+                behavior: CompileBehavior::REPL,
+                module_graph: Some(loaded.module_graph),
+                repl: Some((predefined_locals, moved_names)),
+            },
+        )?;
+        let debug_ranges = collect_named_local_debug_ranges(&prepared.ir);
+        let (compiled, root_projection) = compile_owned_ir_with_root_projection(
+            source.to_string(),
+            prepared.owned_ir,
+            &prepared.entry_local_types,
+            policy.typing_mode,
+            policy.ownership_checking,
+            debug_ranges,
+            LocalLayoutPolicy::PersistentRoots(&bindings),
+        )
+        .map_err(|error| SourcePathError::SourceWithMap {
+            error,
+            sources: prepared.sources,
+        })?;
+        let mut bindings = bindings;
+        for binding in &mut bindings {
+            let fact = compiled
+                .program
+                .debug
+                .as_ref()
+                .and_then(|debug| debug.local_index(&binding.name))
+                .and_then(|slot| {
+                    root_projection
+                        .iter()
+                        .find(|fact| fact.slot == u16::from(slot))
+                })
+                .ok_or_else(|| {
+                    SourcePathError::Source(SourceError::Parse(ParseError::new(format!(
+                        "missing final root projection for '{}'",
+                        binding.name
+                    ))))
+                })?;
+            binding.schema = fact.schema.clone();
+            binding.optional = fact.optional;
+        }
+        Ok(CompiledReplProgram { compiled, bindings })
+    };
+    compile().map_err(|error| match error {
+        SourcePathError::Source(error) | SourcePathError::SourceWithMap { error, .. } => error,
+        other => SourceError::Parse(ParseError::new(other.to_string())),
     })
 }
 
@@ -1651,19 +2495,44 @@ fn compile_source_with_flavor_impl(
     flavor: SourceFlavor,
     behavior: CompileBehavior,
 ) -> Result<CompiledProgram, SourceError> {
+    compile_source_with_flavor_capture_output(source, flavor, behavior, None)
+}
+
+fn compile_source_with_flavor_capture_output(
+    source: &str,
+    flavor: SourceFlavor,
+    behavior: CompileBehavior,
+    certification: Option<&mut super::capture_certification::CaptureCertification>,
+) -> Result<CompiledProgram, SourceError> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
-    let effective = default_http_compile_catalog_options(&CompileSourceFileOptions::default());
+    let effective =
+        default_http_compile_catalog_options(flavor, &CompileSourceFileOptions::default());
     let parsed =
         frontends::parse_source_for_compile(source, flavor, &effective).map_err(|err| {
             SourceError::Parse(err.with_line_span_from_source(&source_map, source_id))
         })?;
-    match compile_parsed_output(
+    let policy = frontend_policy_for_flavor(flavor, &effective)
+        .map_err(|err| SourceError::Parse(ParseError::new(err.to_string())))?;
+    // The registered standalone source owns this parse. Keep its identity
+    // private so ordinary diagnostic source metadata remains unchanged.
+    let capture_source_policies =
+        HashMap::from([("<source>".to_owned(), policy.ownership_checking)]);
+    match compile_parsed_output_with_capture_output(
         source.to_string(),
         parsed,
+        &[],
+        &[],
         behavior,
-        TypingMode::for_flavor(flavor),
-        matches!(flavor, SourceFlavor::RustScript),
+        policy.typing_mode,
+        policy.ownership_checking,
+        certification,
+        Some(
+            super::capture_certification::CaptureProducerPolicies::Standalone {
+                source: "<source>",
+                policies: &capture_source_policies,
+            },
+        ),
     ) {
         Err(SourceError::Parse(err)) => Err(SourceError::Parse(
             err.with_line_span_from_source(&source_map, source_id),
@@ -1675,40 +2544,64 @@ fn compile_source_with_flavor_impl(
 fn compile_loaded_units(
     source: String,
     units: Vec<ParsedUnit>,
-    flavor: SourceFlavor,
-    // Carried from the loader for Milestone 2+ (structured imports, symbol
-    // resolution); codegen output is unchanged until then.
-    _module_graph: ModuleGraph,
-    // Compilation-wide source map keyed by the module graph's `SourceId`
-    // space (milestone 5). Every span produced during load/merge references
-    // this map, so errors are returned with it and render from the owning
-    // source.
+    policy: FrontendPolicy,
+    module_graph: ModuleGraph,
     sources: SourceMap,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let diagnostic_path = units
-        .iter()
-        .find(|unit| !unit.parsed.unknown_type_spans.is_empty())
-        .map(|unit| PathBuf::from(&unit.source_name));
-    let merged = merge_units(units)?;
-    compile_parsed_output(
+    compile_loaded_units_with_capture_output(
         source,
-        merged,
-        CompileBehavior::DEFAULT,
-        TypingMode::for_flavor(flavor),
-        matches!(flavor, SourceFlavor::RustScript),
+        units,
+        policy,
+        module_graph,
+        sources,
+        flavor,
+        options,
+        None,
     )
-    .map_err(|error| match (error, diagnostic_path) {
-        (SourceError::Parse(mut parse), Some(path))
-            if parse.code.as_deref() == Some("E_STRICT_UNKNOWN_TYPE") =>
-        {
-            parse.message = format!("{}: {}", path.display(), parse.message);
-            SourcePathError::SourceWithMap {
-                error: SourceError::Parse(parse),
-                sources,
-            }
-        }
-        (error, _) => SourcePathError::SourceWithMap { error, sources },
-    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_loaded_units_with_capture_output(
+    source: String,
+    units: Vec<ParsedUnit>,
+    policy: FrontendPolicy,
+    module_graph: ModuleGraph,
+    sources: SourceMap,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+    certification: Option<&mut super::capture_certification::CaptureCertification>,
+) -> Result<CompiledProgram, SourcePathError> {
+    let prepared = prepare_typed_units(
+        units,
+        sources,
+        policy,
+        flavor,
+        options,
+        CompileBehavior::DEFAULT,
+        Some(module_graph),
+    )?;
+    let local_debug_ranges = collect_named_local_debug_ranges(&prepared.ir);
+    let owned_ir = prepared.owned_ir;
+    let sources = prepared.sources;
+    compile_owned_ir_with_capture_output(
+        source,
+        owned_ir,
+        &[],
+        policy.typing_mode,
+        policy.ownership_checking,
+        local_debug_ranges,
+        LocalLayoutPolicy::Compact,
+        certification,
+        Some(
+            super::capture_certification::CaptureProducerPolicies::Linked(
+                &prepared.capture_source_policies,
+            ),
+        ),
+    )
+    .map(|(compiled, _)| compiled)
+    .map_err(|error| SourcePathError::SourceWithMap { error, sources })
 }
 
 fn compile_source_with_flavor_and_options_impl(
@@ -1719,7 +2612,7 @@ fn compile_source_with_flavor_and_options_impl(
     // Explicit catalogs are forwarded unchanged. Otherwise the HTTP catalog is
     // installed so `http::client::sse` named structs and function schemas are
     // available without converting `io::` / `sqlite::` / `jit::` builtins.
-    let effective = default_http_compile_catalog_options(options);
+    let effective = default_http_compile_catalog_options(flavor, options);
 
     compile_source_with_flavor_and_options_pipeline(source, flavor, &effective)
 }
@@ -1731,14 +2624,17 @@ fn compile_source_with_flavor_and_options_pipeline(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let path = virtual_inmemory_entry_path(flavor);
-    let loaded = load_units_for_source_file(&path, flavor, source, options)?;
+    let policy = frontend_policy_for_flavor(flavor, options)?;
+    let path = virtual_inmemory_entry_path(flavor, options)?;
+    let loaded = load_units_for_source_file_with_context(&path, flavor, source, options, None)?;
     compile_loaded_units(
         source.to_string(),
         loaded.units,
-        flavor,
+        policy,
         loaded.module_graph,
         loaded.sources,
+        flavor,
+        options,
     )
 }
 
@@ -1746,8 +2642,12 @@ fn compile_source_with_flavor_and_options_pipeline(
 /// surface is enabled and the caller did not supply a custom catalog. Explicit
 /// catalogs remain unchanged.
 fn default_standard_catalog_options(
+    flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> CompileSourceFileOptions {
+    if matches!(flavor, SourceFlavor::Plugin(_)) {
+        return options.clone();
+    }
     #[cfg(feature = "runtime")]
     {
         let mut effective = options.clone();
@@ -1767,8 +2667,12 @@ fn default_standard_catalog_options(
 /// and function schemas without pulling `io::` / `sqlite::` / `jit::` into
 /// catalog host imports.
 fn default_http_compile_catalog_options(
+    flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> CompileSourceFileOptions {
+    if matches!(flavor, SourceFlavor::Plugin(_)) {
+        return options.clone();
+    }
     #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
     {
         let mut effective = options.clone();
@@ -1800,24 +2704,104 @@ fn compile_source_at_path_with_flavor_and_options_impl(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let effective = default_http_compile_catalog_options(options);
+    let effective = default_http_compile_catalog_options(flavor, options);
+    let policy = frontend_policy_for_flavor(flavor, &effective)?;
     let loaded = load_units_for_source_file(path, flavor, source, &effective)?;
     compile_loaded_units(
         source.to_string(),
         loaded.units,
-        flavor,
+        policy,
         loaded.module_graph,
         loaded.sources,
+        flavor,
+        &effective,
     )
 }
 
-fn virtual_inmemory_entry_path(flavor: SourceFlavor) -> PathBuf {
-    let ext = match flavor {
+fn virtual_inmemory_entry_path(
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+) -> Result<PathBuf, SourcePathError> {
+    let extension = match flavor {
         SourceFlavor::RustScript => "rss",
-        SourceFlavor::JavaScript => "js",
-        SourceFlavor::Lua => "lua",
+        SourceFlavor::Plugin(_) => {
+            let plugin = options
+                .source_plugin_for_flavor(flavor)
+                .ok_or(SourcePathError::MissingFrontendPlugin(flavor))?;
+            plugin
+                .descriptor()
+                .extensions
+                .first()
+                .copied()
+                .ok_or(SourcePathError::MissingExtension)?
+        }
     };
-    PathBuf::from("__pd_vm_inmemory__").join(format!("main.{ext}"))
+    Ok(PathBuf::from("__pd_vm_inmemory__").join(format!("main.{extension}")))
+}
+
+/// Compiles through the ordinary module/host/ownership pipeline, retaining
+/// compiler-issued capture facts separately from the unchanged Program.
+pub fn compile_source_with_flavor_and_options_with_capture_certification(
+    source: &str,
+    flavor: SourceFlavor,
+    options: CompileSourceFileOptions,
+) -> Result<super::CertifiedCompilation, SourcePathError> {
+    let source = source.to_owned();
+    run_with_compiler_stack(move || {
+        let effective = default_http_compile_catalog_options(flavor, &options);
+        let policy = frontend_policy_for_flavor(flavor, &effective)?;
+        let path = virtual_inmemory_entry_path(flavor, &effective)?;
+        let loaded =
+            load_units_for_source_file_with_context(&path, flavor, &source, &effective, None)?;
+        let mut facts = Default::default();
+        let compiled = compile_loaded_units_with_capture_output(
+            source,
+            loaded.units,
+            policy,
+            loaded.module_graph,
+            loaded.sources,
+            flavor,
+            &effective,
+            Some(&mut facts),
+        )?;
+        Ok(super::CertifiedCompilation { compiled, facts })
+    })
+}
+
+/// Source-file counterpart, with the same options and errors as ordinary compilation.
+pub fn compile_source_file_with_capture_certification_and_options(
+    path: impl AsRef<Path>,
+    options: CompileSourceFileOptions,
+) -> Result<super::CertifiedCompilation, SourcePathError> {
+    let path = path.as_ref().to_path_buf();
+    run_with_compiler_stack(move || {
+        let flavor = SourceFlavor::from_path_with_options(&path, &options)?;
+        let effective = default_http_compile_catalog_options(flavor, &options);
+        let policy = frontend_policy_for_flavor(flavor, &effective)?;
+        let source = std::fs::read_to_string(&path)?;
+        let loaded = load_units_for_source_file(&path, flavor, &source, &effective)?;
+        let mut facts = Default::default();
+        let compiled = compile_loaded_units_with_capture_output(
+            source,
+            loaded.units,
+            policy,
+            loaded.module_graph,
+            loaded.sources,
+            flavor,
+            &effective,
+            Some(&mut facts),
+        )?;
+        Ok(super::CertifiedCompilation { compiled, facts })
+    })
+}
+
+pub fn compile_source_file_with_capture_certification(
+    path: impl AsRef<Path>,
+) -> Result<super::CertifiedCompilation, SourcePathError> {
+    compile_source_file_with_capture_certification_and_options(
+        path,
+        CompileSourceFileOptions::default(),
+    )
 }
 
 pub fn compile_source_file(path: impl AsRef<Path>) -> Result<CompiledProgram, SourcePathError> {
@@ -1836,16 +2820,19 @@ fn compile_source_file_impl(
     path: &Path,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
-    let effective = default_http_compile_catalog_options(options);
-    let flavor = SourceFlavor::from_path_with_options(path, &effective)?;
+    let flavor = SourceFlavor::from_path_with_options(path, options)?;
+    let effective = default_http_compile_catalog_options(flavor, options);
+    let policy = frontend_policy_for_flavor(flavor, &effective)?;
     let source_raw = std::fs::read_to_string(path)?;
     let loaded = load_units_for_source_file(path, flavor, &source_raw, &effective)?;
     compile_loaded_units(
         source_raw,
         loaded.units,
-        flavor,
+        policy,
         loaded.module_graph,
         loaded.sources,
+        flavor,
+        &effective,
     )
 }
 
@@ -2140,8 +3127,348 @@ mod tests {
     }
 
     #[test]
+    fn rejected_host_return_diagnostics_keep_linked_provenance_and_independent_strict_admission() {
+        let mut builder = crate::HostApiBuilder::new();
+        builder.function(crate::HostFunctionSchema::with_return(
+            "sample::probe",
+            vec![crate::HostParamSchema::value(
+                "value",
+                crate::HostTypeSchema::Int,
+            )],
+            crate::HostTypeSchema::Int,
+        ));
+        let catalog = Arc::new(builder.build().unwrap());
+        let options =
+            || CompileSourceFileOptions::new().with_host_api_catalog(Arc::clone(&catalog));
+        let source = "use sample;\nfn main() { sample::probe(\"wrong\"); }\n";
+        let model = analyze_source_from_string_with_options("main.rss", source, options())
+            .expect("failed host return retains its diagnostic model");
+        assert_eq!(
+            model.diagnostics().len(),
+            1,
+            "only the primary host rejection is published"
+        );
+        let host = model
+            .diagnostics()
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("sample::probe"))
+            .expect("primary host rejection is not masked by return inference");
+        assert_eq!(
+            model.sources().span_text(host.span.unwrap()),
+            Some("sample::probe")
+        );
+        assert!(
+            compile_source_at_path_with_flavor_and_options(
+                "main.rss",
+                source,
+                SourceFlavor::RustScript,
+                options(),
+            )
+            .is_err()
+        );
+        assert!(
+            collect_inferred_local_type_hints_at_path_with_options(
+                "main.rss",
+                source,
+                SourceFlavor::RustScript,
+                options(),
+            )
+            .is_err()
+        );
+        let linked = "use a::util;\nfn run() { helper(); }\n";
+        let options = || {
+            options().with_module_override_source(
+                "a/util.rss",
+                "use sample;\npub fn helper() { sample::probe(\"wrong\"); }\n",
+            )
+        };
+        let model = analyze_source_from_string_with_options("main.rss", linked, options())
+            .expect("linked direct return dependency retains the host diagnostic");
+        assert_eq!(
+            model.diagnostics().len(),
+            1,
+            "dependent returns do not add cascade diagnostics"
+        );
+        let host = model
+            .diagnostics()
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("sample::probe"))
+            .unwrap();
+        assert_eq!(host.span.unwrap().source_id, 1);
+        assert_eq!(
+            model.sources().span_text(host.span.unwrap()),
+            Some("sample::probe")
+        );
+        assert!(
+            compile_source_at_path_with_flavor_and_options(
+                "main.rss",
+                linked,
+                SourceFlavor::RustScript,
+                options(),
+            )
+            .is_err()
+        );
+        assert!(
+            collect_inferred_local_type_hints_at_path_with_options(
+                "main.rss",
+                linked,
+                SourceFlavor::RustScript,
+                options(),
+            )
+            .is_err()
+        );
+        for invalid in [
+            "use sample;\nfn main(value) { sample::probe(\"wrong\"); }\n",
+            "use sample;\nfn main() { sample::probe(\"wrong\"); }\nfn independent(value) -> int { 1 }\n",
+            "use sample;\nfn main() { sample::probe(\"wrong\"); }\nfn independent(value: unknown) -> int { 1 }\n",
+        ] {
+            assert!(
+                analyze_source_from_string_with_options("main.rss", invalid, options()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_policy_root_statement_boundaries_survive_lifetime() {
+        let source = "use self::dep; dep::value();";
+        let options = CompileSourceFileOptions::new().with_module_override_source(
+            "dep.rss",
+            "let captured = 1; if captured == 1 { let a = 2; let b = 3; let c = 4; a + b + c; } let observer = || captured; observer(); pub fn value() -> int { 1 }",
+        );
+        let flavor = SourceFlavor::RustScript;
+        let path = virtual_inmemory_entry_path(flavor, &options).unwrap();
+        let loaded =
+            load_units_for_source_file_with_context(&path, flavor, source, &options, None).unwrap();
+        let prepared = prepare_typed_units(
+            loaded.units,
+            loaded.sources,
+            frontend_policy_for_flavor(flavor, &options).unwrap(),
+            flavor,
+            &options,
+            CompileBehavior::DEFAULT,
+            Some(loaded.module_graph),
+        )
+        .unwrap();
+        for (stage, ir) in [("admission", &prepared.ir), ("owned", &prepared.owned_ir)] {
+            println!(
+                "{stage}: stmts={} boundaries={}",
+                ir.stmts.len(),
+                ir.stmt_sources.len()
+            );
+            for (index, stmt) in ir.stmts.iter().enumerate() {
+                println!(
+                    "{stage}[{index}] source={:?} stmt={stmt:?}",
+                    ir.stmt_sources.get(index)
+                );
+            }
+        }
+        assert_eq!(
+            prepared.owned_ir.stmts.len(),
+            prepared.owned_ir.stmt_sources.len()
+        );
+        let dependency = prepared.ir.stmt_sources[2].as_deref().unwrap();
+        let assert_origins = |ir: &FrontendIr| {
+            assert_eq!(ir.stmts.len(), ir.stmt_sources.len());
+            let closure = ir
+                .stmts
+                .iter()
+                .position(|stmt| {
+                    matches!(
+                        stmt,
+                        Stmt::Let {
+                            expr: Expr::Closure(_),
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            assert_eq!(ir.stmt_sources[closure].as_deref(), Some(dependency));
+            for (stmt, source) in ir.stmts.iter().zip(&ir.stmt_sources) {
+                if matches!(stmt, Stmt::Drop { .. }) {
+                    assert_eq!(source.as_deref(), Some(dependency));
+                }
+            }
+        };
+        assert_origins(&prepared.owned_ir);
+        let owned = lifetime::enforce_source_availability_with_entry_locals(
+            prepared.ir.clone(),
+            &[],
+            false,
+            &[],
+            &prepared.capture_source_policies,
+            true,
+            &prepared.sources,
+        )
+        .unwrap();
+        assert_origins(&owned);
+    }
+
+    #[test]
+    fn linked_local_hints_order_by_source_without_erasing_dependency_provenance() {
+        let source = "use a::util as util;\nlet value = util::identity(42);\n";
+        let dependency = "pub fn identity(value: int) -> int { value }\n";
+        let options =
+            CompileSourceFileOptions::new().with_module_override_source("a/util.rss", dependency);
+        let hints = collect_inferred_local_type_hints_with_options(
+            source,
+            SourceFlavor::RustScript,
+            options,
+        )
+        .expect("linked hints retain both source owners");
+        let values = hints
+            .iter()
+            .filter(|hint| hint.name == "value")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values.len(),
+            2,
+            "root local and dependency parameter survive"
+        );
+        assert_eq!(values[0].span.unwrap().source_id, 0);
+        assert_eq!(values[0].declared_line, Some(2));
+        assert_eq!(values[0].last_line, Some(2));
+        assert_eq!(values[1].span.unwrap().source_id, 1);
+        assert_eq!(values[1].declared_line, Some(1));
+        for (hint, text) in values.iter().zip([source, dependency]) {
+            let span = hint.span.unwrap();
+            assert_eq!(&text[span.lo..span.hi], "value");
+            assert_eq!(hint.schema, Some(TypeSchema::Int));
+        }
+        assert_ne!(values[0].source_name, values[1].source_name);
+    }
+
+    #[test]
+    fn native_ir_available_optional_sibling_after_normal_projection() {
+        let source = "struct Entry { name: string, note: string? }\nlet entry: Entry = { name: \"first\" };\nlet name = entry.name;\nlet note = entry?.note;\nnote;\n";
+        let mut parsed = crate::compiler::frontends::parse_source(
+            source,
+            SourceFlavor::RustScript,
+            &CompileSourceFileOptions::new(),
+        )
+        .unwrap();
+        // Native parser IR, with explicit language-neutral field intent.
+        // Native `?.` syntax itself keeps its established value semantics.
+        for stmt in &mut parsed.stmts {
+            if let Stmt::Let {
+                expr: Expr::OptionalGet {
+                    field_projection, ..
+                },
+                ..
+            } = stmt
+            {
+                *field_projection = true;
+            }
+        }
+        let compiled = compile_parsed_output(
+            source.to_string(),
+            parsed,
+            CompileBehavior::DEFAULT,
+            TypingMode::Strict,
+            true,
+        )
+        .unwrap_or_else(|error| panic!("native strict sibling projection: {error}"));
+        let mut machine = crate::Vm::new(compiled.program);
+        assert_eq!(machine.run().unwrap(), crate::VmStatus::Halted);
+        assert_eq!(machine.stack(), &[crate::Value::Null]);
+    }
+
+    #[test]
+    fn native_ir_projection_detaches_present_child_without_inserting_absent_child() {
+        for field in ["", ", note: null", ", note: \"ready\""] {
+            let source = format!(
+                "struct Entry {{ name: string, note: string? }}\nlet entry: Entry = {{ name: \"first\"{field} }};\nlet note = entry?.note;\nnote;"
+            );
+            let mut parsed = crate::compiler::frontends::parse_source(
+                &source,
+                SourceFlavor::RustScript,
+                &CompileSourceFileOptions::new(),
+            )
+            .unwrap();
+            let root = parsed
+                .local_bindings
+                .iter()
+                .find(|(name, _)| name == "entry")
+                .unwrap()
+                .1;
+            for stmt in &mut parsed.stmts {
+                if let Stmt::Let {
+                    expr:
+                        Expr::OptionalGet {
+                            field_projection, ..
+                        },
+                    ..
+                } = stmt
+                {
+                    *field_projection = true;
+                }
+            }
+            let compiled = compile_parsed_output(
+                source,
+                parsed,
+                CompileBehavior::REPL,
+                TypingMode::Strict,
+                true,
+            )
+            .unwrap();
+            let mut machine = crate::Vm::new(compiled.program);
+            assert_eq!(machine.run().unwrap(), crate::VmStatus::Halted);
+            let crate::Value::Map(record) = &machine.locals()[root as usize] else {
+                panic!("record retained in REPL");
+            };
+            assert!(
+                record.get(&crate::Value::string("note")).is_none(),
+                "moved child must be removed: {record:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_ir_nested_optional_projection_detaches_noncopy_child() {
+        let source = "struct Entry { note: string? }\nlet entry: Entry = { note: \"ready\" };\nlet note = (entry?.note).unwrap_or(\"fallback\");\nnote;";
+        let mut parsed = crate::compiler::frontends::parse_source(
+            source,
+            SourceFlavor::RustScript,
+            &CompileSourceFileOptions::new(),
+        )
+        .unwrap();
+        let root = parsed
+            .local_bindings
+            .iter()
+            .find(|(name, _)| name == "entry")
+            .unwrap()
+            .1;
+        for stmt in &mut parsed.stmts {
+            if let Stmt::Let {
+                expr: Expr::OptionUnwrapOr { value, .. },
+                ..
+            } = stmt
+                && let Expr::OptionalGet {
+                    field_projection, ..
+                } = value.as_mut()
+            {
+                *field_projection = true;
+            }
+        }
+        let compiled = compile_parsed_output(
+            source.to_string(),
+            parsed,
+            CompileBehavior::REPL,
+            TypingMode::Strict,
+            true,
+        )
+        .unwrap();
+        let mut machine = crate::Vm::new(compiled.program);
+        assert_eq!(machine.run().unwrap(), crate::VmStatus::Halted);
+        assert_eq!(machine.stack(), &[crate::Value::string("ready")]);
+        let crate::Value::Map(record) = &machine.locals()[root as usize] else {
+            panic!("record retained in REPL");
+        };
+        assert!(record.get(&crate::Value::string("note")).is_none());
+    }
+
+    #[test]
     fn strict_non_concrete_struct_diagnostic_carries_exact_decl_span() {
-        // Strict RustScript rejects struct schemas whose fields are not fully
+        // Strict typing rejects struct schemas whose fields are not fully
         // concrete. The diagnostic must carry the exact parser-origin span of
         // the struct declaration (its name identifier), resolved from the
         // `StructDeclSite` provenance recorded by the parser — never a
@@ -2185,8 +3512,8 @@ mod tests {
             std::iter::once(("x".to_string(), crate::compiler::ir::TypeSchema::Unknown)).collect(),
         );
 
-        let type_info = typing::infer_types(&ir, TypingMode::StrictRustScript, &[]);
-        let err = enforce_strict_rustscript_type_resolution(&ir, &type_info)
+        let type_info = typing::infer_types(&ir, TypingMode::Strict, &[]);
+        let err = enforce_strict_type_resolution(&ir, &type_info)
             .expect_err("non-concrete struct schema must be rejected in strict mode");
         match err {
             CompileError::StrictTypingRequired { span, .. } => {

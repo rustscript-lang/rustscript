@@ -69,4 +69,30 @@ pub(super) fn enforce_local_availability_with_entry_locals(
     )
 }
 
-pub(super) use availability::allocate_local_slots;
+pub(super) fn enforce_source_availability_with_entry_locals(
+    ir: FrontendIr,
+    entry_locals: &[EntryLocalAvailability],
+    clear_dead_locals: bool,
+    owned_local_slots: &[bool],
+    policies: &std::collections::HashMap<String, bool>,
+    default_policy: bool,
+    sources: &super::source_map::SourceMap,
+) -> Result<FrontendIr, ParseError> {
+    availability::enforce_source_availability(
+        ir,
+        entry_locals,
+        clear_dead_locals,
+        default_policy,
+        owned_local_slots,
+        Some(policies),
+        Some(sources),
+    )
+}
+
+pub(super) struct LocalSlotAllocation {
+    pub(super) ir: FrontendIr,
+    /// Logical pre-allocation slot to physical slot, shared by IR and entry seeds.
+    pub(super) mapping: Vec<LocalSlot>,
+}
+
+pub(super) use availability::{allocate_local_slots, allocate_local_slots_with_root_slots};
