@@ -511,6 +511,41 @@ fn opted_in_epoch_configuration_and_interrupt_conflict_keep_legacy_rules() {
 }
 
 #[test]
+fn malformed_vmbc_keeps_wire_error_type_in_all_ordinary_cli_routes() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("malformed.vmbc");
+    std::fs::write(&path, b"invalid VMBC bytes").unwrap();
+    let expected = crate::decode_program(&std::fs::read(&path).unwrap())
+        .unwrap_err()
+        .to_string();
+    for selected in [
+        CliHostServices::default(),
+        CliHostServices::default().with_capture_certification(),
+        services(Arc::new(Mutex::new(Observations::default()))),
+        services(Arc::new(Mutex::new(Observations::default()))).with_capture_certification(),
+    ] {
+        for emit in [false, true] {
+            let mut args = Vec::new();
+            if emit {
+                args.extend([
+                    "--emit-vmbc".to_owned(),
+                    scratch.0.join("rejected.vmbc").display().to_string(),
+                ]);
+            }
+            args.push(path.display().to_string());
+            let error = run_with_args(&CliRuntime::default(), &args, &selected).unwrap_err();
+            assert_eq!(error.to_string(), expected);
+            assert!(
+                error.downcast_ref::<crate::WireError>().is_some(),
+                "WireError was wrapped: {error:?}"
+            );
+            assert!(error.downcast_ref::<io::Error>().is_none());
+            assert!(!scratch.0.join("rejected.vmbc").exists());
+        }
+    }
+}
+
+#[test]
 fn default_services_remain_uncertified_with_actual_owner_candidate() {
     let scratch = Scratch::new();
     let observations = Arc::new(Mutex::new(Observations::default()));

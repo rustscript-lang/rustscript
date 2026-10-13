@@ -358,9 +358,9 @@ pub fn run_with_args(
 fn load_ordinary_cli_program(
     source_path: &Path,
     options: CompileSourceFileOptions,
-) -> Result<Program, io::Error> {
+) -> Result<Program, Box<dyn std::error::Error>> {
     if source_path.extension().is_some_and(|ext| ext == "vmbc") {
-        crate::decode_program(&std::fs::read(source_path)?).map_err(io::Error::other)
+        Ok(crate::decode_program(&std::fs::read(source_path)?)?)
     } else {
         let compiled = compile_source_file_with_options(source_path, options)
             .map_err(|err| io::Error::other(render_source_path_error(source_path, &err)))?;
