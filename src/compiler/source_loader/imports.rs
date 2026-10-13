@@ -72,6 +72,28 @@ pub(super) fn scan_module_imports(
     )
 }
 
+pub(super) fn scan_module_imports_with_entry_locals(
+    source: &str,
+    path: &Path,
+    options: &CompileSourceFileOptions,
+    source_id: u32,
+    locals: &[super::super::ReplLocalBinding],
+) -> Result<(Vec<ModuleImport>, Vec<UseDecl>), SourcePathError> {
+    if locals.is_empty() {
+        return scan_module_imports(source, SourceFlavor::RustScript, path, options, source_id);
+    }
+    let parsed = frontends::parse_rustscript_repl_source_with_context(
+        source,
+        locals,
+        options.host_api_catalog().cloned(),
+        source_id,
+        true,
+    )
+    .map_err(|error| SourcePathError::Source(SourceError::Parse(error)))?;
+    let decls = parsed.ir.use_declarations;
+    Ok((use_declarations_to_module_imports(path, &decls)?, decls))
+}
+
 fn scan_module_imports_with_context(
     source: &str,
     flavor: SourceFlavor,

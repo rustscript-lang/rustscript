@@ -11,7 +11,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
 
 use vm::operation::OperationCancelReason;
 use vm::operation::OperationId;

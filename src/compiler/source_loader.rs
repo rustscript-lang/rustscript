@@ -55,7 +55,7 @@ mod imports;
 mod model;
 
 pub use self::model::{DeclarationNamespace, ImportClause, ModuleImport, NamedImport};
-use graph::{collect_module_units, frontend_imports_for_module, record_module_symbols};
+use graph::{frontend_imports_for_module, record_module_symbols};
 use imports::{module_identity, parse_module_imports_with_context, strip_import_directives};
 use model::ModuleCollectState;
 pub(super) struct LoadedSourceUnits {
@@ -67,6 +67,7 @@ pub(super) struct LoadedSourceUnits {
     /// its graph source id, so spans carried by the loaded units and by any
     /// load-time diagnostic resolve to the owning source.
     pub(super) sources: SourceMap,
+    pub(super) repl_bindings: Vec<super::ReplLocalBinding>,
 }
 
 fn effective_source_options(options: &CompileSourceFileOptions) -> CompileSourceFileOptions {
@@ -89,6 +90,17 @@ pub(super) fn load_units_for_source_file_with_context(
     options: &CompileSourceFileOptions,
     original_path: Option<&Path>,
 ) -> Result<LoadedSourceUnits, SourcePathError> {
+    load_units_with_entry_locals(path, flavor, source_raw, options, original_path, None)
+}
+
+pub(super) fn load_units_with_entry_locals(
+    path: &Path,
+    flavor: SourceFlavor,
+    source_raw: &str,
+    options: &CompileSourceFileOptions,
+    original_path: Option<&Path>,
+    entry_locals: Option<&[super::ReplLocalBinding]>,
+) -> Result<LoadedSourceUnits, SourcePathError> {
     let effective_options = effective_source_options(options);
     // The root participates in the same identity scheme as every module:
     // canonical disk identity when the file exists, normalized virtual
@@ -107,15 +119,25 @@ pub(super) fn load_units_for_source_file_with_context(
         .add_source_at(0, path.display().to_string(), source_raw.to_string());
     collect_state.visiting.push(path.to_path_buf());
 
-    let root_imports = parse_module_imports_with_context(
-        source_raw,
-        flavor,
-        path,
-        &effective_options,
-        0,
-        original_path,
-    )
-    .map_err(|err| {
+    let scan = match entry_locals {
+        Some(locals) => imports::scan_module_imports_with_entry_locals(
+            source_raw,
+            path,
+            &effective_options,
+            0,
+            locals,
+        )
+        .map(|(imports, _)| imports),
+        None => parse_module_imports_with_context(
+            source_raw,
+            flavor,
+            path,
+            &effective_options,
+            0,
+            original_path,
+        ),
+    };
+    let root_imports = scan.map_err(|err| {
         // The root's own scan/parse diagnostics attach their span against
         // the pre-registered root source and carry the compilation-wide map,
         // so they render from the root's text.
@@ -131,12 +153,13 @@ pub(super) fn load_units_for_source_file_with_context(
         }
     })?;
 
-    collect_module_units(
+    graph::collect_module_units_with_entry_locals(
         path,
         source_raw,
         flavor,
         &effective_options,
         &mut collect_state,
+        entry_locals,
     )
     .map_err(|err| {
         // Load-time source diagnostics (nested scan/parse errors, symbol
@@ -169,16 +192,30 @@ pub(super) fn load_units_for_source_file_with_context(
     } else {
         ParsePhase::Standalone
     };
-    let mut root_parsed = frontends::parse_module_source_with_source_id(
-        &root_parse_source,
-        flavor,
-        &effective_options,
-        root_source_id,
-        original_path,
-        root_phase,
-        &frontend_imports,
-    )
-    .map_err(|err| {
+    let mut repl_bindings = Vec::new();
+    let parsed = match entry_locals {
+        Some(locals) => frontends::parse_rustscript_repl_source_with_context(
+            &root_parse_source,
+            locals,
+            effective_options.host_api_catalog().cloned(),
+            root_source_id,
+            true,
+        )
+        .map(|parsed| {
+            repl_bindings = parsed.bindings;
+            parsed.ir
+        }),
+        None => frontends::parse_module_source_with_source_id(
+            &root_parse_source,
+            flavor,
+            &effective_options,
+            root_source_id,
+            original_path,
+            root_phase,
+            &frontend_imports,
+        ),
+    };
+    let mut root_parsed = parsed.map_err(|err| {
         // Module sources are parsed verbatim (no synthetic prelude, no
         // textual rewrite), so parse lines already refer to the owning
         // source; rebuild the span against the compilation-wide map so the
@@ -314,6 +351,7 @@ pub(super) fn load_units_for_source_file_with_context(
         units: collect_state.units,
         module_graph: collect_state.module_graph,
         sources: collect_state.sources,
+        repl_bindings,
     })
 }
 

@@ -499,17 +499,28 @@ pub(super) fn parse_rustscript_repl_source(
 /// REPL parse with an optional catalog snapshot: when `Some`, the parsed IR
 /// carries `host_api_metadata` so standard host calls compile to exact V13
 /// `HostImport` schemas (never a name-only fallback).
+#[cfg(test)]
 pub(super) fn parse_rustscript_repl_source_with_catalog(
     source: &str,
     predefined_locals: &[ReplLocalBinding],
     host_catalog: Option<Arc<HostApiCatalog>>,
+) -> Result<ParsedRustScriptReplSource, ParseError> {
+    parse_rustscript_repl_source_with_context(source, predefined_locals, host_catalog, 0, false)
+}
+
+pub(super) fn parse_rustscript_repl_source_with_context(
+    source: &str,
+    predefined_locals: &[ReplLocalBinding],
+    host_catalog: Option<Arc<HostApiCatalog>>,
+    source_id: u32,
+    allow_implicit_externs: bool,
 ) -> Result<ParsedRustScriptReplSource, ParseError> {
     let lowered = rustscript::lower(source)?;
     parse_lowered_repl_with_mapping(
         source,
         lowered,
         predefined_locals,
-        false,
+        (source_id, allow_implicit_externs),
         false,
         true,
         host_catalog,
@@ -732,13 +743,14 @@ fn parse_lowered_repl_with_mapping(
     original_source: &str,
     lowered: LoweredSource,
     predefined_locals: &[ReplLocalBinding],
-    allow_implicit_externs: bool,
+    entry_context: (u32, bool),
     allow_implicit_semicolons: bool,
     enforce_mutable_bindings: bool,
     host_catalog: Option<Arc<HostApiCatalog>>,
 ) -> Result<ParsedRustScriptReplSource, ParseError> {
     let mut source_map = SourceMap::new();
-    let original_source_id = source_map.add_source("<source>", original_source.to_string());
+    let (original_source_id, allow_implicit_externs) = entry_context;
+    source_map.add_source_at(original_source_id, "<source>", original_source.to_string());
     let lowered_source_id = source_map.add_source("<lowered>", lowered.text.clone());
 
     match parse_repl_with_parser(
