@@ -4,7 +4,8 @@ use std::hash::{Hash, Hasher};
 use crate::ValueType;
 use crate::builtins::default_host_callable;
 use crate::host_api::{
-    HostApiFingerprint, HostFunctionSchema, HostParamPassing, HostTypeSchema, ResourceTypeKey,
+    HostApiCatalog, HostApiFingerprint, HostFunctionSchema, HostParamPassing, HostTypeSchema,
+    ResourceTypeKey,
 };
 
 use super::ParseError;
@@ -543,7 +544,14 @@ pub enum Expr {
         name: String,
         type_args: Vec<TypeSchema>,
     },
+    /// Missing-key lookup. Value mode retains optional-container ownership;
+    /// projection mode reads a literal child of a direct local with the same
+    /// availability, copyability and resource rules as ordinary `Get`.
     OptionalGet {
+        /// Explicit producer intent. A projection requires `Var` plus a
+        /// literal String/Int key; borrowed, temporary and dynamic-key
+        /// receivers must use value mode. Native `?.` remains value mode.
+        field_projection: bool,
         container: Box<Expr>,
         key: Box<Expr>,
         container_slot: LocalSlot,
@@ -922,6 +930,100 @@ impl HostApiIrMetadata {
         self.candidates_by_function_index.insert(index, candidates);
         Ok(())
     }
+
+    /// Confirms an installed index still carries the complete catalog family
+    /// for the exact logical name and arity that owns it.
+    pub(crate) fn validate_binding(
+        &self,
+        index: u16,
+        catalog: &HostApiCatalog,
+        name: &str,
+        arity: u8,
+    ) -> Result<(), ParseError> {
+        if self.fingerprint != catalog.fingerprint() {
+            return Err(ParseError::new(format!(
+                "host catalog identity mismatch while validating '{name}'"
+            )));
+        }
+        let expected = catalog
+            .functions_named(name)
+            .into_iter()
+            .filter(|candidate| candidate.params.len() == usize::from(arity))
+            .cloned()
+            .collect::<Vec<_>>();
+        if expected.is_empty() {
+            return Err(ParseError::new(format!(
+                "host function '{name}' has no overload with {arity} argument(s)"
+            )));
+        }
+        let candidates = self.candidates(index).ok_or_else(|| {
+            ParseError::new(format!(
+                "catalog-bound host function '{name}' at index {index} has no candidate metadata"
+            ))
+        })?;
+        if candidates != expected.as_slice() {
+            return Err(ParseError::new(format!(
+                "catalog-bound host function '{name}' at index {index} does not retain its complete {arity}-argument candidate family"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Fails closed before code generation when a plugin emits an import for a
+    /// catalog-owned name without the exact caller-catalog candidate binding.
+    pub(crate) fn validate_catalog_bindings(
+        metadata: Option<&Self>,
+        functions: &[FunctionDecl],
+        function_impls: &HashMap<u16, FunctionImpl>,
+        catalog: &HostApiCatalog,
+    ) -> Result<(), ParseError> {
+        let Some(metadata) = metadata else {
+            if let Some(function) = functions.iter().find(|function| {
+                !function_impls.contains_key(&function.index)
+                    && !catalog.functions_named(&function.name).is_empty()
+            }) {
+                return Err(ParseError::new(format!(
+                    "catalog-bound host function '{}' at index {} has no host catalog metadata",
+                    function.name, function.index
+                )));
+            }
+            return Ok(());
+        };
+        if metadata.fingerprint != catalog.fingerprint() {
+            return Err(ParseError::new(
+                "frontend IR host metadata belongs to a different caller catalog",
+            ));
+        }
+        for index in metadata.function_indices() {
+            let mut declarations = functions.iter().filter(|function| function.index == index);
+            let Some(function) = declarations.next() else {
+                return Err(ParseError::new(format!(
+                    "host metadata references missing function index {index}"
+                )));
+            };
+            if declarations.next().is_some() {
+                return Err(ParseError::new(format!(
+                    "host metadata function index {index} is declared more than once"
+                )));
+            }
+            if function_impls.contains_key(&index) {
+                return Err(ParseError::new(format!(
+                    "host metadata is attached to implemented function '{}' at index {index}",
+                    function.name
+                )));
+            }
+            metadata.validate_binding(index, catalog, &function.name, function.arity)?;
+        }
+        for function in functions {
+            if function_impls.contains_key(&function.index)
+                || catalog.functions_named(&function.name).is_empty()
+            {
+                continue;
+            }
+            metadata.validate_binding(function.index, catalog, &function.name, function.arity)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1039,6 +1141,13 @@ impl SemanticIndex {
     /// leaves [`None`]. In that case the caller gets a minimal index with no
     /// provenance records.
     pub fn build(slot_schemas: Vec<Option<TypeSchema>>, ir: &FrontendIr) -> Self {
+        let typed = super::FrontendTypedIr {
+            source_id: None,
+            ir,
+            local_schemas: &slot_schemas,
+            host_api_catalog: None,
+            source_map: None,
+        };
         let mut resolved_calls = HashMap::new();
         let mut function_return_schemas = HashMap::new();
         let mut func_params = HashMap::new();
@@ -1046,7 +1155,11 @@ impl SemanticIndex {
         // Per-function declaration metadata from the flat function table.
         for decl in &ir.functions {
             func_params.insert(decl.index, decl.args.clone());
-            function_return_schemas.insert(decl.index, decl.return_schema.clone());
+            let result = match typed.schema_of_function(decl.index) {
+                Some(TypeSchema::Callable { result, .. }) => Some(*result),
+                _ => None,
+            };
+            function_return_schemas.insert(decl.index, result);
         }
 
         // Pair every parsed call site with the typed/resolved Expr node that
@@ -1066,26 +1179,16 @@ impl SemanticIndex {
             }
             // Walk the legalized IR and attach resolved facts by node id.
             for stmt in &ir.stmts {
-                collect_resolved_calls_in_stmt(
-                    stmt,
-                    &mut by_id,
-                    &function_return_schemas,
-                    &slot_schemas,
-                );
+                collect_resolved_calls_in_stmt(stmt, &mut by_id, &typed, &slot_schemas);
             }
             for function_impl in ir.function_impls.values() {
                 for stmt in &function_impl.body_stmts {
-                    collect_resolved_calls_in_stmt(
-                        stmt,
-                        &mut by_id,
-                        &function_return_schemas,
-                        &slot_schemas,
-                    );
+                    collect_resolved_calls_in_stmt(stmt, &mut by_id, &typed, &slot_schemas);
                 }
                 collect_resolved_calls_in_expr(
                     &function_impl.body_expr,
                     &mut by_id,
-                    &function_return_schemas,
+                    &typed,
                     &slot_schemas,
                 );
             }
@@ -1112,20 +1215,15 @@ impl SemanticIndex {
 fn collect_resolved_calls_in_stmt(
     stmt: &Stmt,
     by_id: &mut HashMap<SemanticNodeId, ResolvedCallInfo>,
-    function_return_schemas: &HashMap<u16, Option<TypeSchema>>,
+    typed: &super::FrontendTypedIr<'_>,
     slot_schemas: &[Option<TypeSchema>],
 ) {
     match stmt {
         Stmt::Let { expr, .. } | Stmt::Expr { expr, .. } | Stmt::Assign { expr, .. } => {
-            collect_resolved_calls_in_expr(expr, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(expr, by_id, typed, slot_schemas);
         }
         Stmt::ClosureLet { closure, .. } => {
-            collect_resolved_calls_in_expr(
-                &closure.body,
-                by_id,
-                function_return_schemas,
-                slot_schemas,
-            );
+            collect_resolved_calls_in_expr(&closure.body, by_id, typed, slot_schemas);
         }
         Stmt::IfElse {
             condition,
@@ -1133,9 +1231,9 @@ fn collect_resolved_calls_in_stmt(
             else_branch,
             ..
         } => {
-            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(condition, by_id, typed, slot_schemas);
             for s in then_branch.iter().chain(else_branch.iter()) {
-                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_stmt(s, by_id, typed, slot_schemas);
             }
         }
         Stmt::For {
@@ -1145,19 +1243,19 @@ fn collect_resolved_calls_in_stmt(
             body,
             ..
         } => {
-            collect_resolved_calls_in_stmt(init, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_stmt(post, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_stmt(init, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_expr(condition, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_stmt(post, by_id, typed, slot_schemas);
             for s in body {
-                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_stmt(s, by_id, typed, slot_schemas);
             }
         }
         Stmt::While {
             condition, body, ..
         } => {
-            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(condition, by_id, typed, slot_schemas);
             for s in body {
-                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_stmt(s, by_id, typed, slot_schemas);
             }
         }
         _ => {}
@@ -1168,23 +1266,23 @@ fn collect_resolved_calls_in_stmt(
 fn collect_resolved_calls_in_expr(
     expr: &Expr,
     by_id: &mut HashMap<SemanticNodeId, ResolvedCallInfo>,
-    function_return_schemas: &HashMap<u16, Option<TypeSchema>>,
+    typed: &super::FrontendTypedIr<'_>,
     slot_schemas: &[Option<TypeSchema>],
 ) {
     match expr {
-        Expr::Call(index, _type_args, args, host, semantic_id) => {
+        Expr::Call(_index, _type_args, args, host, semantic_id) => {
             if let Some(id) = semantic_id
                 && let Some(entry) = by_id.get_mut(id)
             {
                 if let Some(resolved) = host {
                     entry.return_type = resolved.return_type.clone();
                     entry.host = Some((**resolved).clone());
-                } else if let Some(schema) = function_return_schemas.get(index).cloned() {
-                    entry.return_type = schema.unwrap_or(TypeSchema::Unknown);
+                } else {
+                    entry.return_type = typed.schema_of_expr(expr).unwrap_or(TypeSchema::Unknown);
                 }
             }
             for arg in args {
-                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_expr(arg, by_id, typed, slot_schemas);
             }
         }
         Expr::ModuleCall(_symbol, _type_args, args, semantic_id) => {
@@ -1198,7 +1296,7 @@ fn collect_resolved_calls_in_expr(
                 entry.return_type = TypeSchema::Unknown;
             }
             for arg in args {
-                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_expr(arg, by_id, typed, slot_schemas);
             }
         }
         Expr::LocalCall(slot, _type_args, args, semantic_id) => {
@@ -1220,14 +1318,14 @@ fn collect_resolved_calls_in_expr(
                     .unwrap_or(TypeSchema::Unknown);
             }
             for arg in args {
-                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_expr(arg, by_id, typed, slot_schemas);
             }
         }
         Expr::Block { stmts, expr: inner } => {
             for s in stmts {
-                collect_resolved_calls_in_stmt(s, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_stmt(s, by_id, typed, slot_schemas);
             }
-            collect_resolved_calls_in_expr(inner, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(inner, by_id, typed, slot_schemas);
         }
         Expr::IfElse {
             condition,
@@ -1235,9 +1333,9 @@ fn collect_resolved_calls_in_expr(
             else_expr,
             ..
         } => {
-            collect_resolved_calls_in_expr(condition, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_expr(then_expr, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_expr(else_expr, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(condition, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_expr(then_expr, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_expr(else_expr, by_id, typed, slot_schemas);
         }
         Expr::Match {
             value,
@@ -1245,35 +1343,20 @@ fn collect_resolved_calls_in_expr(
             default,
             ..
         } => {
-            collect_resolved_calls_in_expr(value, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(value, by_id, typed, slot_schemas);
             for (_, arm_expr) in arms {
-                collect_resolved_calls_in_expr(
-                    arm_expr,
-                    by_id,
-                    function_return_schemas,
-                    slot_schemas,
-                );
+                collect_resolved_calls_in_expr(arm_expr, by_id, typed, slot_schemas);
             }
-            collect_resolved_calls_in_expr(default, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(default, by_id, typed, slot_schemas);
         }
         Expr::Closure(closure) => {
-            collect_resolved_calls_in_expr(
-                &closure.body,
-                by_id,
-                function_return_schemas,
-                slot_schemas,
-            );
+            collect_resolved_calls_in_expr(&closure.body, by_id, typed, slot_schemas);
         }
         Expr::ClosureCall(closure, args) => {
             for arg in args {
-                collect_resolved_calls_in_expr(arg, by_id, function_return_schemas, slot_schemas);
+                collect_resolved_calls_in_expr(arg, by_id, typed, slot_schemas);
             }
-            collect_resolved_calls_in_expr(
-                &closure.body,
-                by_id,
-                function_return_schemas,
-                slot_schemas,
-            );
+            collect_resolved_calls_in_expr(&closure.body, by_id, typed, slot_schemas);
         }
         Expr::Add(l, r)
         | Expr::Sub(l, r)
@@ -1285,25 +1368,25 @@ fn collect_resolved_calls_in_expr(
         | Expr::Eq(l, r)
         | Expr::Lt(l, r)
         | Expr::Gt(l, r) => {
-            collect_resolved_calls_in_expr(l, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_expr(r, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(l, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_expr(r, by_id, typed, slot_schemas);
         }
         Expr::Neg(inner)
         | Expr::Not(inner)
         | Expr::ToOwned(inner)
         | Expr::Borrow(inner)
         | Expr::BorrowMut(inner) => {
-            collect_resolved_calls_in_expr(inner, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(inner, by_id, typed, slot_schemas);
         }
         Expr::OptionalGet { container, key, .. } => {
-            collect_resolved_calls_in_expr(container, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_expr(key, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(container, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_expr(key, by_id, typed, slot_schemas);
         }
         Expr::OptionUnwrapOr {
             value, fallback, ..
         } => {
-            collect_resolved_calls_in_expr(value, by_id, function_return_schemas, slot_schemas);
-            collect_resolved_calls_in_expr(fallback, by_id, function_return_schemas, slot_schemas);
+            collect_resolved_calls_in_expr(value, by_id, typed, slot_schemas);
+            collect_resolved_calls_in_expr(fallback, by_id, typed, slot_schemas);
         }
         _ => {}
     }
@@ -1525,6 +1608,8 @@ pub struct LexerToken {
 /// collision-free during unit merge.
 #[derive(Clone, Debug, Default)]
 pub struct ParsedSemanticIndex {
+    /// Canonical nominal identities joined to their source declaration/alias.
+    pub type_provenance: Vec<GuestTypeProvenance>,
     /// All parsed call sites, in allocation order.
     pub call_sites: Vec<ParsedCallSite>,
     /// All parsed local declarations, in allocation order.
@@ -1561,6 +1646,40 @@ pub struct StmtSpanSite {
     /// token), never a line-wide guess. The same line may host many
     /// statements; each records its own independent span.
     pub span: Span,
+}
+
+/// One source spelling of a module-owned guest type. Display never changes
+/// the canonical schema identity or the original parser declaration name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestTypeProvenance {
+    pub canonical_name: String,
+    pub source_name: String,
+    pub source_id: u32,
+    pub declaration_span: Option<Span>,
+}
+
+impl FrontendIr {
+    /// Canonical schema with source-owned spellings for language-neutral labels.
+    pub fn source_schema(&self, schema: &TypeSchema, source_id: u32) -> TypeSchema {
+        let mut names = HashMap::new();
+        if let Some(index) = &self.parsed_semantic_index {
+            for provenance in &index.type_provenance {
+                if provenance.source_id == source_id {
+                    names
+                        .entry(provenance.canonical_name.clone())
+                        .or_insert_with(|| provenance.source_name.clone());
+                }
+            }
+            for provenance in &index.type_provenance {
+                names
+                    .entry(provenance.canonical_name.clone())
+                    .or_insert_with(|| provenance.source_name.clone());
+            }
+        }
+        let mut display = schema.clone();
+        super::linker::remap_type_schema_names(&mut display, &names);
+        display
+    }
 }
 
 impl ParsedSemanticIndex {

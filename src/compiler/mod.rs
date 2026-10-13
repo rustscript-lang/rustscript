@@ -38,8 +38,9 @@ pub use self::frontends::parse_source_with_dialect;
 pub use self::host_call_resolve::{HostCallResolveError, HostCallResolver};
 pub use self::ir::{
     AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, FunctionParam,
-    LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern, ResolvedHostCall, ResolvedHostParam,
-    SemanticIndex, Stmt, StructDecl, StructDeclOrigin, TypeSchema,
+    GuestTypeProvenance, LocalIrBuilder, LocalSlot, MatchPattern, MatchTypePattern,
+    ResolvedHostCall, ResolvedHostParam, SemanticIndex, Stmt, StructDecl, StructDeclOrigin,
+    TypeSchema,
 };
 pub use self::modules::{
     DeclSymbol, ExportEntry, ImportTargetKind, ImportedBinding, ModuleGraph, ModuleId, ModuleNode,
@@ -63,7 +64,7 @@ pub use self::semantic_model::{
     CompletionItemKind, Definition, SemanticCompletion, SemanticDiagnostic, SemanticModel,
     SourcePosition,
 };
-pub use self::source_loader::{FrontendImportSyntax, ImportClause, ModuleImport, NamedImport};
+pub use self::source_loader::{DeclarationNamespace, ImportClause, ModuleImport, NamedImport};
 
 #[derive(Debug)]
 pub enum CompileError {
@@ -300,9 +301,18 @@ impl ParseError {
     }
 
     pub fn with_line_span_from_source(mut self, source_map: &SourceMap, source_id: u32) -> Self {
-        if self.span.is_some() {
+        if self.span.is_some_and(|span| {
+            span.source_id == source_id
+                && span.lo <= span.hi
+                && source_map.source(source_id).is_some_and(|text| {
+                    span.hi <= text.len()
+                        && text.is_char_boundary(span.lo)
+                        && text.is_char_boundary(span.hi)
+                })
+        }) {
             return self;
         }
+        self.span = None;
         if let Some(span) = source_map.line_span(source_id, self.line) {
             self.span = Some(span);
         }
@@ -386,7 +396,7 @@ impl fmt::Display for SourcePathError {
             SourcePathError::MissingExtension => write!(f, "source file must have an extension"),
             SourcePathError::UnsupportedExtension(ext) => write!(
                 f,
-                "unsupported source extension '.{ext}', expected .rss, .js, or .lua"
+                "unsupported source extension '.{ext}', expected .rss or a registered frontend extension"
             ),
             SourcePathError::MissingFrontendPlugin(flavor) => {
                 write!(f, "no frontend plugin registered for {flavor:?} source")
@@ -433,21 +443,107 @@ impl From<SourceError> for SourcePathError {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FrontendId(&'static str);
+
+impl FrontendId {
+    pub const fn new(id: &'static str) -> Self {
+        Self(id)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FrontendTypingPolicy {
+    Strict,
+    Dynamic,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SourceFrontendDescriptor {
+    pub id: FrontendId,
+    pub extensions: &'static [&'static str],
+    pub typing_policy: FrontendTypingPolicy,
+    pub supports_ownership_checking: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ParsePhase {
+    ImportDiscovery,
+    Module,
+    Standalone,
+}
+
+#[derive(Clone, Debug)]
+pub enum FrontendImportedDeclaration {
+    Function {
+        local: String,
+        symbol: SymbolId,
+        declaration: FunctionDecl,
+    },
+    Type {
+        local: String,
+        symbol: SymbolId,
+        schema: TypeSchema,
+        declaration: Option<StructDecl>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct FrontendTypeExport {
+    pub source_name: String,
+    pub schema: TypeSchema,
+    pub declaration: Option<StructDecl>,
+}
+
+pub struct SourceFrontendContext<'a> {
+    pub source_id: u32,
+    pub original_path: Option<&'a Path>,
+    pub phase: ParsePhase,
+    pub host_api_catalog: Option<&'a crate::host_api::HostApiCatalog>,
+    pub imports: &'a [FrontendImportedDeclaration],
+}
+
+pub struct FrontendTypedIr<'a> {
+    /// Source whose producer is being admitted. The IR and logical schemas are
+    /// shared across the compilation; validators scope their rules to this id.
+    pub source_id: Option<u32>,
+    pub ir: &'a FrontendIr,
+    pub local_schemas: &'a [Option<TypeSchema>],
+    pub host_api_catalog: Option<&'a crate::host_api::HostApiCatalog>,
+    pub source_map: Option<&'a SourceMap>,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SourceFlavor {
     RustScript,
-    JavaScript,
-    Lua,
+    Plugin(FrontendId),
 }
 
 pub trait SourcePlugin: Sync {
-    fn flavor(&self) -> SourceFlavor;
+    fn descriptor(&self) -> SourceFrontendDescriptor;
 
-    fn extensions(&self) -> &'static [&'static str];
+    fn parse_source(
+        &self,
+        source: &str,
+        context: &SourceFrontendContext<'_>,
+    ) -> Result<FrontendIr, ParseError>;
 
-    fn import_syntax(&self) -> FrontendImportSyntax;
+    fn module_type_exports(
+        &self,
+        _source: &str,
+        _context: &SourceFrontendContext<'_>,
+        _ir: &FrontendIr,
+    ) -> Result<Vec<FrontendTypeExport>, ParseError> {
+        Ok(Vec::new())
+    }
 
-    fn parse_source(&self, source: &str) -> Result<FrontendIr, ParseError>;
+    fn validate_typed_ir(&self, _typed_ir: &FrontendTypedIr<'_>) -> Result<(), CompileError> {
+        Ok(())
+    }
 
     fn parser_dialect(&self) -> Option<&'static dyn ParserDialect> {
         None
@@ -457,6 +553,7 @@ pub trait SourcePlugin: Sync {
         &self,
         _source: &str,
         _path: &Path,
+        _context: &SourceFrontendContext<'_>,
     ) -> Result<Vec<ModuleImport>, SourcePathError> {
         Ok(Vec::new())
     }
@@ -483,19 +580,18 @@ pub struct SharedParserOptions {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TypingMode {
     DynamicHints,
-    StrictRustScript,
+    Strict,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct FrontendPolicy {
+    pub typing_mode: TypingMode,
+    pub ownership_checking: bool,
 }
 
 impl TypingMode {
-    pub(crate) fn for_flavor(flavor: SourceFlavor) -> Self {
-        match flavor {
-            SourceFlavor::RustScript => Self::StrictRustScript,
-            SourceFlavor::JavaScript | SourceFlavor::Lua => Self::DynamicHints,
-        }
-    }
-
     pub(crate) fn is_strict(self) -> bool {
-        matches!(self, Self::StrictRustScript)
+        matches!(self, Self::Strict)
     }
 }
 
@@ -503,8 +599,6 @@ impl SourceFlavor {
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_ascii_lowercase().as_str() {
             "rss" => Some(Self::RustScript),
-            "js" => Some(Self::JavaScript),
-            "lua" => Some(Self::Lua),
             _ => None,
         }
     }
@@ -527,7 +621,7 @@ impl SourceFlavor {
             .and_then(|value| value.to_str())
             .ok_or(SourcePathError::MissingExtension)?;
         if let Some(plugin) = options.source_plugin_for_extension(ext) {
-            return Ok(plugin.flavor());
+            return Ok(SourceFlavor::Plugin(plugin.descriptor().id));
         }
         SourceFlavor::from_extension(ext)
             .ok_or_else(|| SourcePathError::UnsupportedExtension(ext.to_string()))
@@ -704,10 +798,13 @@ impl CompileSourceFileOptions {
         &self,
         flavor: SourceFlavor,
     ) -> Option<&'static dyn SourcePlugin> {
+        let SourceFlavor::Plugin(id) = flavor else {
+            return None;
+        };
         self.source_plugins
             .iter()
             .copied()
-            .find(|plugin| plugin.flavor() == flavor)
+            .find(|plugin| plugin.descriptor().id == id)
     }
 
     pub(crate) fn source_plugin_for_extension(
@@ -716,10 +813,31 @@ impl CompileSourceFileOptions {
     ) -> Option<&'static dyn SourcePlugin> {
         self.source_plugins.iter().copied().find(|plugin| {
             plugin
-                .extensions()
+                .descriptor()
+                .extensions
                 .iter()
                 .any(|candidate| candidate.eq_ignore_ascii_case(ext))
         })
+    }
+
+    pub(crate) fn frontend_policy(&self, flavor: SourceFlavor) -> Option<FrontendPolicy> {
+        match flavor {
+            SourceFlavor::RustScript => Some(FrontendPolicy {
+                typing_mode: TypingMode::Strict,
+                ownership_checking: true,
+            }),
+            SourceFlavor::Plugin(id) => {
+                let plugin = self.source_plugin_for_flavor(SourceFlavor::Plugin(id))?;
+                let descriptor = plugin.descriptor();
+                Some(FrontendPolicy {
+                    typing_mode: match descriptor.typing_policy {
+                        FrontendTypingPolicy::Strict => TypingMode::Strict,
+                        FrontendTypingPolicy::Dynamic => TypingMode::DynamicHints,
+                    },
+                    ownership_checking: descriptor.supports_ownership_checking,
+                })
+            }
+        }
     }
 }
 

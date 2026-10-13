@@ -712,7 +712,7 @@ impl<'a> TypeContext<'a> {
                     || self.function_returns_optional(*index)
             }
             Expr::LocalCall(slot, _, _, _) => match state.callable(*slot) {
-                Some(InferredCallable::Function(index)) => {
+                Some(InferredCallable::Function(index, _)) => {
                     BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::ReFind)
                         || self.function_returns_optional(*index)
                 }
@@ -1031,7 +1031,7 @@ impl<'a> TypeContext<'a> {
         state: &LocalTypeState,
     ) -> Option<LocalTypeState> {
         let capture_copies = match callable {
-            InferredCallable::Function(index) => self
+            InferredCallable::Function(index, _) => self
                 .function_impls
                 .get(index)
                 .map(|function_impl| function_impl.capture_copies.as_slice())?,
@@ -1093,14 +1093,22 @@ impl<'a> TypeContext<'a> {
                         .map(|schema| {
                             schema
                                 .as_ref()
-                                .map(|schema| self.resolve_schema(schema))
+                                .map(|schema| self.substitute_schema_generics(schema))
                                 .unwrap_or(TypeSchema::Unknown)
                         })
                         .collect(),
                     result: Box::new(
                         decl.return_schema
                             .as_ref()
-                            .map(|schema| self.resolve_schema(schema))
+                            .map(|schema| self.substitute_schema_generics(schema))
+                            .or_else(|| {
+                                let schema =
+                                    self.infer_observed_function_return_schema(*index, type_args)?;
+                                Some(logical_optional_schema(
+                                    schema,
+                                    self.function_returns_optional(*index),
+                                ))
+                            })
                             .unwrap_or(TypeSchema::Unknown),
                     ),
                 };
@@ -1109,10 +1117,47 @@ impl<'a> TypeContext<'a> {
                 }
                 Some(schema)
             }
-            Expr::Closure(closure) => Some(TypeSchema::Callable {
-                params: vec![TypeSchema::Unknown; closure.param_slots.len()],
-                result: Box::new(TypeSchema::Unknown),
-            }),
+            Expr::Closure(closure) => {
+                let param_schemas = closure
+                    .param_slots
+                    .iter()
+                    .map(|slot| {
+                        state.schema(*slot).cloned().map(|schema| {
+                            if state.is_optional(*slot)
+                                && !matches!(schema, TypeSchema::Optional(_))
+                            {
+                                TypeSchema::Optional(Box::new(schema))
+                            } else {
+                                schema
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let nested = self.build_callable_state(
+                    &closure.param_slots,
+                    Some(&param_schemas),
+                    &closure.capture_copies,
+                    None,
+                    state,
+                )?;
+                let result = self
+                    .infer_expr_schema(&closure.body, &nested)
+                    .or_else(|| {
+                        super::scalar_schema_from_bound_type(
+                            self.infer_expr_type(&closure.body, &nested),
+                        )
+                    })
+                    .unwrap_or(TypeSchema::Unknown);
+                let result =
+                    logical_optional_schema(result, self.expr_is_optional(&closure.body, &nested));
+                Some(TypeSchema::Callable {
+                    params: param_schemas
+                        .into_iter()
+                        .map(|schema| schema.unwrap_or(TypeSchema::Unknown))
+                        .collect(),
+                    result: Box::new(result),
+                })
+            }
             Expr::Call(index, type_args, args, resolution, _) => {
                 if let Some(resolved) = resolution {
                     Some(resolved.return_type.clone())
@@ -1123,7 +1168,12 @@ impl<'a> TypeContext<'a> {
                 }
             }
             Expr::LocalCall(slot, type_args, args, _) => match state.callable(*slot).cloned() {
-                Some(InferredCallable::Function(index)) => {
+                Some(InferredCallable::Function(index, bound_args)) => {
+                    let type_args = if type_args.is_empty() {
+                        &bound_args
+                    } else {
+                        type_args
+                    };
                     self.infer_named_call_schema(index, type_args, args, state)
                 }
                 Some(InferredCallable::Closure(closure)) => {
@@ -1355,7 +1405,12 @@ impl<'a> TypeContext<'a> {
                 }
             }
             Expr::LocalCall(slot, type_args, args, _) => match state.callable(*slot).cloned() {
-                Some(InferredCallable::Function(index)) => {
+                Some(InferredCallable::Function(index, bound_args)) => {
+                    let type_args = if type_args.is_empty() {
+                        &bound_args
+                    } else {
+                        type_args
+                    };
                     if let Some(decl) = self.function_decls.get(&index)
                         && let inferred =
                             infer_host_passthrough_return_type(&decl.name, args, state, self)
@@ -1800,7 +1855,10 @@ impl<'a> TypeContext<'a> {
             self.push_generic_bindings(&function_decl.type_params, type_args);
         }
         let result = if let Some(schema) = function_decl.return_schema.as_ref() {
-            Some(self.resolve_schema(schema).clone_inner_if_optional())
+            Some(
+                self.substitute_schema_generics(schema)
+                    .clone_inner_if_optional(),
+            )
         } else {
             self.function_impls
                 .get(&index)
@@ -1815,7 +1873,7 @@ impl<'a> TypeContext<'a> {
                     )?;
                     self.apply_stmts(&function_impl.body_stmts, &mut nested);
                     self.infer_expr_schema(&function_impl.body_expr, &nested)
-                        .map(|schema| self.resolve_schema(&schema))
+                        .map(|schema| self.substitute_schema_generics(&schema))
                 })
         };
         if !function_decl.type_params.is_empty() {
@@ -1913,7 +1971,7 @@ impl<'a> TypeContext<'a> {
             .and_then(|mut nested| {
                 self.apply_stmts(&function_impl.body_stmts, &mut nested);
                 self.infer_expr_schema(&function_impl.body_expr, &nested)
-                    .map(|schema| self.resolve_schema(&schema))
+                    .map(|schema| self.substitute_schema_generics(&schema))
             });
         if !function_decl.type_params.is_empty() {
             self.pop_generic_bindings();
@@ -2056,7 +2114,11 @@ impl<'a> TypeContext<'a> {
         let resolved = function_decl
             .arg_schemas
             .iter()
-            .map(|schema| schema.as_ref().map(|schema| self.resolve_schema(schema)))
+            .map(|schema| {
+                schema
+                    .as_ref()
+                    .map(|schema| self.substitute_schema_generics(schema))
+            })
             .collect::<Vec<_>>();
         if !function_decl.type_params.is_empty() {
             self.pop_generic_bindings();
@@ -2069,10 +2131,16 @@ impl<'a> TypeContext<'a> {
         callable: &InferredCallable,
     ) -> Option<TypeSchema> {
         match callable {
-            InferredCallable::Function(index) => {
+            InferredCallable::Function(index, type_args) => {
                 let function_decl = self.function_decls.get(index).cloned()?;
-                if !function_decl.type_params.is_empty() {
+                if function_decl.type_params.len() != type_args.len() {
                     return None;
+                }
+                if !type_args.is_empty() {
+                    return self.infer_expr_schema(
+                        &Expr::FunctionRef(*index, type_args.clone()),
+                        &LocalTypeState::default(),
+                    );
                 }
                 let params = function_decl
                     .arg_schemas
@@ -2085,7 +2153,7 @@ impl<'a> TypeContext<'a> {
                     .or_else(|| self.infer_observed_function_return_schema(*index, &[]))?;
                 Some(TypeSchema::Callable {
                     params,
-                    result: Box::new(self.resolve_schema(&result)),
+                    result: Box::new(self.substitute_schema_generics(&result)),
                 })
             }
             InferredCallable::Closure(_) => None,
@@ -2198,7 +2266,12 @@ impl<'a> TypeContext<'a> {
                 }
             }
             Expr::LocalCall(slot, type_args, args, _) => match state.callable(*slot).cloned() {
-                Some(InferredCallable::Function(index)) => {
+                Some(InferredCallable::Function(index, bound_args)) => {
+                    let type_args = if type_args.is_empty() {
+                        &bound_args
+                    } else {
+                        type_args
+                    };
                     if let Some(builtin) = BuiltinFunction::from_call_index(index) {
                         self.validate_builtin_argument_types(
                             builtin,
@@ -2488,7 +2561,9 @@ impl<'a> TypeContext<'a> {
     ) -> Option<InferredCallable> {
         match expr {
             Expr::Closure(closure) => Some(InferredCallable::Closure(closure.clone())),
-            Expr::FunctionRef(index, _) => Some(InferredCallable::Function(*index)),
+            Expr::FunctionRef(index, type_args) => {
+                Some(InferredCallable::Function(*index, type_args.clone()))
+            }
             Expr::Var(slot) | Expr::MoveVar(slot) => state.callable(*slot).cloned(),
             _ => None,
         }
@@ -2629,11 +2704,10 @@ fn merge_observed_function_param_callable(
     match (current, next) {
         (None, rhs) => rhs,
         (lhs, None) => lhs,
-        (Some(InferredCallable::Function(lhs)), Some(InferredCallable::Function(rhs)))
-            if lhs == rhs =>
-        {
-            Some(InferredCallable::Function(lhs))
-        }
+        (
+            Some(InferredCallable::Function(lhs, lhs_args)),
+            Some(InferredCallable::Function(rhs, rhs_args)),
+        ) if lhs == rhs && lhs_args == rhs_args => Some(InferredCallable::Function(lhs, lhs_args)),
         (Some(InferredCallable::Closure(lhs)), Some(InferredCallable::Closure(_))) => {
             Some(InferredCallable::Closure(lhs))
         }
@@ -2676,6 +2750,19 @@ fn schema_from_bound_type(ty: BoundType) -> Option<TypeSchema> {
             params: Vec::new(),
             result: Box::new(TypeSchema::Unknown),
         }),
+    }
+}
+
+fn logical_optional_schema(schema: TypeSchema, optional: bool) -> TypeSchema {
+    if optional
+        && !matches!(
+            schema,
+            TypeSchema::Optional(_) | TypeSchema::Unknown | TypeSchema::Null
+        )
+    {
+        TypeSchema::Optional(Box::new(schema))
+    } else {
+        schema
     }
 }
 
@@ -2814,17 +2901,20 @@ pub(super) fn infer_access_schema(
     context: &mut TypeContext<'_>,
     state: &LocalTypeState,
 ) -> Result<TypeSchema, String> {
+    let source_schema = context.substitute_schema_generics(schema);
     let resolved = context.resolve_schema(schema);
     if resolved.array_prefix_and_rest().is_some() {
         let key_ty = context.infer_expr_type(key, state);
         if matches!(key_ty, BoundType::Unknown | BoundType::Int) {
             if let Some(index) = literal_int_index(key) {
-                return Ok(resolved
+                return Ok(source_schema
                     .array_item_schema_at(index)
+                    .or_else(|| resolved.array_item_schema_at(index))
                     .unwrap_or(TypeSchema::Unknown));
             }
-            return Ok(resolved
+            return Ok(source_schema
                 .collapsed_array_item_schema()
+                .or_else(|| resolved.collapsed_array_item_schema())
                 .unwrap_or(TypeSchema::Unknown));
         }
         return Err(format!(
@@ -2841,14 +2931,27 @@ pub(super) fn infer_access_schema(
         )),
         TypeSchema::Named(name, _) => Err(format!("unknown struct schema '{name}'")),
         TypeSchema::Object(fields) => match key {
-            Expr::String(name) => fields
-                .get(name)
-                .cloned()
-                .ok_or_else(|| format!("field '{name}' is not declared in the object schema")),
+            Expr::String(name) => {
+                let field_schema = match &source_schema {
+                    TypeSchema::Object(source_fields) => source_fields.get(name).cloned(),
+                    TypeSchema::Named(struct_name, type_args) => {
+                        source_named_struct_field_schema(struct_name, type_args, name, context)
+                            .or_else(|| fields.get(name).cloned())
+                    }
+                    _ => fields.get(name).cloned(),
+                };
+                field_schema
+                    .ok_or_else(|| format!("field '{name}' is not declared in the object schema"))
+            }
             other => {
                 let key_ty = context.infer_expr_type(other, state);
                 if matches!(key_ty, BoundType::String | BoundType::Unknown) {
-                    Ok(collapse_object_field_schema(&fields))
+                    match &source_schema {
+                        TypeSchema::Object(source_fields) => {
+                            Ok(collapse_object_field_schema(source_fields))
+                        }
+                        _ => Ok(collapse_object_field_schema(&fields)),
+                    }
                 } else {
                     Err(format!(
                         "schema-typed object access requires a string field name, got {}",
@@ -2879,12 +2982,40 @@ pub(super) fn infer_access_schema(
                 ))
             }
         }
-        TypeSchema::Map(value) => Ok(*value),
+        TypeSchema::Map(value) => match source_schema {
+            TypeSchema::Map(source_value) => Ok(*source_value),
+            _ => Ok(*value),
+        },
         other => Err(format!(
             "cannot access fields on schema type '{}'",
             schema_label(&other)
         )),
     }
+}
+
+fn source_named_struct_field_schema(
+    struct_name: &str,
+    type_args: &[TypeSchema],
+    field_name: &str,
+    context: &mut TypeContext<'_>,
+) -> Option<TypeSchema> {
+    let declaration = context.struct_schemas.get(struct_name)?.clone();
+    if declaration.type_params.len() != type_args.len() {
+        return None;
+    }
+    let TypeSchema::Object(fields) = declaration.body_schema else {
+        return None;
+    };
+    if !declaration.type_params.is_empty() {
+        context.push_generic_bindings(&declaration.type_params, type_args);
+    }
+    let schema = fields
+        .get(field_name)
+        .map(|schema| context.substitute_schema_generics(schema));
+    if !declaration.type_params.is_empty() {
+        context.pop_generic_bindings();
+    }
+    schema
 }
 
 fn collapse_object_field_schema(fields: &HashMap<String, TypeSchema>) -> TypeSchema {
@@ -3171,7 +3302,7 @@ mod tests {
             &empty_names,
             &empty_returns,
             &empty_signatures,
-            TypingMode::StrictRustScript,
+            TypingMode::Strict,
             None,
         );
         let state = LocalTypeState::default();
@@ -3228,7 +3359,7 @@ mod tests {
             &empty_names,
             &empty_returns,
             &empty_signatures,
-            TypingMode::StrictRustScript,
+            TypingMode::Strict,
             None,
         );
         let state = LocalTypeState::default();
@@ -3322,7 +3453,7 @@ mod tests {
             &empty_names,
             &returns,
             &empty_signatures,
-            TypingMode::StrictRustScript,
+            TypingMode::Strict,
             None,
         );
         let state = LocalTypeState::default();
@@ -3387,7 +3518,7 @@ mod tests {
             &empty_names,
             &empty_returns,
             &signatures,
-            TypingMode::StrictRustScript,
+            TypingMode::Strict,
             None,
         );
         let state = LocalTypeState::default();
