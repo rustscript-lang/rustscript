@@ -23,12 +23,12 @@ use crate::vm::native::{
     enter_call_value_signature, entry_signature, frame_state_entry_address, frame_state_signature,
     free_buffer_signature, helper_entry_offset, helper_signature,
     init_null_value_slot_entry_address, jump_with_status, leave_frame_entry_address,
-    leave_frame_signature, pack_shared_signature, resolve_offsets,
+    leave_frame_signature, note_local_write_entry_address, pack_shared_signature, resolve_offsets,
     restore_active_exit_state_entry_address, restore_exit_signature,
     restore_exit_state_entry_address, shared_array_from_buffer_entry_address,
     shared_bytes_from_buffer_entry_address, shared_string_from_buffer_entry_address,
-    value_eq_entry_address, value_eq_signature, value_slot_signature,
-    write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
+    synchronize_active_exit_state_entry_address, value_eq_entry_address, value_eq_signature,
+    value_slot_signature, write_heap_value_to_slot_entry_address, zero_bytes_entry_address,
 };
 use crate::vm::{Program, Value, Vm, VmError, VmResult};
 #[cfg(feature = "cranelift-jit")]
@@ -306,6 +306,7 @@ struct AotDeoptHelperRefs {
     array_push_ref: cranelift_codegen::ir::SigRef,
     collection_set_ref: cranelift_codegen::ir::SigRef,
     restore_exit_ref: cranelift_codegen::ir::SigRef,
+    local_write_ref: cranelift_codegen::ir::SigRef,
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -324,6 +325,7 @@ struct AotDeoptHelperAddrs {
     array_push: usize,
     collection_set: usize,
     restore_exit: usize,
+    local_write: usize,
 }
 
 #[cfg(feature = "cranelift-jit")]
@@ -492,7 +494,8 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
         box_heap_value: write_heap_value_to_slot_entry_address(),
         array_push: array_push_entry_address(),
         collection_set: collection_set_entry_address(),
-        restore_exit: restore_active_exit_state_entry_address(),
+        restore_exit: synchronize_active_exit_state_entry_address(),
+        local_write: note_local_write_entry_address(),
     };
     let layout = detect_native_stack_layout().map_err(|err| {
         AotCompileError::Codegen(format!("detect native stack layout failed: {err}"))
@@ -535,10 +538,12 @@ fn compile_ssa(program: &Program, ssa: &AotSsaProgram) -> Result<CompiledProgram
             enter_call_value_ref: b.import_signature(enter_call_value_sig),
             enter_call_script_ref: b.import_signature(enter_call_script_sig),
             leave_frame_ref: b.import_signature(leave_frame_sig),
-            clone_value_ref: b.import_signature(clone_value_sig),
+            clone_value_ref: b.import_signature(clone_value_sig.clone()),
             value_eq_ref: b.import_signature(value_eq_sig),
             init_null_slot_ref: b.import_signature(value_slot_sig.clone()),
             clear_value_slot_ref: b.import_signature(value_slot_sig),
+            // Both private helpers take two pointer-width arguments and return status.
+            local_write_ref: b.import_signature(clone_value_sig),
             box_heap_value_ref: b.import_signature(box_heap_sig),
             array_push_ref: b.import_signature(array_push_sig),
             collection_set_ref: b.import_signature(collection_set_sig),
@@ -921,6 +926,18 @@ fn lower_aot_ssa_inst(
         ..
     } = ctx;
     let value = match &inst.kind {
+        AotSsaInstKind::LocalWrite { index } => {
+            let local = b.ins().iconst(pointer_type, i64::from(*index));
+            call_status_helper(
+                b,
+                ctx.exit_block,
+                pointer_type,
+                ctx.helper_refs.local_write_ref,
+                ctx.helper_addrs.local_write,
+                &[vm_ptr, local],
+            )?;
+            b.ins().iconst(types::I8, 0)
+        }
         AotSsaInstKind::IntConst(value) => b.ins().iconst(types::I64, *value),
         AotSsaInstKind::FloatConst(value) => b.ins().f64const(*value),
         AotSsaInstKind::BoolConst(value) => b.ins().iconst(types::I8, i64::from(*value as u8)),

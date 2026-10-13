@@ -104,6 +104,10 @@ pub(crate) struct AotSsaBlockParam {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AotSsaInstKind {
+    // Private semantic effect retained even when SSA aliases the value.
+    LocalWrite {
+        index: u8,
+    },
     IntConst(i64),
     FloatConst(f64),
     BoolConst(bool),
@@ -313,7 +317,8 @@ pub(crate) enum AotSsaInstKind {
 impl AotSsaInstKind {
     fn inputs(&self) -> Vec<AotSsaValueId> {
         match self {
-            Self::IntConst(_)
+            Self::LocalWrite { .. }
+            | Self::IntConst(_)
             | Self::FloatConst(_)
             | Self::BoolConst(_)
             | Self::ConstSlot { .. } => Vec::new(),
@@ -1836,6 +1841,28 @@ fn apply_direct_instruction<E: InstEmitter>(
             Ok(true)
         }
         AotInstruction::Stloc { index } => {
+            // Only a capturing script region can hold a cell at this local.
+            // Ordinary scalar functions retain their existing native fast path.
+            let prototype = program
+                .function_regions
+                .iter()
+                .find(|region| (region.start_ip as usize) <= ip && ip < region.end_ip as usize)
+                .and_then(|region| region.prototype_id)
+                .and_then(|id| program.callable_prototypes.get(id as usize));
+            if prototype.is_some_and(|p| {
+                p.capture_slots
+                    .iter()
+                    .zip(&p.capture_modes)
+                    .any(|(slot, mode)| {
+                        *slot == u16::from(*index) && *mode == crate::CaptureBindingMode::Move
+                    })
+            }) {
+                emitter.emit(
+                    ip,
+                    AotSsaInstKind::LocalWrite { index: *index },
+                    AotSsaValueRepr::Bool,
+                );
+            }
             let value = frame.pop(ip, "stloc")?;
             let local = frame
                 .locals

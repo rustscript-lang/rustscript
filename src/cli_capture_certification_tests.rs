@@ -641,7 +641,7 @@ fn source_companion_and_source_deleted_aot_never_reissue_capture_facts() {
         state.query_certified,
         (state.calls, state.live, state.unavailable)
     );
-    assert_eq!((state.calls, state.live, state.unavailable), (3, 0, 3));
+    assert_eq!((state.calls, state.live, state.unavailable), (3, 1, 2));
 }
 
 #[test]

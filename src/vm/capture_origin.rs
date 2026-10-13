@@ -468,6 +468,9 @@ mod tests {
         internal_same_bits: bool,
         detach: bool,
         held_alias: Option<Value>,
+        inspect_native_origin: bool,
+        expect_after_guest_write: bool,
+        native_semantic_write: bool,
     }
 
     fn fixture(source: &str, certified: bool) -> Vm {
@@ -520,13 +523,28 @@ mod tests {
         for schema in crate::catalog_import_schemas(&catalog, "neutral::check") {
             registry.register_exact_static("neutral::check", 0, schema, |vm, _| {
                 let expected = vm.host_context().module_state::<ProbeState>().unwrap().expected.clone();
+                if vm.host_context().module_state::<ProbeState>().unwrap().inspect_native_origin {
+                    let frame = vm.instance.execution_frames.last().unwrap();
+                    let state = vm.host.get_module_state::<CaptureState>().unwrap();
+                    let records = state.frames.get(&frame.local_base);
+                    let record = records.and_then(|roots| roots.iter().flatten().next());
+                    let cell_matches = record.is_some_and(|record| {
+                        vm.instance.capture_cells.values().any(|cell| record.cell.ptr_eq(&Arc::downgrade(cell)))
+                    });
+                    eprintln!("native origin diagnostic: stats={:?} frame_prototype={:?} frame_roots_present={} record_present={} record_valid={:?} actual_cell_match={} native_count={}", vm.capture_certification_stats(), frame.prototype_id, records.is_some(), record.is_some(), record.map(|r| r.valid.load(Ordering::Acquire)), cell_matches, vm.aot_exec_count());
+                }
                 if let Some(expected) = expected {
                     assert!(matches!(vm.host_context().checked_move_resource_capture::<BoxPayload>(&key()), Err(error) if error == expected));
                 } else {
                     let held = vm.host_context().module_state_mut::<ProbeState>().unwrap().held_alias.take();
                     drop(held);
                     let context = vm.host_context();
-                    let checked = context.checked_move_resource_capture::<BoxPayload>(&key()).unwrap();
+                    let queried = context.checked_move_resource_capture::<BoxPayload>(&key());
+                    let checked = match queried {
+                        Ok(checked) => checked,
+                        Err(error) if context.module_state::<ProbeState>().unwrap().inspect_native_origin => return Err(crate::VmError::HostError(format!("source-native checked origin unavailable: {error}"))),
+                        Err(error) => panic!("unexpected checked origin failure: {error}"),
+                    };
                     assert!(matches!(context.checked_move_resource_capture::<BoxPayload>(&ResourceTypeKey::new("neutral.other-key").unwrap()), Err(CaptureQueryError::NoMatchingCapture)));
                     assert!(matches!(context.checked_move_resource_capture::<OtherConcrete>(&key()), Err(CaptureQueryError::Resource(_))));
                     assert_eq!(context.resource(checked.token()).unwrap().get().0, 41);
@@ -544,10 +562,14 @@ mod tests {
                         let prototype = &vm.program.callable_prototypes[frame.prototype_id.unwrap() as usize];
                         vm.set_local(prototype.capture_slots[0] as u8, Value::Int(handle.raw() as i64)).unwrap();
                         assert_eq!(root.observe(&vm.host_context()), CaptureRootState::Unavailable);
-                    } else if internal || detach {
+                    } else if internal || detach || context.module_state::<ProbeState>().unwrap().native_semantic_write {
                         let frame = vm.instance.execution_frames.last().unwrap();
                         let slot = vm.program.callable_prototypes[frame.prototype_id.unwrap() as usize].capture_slots[0] as u8;
                         if internal { vm.store_local_with_drop_contract(slot, Value::Int(handle.raw() as i64)).unwrap(); }
+                        if vm.host_context().module_state::<ProbeState>().unwrap().native_semantic_write {
+                            vm.note_native_semantic_local_write(slot).unwrap();
+                            vm.synchronize_native_local(slot, Value::Int(handle.raw() as i64)).unwrap();
+                        }
                         if detach { vm.detach_local_with_drop_contract(slot).unwrap(); }
                         assert_eq!(root.observe(&vm.host_context()), CaptureRootState::Unavailable);
                         assert!(vm.capture_certification_stats().unwrap().valid);
@@ -569,6 +591,7 @@ mod tests {
                     let mut context = vm.host_context();
                     let state = context.module_state_mut::<ProbeState>().unwrap();
                     state.root = Some(root); state.handle = Some(handle);
+                    if state.expect_after_guest_write { state.expected = Some(CaptureQueryError::Unavailable); }
                 }
                 vm.host_context().module_state_mut::<ProbeState>().unwrap().calls += 1;
                 Ok(super::super::CallOutcome::Return(super::super::CallReturn::one(Value::Int(41))))
@@ -612,6 +635,92 @@ mod tests {
             .unwrap()
             .environment = callable.env.as_ref().map(Arc::downgrade);
         value
+    }
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn no_self_source_native_readonly_query_preserves_issued_capture_origin() {
+        let mut vm = fixture(NO_SELF, true);
+        vm.host_context()
+            .module_state_mut::<ProbeState>()
+            .unwrap()
+            .inspect_native_origin = true;
+        vm.compile_aot().unwrap();
+        let closure = take_closure(&mut vm);
+        assert_eq!(vm.invoke_callable(closure, &[]).unwrap(), Value::Int(41));
+        assert!(vm.aot_exec_count() > 1);
+        assert!(vm.capture_certification_stats().unwrap().valid);
+        let root = vm
+            .host_context()
+            .module_state::<ProbeState>()
+            .unwrap()
+            .root
+            .clone()
+            .unwrap();
+        assert_eq!(root.observe(&vm.host_context()), CaptureRootState::Released);
+        assert_eq!(vm.host_context().resource_count(), 1);
+        vm.reset_for_reuse().unwrap();
+        assert_eq!(vm.host_context().resource_count(), 0);
+    }
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn source_native_guest_call_readonly_query_preserves_issued_capture_origin() {
+        let source = "let owner = neutral::open(); let dispatch = || if true => { neutral::check(); 41 } else => { neutral::close(owner); 41 }; dispatch();";
+        let mut vm = fixture(source, true);
+        vm.host_context()
+            .module_state_mut::<ProbeState>()
+            .unwrap()
+            .inspect_native_origin = true;
+        vm.compile_aot().unwrap();
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+        assert!(vm.aot_exec_count() > 1);
+        assert_eq!(
+            vm.host_context()
+                .module_state::<ProbeState>()
+                .unwrap()
+                .calls,
+            1
+        );
+        assert!(vm.capture_certification_stats().unwrap().valid);
+        vm.reset_for_reuse().unwrap();
+        assert_eq!(vm.host_context().resource_count(), 0);
+    }
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn source_native_semantic_same_bits_write_is_not_reauthorized_by_sync() {
+        let mut vm = fixture(NO_SELF, true);
+        vm.host_context()
+            .module_state_mut::<ProbeState>()
+            .unwrap()
+            .native_semantic_write = true;
+        vm.compile_aot().unwrap();
+        let closure = take_closure(&mut vm);
+        assert_eq!(vm.invoke_callable(closure, &[]).unwrap(), Value::Int(41));
+        assert!(vm.aot_exec_count() > 1);
+        assert!(vm.capture_certification_stats().unwrap().valid);
+        assert_eq!(vm.host_context().resource_count(), 1);
+        vm.reset_for_reuse().unwrap();
+    }
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn source_native_guest_same_value_assignment_invalidates_the_old_origin() {
+        let source = "let mut owner = neutral::open(); let dispatch = || if true => { neutral::check(); owner = owner; neutral::check(); 41 } else => { neutral::check(); neutral::close(owner); 41 }; dispatch();";
+        let mut vm = fixture(source, true);
+        vm.host_context()
+            .module_state_mut::<ProbeState>()
+            .unwrap()
+            .expect_after_guest_write = true;
+        vm.compile_aot().unwrap();
+        assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+        assert!(vm.aot_exec_count() > 1);
+        assert_eq!(
+            vm.host_context()
+                .module_state::<ProbeState>()
+                .unwrap()
+                .calls,
+            2
+        );
+        assert_eq!(vm.host_context().resource_count(), 1);
+        vm.reset_for_reuse().unwrap();
     }
     #[test]
     fn no_self_actual_frame_cell_survives_expired_environment_then_releases() {

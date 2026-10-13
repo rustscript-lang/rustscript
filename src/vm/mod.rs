@@ -2649,6 +2649,38 @@ impl Vm {
         Ok(value as u32)
     }
 
+    // SSA synchronization is not a new guest write. Genuine native stores
+    // invalidate capture authority at their original semantic instruction.
+    pub(super) fn synchronize_native_local(&mut self, index: u8, value: Value) -> VmResult<()> {
+        let absolute = self.absolute_local_index(index)?;
+        if let Some(cell) = self.instance.capture_cells.get(&absolute).cloned() {
+            if Self::value_references_capture_cell(&value, &cell, &mut HashSet::new())? {
+                return Err(VmError::InvalidFrameState(
+                    "callable capture ownership cycle is unsupported",
+                ));
+            }
+            let previous = {
+                let mut captured = cell
+                    .lock()
+                    .map_err(|_| VmError::InvalidFrameState("capture cell lock is poisoned"))?;
+                std::mem::replace(&mut *captured, value.clone())
+            };
+            self.instance.locals[absolute] = value;
+            self.drop_value_with_contract(previous);
+            Ok(())
+        } else {
+            self.store_local_absolute_with_drop_contract(absolute, index, value)
+        }
+    }
+
+    pub(super) fn note_native_semantic_local_write(&mut self, index: u8) -> VmResult<()> {
+        let absolute = self.absolute_local_index(index)?;
+        if let Some(cell) = self.instance.capture_cells.get(&absolute).cloned() {
+            self.invalidate_capture_cell(&cell);
+        }
+        Ok(())
+    }
+
     #[inline(always)]
     pub(super) fn store_local_with_drop_contract(
         &mut self,

@@ -1241,6 +1241,79 @@ pub(crate) extern "C" fn pd_vm_native_restore_active_exit_state(
     })
 }
 
+pub(crate) extern "C" fn pd_vm_native_synchronize_active_exit_state(
+    vm: *mut Vm,
+    stack_src: *const Value,
+    stack_len: usize,
+    locals_src: *const Value,
+    locals_len: usize,
+    ip: usize,
+) -> i32 {
+    run_step(vm, "synchronize_active_exit_state", |vm| {
+        let stack_base = vm.active_operand_stack_base();
+        let local_base = vm.active_local_base();
+        let expected_locals_len = local_base
+            .checked_add(locals_len)
+            .ok_or_else(|| VmError::JitNative("native active local length overflow".to_string()))?;
+        if expected_locals_len != vm.instance.locals.len() {
+            return Err(VmError::JitNative(format!(
+                "native active exit restore locals length mismatch: expected {}, got {}",
+                vm.instance.locals.len(),
+                expected_locals_len
+            )));
+        }
+        if stack_base > vm.instance.stack.len() {
+            return Err(VmError::JitNative(format!(
+                "native active stack base {stack_base} exceeds stack length {}",
+                vm.instance.stack.len()
+            )));
+        }
+        if stack_len != 0 && stack_src.is_null() {
+            return Err(VmError::JitNative(
+                "native active exit restore received null stack buffer".to_string(),
+            ));
+        }
+        if locals_len != 0 && locals_src.is_null() {
+            return Err(VmError::JitNative(
+                "native active exit restore received null locals buffer".to_string(),
+            ));
+        }
+
+        vm.instance.stack.truncate(stack_base);
+        vm.instance.stack.reserve(stack_len);
+        for index in 0..stack_len {
+            let value = unsafe { std::ptr::read(stack_src.add(index)) };
+            vm.instance.stack.push(value);
+        }
+
+        for index in 0..locals_len {
+            let local_index = u8::try_from(index).map_err(|_| {
+                VmError::JitNative("native active local index out of range".to_string())
+            })?;
+            let value = unsafe { std::ptr::read(locals_src.add(index)) };
+            vm.synchronize_native_local(local_index, value)?;
+        }
+
+        vm.jump_to(ip)?;
+        Ok(STATUS_CONTINUE)
+    })
+}
+
+pub(crate) extern "C" fn pd_vm_native_note_local_write(vm: *mut Vm, index: usize) -> i32 {
+    run_step(vm, "note_semantic_local_write", |vm| {
+        let index = u8::try_from(index)
+            .map_err(|_| VmError::JitNative("native local write index out of range".into()))?;
+        vm.note_native_semantic_local_write(index)?;
+        Ok(STATUS_CONTINUE)
+    })
+}
+pub(crate) fn synchronize_active_exit_state_entry_address() -> usize {
+    pd_vm_native_synchronize_active_exit_state as *const () as usize
+}
+pub(crate) fn note_local_write_entry_address() -> usize {
+    pd_vm_native_note_local_write as *const () as usize
+}
+
 pub(crate) extern "C" fn pd_vm_native_restore_sparse_exit_state(
     vm: *mut Vm,
     stack_src: *const Value,
