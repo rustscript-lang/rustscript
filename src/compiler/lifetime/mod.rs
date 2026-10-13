@@ -69,8 +69,9 @@ pub(super) fn enforce_local_availability_with_entry_locals(
     )
 }
 
-pub(super) fn enforce_source_availability(
+pub(super) fn enforce_source_availability_with_entry_locals(
     ir: FrontendIr,
+    entry_locals: &[EntryLocalAvailability],
     clear_dead_locals: bool,
     owned_local_slots: &[bool],
     policies: &std::collections::HashMap<String, bool>,
@@ -79,7 +80,7 @@ pub(super) fn enforce_source_availability(
 ) -> Result<FrontendIr, ParseError> {
     availability::enforce_source_availability(
         ir,
-        &[],
+        entry_locals,
         clear_dead_locals,
         default_policy,
         owned_local_slots,
