@@ -178,6 +178,14 @@ pub(crate) enum AotSsaInstKind {
         lhs: AotSsaValueId,
         rhs: AotSsaValueId,
     },
+    TaggedNumberSub {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    TaggedNumberMul {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
     IntMul {
         lhs: AotSsaValueId,
         rhs: AotSsaValueId,
@@ -268,6 +276,14 @@ pub(crate) enum AotSsaInstKind {
         lhs: AotSsaValueId,
         rhs: AotSsaValueId,
     },
+    TaggedNumberCmpLt {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
+    TaggedNumberCmpGt {
+        lhs: AotSsaValueId,
+        rhs: AotSsaValueId,
+    },
     StringCmpEq {
         lhs: AotSsaValueId,
         rhs: AotSsaValueId,
@@ -329,6 +345,8 @@ impl AotSsaInstKind {
             Self::MapSet { map, key, value } => vec![*map, *key, *value],
             Self::IntAdd { lhs, rhs }
             | Self::IntSub { lhs, rhs }
+            | Self::TaggedNumberSub { lhs, rhs }
+            | Self::TaggedNumberMul { lhs, rhs }
             | Self::IntMul { lhs, rhs }
             | Self::IntDiv { lhs, rhs }
             | Self::IntMod { lhs, rhs }
@@ -347,6 +365,8 @@ impl AotSsaInstKind {
             | Self::IntCmpGt { lhs, rhs }
             | Self::BoolCmpEq { lhs, rhs }
             | Self::TaggedCmpEq { lhs, rhs }
+            | Self::TaggedNumberCmpLt { lhs, rhs }
+            | Self::TaggedNumberCmpGt { lhs, rhs }
             | Self::StringCmpEq { lhs, rhs }
             | Self::BytesCmpEq { lhs, rhs }
             | Self::NullCmpEq { lhs, rhs }
@@ -2580,6 +2600,29 @@ where
             });
             Ok(true)
         }
+        _ if matches!(instruction, "sub" | "mul")
+            && is_numeric_repr(lhs.value.repr)
+            && is_numeric_repr(rhs.value.repr) =>
+        {
+            frame.stack.push(FrameValue {
+                value: emitter.emit(
+                    ip,
+                    if instruction == "sub" {
+                        AotSsaInstKind::TaggedNumberSub {
+                            lhs: lhs.value.id,
+                            rhs: rhs.value.id,
+                        }
+                    } else {
+                        AotSsaInstKind::TaggedNumberMul {
+                            lhs: lhs.value.id,
+                            rhs: rhs.value.id,
+                        }
+                    },
+                    AotSsaValueRepr::Tagged,
+                ),
+            });
+            Ok(true)
+        }
         _ => {
             frame.stack.push(lhs);
             frame.stack.push(rhs);
@@ -2629,6 +2672,17 @@ fn emit_generic_compare<E: InstEmitter>(
                 }
             })
         }
+        _ if is_numeric_repr(lhs.value.repr) && is_numeric_repr(rhs.value.repr) => Some(if is_lt {
+            AotSsaInstKind::TaggedNumberCmpLt {
+                lhs: lhs.value.id,
+                rhs: rhs.value.id,
+            }
+        } else {
+            AotSsaInstKind::TaggedNumberCmpGt {
+                lhs: lhs.value.id,
+                rhs: rhs.value.id,
+            }
+        }),
         _ => None,
     };
     if let Some(kind) = kind {
@@ -2842,6 +2896,79 @@ fn promoted_numeric_result_repr(arg_reprs: &[AotSsaValueRepr]) -> Option<AotSsaV
 mod tests {
     use super::*;
     use crate::{BytecodeBuilder, HostImport, Value};
+
+    #[test]
+    fn aot_ssa_number_relations_retain_dynamic_operands_without_hints() {
+        for (body, expected) in [
+            ("a < 2", "TaggedNumberCmpLt"),
+            ("2 < a", "TaggedNumberCmpLt"),
+            ("a > b", "TaggedNumberCmpGt"),
+        ] {
+            let source =
+                format!("fn compare(a: number, b: number) -> bool {{ {body} }} compare(1, 2);");
+            let compiled = crate::compile_source(&source).unwrap();
+            let ssa = build_aot_ssa(&compiled.program).unwrap();
+            ssa.verify().unwrap();
+            let text = ssa.text();
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains("InterpreterBoundary"), "{text}");
+            for inst in ssa.blocks.iter().flat_map(|block| &block.insts) {
+                if matches!(
+                    inst.kind,
+                    AotSsaInstKind::TaggedNumberCmpLt { .. }
+                        | AotSsaInstKind::TaggedNumberCmpGt { .. }
+                ) {
+                    assert_eq!(inst.output.repr, AotSsaValueRepr::Bool);
+                    assert_eq!(inst.kind.inputs().len(), 2);
+                    assert_eq!(
+                        operand_types_at(&compiled.program, inst.ip),
+                        (ValueType::Unknown, ValueType::Unknown)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aot_ssa_number_factorial_uses_only_measured_dynamic_arithmetic() {
+        let compiled = crate::compile_source("fn factorial(n: number) -> number { if n < 2 => { 1 } else => { n * factorial(n - 1) } } factorial(6);").unwrap();
+        let ssa = build_aot_ssa(&compiled.program).unwrap();
+        ssa.verify().unwrap();
+        let text = ssa.text();
+        for kind in ["TaggedNumberCmpLt", "TaggedNumberSub", "TaggedNumberMul"] {
+            assert!(text.contains(kind), "{text}");
+        }
+        assert!(!text.contains("InterpreterBoundary"), "{text}");
+        for inst in ssa.blocks.iter().flat_map(|block| &block.insts) {
+            if matches!(
+                inst.kind,
+                AotSsaInstKind::TaggedNumberSub { .. } | AotSsaInstKind::TaggedNumberMul { .. }
+            ) {
+                assert_eq!(inst.output.repr, AotSsaValueRepr::Tagged);
+                assert_eq!(inst.kind.inputs().len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn aot_ssa_retains_static_numeric_fast_paths_and_checked_float_coercion() {
+        for (parameter, literal, expected) in [
+            ("int", "2", "IntCmpLt"),
+            ("float", "2.0", "FloatCmpLt"),
+            ("number", "2.0", "TaggedNumberToFloat"),
+        ] {
+            let argument = if parameter == "float" { "1.0" } else { "1" };
+            let source = format!(
+                "fn compare(n: {parameter}) -> bool {{ n < {literal} }} compare({argument});"
+            );
+            let compiled = crate::compile_source(&source).unwrap();
+            let ssa = build_aot_ssa(&compiled.program).unwrap();
+            ssa.verify().unwrap();
+            let text = ssa.text();
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains("TaggedNumberCmpLt"), "{text}");
+        }
+    }
 
     #[test]
     fn aot_ssa_exposes_call_and_resume_checkpoints() {

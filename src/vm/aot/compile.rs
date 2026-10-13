@@ -1113,6 +1113,21 @@ fn lower_aot_ssa_inst(
             value_reprs,
         )?,
         AotSsaInstKind::IntAdd { lhs, rhs } => b.ins().iadd(values[lhs], values[rhs]),
+        AotSsaInstKind::TaggedNumberSub { lhs, rhs }
+        | AotSsaInstKind::TaggedNumberMul { lhs, rhs } => {
+            let lhs = aot_box_numeric_operand(b, ctx, values[lhs], value_reprs[lhs])?;
+            let rhs = aot_box_numeric_operand(b, ctx, values[rhs], value_reprs[rhs])?;
+            aot_lower_tagged_number_arithmetic(
+                b,
+                ctx,
+                AotBinaryOp {
+                    ip: inst.ip,
+                    lhs,
+                    rhs,
+                },
+                matches!(inst.kind, AotSsaInstKind::TaggedNumberMul { .. }),
+            )?
+        }
         AotSsaInstKind::IntSub { lhs, rhs } => b.ins().isub(values[lhs], values[rhs]),
         AotSsaInstKind::IntMul { lhs, rhs } => b.ins().imul(values[lhs], values[rhs]),
         AotSsaInstKind::IntDiv { lhs, rhs } => aot_lower_int_divrem(
@@ -1183,6 +1198,21 @@ fn lower_aot_ssa_inst(
         }
         AotSsaInstKind::BoolCmpEq { lhs, rhs } => {
             b.ins().icmp(IntCC::Equal, values[lhs], values[rhs])
+        }
+        AotSsaInstKind::TaggedNumberCmpLt { lhs, rhs }
+        | AotSsaInstKind::TaggedNumberCmpGt { lhs, rhs } => {
+            let lhs = aot_box_numeric_operand(b, ctx, values[lhs], value_reprs[lhs])?;
+            let rhs = aot_box_numeric_operand(b, ctx, values[rhs], value_reprs[rhs])?;
+            aot_lower_tagged_number_compare(
+                b,
+                ctx,
+                AotBinaryOp {
+                    ip: inst.ip,
+                    lhs,
+                    rhs,
+                },
+                matches!(inst.kind, AotSsaInstKind::TaggedNumberCmpLt { .. }),
+            )?
         }
         AotSsaInstKind::TaggedCmpEq { lhs, rhs } => aot_lower_tagged_eq(
             b,
@@ -2182,6 +2212,166 @@ fn aot_lower_int_divrem(
 
     b.switch_to_block(cont);
     b.block_params(cont)[0]
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_box_numeric_operand(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    value: cranelift_codegen::ir::Value,
+    repr: AotSsaValueRepr,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    if repr == AotSsaValueRepr::Tagged {
+        return Ok(value);
+    }
+    let slot = alloc_single_value_slot(b, ctx.pointer_type, ctx.layout.value.size)?;
+    match repr {
+        AotSsaValueRepr::I64 => ssa_store_int_in_value(b, ctx.layout.value, slot, value),
+        AotSsaValueRepr::F64 => ssa_store_float_in_value(b, ctx.layout.value, slot, value),
+        _ => {
+            return Err(AotCompileError::Codegen(
+                "non-numeric operand representation".into(),
+            ));
+        }
+    }
+    Ok(slot)
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_tagged_number_dispatch(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    op: AotBinaryOp,
+) -> Result<(Block, Block), AotCompileError> {
+    let AotBinaryOp { ip, lhs, rhs } = op;
+    let layout = ctx.layout.value;
+    let lhs_tag = ssa_load_tag_i32(b, layout, lhs);
+    let rhs_tag = ssa_load_tag_i32(b, layout, rhs);
+    let lhs_int = b
+        .ins()
+        .icmp_imm(IntCC::Equal, lhs_tag, i64::from(layout.int_tag));
+    let rhs_int = b
+        .ins()
+        .icmp_imm(IntCC::Equal, rhs_tag, i64::from(layout.int_tag));
+    let lhs_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, lhs_tag, i64::from(layout.float_tag));
+    let rhs_float = b
+        .ins()
+        .icmp_imm(IntCC::Equal, rhs_tag, i64::from(layout.float_tag));
+    let lhs_numeric = b.ins().bor(lhs_int, lhs_float);
+    let rhs_numeric = b.ins().bor(rhs_int, rhs_float);
+    let valid = b.ins().band(lhs_numeric, rhs_numeric);
+    let dispatch = b.create_block();
+    let fail = b.create_block();
+    let ints = b.create_block();
+    let floats = b.create_block();
+    b.ins().brif(valid, dispatch, &[], fail, &[]);
+
+    b.switch_to_block(fail);
+    aot_emit_error_status(
+        b,
+        ctx.vm_ptr,
+        ctx.exit_block,
+        ctx.pointer_type,
+        ctx.offsets,
+        ip,
+    )?;
+
+    b.switch_to_block(dispatch);
+    let both_int = b.ins().band(lhs_int, rhs_int);
+    b.ins().brif(both_int, ints, &[], floats, &[]);
+    Ok((ints, floats))
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_lower_tagged_number_arithmetic(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    op: AotBinaryOp,
+    is_mul: bool,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotBinaryOp { ip, lhs, rhs } = op;
+    let layout = ctx.layout.value;
+    // The result can only hold Int or Float, so this private scratch Value
+    // has no resource ownership to initialize, clone, or release.
+    let out = alloc_single_value_slot(b, ctx.pointer_type, layout.size)?;
+    let (ints, floats) = aot_tagged_number_dispatch(b, ctx, op)?;
+    let done = b.create_block();
+
+    b.switch_to_block(ints);
+    let lhs_value = b
+        .ins()
+        .load(types::I64, MemFlags::new(), lhs, layout.int_payload_offset);
+    let rhs_value = b
+        .ins()
+        .load(types::I64, MemFlags::new(), rhs, layout.int_payload_offset);
+    let result = if is_mul {
+        b.ins().imul(lhs_value, rhs_value)
+    } else {
+        b.ins().isub(lhs_value, rhs_value)
+    };
+    ssa_store_int_in_value(b, layout, out, result);
+    b.ins().jump(done, &[]);
+
+    b.switch_to_block(floats);
+    let lhs_value = aot_lower_tagged_number_to_float(b, ctx, AotTaggedValueOp { ip, value: lhs })?;
+    let rhs_value = aot_lower_tagged_number_to_float(b, ctx, AotTaggedValueOp { ip, value: rhs })?;
+    let result = if is_mul {
+        b.ins().fmul(lhs_value, rhs_value)
+    } else {
+        b.ins().fsub(lhs_value, rhs_value)
+    };
+    ssa_store_float_in_value(b, layout, out, result);
+    b.ins().jump(done, &[]);
+
+    b.switch_to_block(done);
+    Ok(out)
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_lower_tagged_number_compare(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    op: AotBinaryOp,
+    is_lt: bool,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotBinaryOp { ip, lhs, rhs } = op;
+    let layout = ctx.layout.value;
+    let (ints, floats) = aot_tagged_number_dispatch(b, ctx, op)?;
+    let done = b.create_block();
+    b.append_block_param(done, types::I8);
+
+    // Payloads are read only after both existing tags have been checked.
+    // Int/Int must not lose precision through an f64 conversion.
+    b.switch_to_block(ints);
+    let lhs_value = b
+        .ins()
+        .load(types::I64, MemFlags::new(), lhs, layout.int_payload_offset);
+    let rhs_value = b
+        .ins()
+        .load(types::I64, MemFlags::new(), rhs, layout.int_payload_offset);
+    let cc = if is_lt {
+        IntCC::SignedLessThan
+    } else {
+        IntCC::SignedGreaterThan
+    };
+    let result = b.ins().icmp(cc, lhs_value, rhs_value);
+    b.ins().jump(done, &[BlockArg::Value(result)]);
+
+    b.switch_to_block(floats);
+    let lhs_value = aot_lower_tagged_number_to_float(b, ctx, AotTaggedValueOp { ip, value: lhs })?;
+    let rhs_value = aot_lower_tagged_number_to_float(b, ctx, AotTaggedValueOp { ip, value: rhs })?;
+    let cc = if is_lt {
+        cranelift_codegen::ir::condcodes::FloatCC::LessThan
+    } else {
+        cranelift_codegen::ir::condcodes::FloatCC::GreaterThan
+    };
+    let result = b.ins().fcmp(cc, lhs_value, rhs_value);
+    b.ins().jump(done, &[BlockArg::Value(result)]);
+
+    b.switch_to_block(done);
+    Ok(b.block_params(done)[0])
 }
 
 #[cfg(feature = "cranelift-jit")]
