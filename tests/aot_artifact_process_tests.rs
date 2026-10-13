@@ -149,6 +149,71 @@ fn roundtrip(name: &str, source: &str, result: i64) {
 }
 
 #[test]
+fn fresh_process_number_factorial_artifact_is_native_with_and_without_source() {
+    roundtrip(
+        "number-factorial",
+        "fn factorial(n: number) -> number { if n < 2 => { 1 } else => { n * factorial(n - 1) } } factorial(6);",
+        720,
+    );
+}
+
+#[test]
+fn fresh_process_float_number_factorial_retains_float_result() {
+    let fixture = Fixture::new("float-number-factorial");
+    let source = fixture.0.join("program.rss");
+    let artifact = fixture.0.join("program.pat");
+    fs::write(&source, "fn factorial(n: number) -> number { if n < 2 => { 1 } else => { n * factorial(n - 1) } } factorial(6.0);").unwrap();
+    let source = source.to_str().unwrap();
+    let artifact = artifact.to_str().unwrap();
+    let assert_float_native = |output: Output| {
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("vm halted"), "{stdout}");
+        assert!(stdout.contains("stack: [Float(720.0)]"), "{stdout}");
+        assert!(stdout.contains("lowering=ssa"), "{stdout}");
+        assert!(!stdout.contains("interpreter-boundary"), "{stdout}");
+        let count = stdout
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("aot executions: "))
+            .expect("native execution count")
+            .parse::<u64>()
+            .unwrap();
+        assert!(count > 0, "{stdout}");
+    };
+    assert_float_native(run_cli(&[
+        "--aot-save",
+        artifact,
+        "--aot-dump",
+        "--fuel",
+        "100000",
+        source,
+    ]));
+    assert_float_native(run_cli(&[
+        "--aot-load",
+        artifact,
+        "--aot-dump",
+        "--fuel",
+        "100000",
+        source,
+    ]));
+    assert_float_native(run_cli(&[
+        "--aot-load",
+        artifact,
+        "--aot-dump",
+        "--fuel",
+        "100000",
+    ]));
+    fs::remove_file(source).unwrap();
+    assert_float_native(run_cli(&[
+        "--aot-load",
+        artifact,
+        "--aot-dump",
+        "--fuel",
+        "100000",
+    ]));
+}
+
+#[test]
 fn fresh_process_native_artifact_loads_both_entrypoints() {
     roundtrip("neutral", "let value = 1 + 2; value;", 3);
 }
