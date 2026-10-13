@@ -76,6 +76,7 @@ struct PreparedTypedUnits {
     module_graph: Option<ModuleGraph>,
     analysis_errors: Vec<CompileError>,
     entry_local_types: Vec<typing::EntryLocalType>,
+    capture_source_policies: HashMap<String, bool>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -225,6 +226,10 @@ fn prepare_typed_units_with_entry(
         module_graph,
         analysis_errors,
         entry_local_types,
+        capture_source_policies: owners
+            .iter()
+            .map(|owner| (owner.source_name.clone(), owner.policy.ownership_checking))
+            .collect(),
     })
 }
 
@@ -821,6 +826,7 @@ fn frontend_policy_for_flavor(
         .ok_or(SourcePathError::MissingFrontendPlugin(flavor))
 }
 
+#[cfg(all(test, feature = "runtime"))]
 fn compile_parsed_output(
     source: String,
     parsed: FrontendIr,
@@ -839,6 +845,7 @@ fn compile_parsed_output(
     )
 }
 
+#[cfg(all(test, feature = "runtime"))]
 fn compile_parsed_output_with_entry_locals(
     source: String,
     parsed: FrontendIr,
@@ -847,6 +854,31 @@ fn compile_parsed_output_with_entry_locals(
     behavior: CompileBehavior,
     typing_mode: TypingMode,
     enable_local_move_semantics: bool,
+) -> Result<CompiledProgram, SourceError> {
+    compile_parsed_output_with_capture_output(
+        source,
+        parsed,
+        entry_locals,
+        entry_local_types,
+        behavior,
+        typing_mode,
+        enable_local_move_semantics,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_parsed_output_with_capture_output(
+    source: String,
+    parsed: FrontendIr,
+    entry_locals: &[lifetime::EntryLocalAvailability],
+    entry_local_types: &[typing::EntryLocalType],
+    behavior: CompileBehavior,
+    typing_mode: TypingMode,
+    enable_local_move_semantics: bool,
+    certification: Option<&mut super::capture_certification::CaptureCertification>,
+    capture_source_policies: Option<super::capture_certification::CaptureProducerPolicies<'_>>,
 ) -> Result<CompiledProgram, SourceError> {
     // Normal compilation passes no entry locals. The REPL uses this hook to treat
     // carried-over locals from prior entries as already available at snippet start.
@@ -880,7 +912,7 @@ fn compile_parsed_output_with_entry_locals(
         &owned_local_slots,
     )
     .map_err(SourceError::Parse)?;
-    compile_owned_ir_output(
+    compile_owned_ir_with_capture_output(
         source,
         parsed,
         entry_local_types,
@@ -888,7 +920,10 @@ fn compile_parsed_output_with_entry_locals(
         enable_local_move_semantics,
         local_debug_ranges,
         LocalLayoutPolicy::Compact,
+        certification,
+        capture_source_policies,
     )
+    .map(|(compiled, _)| compiled)
 }
 
 /// Final layout belongs to the compilation owner, not current-snippet liveness.
@@ -900,27 +935,6 @@ enum LocalLayoutPolicy<'a> {
     PersistentRoots(&'a [ReplLocalBinding]),
 }
 
-fn compile_owned_ir_output(
-    source: String,
-    parsed: FrontendIr,
-    entry_local_types: &[typing::EntryLocalType],
-    typing_mode: TypingMode,
-    enable_local_move_semantics: bool,
-    local_debug_ranges: HashMap<String, LocalDebugRange>,
-    local_layout: LocalLayoutPolicy<'_>,
-) -> Result<CompiledProgram, SourceError> {
-    compile_owned_ir_with_root_projection(
-        source,
-        parsed,
-        entry_local_types,
-        typing_mode,
-        enable_local_move_semantics,
-        local_debug_ranges,
-        local_layout,
-    )
-    .map(|(compiled, _)| compiled)
-}
-
 fn compile_owned_ir_with_root_projection(
     source: String,
     parsed: FrontendIr,
@@ -930,6 +944,42 @@ fn compile_owned_ir_with_root_projection(
     local_debug_ranges: HashMap<String, LocalDebugRange>,
     local_layout: LocalLayoutPolicy<'_>,
 ) -> Result<(CompiledProgram, Vec<typing::EntryLocalType>), SourceError> {
+    compile_owned_ir_with_capture_output(
+        source,
+        parsed,
+        entry_local_types,
+        typing_mode,
+        enable_local_move_semantics,
+        local_debug_ranges,
+        local_layout,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_owned_ir_with_capture_output(
+    source: String,
+    parsed: FrontendIr,
+    entry_local_types: &[typing::EntryLocalType],
+    typing_mode: TypingMode,
+    enable_local_move_semantics: bool,
+    local_debug_ranges: HashMap<String, LocalDebugRange>,
+    local_layout: LocalLayoutPolicy<'_>,
+    certification: Option<&mut super::capture_certification::CaptureCertification>,
+    capture_source_policies: Option<super::capture_certification::CaptureProducerPolicies<'_>>,
+) -> Result<(CompiledProgram, Vec<typing::EntryLocalType>), SourceError> {
+    // Authority follows each admitted producer, never the merged entry policy.
+    let mut origins = certification.as_ref().map(|_| {
+        let mut origins =
+            typing::infer_types_with_capture_origins(&parsed, typing_mode, entry_local_types, &[])
+                .2;
+        let Some(policies) = capture_source_policies else {
+            return Default::default();
+        };
+        origins.retain_admitted_producers(&parsed, policies);
+        origins
+    });
     // Classify named callable materialization on the final merged IR
     // (post-lifetime, so capture metadata and rewritten uses are
     // authoritative). Codegen consumes `requires_callable_slot` to omit
@@ -943,11 +993,19 @@ fn compile_owned_ir_with_root_projection(
     // the unallocated IR.
     let callable_use_facts = materialization::classify_named_callables(&parsed);
     let (parsed, entry_local_types, root_slots) = match local_layout {
-        LocalLayoutPolicy::Compact => (
+        LocalLayoutPolicy::Compact if origins.is_none() => (
             lifetime::allocate_local_slots(parsed).map_err(SourceError::Parse)?,
             entry_local_types.to_vec(),
             Vec::new(),
         ),
+        LocalLayoutPolicy::Compact => {
+            let allocation = lifetime::allocate_local_slots_with_root_slots(parsed, &[])
+                .map_err(SourceError::Parse)?;
+            if let Some(origins) = &mut origins {
+                origins.remap(&allocation.mapping);
+            }
+            (allocation.ir, entry_local_types.to_vec(), Vec::new())
+        }
         LocalLayoutPolicy::PersistentRoots(bindings) => {
             // The parser/session owner identifies observable root bindings.
             // The frontend's cumulative locals count also contains callee
@@ -970,6 +1028,9 @@ fn compile_owned_ir_with_root_projection(
                 .collect::<Result<Vec<_>, _>>()?;
             let allocation = lifetime::allocate_local_slots_with_root_slots(parsed, &root_slots)
                 .map_err(SourceError::Parse)?;
+            if let Some(origins) = &mut origins {
+                origins.remap(&allocation.mapping);
+            }
             let remapped_types = entry_local_types
                 .iter()
                 .map(|entry| {
@@ -1100,9 +1161,13 @@ fn compile_owned_ir_with_root_projection(
             .add_local_debug(name, index, range.declared_line, range.last_line)
             .map_err(SourceError::Compile)?;
     }
-    let mut program = compiler
-        .compile_program(&stmts)
-        .map_err(SourceError::Compile)?;
+    let mut program = match (certification, origins) {
+        (Some(output), Some(origins)) => {
+            compiler.compile_program_certified(&stmts, &origins, output)
+        }
+        _ => compiler.compile_program(&stmts),
+    }
+    .map_err(SourceError::Compile)?;
     program.local_count = program.local_count.max(locals);
     let runtime_locals = program.local_count;
     Ok((
@@ -1441,6 +1506,23 @@ fn record_local_source_names(
             | Stmt::Drop { .. } => {}
         }
     }
+}
+
+/// Retains compiler capture authority while preserving ordinary source admission.
+pub fn compile_source_with_capture_certification(
+    source: &str,
+) -> Result<super::CertifiedCompilation, SourceError> {
+    let source = source.to_owned();
+    run_with_compiler_stack(move || {
+        let mut facts = Default::default();
+        let compiled = compile_source_with_flavor_capture_output(
+            &source,
+            SourceFlavor::RustScript,
+            CompileBehavior::DEFAULT,
+            Some(&mut facts),
+        )?;
+        Ok(super::CertifiedCompilation { compiled, facts })
+    })
 }
 
 pub fn compile_source(source: &str) -> Result<CompiledProgram, SourceError> {
@@ -2413,6 +2495,15 @@ fn compile_source_with_flavor_impl(
     flavor: SourceFlavor,
     behavior: CompileBehavior,
 ) -> Result<CompiledProgram, SourceError> {
+    compile_source_with_flavor_capture_output(source, flavor, behavior, None)
+}
+
+fn compile_source_with_flavor_capture_output(
+    source: &str,
+    flavor: SourceFlavor,
+    behavior: CompileBehavior,
+    certification: Option<&mut super::capture_certification::CaptureCertification>,
+) -> Result<CompiledProgram, SourceError> {
     let mut source_map = SourceMap::new();
     let source_id = source_map.add_source("<source>", source.to_string());
     let effective =
@@ -2423,12 +2514,25 @@ fn compile_source_with_flavor_impl(
         })?;
     let policy = frontend_policy_for_flavor(flavor, &effective)
         .map_err(|err| SourceError::Parse(ParseError::new(err.to_string())))?;
-    match compile_parsed_output(
+    // The registered standalone source owns this parse. Keep its identity
+    // private so ordinary diagnostic source metadata remains unchanged.
+    let capture_source_policies =
+        HashMap::from([("<source>".to_owned(), policy.ownership_checking)]);
+    match compile_parsed_output_with_capture_output(
         source.to_string(),
         parsed,
+        &[],
+        &[],
         behavior,
         policy.typing_mode,
         policy.ownership_checking,
+        certification,
+        Some(
+            super::capture_certification::CaptureProducerPolicies::Standalone {
+                source: "<source>",
+                policies: &capture_source_policies,
+            },
+        ),
     ) {
         Err(SourceError::Parse(err)) => Err(SourceError::Parse(
             err.with_line_span_from_source(&source_map, source_id),
@@ -2446,6 +2550,29 @@ fn compile_loaded_units(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
 ) -> Result<CompiledProgram, SourcePathError> {
+    compile_loaded_units_with_capture_output(
+        source,
+        units,
+        policy,
+        module_graph,
+        sources,
+        flavor,
+        options,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_loaded_units_with_capture_output(
+    source: String,
+    units: Vec<ParsedUnit>,
+    policy: FrontendPolicy,
+    module_graph: ModuleGraph,
+    sources: SourceMap,
+    flavor: SourceFlavor,
+    options: &CompileSourceFileOptions,
+    certification: Option<&mut super::capture_certification::CaptureCertification>,
+) -> Result<CompiledProgram, SourcePathError> {
     let prepared = prepare_typed_units(
         units,
         sources,
@@ -2458,7 +2585,7 @@ fn compile_loaded_units(
     let local_debug_ranges = collect_named_local_debug_ranges(&prepared.ir);
     let owned_ir = prepared.owned_ir;
     let sources = prepared.sources;
-    compile_owned_ir_output(
+    compile_owned_ir_with_capture_output(
         source,
         owned_ir,
         &[],
@@ -2466,7 +2593,14 @@ fn compile_loaded_units(
         policy.ownership_checking,
         local_debug_ranges,
         LocalLayoutPolicy::Compact,
+        certification,
+        Some(
+            super::capture_certification::CaptureProducerPolicies::Linked(
+                &prepared.capture_source_policies,
+            ),
+        ),
     )
+    .map(|(compiled, _)| compiled)
     .map_err(|error| SourcePathError::SourceWithMap { error, sources })
 }
 
@@ -2603,6 +2737,71 @@ fn virtual_inmemory_entry_path(
         }
     };
     Ok(PathBuf::from("__pd_vm_inmemory__").join(format!("main.{extension}")))
+}
+
+/// Compiles through the ordinary module/host/ownership pipeline, retaining
+/// compiler-issued capture facts separately from the unchanged Program.
+pub fn compile_source_with_flavor_and_options_with_capture_certification(
+    source: &str,
+    flavor: SourceFlavor,
+    options: CompileSourceFileOptions,
+) -> Result<super::CertifiedCompilation, SourcePathError> {
+    let source = source.to_owned();
+    run_with_compiler_stack(move || {
+        let effective = default_http_compile_catalog_options(flavor, &options);
+        let policy = frontend_policy_for_flavor(flavor, &effective)?;
+        let path = virtual_inmemory_entry_path(flavor, &effective)?;
+        let loaded =
+            load_units_for_source_file_with_context(&path, flavor, &source, &effective, None)?;
+        let mut facts = Default::default();
+        let compiled = compile_loaded_units_with_capture_output(
+            source,
+            loaded.units,
+            policy,
+            loaded.module_graph,
+            loaded.sources,
+            flavor,
+            &effective,
+            Some(&mut facts),
+        )?;
+        Ok(super::CertifiedCompilation { compiled, facts })
+    })
+}
+
+/// Source-file counterpart, with the same options and errors as ordinary compilation.
+pub fn compile_source_file_with_capture_certification_and_options(
+    path: impl AsRef<Path>,
+    options: CompileSourceFileOptions,
+) -> Result<super::CertifiedCompilation, SourcePathError> {
+    let path = path.as_ref().to_path_buf();
+    run_with_compiler_stack(move || {
+        let flavor = SourceFlavor::from_path_with_options(&path, &options)?;
+        let effective = default_http_compile_catalog_options(flavor, &options);
+        let policy = frontend_policy_for_flavor(flavor, &effective)?;
+        let source = std::fs::read_to_string(&path)?;
+        let loaded = load_units_for_source_file(&path, flavor, &source, &effective)?;
+        let mut facts = Default::default();
+        let compiled = compile_loaded_units_with_capture_output(
+            source,
+            loaded.units,
+            policy,
+            loaded.module_graph,
+            loaded.sources,
+            flavor,
+            &effective,
+            Some(&mut facts),
+        )?;
+        Ok(super::CertifiedCompilation { compiled, facts })
+    })
+}
+
+pub fn compile_source_file_with_capture_certification(
+    path: impl AsRef<Path>,
+) -> Result<super::CertifiedCompilation, SourcePathError> {
+    compile_source_file_with_capture_certification_and_options(
+        path,
+        CompileSourceFileOptions::default(),
+    )
 }
 
 pub fn compile_source_file(path: impl AsRef<Path>) -> Result<CompiledProgram, SourcePathError> {
@@ -3027,6 +3226,81 @@ mod tests {
                 analyze_source_from_string_with_options("main.rss", invalid, options()).is_err()
             );
         }
+    }
+
+    #[test]
+    fn mixed_policy_root_statement_boundaries_survive_lifetime() {
+        let source = "use self::dep; dep::value();";
+        let options = CompileSourceFileOptions::new().with_module_override_source(
+            "dep.rss",
+            "let captured = 1; if captured == 1 { let a = 2; let b = 3; let c = 4; a + b + c; } let observer = || captured; observer(); pub fn value() -> int { 1 }",
+        );
+        let flavor = SourceFlavor::RustScript;
+        let path = virtual_inmemory_entry_path(flavor, &options).unwrap();
+        let loaded =
+            load_units_for_source_file_with_context(&path, flavor, source, &options, None).unwrap();
+        let prepared = prepare_typed_units(
+            loaded.units,
+            loaded.sources,
+            frontend_policy_for_flavor(flavor, &options).unwrap(),
+            flavor,
+            &options,
+            CompileBehavior::DEFAULT,
+            Some(loaded.module_graph),
+        )
+        .unwrap();
+        for (stage, ir) in [("admission", &prepared.ir), ("owned", &prepared.owned_ir)] {
+            println!(
+                "{stage}: stmts={} boundaries={}",
+                ir.stmts.len(),
+                ir.stmt_sources.len()
+            );
+            for (index, stmt) in ir.stmts.iter().enumerate() {
+                println!(
+                    "{stage}[{index}] source={:?} stmt={stmt:?}",
+                    ir.stmt_sources.get(index)
+                );
+            }
+        }
+        assert_eq!(
+            prepared.owned_ir.stmts.len(),
+            prepared.owned_ir.stmt_sources.len()
+        );
+        let dependency = prepared.ir.stmt_sources[2].as_deref().unwrap();
+        let assert_origins = |ir: &FrontendIr| {
+            assert_eq!(ir.stmts.len(), ir.stmt_sources.len());
+            let closure = ir
+                .stmts
+                .iter()
+                .position(|stmt| {
+                    matches!(
+                        stmt,
+                        Stmt::Let {
+                            expr: Expr::Closure(_),
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            assert_eq!(ir.stmt_sources[closure].as_deref(), Some(dependency));
+            for (stmt, source) in ir.stmts.iter().zip(&ir.stmt_sources) {
+                if matches!(stmt, Stmt::Drop { .. }) {
+                    assert_eq!(source.as_deref(), Some(dependency));
+                }
+            }
+        };
+        assert_origins(&prepared.owned_ir);
+        let owned = lifetime::enforce_source_availability_with_entry_locals(
+            prepared.ir.clone(),
+            &[],
+            false,
+            &[],
+            &prepared.capture_source_policies,
+            true,
+            &prepared.sources,
+        )
+        .unwrap();
+        assert_origins(&owned);
     }
 
     #[test]

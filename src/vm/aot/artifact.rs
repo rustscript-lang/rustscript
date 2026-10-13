@@ -136,6 +136,10 @@ impl Vm {
         } else {
             CompiledProgram::from_code(decoded.code, decoded.resume_ips)?
         };
+        // Persisted native code carries no compiler-issued cell provenance.
+        // Loading retains its legacy execution behavior, but cannot authenticate
+        // a source certificate from the artifact's cache key alone.
+        self.revoke_capture_certification();
         self.engine.aot_program = Some(compiled);
         self.engine.aot_exec_count = 0;
         Ok(())
