@@ -4,7 +4,7 @@ mod helpers;
 mod state;
 mod validate;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::ValueType;
 
@@ -24,10 +24,135 @@ pub(crate) use self::state::{
     BoundType, HostCallableSignature, LocalTypeState, TypeInferenceResult,
 };
 use super::CompileError;
+use super::FrontendTypedIr;
 use super::TypingMode;
 use super::ir::{
     Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, StructDecl, TypeSchema,
 };
+
+impl FrontendTypedIr<'_> {
+    /// Returns the compiler's existing logical schema inference for `expression`.
+    pub fn schema_of_expr(&self, expression: &Expr) -> Option<TypeSchema> {
+        let state = local_state_from_schemas(self.local_schemas);
+        let function_names = build_function_names(&self.ir.functions);
+        let function_decls = build_function_decl_map(&self.ir.functions);
+        let host_import_return_types =
+            build_host_import_return_types(&self.ir.functions, &self.ir.function_impls);
+        let host_import_signatures =
+            build_host_import_signatures(&self.ir.functions, &self.ir.function_impls);
+        let mut context = TypeContext::new(
+            &self.ir.function_impls,
+            &function_decls,
+            &self.ir.struct_schemas,
+            &function_names,
+            &host_import_return_types,
+            &host_import_signatures,
+            TypingMode::DynamicHints,
+            self.ir.parsed_semantic_index.as_ref(),
+        );
+        let schema = context
+            .infer_expr_schema(expression, &state)
+            .or_else(|| scalar_schema_from_bound_type(context.infer_expr_type(expression, &state)));
+        schema.map(|schema| {
+            if context.expr_is_optional(expression, &state)
+                && !matches!(schema, TypeSchema::Optional(_))
+            {
+                TypeSchema::Optional(Box::new(schema))
+            } else {
+                schema
+            }
+        })
+    }
+
+    /// Returns the complete logical callable schema for a declared function.
+    pub fn schema_of_function(&self, index: u16) -> Option<TypeSchema> {
+        let declaration = self.ir.functions.iter().find(|decl| decl.index == index)?;
+        let state = local_state_from_schemas(self.local_schemas);
+        let function_names = build_function_names(&self.ir.functions);
+        let function_decls = build_function_decl_map(&self.ir.functions);
+        let host_import_return_types =
+            build_host_import_return_types(&self.ir.functions, &self.ir.function_impls);
+        let host_import_signatures =
+            build_host_import_signatures(&self.ir.functions, &self.ir.function_impls);
+        let mut context = TypeContext::new(
+            &self.ir.function_impls,
+            &function_decls,
+            &self.ir.struct_schemas,
+            &function_names,
+            &host_import_return_types,
+            &host_import_signatures,
+            TypingMode::DynamicHints,
+            self.ir.parsed_semantic_index.as_ref(),
+        );
+        let type_args = declaration
+            .type_params
+            .iter()
+            .cloned()
+            .map(TypeSchema::GenericParam)
+            .collect::<Vec<_>>();
+        let result = match context.infer_expr_schema(&Expr::FunctionRef(index, type_args), &state) {
+            Some(TypeSchema::Callable { result, .. }) => *result,
+            _ => TypeSchema::Unknown,
+        };
+        let params = declaration
+            .args
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                declaration
+                    .arg_schemas
+                    .get(index)
+                    .cloned()
+                    .flatten()
+                    // Body-local observations are inference hints, not a
+                    // declaration-wide argument contract. Keep unannotated
+                    // parameters dynamic, as FunctionRef does.
+                    .unwrap_or(TypeSchema::Unknown)
+            })
+            .collect();
+        Some(TypeSchema::Callable {
+            params,
+            result: Box::new(result),
+        })
+    }
+}
+
+fn scalar_schema_from_bound_type(bound_type: BoundType) -> Option<TypeSchema> {
+    match bound_type {
+        BoundType::Null => Some(TypeSchema::Null),
+        BoundType::Int => Some(TypeSchema::Int),
+        BoundType::Float => Some(TypeSchema::Float),
+        BoundType::Number => Some(TypeSchema::Number),
+        BoundType::Bool => Some(TypeSchema::Bool),
+        BoundType::String => Some(TypeSchema::String),
+        BoundType::Bytes => Some(TypeSchema::Bytes),
+        BoundType::Unknown
+        | BoundType::Array
+        | BoundType::ArrayOf(_)
+        | BoundType::Map
+        | BoundType::MapOf(_)
+        | BoundType::Callable => None,
+    }
+}
+
+fn local_state_from_schemas(local_schemas: &[Option<TypeSchema>]) -> LocalTypeState {
+    let entry_local_types = local_schemas
+        .iter()
+        .enumerate()
+        .filter_map(|(index, schema)| {
+            Some(EntryLocalType {
+                slot: u16::try_from(index).ok()?,
+                schema: schema.clone(),
+                optional: false,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut state = LocalTypeState::default();
+    seed_entry_local_state(&mut state, &entry_local_types);
+    state
+}
+
+pub(crate) use self::context::render_schema_label;
 
 #[derive(Clone, Debug)]
 pub(super) struct EntryLocalType {
@@ -98,10 +223,24 @@ fn record_entry_local_types(
 }
 
 pub(super) fn legalize_builtins_and_bind_types(
-    mut ir: FrontendIr,
+    ir: FrontendIr,
     typing_mode: TypingMode,
     entry_local_types: &[EntryLocalType],
 ) -> Result<FrontendIr, CompileError> {
+    let (ir, error) = legalize_for_admission(ir, typing_mode, entry_local_types);
+    match error {
+        Some(error) => Err(error),
+        None => Ok(ir),
+    }
+}
+
+// Retain all successfully resolved facts even when another host call fails.
+// This view is admission/diagnostic-only until the error is discharged.
+pub(super) fn legalize_for_admission(
+    mut ir: FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+) -> (FrontendIr, Option<CompileError>) {
     // Exact callee spans for every parsed call site, keyed by the
     // [`SemanticNodeId`] carried on the typed [`Expr::Call`] nodes. The
     // host-call resolver attaches these to its failure diagnostic so the
@@ -122,7 +261,7 @@ pub(super) fn legalize_builtins_and_bind_types(
         let mut pass = HostCallResolutionPass::new(None, HostCallResolutionPhase::Disabled)
             .with_call_site_spans(&call_site_spans);
         run_legalize_round(&mut ir, typing_mode, entry_local_types, &mut pass);
-        return Ok(ir);
+        return (ir, None);
     };
 
     loop {
@@ -134,7 +273,7 @@ pub(super) fn legalize_builtins_and_bind_types(
             continue;
         }
         if refine.unresolved() == 0 {
-            return Ok(ir);
+            return (ir, None);
         }
 
         let mut final_pass =
@@ -145,11 +284,16 @@ pub(super) fn legalize_builtins_and_bind_types(
             continue;
         }
         if final_pass.unresolved() == 0 {
-            return Ok(ir);
+            return (ir, None);
         }
-        return Err(final_pass
-            .take_error()
-            .expect("a final unresolved catalog call must record a compile error"));
+        return (
+            ir,
+            Some(
+                final_pass
+                    .take_error()
+                    .expect("a final unresolved catalog call must record a compile error"),
+            ),
+        );
     }
 }
 
@@ -302,13 +446,32 @@ pub(super) fn infer_types(
         collect_function_types(decl.index, function_impl, decl, &mut outputs, &env);
     }
 
-    TypeInferenceResult {
+    let mut facts = TypeInferenceResult {
         local_types,
         local_schemas,
         local_schema_labels,
         callable_slots,
         optional_slots,
-    }
+        function_schemas: HashMap::new(),
+    };
+    let schemas = facts.logical_schemas();
+    let typed = FrontendTypedIr {
+        source_id: None,
+        ir,
+        local_schemas: &schemas,
+        host_api_catalog: None,
+        source_map: None,
+    };
+    facts.function_schemas = ir
+        .functions
+        .iter()
+        .filter_map(|decl| {
+            typed
+                .schema_of_function(decl.index)
+                .map(|schema| (decl.index, schema))
+        })
+        .collect();
+    facts
 }
 
 pub(super) fn validate_if_else_type_consistency(
@@ -316,6 +479,41 @@ pub(super) fn validate_if_else_type_consistency(
     typing_mode: TypingMode,
     entry_local_types: &[EntryLocalType],
 ) -> Result<(), CompileError> {
+    validate_source_type_consistency(ir, typing_mode, entry_local_types, None)
+}
+
+pub(super) fn validate_source_type_consistency(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    owner: Option<&str>,
+) -> Result<(), CompileError> {
+    check_source_type_consistency(ir, typing_mode, entry_local_types, owner, false, None)
+        .map(|_| ())
+}
+
+pub(super) fn analyze_source_type_consistency(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    owner: Option<&str>,
+    host_error: Option<&CompileError>,
+) -> Result<Vec<CompileError>, CompileError> {
+    check_source_type_consistency(ir, typing_mode, entry_local_types, owner, true, host_error)
+}
+
+fn check_source_type_consistency(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    owner: Option<&str>,
+    recover_typing_diagnostics: bool,
+    host_error: Option<&CompileError>,
+) -> Result<Vec<CompileError>, CompileError> {
+    let mut diagnostics = Vec::new();
+    let dependent_host_returns = host_error
+        .map(|error| host_error_dependent_returns(ir, error))
+        .unwrap_or_default();
     let function_names = build_function_names(&ir.functions);
     let function_decls = build_function_decl_map(&ir.functions);
     let host_import_return_types =
@@ -334,7 +532,16 @@ pub(super) fn validate_if_else_type_consistency(
         ir.parsed_semantic_index.as_ref(),
     );
     for (index, stmt) in ir.stmts.iter().enumerate() {
-        validate_stmts(
+        if owner.is_some_and(|owner| {
+            ir.stmt_sources
+                .get(index)
+                .and_then(|source| source.as_deref())
+                != Some(owner)
+        }) {
+            context.apply_stmts(std::slice::from_ref(stmt), &mut top_state);
+            continue;
+        }
+        if let Err(error) = validate_stmts(
             std::slice::from_ref(stmt),
             &mut top_state,
             None,
@@ -343,22 +550,116 @@ pub(super) fn validate_if_else_type_consistency(
                 .and_then(|source| source.as_deref()),
             &mut context,
             false,
-        )?;
+        ) {
+            retain_native_typing_diagnostic(error, recover_typing_diagnostics, &mut diagnostics)?;
+            // A failed statement still contributes its real type flow to later
+            // validation sites; an earlier diagnostic cannot mask a hard error.
+            context.apply_stmts(std::slice::from_ref(stmt), &mut top_state);
+        }
     }
 
     for decl in &ir.functions {
         let Some(function_impl) = ir.function_impls.get(&decl.index) else {
             continue;
         };
-        validate_function_impl(
+        if owner.is_some_and(|owner| {
+            ir.function_sources.get(&decl.index).map(String::as_str) != Some(owner)
+        }) {
+            continue;
+        }
+        if let Err(error) = validate_function_impl(
             decl.index,
             function_impl,
             ir.function_sources.get(&decl.index).map(String::as_str),
             &mut context,
-        )?;
+        ) {
+            // Only the final inferred-return error of a provenance-proven
+            // direct call chain is fallout from this rejected host call.
+            // Body validation already ran; independent Strict slot admission
+            // and source hooks still run in the shared pipeline afterwards.
+            if recover_typing_diagnostics
+                && dependent_host_returns.contains(&decl.index)
+                && matches!(&error, CompileError::StrictTypingRequired {
+                    line: Some(line), span: Some(span), ..
+                } if *line == function_impl.body_expr_line
+                    && ir.parsed_semantic_index.as_ref().is_some_and(|index| {
+                        index.func_decls.iter().any(|site| {
+                            site.function_index == decl.index && site.ident_span == *span
+                        })
+                    }))
+            {
+                // Its unresolved facts remain unchanged; the exact host error
+                // is retained by the pipeline instead of a return cascade.
+                continue;
+            }
+            retain_native_typing_diagnostic(error, recover_typing_diagnostics, &mut diagnostics)?;
+        }
     }
 
-    Ok(())
+    Ok(diagnostics)
+}
+
+fn host_error_dependent_returns(ir: &FrontendIr, error: &CompileError) -> HashSet<u16> {
+    let CompileError::HostCallResolve {
+        span: Some(callee), ..
+    } = error
+    else {
+        return HashSet::new();
+    };
+    let Some(index) = ir.parsed_semantic_index.as_ref() else {
+        return HashSet::new();
+    };
+    let mut affected = HashSet::new();
+    loop {
+        let before = affected.len();
+        for declaration in &ir.functions {
+            if declaration.return_schema.is_some() || affected.contains(&declaration.index) {
+                continue;
+            }
+            let Some(implementation) = ir.function_impls.get(&declaration.index) else {
+                continue;
+            };
+            let Expr::Call(target, _, _, None, Some(id)) = &implementation.body_expr else {
+                continue;
+            };
+            let Some(site) = index.call_sites.iter().find(|site| site.id == *id) else {
+                continue;
+            };
+            let failed_host = site.callee_span == *callee
+                && ir
+                    .host_api_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.candidates(*target))
+                    .is_some();
+            if failed_host || affected.contains(target) {
+                affected.insert(declaration.index);
+            }
+        }
+        if before == affected.len() {
+            break;
+        }
+    }
+    affected
+}
+
+fn retain_native_typing_diagnostic(
+    error: CompileError,
+    recover: bool,
+    diagnostics: &mut Vec<CompileError>,
+) -> Result<(), CompileError> {
+    if recover
+        && matches!(
+            error,
+            CompileError::BinaryOperandTypeMismatch { .. }
+                | CompileError::IfElseBranchTypeMismatch { .. }
+                | CompileError::CallableArgumentTypeMismatch { .. }
+        )
+    {
+        diagnostics.push(error);
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 pub(crate) fn infer_expr_type(expr: &Expr, state: &LocalTypeState) -> BoundType {
@@ -796,23 +1097,101 @@ mod catalog_call_resolution_tests {
         let hint_error = crate::compiler::collect_inferred_local_type_hints_with_options(
             source,
             SourceFlavor::RustScript,
-            CompileSourceFileOptions::default().with_host_api_catalog(catalog),
+            CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog)),
         )
         .expect_err("hint collection must return the resolver error");
 
-        for error in [compile_error, hint_error] {
+        for (entrypoint, error) in [("compile", compile_error), ("hint", hint_error)] {
             let source_error = match error {
                 crate::compiler::SourcePathError::Source(error) => error,
                 crate::compiler::SourcePathError::SourceWithMap { error, .. } => error,
                 other => panic!("unexpected path error: {other}"),
             };
-            assert!(matches!(
-                source_error,
-                crate::compiler::SourceError::Compile(CompileError::HostCallResolve {
-                    line: Some(3),
+            assert!(
+                matches!(
+                    source_error,
+                    crate::compiler::SourceError::Compile(CompileError::HostCallResolve {
+                        line: Some(3),
+                        ..
+                    })
+                ),
+                "{entrypoint}: {source_error:?}"
+            );
+        }
+
+        let configured =
+            || CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+        let valid = "use acme;\nlet file = acme::open(\"x\");\nacme::consume(file);\n";
+        crate::compiler::compile_source_with_flavor_and_options(
+            valid,
+            SourceFlavor::RustScript,
+            configured(),
+        )
+        .expect("the original owned resource remains admissible");
+        let hints = crate::compiler::collect_inferred_local_type_hints_with_options(
+            valid,
+            SourceFlavor::RustScript,
+            configured(),
+        )
+        .unwrap();
+        assert!(hints.iter().any(|hint| {
+            hint.name == "file"
+                && hint.schema
+                    == Some(TypeSchema::Resource(
+                        ResourceTypeKey::new("acme.file").unwrap(),
+                    ))
+        }));
+
+        // Recovery still runs ownership admission. A standalone copy or a
+        // use-after-move is independent of an invalid catalog call, including
+        // when the independent statement shares the same source line.
+        for invalid in [
+            source,
+            "use acme;\nlet file = acme::open(\"x\");\nfile.copy(); acme::consume(42);\n",
+            "use acme;\nlet file = acme::open(\"x\");\nacme::consume(42); file.copy();\n",
+            "use acme;\nlet file = acme::open(\"x\");\nacme::consume(file);\nfile;\nacme::consume(42);\n",
+        ] {
+            let analyzed = crate::compiler::analyze_source_from_string_with_options(
+                "main.rss",
+                invalid,
+                configured(),
+            )
+            .err()
+            .expect("host recovery must retain ownership rejection");
+            let mut errors = vec![analyzed];
+            if invalid != source {
+                errors.push(
+                    crate::compiler::compile_source_with_flavor_and_options(
+                        invalid,
+                        SourceFlavor::RustScript,
+                        configured(),
+                    )
+                    .err()
+                    .expect("independent ownership rejection in compile"),
+                );
+                errors.push(
+                    crate::compiler::collect_inferred_local_type_hints_with_options(
+                        invalid,
+                        SourceFlavor::RustScript,
+                        configured(),
+                    )
+                    .expect_err("independent ownership rejection in hints"),
+                );
+            }
+            for error in errors {
+                let crate::compiler::SourcePathError::SourceWithMap {
+                    error: crate::compiler::SourceError::Parse(error),
                     ..
-                })
-            ));
+                } = error
+                else {
+                    panic!("independent ownership diagnostic required: {error:?}");
+                };
+                assert!(
+                    error.code.as_deref() == Some("E_OWNERSHIP_COPY_RESOURCE")
+                        || error.message.contains("moved"),
+                    "{error:?}"
+                );
+            }
         }
     }
 

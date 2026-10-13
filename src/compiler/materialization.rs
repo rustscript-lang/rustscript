@@ -1489,6 +1489,7 @@ mod tests {
             module: ModuleId(2),
             source_id: 1,
             host_catalog_supplied: false,
+            runtime_reachable: true,
         };
 
         let root_unit = ParsedUnit {
@@ -1512,6 +1513,7 @@ mod tests {
             module: ModuleId(1),
             source_id: 0,
             host_catalog_supplied: false,
+            runtime_reachable: true,
         };
 
         let merged =
