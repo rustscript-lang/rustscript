@@ -6,6 +6,7 @@ use std::task::{Context, Poll, Waker};
 
 pub(crate) mod aot;
 pub mod async_host;
+mod callable_maintenance;
 mod capability;
 pub mod diagnostics;
 mod engine;
@@ -36,6 +37,9 @@ mod tests;
 pub use self::aot::AotArtifactError;
 use self::async_host::preserve_stream_cleanup;
 pub use self::async_host::{CaptureAsyncHostContext, HostFuture, HostFutureOutput};
+pub use self::callable_maintenance::{
+    CallableIdentityMaintenanceConfig, CallableIdentityMaintenanceStats,
+};
 pub use self::capability::{CapabilityProfile, CapabilityProfileBuilder};
 use self::engine::Engine;
 pub use self::epoch::{EpochCheckpoint, EpochHandle};
@@ -1149,13 +1153,16 @@ impl Vm {
     pub fn new_shared_with_jit_config(program: Arc<Program>, jit_config: jit::JitConfig) -> Self {
         let engine = Engine::new(jit_config, &program);
         let mut instance = Instance::new(&program);
-        instance.initialize_root_callable_bindings(&program);
+        let mut host = HostRuntime::with_standard_composition(crate::standard_composition());
+        instance.initialize_root_callable_bindings(&program, |entries| {
+            callable_maintenance::after_registration(entries, &mut host.module_state_store);
+        });
         Self {
             program,
             engine,
             instance,
             run_ctx: RunContext::default(),
-            host: HostRuntime::with_standard_composition(crate::standard_composition()),
+            host,
         }
     }
 
@@ -1296,7 +1303,10 @@ impl Vm {
             return Err(error);
         }
         self.run_ctx.reset_for_reuse();
-        self.instance.reset(&self.program);
+        callable_maintenance::identities_cleared(&mut self.host.module_state_store);
+        self.instance.reset(&self.program, |entries| {
+            callable_maintenance::after_registration(entries, &mut self.host.module_state_store);
+        });
         self.engine.reset_runtime_state(&self.program);
         Ok(())
     }
@@ -1777,9 +1787,11 @@ impl Vm {
             kind: prototype.kind,
             env,
         });
-        self.instance
-            .owned_callables
-            .push(Arc::downgrade(&callable));
+        callable_maintenance::register(
+            &mut self.instance.owned_callables,
+            &mut self.host.module_state_store,
+            Arc::downgrade(&callable),
+        );
         Ok(Value::Callable(callable))
     }
 
@@ -1979,9 +1991,11 @@ impl Vm {
                         kind,
                         env: None,
                     });
-                    self.instance
-                        .owned_callables
-                        .push(Arc::downgrade(&callable));
+                    callable_maintenance::register(
+                        &mut self.instance.owned_callables,
+                        &mut self.host.module_state_store,
+                        Arc::downgrade(&callable),
+                    );
                     self.instance.locals[local_base + relative] = Value::Callable(callable);
                 }
                 for (slot, value) in inherited_callables {
@@ -3731,6 +3745,7 @@ impl Vm {
         self.instance.queued_callables.clear();
         self.instance.completed_callable_results.clear();
         self.instance.owned_callables.clear();
+        callable_maintenance::identities_cleared(&mut self.host.module_state_store);
         self.instance.draining_queued_callables = false;
         self.clear_stack_with_drop_contract();
         self.instance.capture_cells.clear();
