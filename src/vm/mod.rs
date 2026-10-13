@@ -7,6 +7,11 @@ use std::task::{Context, Poll, Waker};
 pub(crate) mod aot;
 pub mod async_host;
 mod callable_maintenance;
+mod capture_origin;
+pub use capture_origin::{
+    CaptureCertificationStats, CaptureQueryError, CaptureRootState, CheckedResourceCapture,
+    ResourceCaptureRoot,
+};
 mod capability;
 pub mod diagnostics;
 mod engine;
@@ -1280,6 +1285,7 @@ impl Vm {
     /// `RuntimeRequired` resource error while retaining the old scope,
     /// process/pipes, and pending reset for a later poll under that runtime.
     pub fn reset_for_reuse(&mut self) -> VmResult<()> {
+        self.revoke_capture_certification();
         if self.stream_completion_running() {
             return Err(VmError::InvalidFrameState(
                 "callable stream completion is running",
@@ -1808,6 +1814,7 @@ impl Vm {
             &mut self.host.module_state_store,
             Arc::downgrade(&callable),
         );
+        self.certify_capture_cells(&callable);
         Ok(Value::Callable(callable))
     }
 
@@ -2071,6 +2078,7 @@ impl Vm {
                         }
                     }
                 }
+                self.certify_capture_frame(local_base, callable.as_ref(), prototype_id);
                 if let Some(slot) = prototype.self_slot {
                     let relative = slot as usize;
                     if relative >= local_count {
@@ -2129,6 +2137,7 @@ impl Vm {
             .execution_frames
             .pop()
             .ok_or(VmError::InvalidFrameState("missing active frame"))?;
+        self.release_capture_frame(frame.local_base);
         self.instance.active_local_base_cache = self
             .instance
             .execution_frames
@@ -2700,6 +2709,7 @@ impl Vm {
                     "callable capture ownership cycle is unsupported",
                 ));
             }
+            self.invalidate_capture_cell(&cell);
             let previous = {
                 let mut captured = cell
                     .lock()
@@ -2773,6 +2783,9 @@ impl Vm {
 
     pub(crate) fn detach_local_with_drop_contract(&mut self, index: u8) -> VmResult<()> {
         let absolute = self.absolute_local_index(index)?;
+        if let Some(cell) = self.instance.capture_cells.get(&absolute).cloned() {
+            self.invalidate_capture_cell(&cell);
+        }
         self.instance.capture_cells.remove(&absolute);
         let slot = self
             .instance
@@ -3513,6 +3526,8 @@ impl Vm {
     }
 
     pub fn set_local(&mut self, index: u8, value: Value) -> VmResult<()> {
+        self.absolute_local_index(index)?;
+        self.revoke_capture_certification();
         self.store_local_with_drop_contract(index, value)?;
         let config = *self.engine.jit.config();
         self.set_jit_config(config);
@@ -3736,6 +3751,7 @@ impl Vm {
         if self.stream_completion_running() {
             return;
         }
+        self.revoke_capture_certification();
         self.invalidate_callback_registries();
         let _ = self.cancel_waiting_host_op_with_reason(
             crate::vm::operation::OperationCancelReason::VmDrop,
@@ -3878,6 +3894,7 @@ impl Vm {
             let Some(frame) = self.instance.execution_frames.pop() else {
                 break;
             };
+            self.release_capture_frame(frame.local_base);
             let frame_end = match frame.local_base.checked_add(frame.local_count) {
                 Some(end) => end,
                 None => self.instance.locals.len(),

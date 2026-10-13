@@ -188,6 +188,26 @@ impl<'a> HostContext<'a> {
         Self { vm }
     }
 
+    /// Selects exactly one compiler-certified direct Move Resource capture in
+    /// the active script frame. Numeric equality alone never supplies origin.
+    pub fn checked_move_resource_capture<T: HostResource>(
+        &self,
+        expected_key: &ResourceTypeKey,
+    ) -> Result<super::CheckedResourceCapture<T>, super::CaptureQueryError> {
+        let (handle, root) = self.vm.checked_capture_origin(expected_key)?;
+        let token = self
+            .typed_resource_with_key::<T>(handle, expected_key)
+            .map_err(|error| super::CaptureQueryError::Resource(Box::new(error)))?;
+        Ok(super::CheckedResourceCapture::new(token, root))
+    }
+
+    pub(super) fn observe_capture_root(
+        &self,
+        root: &super::ResourceCaptureRoot,
+    ) -> super::CaptureRootState {
+        self.vm.observe_capture_root(root)
+    }
+
     /// Registers typed per-VM module state, replacing any earlier value of the
     /// same type.
     ///
