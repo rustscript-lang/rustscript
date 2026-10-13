@@ -707,7 +707,11 @@ pub(crate) extern "C" fn pd_vm_native_materialize_root_callable(
         kind: prototype.kind,
         env: None,
     });
-    vm.instance.owned_callables.push(Arc::downgrade(&callable));
+    crate::vm::callable_maintenance::register(
+        &mut vm.instance.owned_callables,
+        &mut vm.host.module_state_store,
+        Arc::downgrade(&callable),
+    );
     unsafe {
         // The owned temp slot may already hold a previous iteration's
         // materialized callable (the trace reuses the slot on every loop

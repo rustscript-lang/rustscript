@@ -148,7 +148,11 @@ impl Instance {
     /// Rewinds run-scoped interpreter state for a fresh execution of the same
     /// program. Host bindings, backend configuration, and compiled artifacts
     /// (owned outside this struct) are preserved.
-    pub(crate) fn reset(&mut self, program: &Program) {
+    pub(crate) fn reset(
+        &mut self,
+        program: &Program,
+        on_registration: impl FnMut(&mut Vec<Weak<CallableValue>>),
+    ) {
         self.invalidate_callback_registries();
         self.ip = 0;
         self.drop_contract_events = 0;
@@ -159,7 +163,7 @@ impl Instance {
         self.clear_locals_with_drop_contract();
         self.owned_callables.clear();
         self.locals.resize(program.local_count, Value::Null);
-        self.initialize_root_callable_bindings(program);
+        self.initialize_root_callable_bindings(program, on_registration);
         self.call_depth = 0;
         self.run_depth = 0;
         self.execution_frames.clear();
@@ -301,7 +305,11 @@ impl Instance {
         self.callback_registry_flags.push(Arc::downgrade(active));
     }
 
-    pub(crate) fn initialize_root_callable_bindings(&mut self, program: &Program) {
+    pub(crate) fn initialize_root_callable_bindings(
+        &mut self,
+        program: &Program,
+        mut on_registration: impl FnMut(&mut Vec<Weak<CallableValue>>),
+    ) {
         let bindings = program.root_callable_bindings.clone();
         for binding in bindings {
             let Some(kind) = program
@@ -320,6 +328,7 @@ impl Instance {
                 env: None,
             });
             self.owned_callables.push(Arc::downgrade(&callable));
+            on_registration(&mut self.owned_callables);
             self.locals[binding.local_slot as usize] = Value::Callable(callable);
         }
     }
