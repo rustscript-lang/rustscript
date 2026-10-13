@@ -706,10 +706,10 @@ mod tests {
     #[cfg(feature = "cranelift-jit")]
     #[test]
     fn artifact_rebuild_failure_preserves_engine_state_and_source_authority() {
-        // This is the existing tagged-number comparison limitation, not a
-        // synthetic failure marker. Its valid Program survives wire decoding.
+        // This is the remaining unsupported dynamic Number addition boundary,
+        // not a synthetic failure marker. Its valid Program survives wire decoding.
         let issued = crate::compile_source_with_flavor_and_options_with_capture_certification(
-            "fn below(n: number) -> bool { n < 2 } below(6);",
+            "fn successor(n: number) -> number { n + 1 } successor(6);",
             crate::SourceFlavor::RustScript,
             crate::CompileSourceFileOptions::new(),
         )
