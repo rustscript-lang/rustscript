@@ -161,7 +161,8 @@ pub use vm::host_extension::{
 pub use vm::resource::{Resource, ResourceHandle, ResourceMut, ResourceOwned, ResourceRef};
 #[cfg(feature = "runtime")]
 pub use vm::{
-    AotArtifactError, CallOutcome, CallReturn, CapabilityProfile, CapabilityProfileBuilder,
+    AotArtifactError, CallOutcome, CallReturn, CallableIdentityMaintenanceConfig,
+    CallableIdentityMaintenanceStats, CapabilityProfile, CapabilityProfileBuilder,
     CaptureAsyncHostContext, CatalogRegistrationError, CatalogSchemaSelection,
     DEFAULT_MAX_SCRIPT_CALL_DEPTH, EpochCheckpoint, EpochHandle, FuelCheckpoint, HostArgsFunction,
     HostAsyncBridge, HostAsyncOpTerminal, HostBindingPlan, HostContext, HostContextError,

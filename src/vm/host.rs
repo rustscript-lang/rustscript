@@ -156,7 +156,13 @@ impl<'vm> OwnedHostCall<'vm> {
         }
         registry.bind_vm_cached(&mut vm)?;
         configure(&mut vm)?;
-        vm.instance.owned_callables.extend(owned);
+        for callable in owned {
+            super::callable_maintenance::register(
+                &mut vm.instance.owned_callables,
+                &mut vm.host.module_state_store,
+                callable,
+            );
+        }
         clear_owned_callable_vm_state(&mut vm);
         Ok(vm)
     }
@@ -186,7 +192,13 @@ impl Vm {
                 "owned callable vm is not reusable",
             )));
         }
-        self.instance.owned_callables.extend(owned);
+        for callable in owned {
+            super::callable_maintenance::register(
+                &mut self.instance.owned_callables,
+                &mut self.host.module_state_store,
+                callable,
+            );
+        }
         clear_owned_callable_vm_state(self);
         cancellation?;
         reset?;
