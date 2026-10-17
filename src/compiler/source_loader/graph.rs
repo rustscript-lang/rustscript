@@ -1881,6 +1881,9 @@ fn resolve_expr_imported_calls(
         Expr::ResultQuery { value, .. } => {
             resolve_expr_imported_calls(ctx, value, line, parsed_semantic_index.as_deref_mut())?;
         }
+        Expr::ResultTry { value, .. } => {
+            resolve_expr_imported_calls(ctx, value, line, parsed_semantic_index.as_deref_mut())?;
+        }
         Expr::ResultMatch {
             value,
             ok_expr,

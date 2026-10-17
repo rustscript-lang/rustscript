@@ -136,6 +136,8 @@ pub enum WireError {
     InvalidUtf8,
     LengthTooLarge(&'static str, usize),
     SchemaTooDeep,
+    InvalidRetCleanup(&'static str),
+    UnsupportedCapability(&'static str),
     TrailingBytes,
 }
 
@@ -181,6 +183,10 @@ impl fmt::Display for WireError {
                 write!(f, "{field} length is too large: {length}")
             }
             Self::SchemaTooDeep => f.write_str("VMBC type schema nesting is too deep"),
+            Self::InvalidRetCleanup(reason) => write!(f, "invalid ret cleanup: {reason}"),
+            Self::UnsupportedCapability(reason) => {
+                write!(f, "unsupported capability: {reason}")
+            }
             Self::TrailingBytes => f.write_str("trailing bytes after VMBC payload"),
         }
     }

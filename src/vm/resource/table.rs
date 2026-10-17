@@ -740,6 +740,17 @@ impl ResourceTable {
         *self.slots[slot_index].state.get_mut() = state;
     }
 
+    pub(crate) fn close_erased_open_slot(
+        &mut self,
+        handle: ResourceHandle,
+        expected: &ResourceTypeKey,
+        reason: ResourceCloseReason,
+    ) -> ResourceResult<CloseProgress> {
+        self.validate_resource_type_key(handle, expected)?;
+        let slot_index = self.resolve_index(handle)?;
+        self.close_open_slot(slot_index, handle, reason)
+    }
+
     fn close_open_slot(
         &mut self,
         slot_index: usize,

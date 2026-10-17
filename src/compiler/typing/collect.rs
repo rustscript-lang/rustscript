@@ -386,6 +386,7 @@ fn collect_root_expr(
         | Expr::Closure(_) => {}
         Expr::ResultConstruct { payload, .. } => operand(payload, false),
         Expr::ResultQuery { value, .. } => operand(value, false),
+        Expr::ResultTry { value, .. } => operand(value, false),
         Expr::ResultMatch {
             value,
             ok_expr,
@@ -1212,6 +1213,19 @@ fn collect_expr_types(
             let _ = context.infer_expr_type(expr, state);
         }
         Expr::ResultQuery { value, .. } => {
+            collect_expr_types(
+                value,
+                state,
+                local_types,
+                local_schemas,
+                local_schema_labels,
+                callable_slots,
+                optional_slots,
+                context,
+            );
+            let _ = context.infer_expr_type(expr, state);
+        }
+        Expr::ResultTry { value, .. } => {
             collect_expr_types(
                 value,
                 state,
