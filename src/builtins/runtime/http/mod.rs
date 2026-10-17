@@ -117,7 +117,7 @@ pub(super) struct HttpRequestContext {
     config: HttpConfig,
     client: request::HttpClient,
     permit: ConnectionPermit,
-    prepared_request: Option<(request::HttpRequest, Instant)>,
+    request_deadline: Option<Instant>,
 }
 
 impl HttpRequestContext {
@@ -157,7 +157,7 @@ impl HttpRequestContext {
                 config,
                 client: state.client.clone(),
                 permit,
-                prepared_request: None,
+                request_deadline: None,
             },
             deadline,
         ))
@@ -170,12 +170,16 @@ impl CaptureAsyncHostContext for HttpRequestContext {
     }
 
     fn capture_with_args(vm: &mut Vm, args: &[crate::vm::Value]) -> VmResult<Self> {
-        let request = request::take_request(vm, args)?;
-        let mut context = Self::capture(vm)?;
-        let prepared = request::prepare_resource_request(&request, &context.config)?;
-        let deadline = policy::request_deadline(context.config.request_timeout)?;
-        context.prepared_request = Some((prepared, deadline));
-        Ok(context)
+        let result = (|| {
+            let mut context = Self::capture(vm)?;
+            request::with_request(vm, args, |request| {
+                request::validate_resource_request(request, &context.config)
+            })?;
+            context.request_deadline =
+                Some(policy::request_deadline(context.config.request_timeout)?);
+            Ok(context)
+        })();
+        request::finish_capture(vm, args, result)
     }
 }
 
@@ -365,19 +369,19 @@ impl crate::vm::HostExtension for HttpExtension {
 /// Sends an owned request with the embedding runtime and pooled Hyper client.
 #[pd_host_function(name = "http::client::request", contract = buffered_request_contract)]
 pub(super) async fn builtin_http_client_request(
-    _request: i64,
     #[pd_host_context] context: HttpRequestContext,
+    request: crate::vm::resource::ResourceOwned<resources::HttpRequest>,
 ) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<resources::HttpResponse>>> {
     let HttpRequestContext {
         config,
         client,
         permit,
-        prepared_request,
+        request_deadline,
     } = context;
     let _permit = permit;
-    let (request, deadline) = prepared_request.ok_or_else(|| {
-        VmError::HostError("HTTP request capture did not prepare the request".into())
-    })?;
+    let deadline = request_deadline
+        .ok_or_else(|| VmError::HostError("HTTP context requires request admission".into()))?;
+    let request = request::into_request(request.into_inner());
     let response = request::perform_buffered_request(&client, &config, &request, deadline).await?;
     Ok(HostFutureOutput::complete(move |vm| {
         let token = vm

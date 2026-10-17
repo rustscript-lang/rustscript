@@ -334,7 +334,6 @@ fn open_params() -> [TypeSchema; 3] {
 pub(super) struct SseRequestContext {
     http: HttpRequestContext,
     deadline: Instant,
-    request: HttpRequest,
 }
 impl CaptureAsyncHostContext for SseRequestContext {
     fn capture(_vm: &mut Vm) -> VmResult<Self> {
@@ -343,64 +342,67 @@ impl CaptureAsyncHostContext for SseRequestContext {
         ))
     }
     fn capture_with_args(vm: &mut Vm, args: &[Value]) -> VmResult<Self> {
-        let request = super::request::take_request(vm, args)?;
-        let callback = args.get(1).ok_or(VmError::StackUnderflow)?;
-        vm.validate_stream_positional_callback(callback, &event_params())?;
-        let mut timeout = None;
-        if let Some(arg) = args.get(2) {
-            if let Value::Int(ms) = arg {
-                timeout = Some(*ms);
-            } else {
-                vm.validate_stream_positional_callback(arg, &open_params())?;
+        let result = (|| {
+            let callback = args.get(1).ok_or(VmError::StackUnderflow)?;
+            vm.validate_stream_positional_callback(callback, &event_params())?;
+            let mut timeout = None;
+            if let Some(arg) = args.get(2) {
+                if let Value::Int(ms) = arg {
+                    timeout = Some(*ms);
+                } else {
+                    vm.validate_stream_positional_callback(arg, &open_params())?;
+                }
             }
-        }
-        if let Some(arg) = args.get(3) {
-            let Value::Int(ms) = arg else {
-                return Err(VmError::TypeMismatch("SSE timeout_ms"));
-            };
-            timeout = Some(*ms);
-        }
-        let timeout = timeout
-            .map(|ms| {
-                u64::try_from(ms)
-                    .ok()
-                    .filter(|ms| *ms > 0)
-                    .map(Duration::from_millis)
-                    .ok_or_else(|| VmError::HostError("SSE timeout_ms must be positive".into()))
-            })
-            .transpose()?;
-        let (http, deadline) = HttpRequestContext::capture_for(vm, timeout, "SSE")?;
-        let request = prepare_sse_request(&request, &http.config)?;
-        Ok(Self {
-            http,
-            deadline,
-            request,
-        })
+            if let Some(arg) = args.get(3) {
+                let Value::Int(ms) = arg else {
+                    return Err(VmError::TypeMismatch("SSE timeout_ms"));
+                };
+                timeout = Some(*ms);
+            }
+            let timeout = timeout
+                .map(|ms| {
+                    u64::try_from(ms)
+                        .ok()
+                        .filter(|ms| *ms > 0)
+                        .map(Duration::from_millis)
+                        .ok_or_else(|| VmError::HostError("SSE timeout_ms must be positive".into()))
+                })
+                .transpose()?;
+            let (http, deadline) = HttpRequestContext::capture_for(vm, timeout, "SSE")?;
+            super::request::with_request(vm, args, |request| {
+                validate_sse_request(request, &http.config)
+            })?;
+            Ok(Self { http, deadline })
+        })();
+        super::request::finish_capture(vm, args, result)
     }
 }
 
-fn prepare_sse_request(
+fn validate_sse_request(
     request: &super::resources::HttpRequest,
     config: &super::HttpConfig,
-) -> VmResult<HttpRequest> {
-    let mut request = super::request::prepare_resource_request(request, config)?;
+) -> VmResult<()> {
+    super::request::validate_resource_request(request, config)?;
     if request.method != hyper::Method::GET && request.method != hyper::Method::POST {
         return Err(VmError::HostError(
             "SSE requests require GET or POST".into(),
         ));
     }
-    if !request
-        .headers
+    let mut headers = request.headers.clone();
+    add_accept_header(&mut headers);
+    validate_request_header_budget(&headers, config)
+}
+
+fn add_accept_header(headers: &mut Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>) {
+    if !headers
         .iter()
         .any(|(name, _)| name == hyper::header::ACCEPT)
     {
-        request.headers.push((
+        headers.push((
             hyper::header::ACCEPT,
             hyper::header::HeaderValue::from_static("text/event-stream"),
         ));
     }
-    validate_request_header_budget(&request.headers, config)?;
-    Ok(request)
 }
 
 fn sse_data_event(event: SseEvent) -> Vec<Value> {
@@ -719,16 +721,15 @@ async fn open_sse_response(
 
 async fn stream_sse(
     context: SseRequestContext,
+    request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
     callback: Value,
     on_open: Option<Value>,
 ) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
+    let mut request = super::request::into_request(request.into_inner());
+    add_accept_header(&mut request.headers);
     let mut bytes_sent = 0;
-    let (response, url) = open_sse_response(&context, &context.request, &mut bytes_sent).await?;
-    let SseRequestContext {
-        http,
-        deadline,
-        request: _,
-    } = context;
+    let (response, url) = open_sse_response(&context, &request, &mut bytes_sent).await?;
+    let SseRequestContext { http, deadline } = context;
     let driver = SseStreamDriver::new(
         response,
         url,
@@ -759,48 +760,60 @@ async fn stream_sse(
 #[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
 #[pd_host_function(name = "http::client::sse", contract = super::http_sse_contract)]
 pub(super) async fn builtin_http_client_sse(
-    _request: i64,
     #[pd_host_context] context: SseRequestContext,
+    request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
     on_event: VmCallable<fn(String, String, String, String) -> bool>,
 ) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
-    stream_sse(context, on_event.into_value(), None).await
+    stream_sse(context, request, on_event.into_value(), None).await
 }
 
 /// Stream events with an open callback.
 #[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
 #[pd_host_function(name = "http::client::sse", contract = super::http_sse_open_contract)]
 pub(super) async fn builtin_http_client_sse_open(
-    _request: i64,
     #[pd_host_context] context: SseRequestContext,
+    request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
     on_event: VmCallable<fn(String, String, String, String) -> bool>,
     on_open: VmCallable<fn(i64, i64, String) -> bool>,
 ) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
-    stream_sse(context, on_event.into_value(), Some(on_open.into_value())).await
+    stream_sse(
+        context,
+        request,
+        on_event.into_value(),
+        Some(on_open.into_value()),
+    )
+    .await
 }
 
 /// Stream events with a deadline and no open callback.
 #[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
 #[pd_host_function(name = "http::client::sse", contract = super::http_sse_only_timeout_contract)]
 pub(super) async fn builtin_http_client_sse_only_timeout(
-    _request: i64,
     #[pd_host_context] context: SseRequestContext,
+    request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
     on_event: VmCallable<fn(String, String, String, String) -> bool>,
     _timeout_ms: i64,
 ) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
-    stream_sse(context, on_event.into_value(), None).await
+    stream_sse(context, request, on_event.into_value(), None).await
 }
 
 /// Stream events with an optional open callback and timeout.
 #[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
 #[pd_host_function(name = "http::client::sse", contract = super::http_sse_timeout_contract)]
 pub(super) async fn builtin_http_client_sse_timeout(
-    _request: i64,
     #[pd_host_context] context: SseRequestContext,
+    request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
     on_event: VmCallable<fn(String, String, String, String) -> bool>,
     on_open: VmCallable<fn(i64, i64, String) -> bool>,
     _timeout_ms: i64,
 ) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
-    stream_sse(context, on_event.into_value(), Some(on_open.into_value())).await
+    stream_sse(
+        context,
+        request,
+        on_event.into_value(),
+        Some(on_open.into_value()),
+    )
+    .await
 }
 
 #[cfg(test)]

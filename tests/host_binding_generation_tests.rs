@@ -418,7 +418,7 @@ fn generated_http_imports_are_unique_typed_and_independently_capability_gated() 
             .unwrap();
         if name == "http::client::request" {
             assert_eq!(
-                callable.signature.return_type, "int",
+                callable.signature.return_type, "resource",
                 "the buffered request returns an opaque response resource handle"
             );
             assert_eq!(callable.signature.params.len(), 1);

@@ -210,38 +210,75 @@ pub(super) fn host_boundary_error(error: impl std::fmt::Display) -> VmError {
     VmError::HostError(error.to_string())
 }
 
-/// The exact public descriptor admits TakeOwned; context capture consumes the
-/// builder once before any fallible async admission or submission.
-pub(super) fn take_request(
-    vm: &mut crate::vm::Vm,
-    args: &[crate::vm::Value],
-) -> VmResult<RequestBuilder> {
+fn request_handle(args: &[crate::vm::Value]) -> VmResult<crate::vm::resource::ResourceHandle> {
     let raw = match args.first() {
         Some(crate::vm::Value::Int(raw)) => *raw,
         _ => return Err(VmError::TypeMismatch("HTTP request resource")),
     };
-    let handle =
-        crate::vm::resource::ResourceHandle::from_raw(raw as u64).map_err(host_boundary_error)?;
-    vm.host_context()
-        .take_resource::<RequestBuilder>(handle)
-        .map_err(host_boundary_error)
+    crate::vm::resource::ResourceHandle::from_raw(raw as u64).map_err(host_boundary_error)
 }
 
-pub(super) fn prepare_resource_request(
+/// Inspect the typed builder only during synchronous admission. The macro
+/// transfers its concrete ownership after successful context capture.
+pub(super) fn with_request<T>(
+    vm: &mut crate::vm::Vm,
+    args: &[crate::vm::Value],
+    inspect: impl FnOnce(&RequestBuilder) -> VmResult<T>,
+) -> VmResult<T> {
+    let handle = request_handle(args)?;
+    let context = vm.host_context();
+    let key = crate::host_api::ResourceTypeKey::new("http.request").expect("static key");
+    let token = context
+        .typed_resource_with_key::<RequestBuilder>(handle, &key)
+        .map_err(host_boundary_error)?;
+    let request = context.resource(&token).map_err(host_boundary_error)?;
+    inspect(&request)
+}
+
+/// A rejected TakeOwned admission still consumes the builder. Successful
+/// admission leaves that transfer to the macro's ResourceOwned extraction.
+pub(super) fn finish_capture<T>(
+    vm: &mut crate::vm::Vm,
+    args: &[crate::vm::Value],
+    result: VmResult<T>,
+) -> VmResult<T> {
+    match result {
+        Ok(context) => Ok(context),
+        Err(primary) => {
+            let cleanup = request_handle(args).and_then(|handle| {
+                vm.host_context()
+                    .take_resource::<RequestBuilder>(handle)
+                    .map_err(host_boundary_error)
+            });
+            match cleanup {
+                Ok(_) => Err(primary),
+                Err(cleanup) => Err(VmError::HostError(format!(
+                    "{primary}; request admission cleanup failed: {cleanup}"
+                ))),
+            }
+        }
+    }
+}
+
+pub(super) fn validate_resource_request(
     request: &RequestBuilder,
     config: &HttpConfig,
-) -> VmResult<HttpRequest> {
+) -> VmResult<()> {
     super::policy::validate_url_policy(config, SchemeFamily::Http, &request.url)?;
     if request.body.len() > config.max_request_body_bytes {
         return Err(VmError::HostError("HTTP request body exceeds limit".into()));
     }
-    validate_request_header_budget(&request.headers, config)?;
-    Ok(HttpRequest {
-        method: request.method.clone(),
-        url: request.url.clone(),
-        headers: request.headers.clone(),
-        body: request.body.clone().into_bytes(),
-    })
+    validate_request_header_budget(&request.headers, config)
+}
+
+/// Move an already admitted builder into transport state without copying its body.
+pub(super) fn into_request(request: RequestBuilder) -> HttpRequest {
+    HttpRequest {
+        method: request.method,
+        url: request.url,
+        headers: request.headers,
+        body: request.body.into_bytes(),
+    }
 }
 
 /// Executes one bounded request with the shared Hyper client.
@@ -677,7 +714,7 @@ fn reject_declared_oversize(
 
 #[cfg(test)]
 mod tests {
-    use super::{RequestHeaderBudget, prepare_resource_request, validate_response_trailers};
+    use super::{RequestHeaderBudget, validate_resource_request, validate_response_trailers};
     use crate::builtins::runtime::http::{
         HttpConfig,
         resources::{HttpBody, HttpRequest},
@@ -706,14 +743,14 @@ mod tests {
                 body,
                 limits: limits.clone(),
             };
-            let error = prepare_resource_request(&request, &current).unwrap_err();
+            let error = validate_resource_request(&request, &current).unwrap_err();
             assert!(
                 error
                     .to_string()
                     .contains("HTTP request body exceeds limit"),
                 "{error}"
             );
-            assert!(prepare_resource_request(&request, &limits).is_ok());
+            assert!(validate_resource_request(&request, &limits).is_ok());
         }
     }
 
