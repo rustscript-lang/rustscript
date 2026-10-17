@@ -368,6 +368,7 @@ fn prepare_owned_typed_ir(
         super::result::resolve_result_types(&mut legalized, entry.types)
             .map_err(SourceError::Compile)?;
     }
+    super::try_anf::lower_partial_resource_args(&mut legalized).map_err(SourceError::Parse)?;
     parsed = legalized;
     let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, entry.types);
     let mut analysis_errors = Vec::new();
@@ -439,6 +440,9 @@ fn prepare_owned_typed_ir(
         }
         Err(error) => return Err(SourceError::Parse(error)),
     };
+    let mut owned_ir = owned_ir;
+    let structs = owned_ir.struct_schemas.clone();
+    super::try_anf::attach_err_cleanup_schemas(&mut owned_ir, &logical_schemas, &structs);
     for owner in owners {
         if let Some(plugin) = owner.plugin {
             let typed = FrontendTypedIr {
@@ -771,7 +775,8 @@ fn record_expr_local_debug_ranges(
         }
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
-        | Expr::ResultMatch { .. }) => {
+        | Expr::ResultMatch { .. }
+        | Expr::ResultTry { .. }) => {
             other
                 .visit_result_children(|child| record_expr_local_debug_ranges(child, line, ranges));
         }
@@ -910,8 +915,10 @@ fn compile_parsed_output_with_capture_output(
     let mut parsed = parsed;
     super::result::resolve_result_types(&mut parsed, entry_local_types)
         .map_err(SourceError::Compile)?;
-    let parsed = typing::legalize_builtins_and_bind_types(parsed, typing_mode, entry_local_types)
-        .map_err(SourceError::Compile)?;
+    let mut parsed =
+        typing::legalize_builtins_and_bind_types(parsed, typing_mode, entry_local_types)
+            .map_err(SourceError::Compile)?;
+    super::try_anf::lower_partial_resource_args(&mut parsed).map_err(SourceError::Parse)?;
     typing::validate_if_else_type_consistency(&parsed, typing_mode, entry_local_types)
         .map_err(SourceError::Compile)?;
     let pre_lifetime_type_info = typing::infer_types(&parsed, typing_mode, entry_local_types);
@@ -936,6 +943,13 @@ fn compile_parsed_output_with_capture_output(
         &owned_local_slots,
     )
     .map_err(SourceError::Parse)?;
+    let mut parsed = parsed;
+    let structs = parsed.struct_schemas.clone();
+    super::try_anf::attach_err_cleanup_schemas(
+        &mut parsed,
+        &pre_lifetime_type_info.local_schemas,
+        &structs,
+    );
     compile_owned_ir_with_capture_output(
         source,
         parsed,

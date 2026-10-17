@@ -167,7 +167,9 @@ impl Parser {
             let inner = self.parse_unary()?;
             Ok(Expr::Not(Box::new(inner)))
         } else {
-            self.parse_primary()
+            let start = self.current_span();
+            let expr = self.parse_primary()?;
+            self.parse_postfix_access(expr, start)
         }
     }
 
@@ -362,7 +364,8 @@ impl Parser {
                 .unwrap_or_else(|| self.current_span());
             if self.dialect.allow_result_syntax() && name == "Result" && self.check_path_separator()
             {
-                return self.parse_result_constructor(name_span);
+                let expr = self.parse_result_constructor(name_span)?;
+                return self.parse_postfix_access(expr, name_span);
             }
             if self.dialect.allow_dotted_call()
                 && let Some(expr) = self.try_parse_js_dotted_call(&name, name_span)?
@@ -1411,6 +1414,30 @@ impl Parser {
                 continue;
             }
             if self.match_kind(&TokenKind::Question) {
+                if !self.check(&TokenKind::Dot) {
+                    if self.dialect.allow_result_try() {
+                        let question_span = self.tokens[self.pos - 1].span;
+                        let value_slot = self.allocate_hidden_local()?;
+                        let payload_slot = self.allocate_hidden_local()?;
+                        expr = Expr::ResultTry {
+                            value: Box::new(expr),
+                            value_slot,
+                            payload_slot,
+                            operand_schema: TypeSchema::Unknown,
+                            return_schema: TypeSchema::Unknown,
+                            exit_cleanup: Vec::new(),
+                            span: question_span,
+                            semantic_id: None,
+                        };
+                        continue;
+                    }
+                    return Err(ParseError {
+                        line: self.current_line(),
+                        message: "expected '.' after '?' in optional access".to_string(),
+                        span: Some(self.tokens[self.pos - 1].span),
+                        code: None,
+                    });
+                }
                 self.expect(&TokenKind::Dot, "expected '.' after '?' in optional access")?;
                 if self.match_kind(&TokenKind::LBracket) {
                     let bracket_open = self

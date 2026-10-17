@@ -677,10 +677,16 @@ impl LivenessRewriter {
             }
             other @ (Expr::ResultConstruct { .. }
             | Expr::ResultQuery { .. }
-            | Expr::ResultMatch { .. }) => {
+            | Expr::ResultMatch { .. }
+            | Expr::ResultTry { .. }) => {
                 other.visit_result_children(|child| {
                     self.add_expr_uses_impl(child, live, conservative)
                 });
+                if let Expr::ResultTry { exit_cleanup, .. } = other {
+                    for (slot, _) in exit_cleanup {
+                        self.mark_live(live, *slot);
+                    }
+                }
             }
             Expr::Block { stmts, expr } => {
                 let live_out = if conservative {
@@ -1260,6 +1266,20 @@ impl LocalSlotAllocator {
             Expr::ResultQuery { value, .. } => {
                 self.collect_expr_constraints(value, &live_during, protected_slots)?;
             }
+            Expr::ResultTry {
+                value,
+                value_slot,
+                payload_slot,
+                exit_cleanup,
+                ..
+            } => {
+                self.add_slot_live_edges(*value_slot, &live_during);
+                self.add_slot_live_edges(*payload_slot, &live_during);
+                for (slot, _) in exit_cleanup {
+                    self.add_slot_live_edges(*slot, &live_during);
+                }
+                self.collect_expr_constraints(value, &live_during, protected_slots)?;
+            }
             Expr::ResultMatch {
                 value,
                 value_slot,
@@ -1539,6 +1559,20 @@ impl LocalSlotAllocator {
                 self.collect_expr_footprint(payload, set, stack)
             }
             Expr::ResultQuery { value, .. } => self.collect_expr_footprint(value, set, stack),
+            Expr::ResultTry {
+                value,
+                value_slot,
+                payload_slot,
+                exit_cleanup,
+                ..
+            } => {
+                self.mark_set_slot(set, *value_slot);
+                self.mark_set_slot(set, *payload_slot);
+                for (slot, _) in exit_cleanup {
+                    self.mark_set_slot(set, *slot);
+                }
+                self.collect_expr_footprint(value, set, stack);
+            }
             Expr::ResultMatch {
                 value,
                 value_slot,
@@ -1915,7 +1949,8 @@ fn collect_persistent_closure_sources_from_expr(expr: &Expr, slots: &mut BTreeSe
         }
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
-        | Expr::ResultMatch { .. }) => {
+        | Expr::ResultMatch { .. }
+        | Expr::ResultTry { .. }) => {
             other.visit_result_children(|child| {
                 collect_persistent_closure_sources_from_expr(child, slots)
             });
@@ -2112,6 +2147,20 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
         }
         Expr::ResultConstruct { payload, .. } => remap_expr_slots(payload, mapping)?,
         Expr::ResultQuery { value, .. } => remap_expr_slots(value, mapping)?,
+        Expr::ResultTry {
+            value,
+            value_slot,
+            payload_slot,
+            exit_cleanup,
+            ..
+        } => {
+            *value_slot = remap_slot(*value_slot, mapping)?;
+            *payload_slot = remap_slot(*payload_slot, mapping)?;
+            for (slot, _) in exit_cleanup.iter_mut() {
+                *slot = remap_slot(*slot, mapping)?;
+            }
+            remap_expr_slots(value, mapping)?;
+        }
         Expr::ResultMatch {
             value,
             value_slot,

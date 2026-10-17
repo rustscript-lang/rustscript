@@ -106,6 +106,13 @@ pub trait ParserDialect {
     fn allow_result_syntax(&self) -> bool {
         false
     }
+
+    /// Plain postfix `?` as lexical-function Result propagation.
+    ///
+    /// Default off. `?.` optional access and type-position `T?` are unaffected.
+    fn allow_result_try(&self) -> bool {
+        false
+    }
 }
 
 pub(super) fn lint_trailing_function_return_semicolons(

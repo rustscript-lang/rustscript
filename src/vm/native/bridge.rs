@@ -1138,7 +1138,7 @@ fn native_leave_frame(vm: &mut Vm, ret_ip: i64, inherited_state: *mut u8) -> VmR
     let ret_ip = usize::try_from(ret_ip)
         .map_err(|_| VmError::InvalidFrameState("native ret ip out of range"))?;
     vm.jump_to(ret_ip)?;
-    let status = match vm.complete_active_frame()? {
+    let status = match vm.complete_active_frame(ret_ip)? {
         ExecOutcome::Continue => STATUS_LINKED_CONTINUE,
         ExecOutcome::Halted => STATUS_HALTED,
         ExecOutcome::Yielded => STATUS_YIELDED,

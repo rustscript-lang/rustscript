@@ -624,7 +624,8 @@ impl AvailabilityAnalyzer {
             }
             other @ (Expr::ResultConstruct { .. }
             | Expr::ResultQuery { .. }
-            | Expr::ResultMatch { .. }) => {
+            | Expr::ResultMatch { .. }
+            | Expr::ResultTry { .. }) => {
                 other.visit_result_children(|child| {
                     self.capture_mode_for_expr(child, captured_slot, context, implicit, scan);
                 });

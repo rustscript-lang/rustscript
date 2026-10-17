@@ -1289,4 +1289,109 @@ mod tests {
             standalone.dump_aot_info()
         );
     }
+
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn artifact_load_rejects_cleanup_only_metadata_change() {
+        let compiled = crate::compile_source("fn id(x: int) -> int { x }\nid(1);")
+            .expect("cleanup binding fixture should compile");
+        let program = compiled.program.with_local_count(compiled.locals);
+        let site = script_ret_site(&program);
+        let mut with_cleanup = program.clone();
+        with_cleanup
+            .ret_cleanups
+            .push(crate::bytecode::RetCleanupPlan {
+                site,
+                locals: vec![crate::bytecode::RetCleanupLocal {
+                    slot: 0,
+                    schema: crate::compiler::TypeSchema::Resource(
+                        crate::host_api::ResourceTypeKey::new("pr24.closure").unwrap(),
+                    ),
+                }],
+            });
+        let mut other_key = with_cleanup.clone();
+        other_key.ret_cleanups[0].locals[0].schema = crate::compiler::TypeSchema::Resource(
+            crate::host_api::ResourceTypeKey::new("pr24.blocked").unwrap(),
+        );
+        let original_program =
+            crate::vmbc::encode_program(&with_cleanup).expect("cleanup program encodes");
+        let other_program =
+            crate::vmbc::encode_program(&other_key).expect("same-length key encodes");
+        assert_eq!(original_program.len(), other_program.len());
+        assert_ne!(original_program, other_program);
+
+        let mut vm = Vm::new(with_cleanup.clone());
+        vm.compile_aot()
+            .expect("cleanup fixture should compile to aot");
+        let bytes = vm.encode_aot_artifact().expect("artifact encodes");
+        let path = std::env::temp_dir().join("r2-a02-cleanup-only-artifact.bin");
+        vm.save_aot_artifact_to_file(&path).expect("artifact saves");
+
+        let mut mismatched = Vm::new(other_key.clone());
+        let incompatible = mismatched
+            .load_aot_artifact_from_file(&path)
+            .expect_err("cleanup-only program mismatch must reject");
+        assert!(
+            matches!(
+                incompatible,
+                AotArtifactError::IncompatibleProgramHash { .. }
+            ),
+            "{incompatible:?}"
+        );
+        assert!(!mismatched.has_aot_program());
+
+        let pos = bytes
+            .windows(original_program.len())
+            .position(|window| window == original_program)
+            .expect("artifact embeds the program bytes");
+        let mut tampered = bytes.clone();
+        tampered[pos..pos + other_program.len()].copy_from_slice(&other_program);
+        let mut intact = Vm::new(with_cleanup.clone());
+        let hash_error = intact
+            .load_aot_artifact(&tampered)
+            .expect_err("tampered cleanup bytes must fail the embedded hash");
+        assert!(
+            matches!(
+                hash_error,
+                AotArtifactError::EmbeddedProgramHashMismatch { .. }
+            ),
+            "{hash_error:?}"
+        );
+        assert!(!intact.has_aot_program());
+        assert_eq!(intact.aot_exec_count(), 0);
+
+        let mut positive = Vm::new(with_cleanup);
+        positive
+            .load_aot_artifact_from_file(&path)
+            .expect("matching cleanup metadata must load");
+        assert!(positive.has_aot_program());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn script_ret_site(program: &Program) -> u32 {
+        let mut ip = 0usize;
+        while ip < program.code.len() {
+            let opcode = crate::vm::OpCode::try_from(program.code[ip]).expect("opcode");
+            if opcode == crate::vm::OpCode::Ret {
+                let site = u32::try_from(ip).unwrap();
+                let in_frame = program.function_regions.iter().any(|region| {
+                    site >= region.start_ip
+                        && site < region.end_ip
+                        && region.prototype_id.is_some_and(|id| {
+                            program
+                                .callable_prototypes
+                                .get(id as usize)
+                                .is_some_and(|prototype| prototype.frame_local_count > 0)
+                        })
+                });
+                if in_frame {
+                    return site;
+                }
+            }
+            ip = ip
+                .checked_add(1 + opcode.operand_len())
+                .expect("instruction length");
+        }
+        panic!("fixture has no script Ret inside a nonempty frame");
+    }
 }
