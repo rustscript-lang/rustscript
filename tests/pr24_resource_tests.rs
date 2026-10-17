@@ -459,7 +459,9 @@ fn compiled_expression_block_detaches_taken_resource_once() {
 
 #[test]
 fn closure_capture_executes_take_owned_resource_once() {
-    let _guard = CLOSURE_TEST_LOCK.lock().expect("closure test lock");
+    let _guard = CLOSURE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     CLOSURE_CLOSES.store(0, Ordering::SeqCst);
     let options = CompileSourceFileOptions::new().with_host_api_catalog(closure_catalog());
     let source = r#"
@@ -488,7 +490,9 @@ fn closure_capture_executes_take_owned_resource_once() {
 
 #[test]
 fn named_function_capture_executes_take_owned_resource_once() {
-    let _guard = CLOSURE_TEST_LOCK.lock().expect("closure test lock");
+    let _guard = CLOSURE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     CLOSURE_CLOSES.store(0, Ordering::SeqCst);
     let options = CompileSourceFileOptions::new().with_host_api_catalog(closure_catalog());
     let source = r#"
@@ -602,4 +606,400 @@ fn expression_block_rejects_later_resource_use() {
         rendered.contains("moved"),
         "unexpected compiler error: {rendered}"
     );
+}
+
+fn result_resource_catalog() -> Arc<HostApiCatalog> {
+    let mut builder = HostApiBuilder::new();
+    let resource_key = key("pr24.closure");
+    builder.resource(ResourceTypeSchema::new(
+        resource_key.clone(),
+        "closure resource",
+    ));
+    let result_ok = HostTypeSchema::Result {
+        ok: Box::new(HostTypeSchema::Resource(resource_key.clone())),
+        err: Box::new(HostTypeSchema::Int),
+    };
+    let result_err = HostTypeSchema::Result {
+        ok: Box::new(HostTypeSchema::Int),
+        err: Box::new(HostTypeSchema::Resource(resource_key.clone())),
+    };
+    builder.function(HostFunctionSchema::with_return(
+        "test::make_ok_result",
+        Vec::new(),
+        result_ok.clone(),
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "test::make_err_result",
+        Vec::new(),
+        result_err,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "test::make_extra_result",
+        Vec::new(),
+        result_ok.clone(),
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "test::make_wrong_key_result",
+        Vec::new(),
+        result_ok.clone(),
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "test::make_wrong_gen_result",
+        Vec::new(),
+        result_ok.clone(),
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "test::make_wrong_arena_result",
+        Vec::new(),
+        result_ok.clone(),
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "test::make_bad_tag_result",
+        Vec::new(),
+        result_ok.clone(),
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "test::make_bad_payload_result",
+        Vec::new(),
+        result_ok,
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "test::close_closure",
+        vec![HostParamSchema::with_passing(
+            "resource",
+            HostTypeSchema::Resource(resource_key),
+            HostParamPassing::TakeOwned,
+        )],
+        HostTypeSchema::Null,
+    ));
+    Arc::new(
+        builder
+            .build()
+            .expect("result resource catalog should build"),
+    )
+}
+
+fn result_map(ok: bool, payload: Value, extra: bool) -> Value {
+    let mut entries = vec![
+        (Value::string("tag"), Value::Bool(ok)),
+        (Value::string("payload"), payload),
+    ];
+    if extra {
+        entries.push((Value::string("extra"), Value::Int(1)));
+    }
+    Value::map(entries)
+}
+
+struct MakeOkResult;
+impl HostFunction for MakeOkResult {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        let token = vm
+            .host_context()
+            .push_resource(ClosureResource)
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        Ok(CallOutcome::Return(CallReturn::one(result_map(
+            true,
+            Value::Int(token.handle().raw() as i64),
+            false,
+        ))))
+    }
+}
+
+struct MakeErrResult;
+impl HostFunction for MakeErrResult {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        let token = vm
+            .host_context()
+            .push_resource(ClosureResource)
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        Ok(CallOutcome::Return(CallReturn::one(result_map(
+            false,
+            Value::Int(token.handle().raw() as i64),
+            false,
+        ))))
+    }
+}
+
+struct MakeExtraResult;
+impl HostFunction for MakeExtraResult {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        let token = vm
+            .host_context()
+            .push_resource(ClosureResource)
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        Ok(CallOutcome::Return(CallReturn::one(result_map(
+            true,
+            Value::Int(token.handle().raw() as i64),
+            true,
+        ))))
+    }
+}
+
+struct MakeWrongKeyResult;
+impl HostFunction for MakeWrongKeyResult {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        let token = vm
+            .host_context()
+            .push_resource(BlockResource)
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        Ok(CallOutcome::Return(CallReturn::one(result_map(
+            true,
+            Value::Int(token.handle().raw() as i64),
+            false,
+        ))))
+    }
+}
+
+struct MakeWrongArenaResult;
+impl HostFunction for MakeWrongArenaResult {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        let token = vm
+            .host_context()
+            .push_resource(ClosureResource)
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        // Arena identity occupies bits 43..62 of the public handle encoding.
+        let wrong_arena = token.handle().raw() ^ (1 << 43);
+        Ok(CallOutcome::Return(CallReturn::one(result_map(
+            true,
+            Value::Int(wrong_arena as i64),
+            false,
+        ))))
+    }
+}
+
+struct MakeWrongGenResult;
+impl HostFunction for MakeWrongGenResult {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        let token = vm
+            .host_context()
+            .push_resource(ClosureResource)
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        Ok(CallOutcome::Return(CallReturn::one(result_map(
+            true,
+            Value::Int(token.handle().raw().wrapping_add(1) as i64),
+            false,
+        ))))
+    }
+}
+
+struct MakeBadTagResult;
+impl HostFunction for MakeBadTagResult {
+    fn call(&mut self, vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        let token = vm
+            .host_context()
+            .push_resource(ClosureResource)
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        Ok(CallOutcome::Return(CallReturn::one(Value::map(vec![
+            (Value::string("tag"), Value::string("ok")),
+            (
+                Value::string("payload"),
+                Value::Int(token.handle().raw() as i64),
+            ),
+        ]))))
+    }
+}
+
+struct MakeBadPayloadResult;
+impl HostFunction for MakeBadPayloadResult {
+    fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(CallReturn::one(result_map(
+            true,
+            Value::string("not-a-resource"),
+            false,
+        ))))
+    }
+}
+
+fn bind_result_hosts(vm: &mut Vm) {
+    vm.bind_function("test::make_ok_result", Box::new(MakeOkResult));
+    vm.bind_function("test::make_err_result", Box::new(MakeErrResult));
+    vm.bind_function("test::make_extra_result", Box::new(MakeExtraResult));
+    vm.bind_function("test::make_wrong_key_result", Box::new(MakeWrongKeyResult));
+    vm.bind_function("test::make_wrong_gen_result", Box::new(MakeWrongGenResult));
+    vm.bind_function(
+        "test::make_wrong_arena_result",
+        Box::new(MakeWrongArenaResult),
+    );
+    vm.bind_function("test::make_bad_tag_result", Box::new(MakeBadTagResult));
+    vm.bind_function(
+        "test::make_bad_payload_result",
+        Box::new(MakeBadPayloadResult),
+    );
+    vm.bind_function("test::close_closure", Box::new(CloseClosureResource));
+}
+
+#[test]
+fn result_match_transfers_resource_after_nonconsuming_predicate() {
+    let _guard = CLOSURE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    CLOSURE_CLOSES.store(0, Ordering::SeqCst);
+    let options = CompileSourceFileOptions::new().with_host_api_catalog(result_resource_catalog());
+    let source = r#"
+        fn close_one(handle: resource<pr24.closure>) -> int {
+            test::close_closure(handle);
+            1
+        }
+        let value = test::make_ok_result();
+        let flag = value.is_ok();
+        let observed = match value {
+            Result::Ok(handle) => close_one(handle),
+            Result::Err(e) => 0,
+        };
+        let result = if flag => { observed } else => { 0 };
+        result;
+    "#;
+    let compiled =
+        compile_source_with_flavor_and_options(source, vm::SourceFlavor::RustScript, options)
+            .expect("predicate must not consume the Result resource");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    bind_result_hosts(&mut vm);
+    assert_eq!(
+        vm.run().expect("Result resource match should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack().last().cloned(), Some(Value::Int(1)));
+    assert_eq!(CLOSURE_CLOSES.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn result_match_rejects_resource_reuse_and_keeps_err_branch_owned() {
+    let options = CompileSourceFileOptions::new().with_host_api_catalog(result_resource_catalog());
+    let reuse = r#"
+        fn close_twice(handle: resource<pr24.closure>) -> int {
+            test::close_closure(handle);
+            test::close_closure(handle);
+            1
+        }
+        let value = test::make_ok_result();
+        let observed = match value {
+            Result::Ok(handle) => close_twice(handle),
+            Result::Err(e) => 0,
+        };
+        observed;
+    "#;
+    let error = match compile_source_with_flavor_and_options(
+        reuse,
+        vm::SourceFlavor::RustScript,
+        options,
+    ) {
+        Ok(_) => panic!("consumed Result resource must not be reused"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("moved"), "{error}");
+
+    let _guard = CLOSURE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    CLOSURE_CLOSES.store(0, Ordering::SeqCst);
+    let options = CompileSourceFileOptions::new().with_host_api_catalog(result_resource_catalog());
+    let source = r#"
+        fn close_one(handle: resource<pr24.closure>) -> int {
+            test::close_closure(handle);
+            1
+        }
+        let value = test::make_err_result();
+        let observed = match value {
+            Result::Ok(v) => 0,
+            Result::Err(handle) => close_one(handle),
+        };
+        observed;
+    "#;
+    let compiled =
+        compile_source_with_flavor_and_options(source, vm::SourceFlavor::RustScript, options)
+            .expect("Err resource should transfer through the selected arm");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    bind_result_hosts(&mut vm);
+    assert_eq!(
+        vm.run().expect("Err resource match should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack().last().cloned(), Some(Value::Int(1)));
+    assert_eq!(CLOSURE_CLOSES.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn result_host_return_rejects_extra_field_wrong_key_and_wrong_generation() {
+    let _guard = CLOSURE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let options = CompileSourceFileOptions::new().with_host_api_catalog(result_resource_catalog());
+    let source = "test::make_extra_result();";
+    let compiled = compile_source_with_flavor_and_options(
+        source,
+        vm::SourceFlavor::RustScript,
+        options.clone(),
+    )
+    .expect("extra-field call should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    bind_result_hosts(&mut vm);
+    assert!(vm.run().is_err(), "extra Result field must be rejected");
+
+    BLOCK_CLOSES.store(0, Ordering::SeqCst);
+    CLOSURE_CLOSES.store(0, Ordering::SeqCst);
+    let options = CompileSourceFileOptions::new().with_host_api_catalog(result_resource_catalog());
+    let source = "test::make_wrong_key_result();";
+    let compiled =
+        compile_source_with_flavor_and_options(source, vm::SourceFlavor::RustScript, options)
+            .expect("wrong-key call should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    bind_result_hosts(&mut vm);
+    assert!(vm.run().is_err(), "wrong resource key must be rejected");
+    drop(vm);
+    assert_eq!(BLOCK_CLOSES.load(Ordering::SeqCst), 1);
+    assert_eq!(CLOSURE_CLOSES.load(Ordering::SeqCst), 0);
+
+    CLOSURE_CLOSES.store(0, Ordering::SeqCst);
+    let options = CompileSourceFileOptions::new().with_host_api_catalog(result_resource_catalog());
+    let source = "test::make_wrong_gen_result();";
+    let compiled =
+        compile_source_with_flavor_and_options(source, vm::SourceFlavor::RustScript, options)
+            .expect("wrong-generation call should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    bind_result_hosts(&mut vm);
+    assert!(
+        vm.run().is_err(),
+        "wrong resource generation must be rejected"
+    );
+    drop(vm);
+    assert_eq!(CLOSURE_CLOSES.load(Ordering::SeqCst), 1);
+
+    CLOSURE_CLOSES.store(0, Ordering::SeqCst);
+    let options = CompileSourceFileOptions::new().with_host_api_catalog(result_resource_catalog());
+    let source = "test::make_wrong_arena_result();";
+    let compiled =
+        compile_source_with_flavor_and_options(source, vm::SourceFlavor::RustScript, options)
+            .expect("wrong-arena call should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    bind_result_hosts(&mut vm);
+    assert!(vm.run().is_err(), "wrong resource arena must be rejected");
+    drop(vm);
+    assert_eq!(CLOSURE_CLOSES.load(Ordering::SeqCst), 1);
+
+    CLOSURE_CLOSES.store(0, Ordering::SeqCst);
+    let options = CompileSourceFileOptions::new().with_host_api_catalog(result_resource_catalog());
+    let source = "test::make_bad_tag_result();";
+    let compiled =
+        compile_source_with_flavor_and_options(source, vm::SourceFlavor::RustScript, options)
+            .expect("bad-tag call should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    bind_result_hosts(&mut vm);
+    assert!(vm.run().is_err(), "non-bool Result tag must be rejected");
+    drop(vm);
+    assert_eq!(CLOSURE_CLOSES.load(Ordering::SeqCst), 1);
+
+    CLOSURE_CLOSES.store(0, Ordering::SeqCst);
+    let options = CompileSourceFileOptions::new().with_host_api_catalog(result_resource_catalog());
+    let source = "test::make_bad_payload_result();";
+    let compiled =
+        compile_source_with_flavor_and_options(source, vm::SourceFlavor::RustScript, options)
+            .expect("bad-payload call should compile");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    bind_result_hosts(&mut vm);
+    assert!(
+        vm.run().is_err(),
+        "non-resource Result payload must be rejected"
+    );
+    drop(vm);
+    assert_eq!(CLOSURE_CLOSES.load(Ordering::SeqCst), 0);
 }

@@ -395,6 +395,10 @@ fn host_schema_contains_resource(schema: &HostTypeSchema) -> Result<bool, String
                     pending.push((param, depth + 1));
                 }
             }
+            HostTypeSchema::Result { ok, err } => {
+                pending.push((err, depth + 1));
+                pending.push((ok, depth + 1));
+            }
             HostTypeSchema::Named { fields, .. } => {
                 for field in fields {
                     pending.push((&field.ty, depth + 1));
@@ -2420,6 +2424,21 @@ fn validate_host_value(
                 }
             }
             Ok(())
+        }
+        HostTypeSchema::Result { ok, err } => {
+            let (is_ok, payload) = super::split_result_carrier(value)?;
+            let active = if is_ok { ok.as_ref() } else { err.as_ref() };
+            match payload {
+                Some(payload) => validate_host_value(payload, active, program, resources),
+                None if matches!(
+                    active,
+                    HostTypeSchema::Null | HostTypeSchema::Optional(_) | HostTypeSchema::Unknown
+                ) =>
+                {
+                    validate_host_value(&Value::Null, active, program, resources)
+                }
+                None => Err(VmError::TypeMismatch("result")),
+            }
         }
     }
 }

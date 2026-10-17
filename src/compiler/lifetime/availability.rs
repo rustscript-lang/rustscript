@@ -595,7 +595,7 @@ impl AvailabilityAnalyzer {
                     out,
                 ))
             }
-            Stmt::ClosureLet { line, closure } => {
+            Stmt::ClosureLet { line, closure, .. } => {
                 let mut out = state.clone();
                 if out.reachable {
                     self.analyze_closure(closure, &out, *line)?;
@@ -1098,6 +1098,39 @@ impl AvailabilityAnalyzer {
                 }
                 Ok(out)
             }
+            Expr::ResultConstruct { payload, .. } => {
+                let mut out = self.analyze_expr(payload, state, line)?;
+                self.mark_owned_value_reads_moved(payload, &mut out);
+                Ok(out)
+            }
+            Expr::ResultQuery { value, .. } => self.analyze_expr_to_owned(value, state, line),
+            Expr::ResultMatch {
+                value,
+                value_slot,
+                ok_binding,
+                ok_expr,
+                err_binding,
+                err_expr,
+                ..
+            } => {
+                let mut value_state = self.analyze_expr(value, state, line)?;
+                self.mark_owned_value_reads_moved(value, &mut value_state);
+                self.mark_available(&mut value_state, *value_slot, line)?;
+                let mut ok_in = value_state.clone();
+                if let Some(slot) = ok_binding {
+                    self.mark_available(&mut ok_in, *slot, line)?;
+                }
+                let ok_state = self.analyze_expr(ok_expr, &ok_in, line)?;
+                let mut err_in = value_state;
+                if let Some(slot) = err_binding {
+                    self.mark_available(&mut err_in, *slot, line)?;
+                }
+                let err_state = self.analyze_expr(err_expr, &err_in, line)?;
+                let mut out = self.merge_states(ok_state, err_state);
+                self.mark_owned_value_reads_moved(ok_expr, &mut out);
+                self.mark_owned_value_reads_moved(err_expr, &mut out);
+                Ok(out)
+            }
             Expr::ToOwned(inner) => {
                 // `.copy()` on a resource-containing value would duplicate the
                 // underlying handle; the core has no generic resource copy, so
@@ -1479,6 +1512,13 @@ impl AvailabilityAnalyzer {
                         .iter()
                         .any(|(_, arm_expr)| self.expr_contains_owned_local(arm_expr))
                     || self.expr_contains_owned_local(default)
+            }
+            other @ (Expr::ResultConstruct { .. }
+            | Expr::ResultQuery { .. }
+            | Expr::ResultMatch { .. }) => {
+                let mut found = false;
+                other.visit_result_children(|child| found |= self.expr_contains_owned_local(child));
+                found
             }
             Expr::Block { stmts, expr } => {
                 stmts
@@ -1893,6 +1933,53 @@ impl AvailabilityAnalyzer {
                     default: Box::new(self.rewrite_expr_ownership_inner(default, false, state)?),
                 })
             }
+            Expr::ResultConstruct {
+                ok,
+                payload,
+                result_schema,
+                span,
+                semantic_id,
+            } => Ok(Expr::ResultConstruct {
+                ok: *ok,
+                payload: Box::new(self.rewrite_expr_ownership_inner(payload, false, state)?),
+                result_schema: result_schema.clone(),
+                span: *span,
+                semantic_id: *semantic_id,
+            }),
+            Expr::ResultQuery {
+                value,
+                ok,
+                span,
+                semantic_id,
+            } => Ok(Expr::ResultQuery {
+                // Tag reads must not detach a resource-bearing carrier. The
+                // call-arg flag keeps an owned local as `Var` instead of `MoveVar`.
+                value: Box::new(self.rewrite_expr_ownership_inner(value, true, state)?),
+                ok: *ok,
+                span: *span,
+                semantic_id: *semantic_id,
+            }),
+            Expr::ResultMatch {
+                value,
+                value_slot,
+                ok_binding,
+                ok_expr,
+                err_binding,
+                err_expr,
+                scrutinee_schema,
+                span,
+                semantic_id,
+            } => Ok(Expr::ResultMatch {
+                value: Box::new(self.rewrite_expr_ownership_inner(value, false, state)?),
+                value_slot: *value_slot,
+                ok_binding: *ok_binding,
+                ok_expr: Box::new(self.rewrite_expr_ownership_inner(ok_expr, false, state)?),
+                err_binding: *err_binding,
+                err_expr: Box::new(self.rewrite_expr_ownership_inner(err_expr, false, state)?),
+                scrutinee_schema: scrutinee_schema.clone(),
+                span: *span,
+                semantic_id: *semantic_id,
+            }),
             Expr::Block { .. } => self.rewrite_expr_for_ownership_with_state(expr, state, 0),
             Expr::Null
             | Expr::Int(_)

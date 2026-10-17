@@ -797,3 +797,299 @@ fn repl_options_preserve_named_host_identity_and_runtime_values_between_snippets
         )
     );
 }
+
+fn result_entry_state(name: &str, schema: TypeSchema, moved: bool) -> ReplLocalState {
+    ReplLocalState {
+        binding: ReplLocalBinding {
+            name: name.into(),
+            mutable: false,
+            schema: Some(schema),
+            optional: false,
+        },
+        moved,
+    }
+}
+
+fn result_int_string() -> TypeSchema {
+    TypeSchema::Result {
+        ok: Box::new(TypeSchema::Int),
+        err: Box::new(TypeSchema::String),
+    }
+}
+
+fn expect_repl_ok(compiled: Result<vm::CompiledReplProgram, vm::SourceError>, label: &str) {
+    if let Err(error) = compiled {
+        panic!("{label} must compile, got {error}");
+    }
+}
+
+fn expect_repl_err(
+    compiled: Result<vm::CompiledReplProgram, vm::SourceError>,
+    label: &str,
+) -> String {
+    match compiled {
+        Err(error) => format!("{error:?} {error}"),
+        Ok(_) => panic!("{label} must reject"),
+    }
+}
+
+#[test]
+fn result_entry_schema_compiles_carried_result_query() {
+    expect_repl_ok(
+        compile_source_for_repl_with_state(
+            "r.is_ok();",
+            &[result_entry_state("r", result_int_string(), false)],
+        ),
+        "carried Result entry",
+    );
+}
+
+#[test]
+fn result_entry_schema_compiles_carried_callable_query() {
+    let schema = TypeSchema::Callable {
+        params: Vec::new(),
+        result: Box::new(result_int_string()),
+    };
+    expect_repl_ok(
+        compile_source_for_repl_with_state(
+            "f().is_ok();",
+            &[result_entry_state("f", schema, false)],
+        ),
+        "carried callable Result entry",
+    );
+}
+
+#[test]
+fn result_entry_schema_rejects_non_result_and_moved_owned() {
+    let non_result = expect_repl_err(
+        compile_source_for_repl_with_state(
+            "n.is_ok();",
+            &[result_entry_state("n", TypeSchema::Int, false)],
+        ),
+        "non-Result entry",
+    );
+    assert!(
+        non_result.contains("Result"),
+        "non-Result diagnostic was {non_result}"
+    );
+
+    let moved = expect_repl_err(
+        compile_source_for_repl_with_state(
+            "message;",
+            &[result_entry_state("message", TypeSchema::String, true)],
+        ),
+        "moved owned entry",
+    );
+    assert!(
+        moved.contains("moved") || moved.contains("MOVED"),
+        "moved diagnostic was {moved}"
+    );
+
+    let resource = vm::ResourceTypeKey::new("repl.result-entry-resource").unwrap();
+    let copy = expect_repl_err(
+        compile_source_for_repl_with_state(
+            "let duplicate = owned.copy();",
+            &[result_entry_state(
+                "owned",
+                TypeSchema::Resource(resource),
+                false,
+            )],
+        ),
+        "resource copy",
+    );
+    assert!(
+        copy.contains("E_OWNERSHIP_COPY_RESOURCE"),
+        "resource copy diagnostic was {copy}"
+    );
+}
+
+struct EntryShiftPlugin;
+static ENTRY_SHIFT_PLUGIN: EntryShiftPlugin = EntryShiftPlugin;
+struct EntryShiftGrammar;
+impl vm::ParserDialect for EntryShiftGrammar {}
+static ENTRY_SHIFT_GRAMMAR: EntryShiftGrammar = EntryShiftGrammar;
+
+impl vm::SourcePlugin for EntryShiftPlugin {
+    fn descriptor(&self) -> vm::SourceFrontendDescriptor {
+        vm::SourceFrontendDescriptor {
+            id: vm::FrontendId::new("result-entry-shift"),
+            extensions: &["entry-shift"],
+            typing_policy: vm::FrontendTypingPolicy::Strict,
+            supports_ownership_checking: false,
+        }
+    }
+
+    fn parse_source(
+        &self,
+        source: &str,
+        context: &vm::SourceFrontendContext<'_>,
+    ) -> Result<vm::FrontendIr, vm::ParseError> {
+        vm::parse_source_with_dialect(
+            source,
+            &ENTRY_SHIFT_GRAMMAR,
+            vm::SharedParserOptions {
+                source_id: context.source_id,
+                allow_implicit_externs: false,
+                allow_implicit_semicolons: false,
+                enforce_mutable_bindings: true,
+                import_scan_mode: false,
+            },
+        )
+    }
+
+    fn parse_module_imports(
+        &self,
+        source: &str,
+        _path: &std::path::Path,
+        _context: &vm::SourceFrontendContext<'_>,
+    ) -> Result<Vec<vm::ModuleImport>, vm::SourcePathError> {
+        if source.contains("semantic-dependency") {
+            return Ok(vec![
+                vm::ModuleImport::value("ghost.rss", vm::ImportClause::AllPublic, 1).type_only(),
+            ]);
+        }
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn result_entry_schema_runtime_projection_uses_remapped_slots() {
+    let options = vm::CompileSourceFileOptions::default()
+        .with_source_plugin(&ENTRY_SHIFT_PLUGIN)
+        .with_module_override_path("calibration.rss", "calibration.entry-shift")
+        .with_module_override_source(
+            "calibration.rss",
+            "// semantic-dependency\npub fn value() -> int { 1 }\n",
+        )
+        .with_module_override_source(
+            "ghost.rss",
+            "let semantic_local: int = 40;\npub fn invisible() -> int { 3 }\n",
+        );
+    let compiled = vm::compile_source_for_repl_with_state_and_options(
+        "use calibration; r.is_ok();",
+        &[result_entry_state("r", result_int_string(), false)],
+        options,
+    );
+    let compiled = compiled.expect("runtime projection must keep the remapped Result entry");
+    let locals = compiled
+        .compiled
+        .program
+        .debug
+        .as_ref()
+        .expect("debug locals")
+        .locals
+        .iter()
+        .map(|local| local.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        locals.iter().all(|name| !name.contains("semantic_local")),
+        "semantic-only locals must not occupy runtime slots: {locals:?}"
+    );
+}
+
+fn result_entry_state_optional(name: &str, schema: TypeSchema, optional: bool) -> ReplLocalState {
+    ReplLocalState {
+        binding: ReplLocalBinding {
+            name: name.into(),
+            mutable: false,
+            schema: Some(schema),
+            optional,
+        },
+        moved: false,
+    }
+}
+
+fn assert_optional_entry_rejected(source: &str, state: ReplLocalState, label: &str) {
+    let rejected = expect_repl_err(compile_source_for_repl_with_state(source, &[state]), label);
+    assert!(
+        rejected.contains("optional")
+            || rejected.contains("Result")
+            || rejected.contains("unwrapped"),
+        "{label} must reject an unrefined optional use, got {rejected}"
+    );
+}
+
+#[test]
+fn result_entry_schema_rejects_optional_bit_result_query() {
+    assert_optional_entry_rejected(
+        "r.is_ok();",
+        result_entry_state_optional("r", result_int_string(), true),
+        "optional-bit Result entry",
+    );
+}
+
+#[test]
+fn result_entry_schema_rejects_optional_wrapper_result_query() {
+    assert_optional_entry_rejected(
+        "r.is_ok();",
+        result_entry_state_optional(
+            "r",
+            TypeSchema::Optional(Box::new(result_int_string())),
+            false,
+        ),
+        "optional-wrapper Result entry",
+    );
+}
+
+#[test]
+fn result_entry_schema_rejects_optional_callable_call() {
+    let callable = TypeSchema::Callable {
+        params: Vec::new(),
+        result: Box::new(result_int_string()),
+    };
+    assert_optional_entry_rejected(
+        "f().is_ok();",
+        result_entry_state_optional("f", callable.clone(), true),
+        "optional-bit callable entry",
+    );
+    assert_optional_entry_rejected(
+        "f();",
+        result_entry_state_optional("f", callable.clone(), true),
+        "optional-bit callable call",
+    );
+    assert_optional_entry_rejected(
+        "f().is_ok();",
+        result_entry_state_optional("f", TypeSchema::Optional(Box::new(callable)), false),
+        "optional-wrapper callable entry",
+    );
+}
+
+#[test]
+fn result_entry_schema_rejects_captured_optional_result_query() {
+    assert_optional_entry_rejected(
+        "let f = || r.is_ok();",
+        result_entry_state_optional("r", result_int_string(), true),
+        "captured optional Result entry",
+    );
+}
+
+#[test]
+fn result_entry_schema_accepts_unwrapped_optional_result() {
+    let compiled = compile_source_for_repl_with_state(
+        "let fallback: Result<int, string> = Result::Ok(1); r.unwrap_or(fallback).is_ok();",
+        &[result_entry_state_optional("r", result_int_string(), true)],
+    );
+    let compiled = match compiled {
+        Ok(compiled) => compiled,
+        Err(error) => panic!("legitimate unwrap_or of optional Result must compile, got {error}"),
+    };
+    #[cfg(feature = "runtime")]
+    {
+        let mut machine = vm::Vm::new(
+            compiled
+                .compiled
+                .program
+                .with_local_count(compiled.compiled.locals),
+        );
+        machine.set_fuel(100_000);
+        assert_eq!(
+            machine.run().expect("unwrapped optional Result should run"),
+            vm::VmStatus::Halted
+        );
+        assert_eq!(
+            machine.stack().last(),
+            Some(&vm::Value::Bool(true)),
+            "unwrap_or fallback Ok must report is_ok"
+        );
+    }
+}

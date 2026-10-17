@@ -161,6 +161,33 @@ pub(super) struct EntryLocalType {
     pub(super) optional: bool,
 }
 
+/// Whole logical type for a shared entry view.
+///
+/// The optional bit and a single `Optional<S>` wrapper are the same fact.
+/// Unknown is not wrapped or inserted: it is not a nullable value.
+pub(super) fn logical_entry_schema(entry: &EntryLocalType) -> Option<TypeSchema> {
+    let schema = entry.schema.clone()?;
+    project_logical_schema(schema, entry.optional)
+}
+
+pub(super) fn project_logical_schema(schema: TypeSchema, optional: bool) -> Option<TypeSchema> {
+    if matches!(schema, TypeSchema::Unknown) {
+        return None;
+    }
+    let (inner, schema_optional) = schema.split_optional();
+    if matches!(inner, TypeSchema::Unknown) {
+        return None;
+    }
+    let optional = optional || schema_optional;
+    Some(
+        if optional && !matches!(inner, TypeSchema::Optional(_) | TypeSchema::Null) {
+            TypeSchema::Optional(Box::new(inner))
+        } else {
+            inner
+        },
+    )
+}
+
 fn seed_entry_local_state(state: &mut LocalTypeState, entry_local_types: &[EntryLocalType]) {
     for entry_local in entry_local_types {
         let (schema, schema_optional) = entry_local
@@ -907,6 +934,239 @@ pub(crate) fn build_host_import_signatures(
     function_impls: &HashMap<u16, FunctionImpl>,
 ) -> HashMap<u16, HostCallableSignature> {
     helpers::build_host_import_signatures(functions, function_impls)
+}
+
+struct ResultTyping<'a> {
+    function_names: HashMap<u16, String>,
+    function_decls: HashMap<u16, FunctionDecl>,
+    host_import_return_types: HashMap<u16, BoundType>,
+    host_import_signatures: HashMap<u16, HostCallableSignature>,
+    function_impls: &'a HashMap<u16, FunctionImpl>,
+    struct_schemas: &'a HashMap<String, StructDecl>,
+}
+
+impl<'a> ResultTyping<'a> {
+    fn new(
+        functions: &[FunctionDecl],
+        function_impls: &'a HashMap<u16, FunctionImpl>,
+        struct_schemas: &'a HashMap<String, StructDecl>,
+    ) -> Self {
+        Self {
+            function_names: build_function_names(functions),
+            function_decls: build_function_decl_map(functions),
+            host_import_return_types: build_host_import_return_types(functions, function_impls),
+            host_import_signatures: build_host_import_signatures(functions, function_impls),
+            function_impls,
+            struct_schemas,
+        }
+    }
+
+    fn context(&self) -> TypeContext<'_> {
+        TypeContext::new(
+            self.function_impls,
+            &self.function_decls,
+            self.struct_schemas,
+            &self.function_names,
+            &self.host_import_return_types,
+            &self.host_import_signatures,
+            TypingMode::Strict,
+            None,
+        )
+    }
+}
+
+fn result_local_state(slots: &HashMap<LocalSlot, TypeSchema>) -> LocalTypeState {
+    let mut state = LocalTypeState::default();
+    for (slot, schema) in slots {
+        state.set_with_schema_origin(
+            *slot,
+            bound_type_from_schema(schema),
+            Some(schema.clone()),
+            true,
+        );
+    }
+    state
+}
+
+fn inferred_value_schema(
+    typing: &mut ResultTyping<'_>,
+    expr: &Expr,
+    slots: &HashMap<LocalSlot, TypeSchema>,
+) -> Option<TypeSchema> {
+    let state = result_local_state(slots);
+    let mut context = typing.context();
+    context
+        .infer_expr_schema(expr, &state)
+        .or_else(|| scalar_schema_from_bound_type(infer_expr_type(expr, &state)))
+        .filter(|schema| !matches!(schema, TypeSchema::Unknown))
+}
+
+/// Infer and check a Result payload with the typing owner's schema rules.
+/// Numeric compatibility applies only at this selected-payload position.
+/// `Unknown` and unbound generic parameters are not success.
+pub(crate) fn check_result_payload(
+    functions: &[FunctionDecl],
+    function_impls: &HashMap<u16, FunctionImpl>,
+    struct_schemas: &HashMap<String, StructDecl>,
+    payload: &Expr,
+    expected: &TypeSchema,
+    slots: &HashMap<LocalSlot, TypeSchema>,
+) -> Result<(), String> {
+    let mut typing = ResultTyping::new(functions, function_impls, struct_schemas);
+    let Some(actual) = inferred_value_schema(&mut typing, payload, slots) else {
+        return Err(format!(
+            "cannot check Result payload against {}",
+            render_schema_label(expected)
+        ));
+    };
+    let mut context = typing.context();
+    context.result_payload_strict = true;
+    if let Some(detail) =
+        helpers::find_declared_schema_mismatch(expected, &actual, &mut context, String::new())
+    {
+        return Err(detail);
+    }
+    Ok(())
+}
+
+pub(crate) fn contextual_callable_slot_schemas(
+    functions: &[FunctionDecl],
+    function_impls: &HashMap<u16, FunctionImpl>,
+    struct_schemas: &HashMap<String, StructDecl>,
+    caller_slots: &HashMap<LocalSlot, TypeSchema>,
+    param_slots: &[LocalSlot],
+    param_schemas: Option<&[TypeSchema]>,
+    capture_copies: &[(LocalSlot, LocalSlot)],
+) -> HashMap<LocalSlot, TypeSchema> {
+    let caller = result_local_state(caller_slots);
+    let typing = ResultTyping::new(functions, function_impls, struct_schemas);
+    let mut context = typing.context();
+    let declared = param_schemas.map(|schemas| {
+        schemas
+            .iter()
+            .map(|schema| (!matches!(schema, TypeSchema::Unknown)).then(|| schema.clone()))
+            .collect::<Vec<_>>()
+    });
+    let Some(nested) = context.build_callable_state(
+        param_slots,
+        declared.as_deref(),
+        capture_copies,
+        None,
+        &caller,
+    ) else {
+        return HashMap::new();
+    };
+    let mut slots = HashMap::new();
+    for (_, captured) in capture_copies {
+        if let Some(schema) = exported_logical_schema(&nested, *captured) {
+            slots.insert(*captured, schema);
+        }
+    }
+    for slot in param_slots {
+        if let Some(schema) = exported_logical_schema(&nested, *slot) {
+            slots.insert(*slot, schema);
+        }
+    }
+    slots
+}
+
+fn exported_logical_schema(state: &LocalTypeState, slot: LocalSlot) -> Option<TypeSchema> {
+    let schema = state.schema(slot).cloned()?;
+    project_logical_schema(schema, state.is_optional(slot))
+}
+
+pub(crate) fn infer_value_schema(
+    functions: &[FunctionDecl],
+    function_impls: &HashMap<u16, FunctionImpl>,
+    struct_schemas: &HashMap<String, StructDecl>,
+    expr: &Expr,
+    slots: &HashMap<LocalSlot, TypeSchema>,
+) -> Option<TypeSchema> {
+    let mut typing = ResultTyping::new(functions, function_impls, struct_schemas);
+    inferred_value_schema(&mut typing, expr, slots)
+}
+
+pub(crate) fn argument_schemas_for_call(
+    functions: &[FunctionDecl],
+    function_impls: &HashMap<u16, FunctionImpl>,
+    struct_schemas: &HashMap<String, StructDecl>,
+    index: u16,
+    type_args: &[TypeSchema],
+) -> Option<Vec<Option<TypeSchema>>> {
+    if crate::builtins::BuiltinFunction::from_call_index(index).is_some() {
+        return None;
+    }
+    let typing = ResultTyping::new(functions, function_impls, struct_schemas);
+    let mut context = typing.context();
+    context.resolve_function_arg_schemas(index, type_args)
+}
+
+pub(crate) fn expected_container_argument_schemas(
+    functions: &[FunctionDecl],
+    function_impls: &HashMap<u16, FunctionImpl>,
+    struct_schemas: &HashMap<String, StructDecl>,
+    index: u16,
+    args: &[Expr],
+    expected: Option<&TypeSchema>,
+) -> Option<Vec<Option<TypeSchema>>> {
+    let builtin = crate::builtins::BuiltinFunction::from_call_index(index)?;
+    let expected = expected?;
+    match builtin {
+        crate::builtins::BuiltinFunction::ArrayPush if args.len() == 2 => {
+            expected.array_prefix_and_rest()?;
+            let element = expected
+                .array_item_schema_at(0)
+                .or_else(|| expected.collapsed_array_item_schema())
+                .filter(|schema| !matches!(schema, TypeSchema::Unknown));
+            Some(vec![Some(expected.clone()), element])
+        }
+        crate::builtins::BuiltinFunction::Set if args.len() == 3 => {
+            let value = expected_named_or_container_field_schema(
+                functions,
+                function_impls,
+                struct_schemas,
+                expected,
+                &args[1],
+            );
+            Some(vec![Some(expected.clone()), None, value])
+        }
+        _ => None,
+    }
+}
+
+fn expected_named_or_container_field_schema(
+    functions: &[FunctionDecl],
+    function_impls: &HashMap<u16, FunctionImpl>,
+    struct_schemas: &HashMap<String, StructDecl>,
+    expected: &TypeSchema,
+    key: &Expr,
+) -> Option<TypeSchema> {
+    let Expr::String(name) = key else {
+        return None;
+    };
+    let schema = match expected {
+        TypeSchema::Named(struct_name, type_args) => {
+            let typing = ResultTyping::new(functions, function_impls, struct_schemas);
+            let mut context = typing.context();
+            context::source_named_struct_field_schema(struct_name, type_args, name, &mut context)?
+        }
+        TypeSchema::Object(fields) => fields.get(name).cloned()?,
+        TypeSchema::Map(inner) => inner.as_ref().clone(),
+        _ => return None,
+    };
+    (!matches!(schema, TypeSchema::Unknown)).then_some(schema)
+}
+
+pub(crate) fn result_branch_schemas_compatible(
+    functions: &[FunctionDecl],
+    function_impls: &HashMap<u16, FunctionImpl>,
+    struct_schemas: &HashMap<String, StructDecl>,
+    expected: &TypeSchema,
+    actual: &TypeSchema,
+) -> bool {
+    let typing = ResultTyping::new(functions, function_impls, struct_schemas);
+    let context = typing.context();
+    context.substitute_schema_generics(expected) == context.substitute_schema_generics(actual)
 }
 
 #[cfg(test)]

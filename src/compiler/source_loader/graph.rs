@@ -467,6 +467,10 @@ fn collect_named_schema_names(schema: &TypeSchema, names: &mut HashSet<String>) 
                 collect_named_schema_names(schema, names);
             }
         }
+        TypeSchema::Result { ok, err } => {
+            collect_named_schema_names(ok, names);
+            collect_named_schema_names(err, names);
+        }
         TypeSchema::Callable { params, result } => {
             for schema in params {
                 collect_named_schema_names(schema, names);
@@ -1870,6 +1874,22 @@ fn resolve_expr_imported_calls(
         | Expr::Borrow(inner)
         | Expr::BorrowMut(inner) => {
             resolve_expr_imported_calls(ctx, inner, line, parsed_semantic_index.as_deref_mut())?;
+        }
+        Expr::ResultConstruct { payload, .. } => {
+            resolve_expr_imported_calls(ctx, payload, line, parsed_semantic_index.as_deref_mut())?;
+        }
+        Expr::ResultQuery { value, .. } => {
+            resolve_expr_imported_calls(ctx, value, line, parsed_semantic_index.as_deref_mut())?;
+        }
+        Expr::ResultMatch {
+            value,
+            ok_expr,
+            err_expr,
+            ..
+        } => {
+            resolve_expr_imported_calls(ctx, value, line, parsed_semantic_index.as_deref_mut())?;
+            resolve_expr_imported_calls(ctx, ok_expr, line, parsed_semantic_index.as_deref_mut())?;
+            resolve_expr_imported_calls(ctx, err_expr, line, parsed_semantic_index.as_deref_mut())?;
         }
         Expr::IfElse {
             condition,

@@ -23,6 +23,7 @@ mod materialization;
 mod modules;
 mod parser;
 mod pipeline;
+mod result;
 mod semantic_model;
 mod source_loader;
 pub mod source_map;

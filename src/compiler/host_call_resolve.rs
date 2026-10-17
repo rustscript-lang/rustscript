@@ -903,6 +903,9 @@ fn tf_schema_label(schema: &TypeSchema) -> String {
         }
         TypeSchema::GenericParam(name) => name.clone(),
         TypeSchema::Resource(key) => format!("resource<{key}>"),
+        TypeSchema::Result { ok, err } => {
+            format!("Result<{}, {}>", tf_schema_label(ok), tf_schema_label(err))
+        }
     }
 }
 
@@ -971,6 +974,9 @@ fn schema_label(schema: &crate::host_api::HostTypeSchema) -> String {
         }
         HostTypeSchema::Resource(key) => format!("resource<{key}>"),
         HostTypeSchema::Named { name, .. } => name.clone(),
+        HostTypeSchema::Result { ok, err } => {
+            format!("Result<{}, {}>", schema_label(ok), schema_label(err))
+        }
     }
 }
 
@@ -1024,6 +1030,16 @@ fn expand_actual_named(
                     .collect()
             },
             result: Box::new(expand_actual_named(result, expected_result)),
+        },
+        (
+            TypeSchema::Result { ok, err },
+            HostTypeSchema::Result {
+                ok: expected_ok,
+                err: expected_err,
+            },
+        ) => TypeSchema::Result {
+            ok: Box::new(expand_actual_named(ok, expected_ok)),
+            err: Box::new(expand_actual_named(err, expected_err)),
         },
         _ => actual.clone(),
     }

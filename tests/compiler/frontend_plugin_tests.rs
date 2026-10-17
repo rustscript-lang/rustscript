@@ -314,3 +314,624 @@ fn descriptor_typing_policy_rejects_unknown_schema_only_for_strict_plugins() {
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::Int(44)]);
 }
+
+struct ResultIrPlugin;
+
+static RESULT_IR: ResultIrPlugin = ResultIrPlugin;
+
+fn result_schema() -> vm::compiler::TypeSchema {
+    vm::compiler::TypeSchema::Result {
+        ok: Box::new(vm::compiler::TypeSchema::Int),
+        err: Box::new(vm::compiler::TypeSchema::Int),
+    }
+}
+
+fn result_ir() -> FrontendIr {
+    let span = vm::Span::new(0, 0, 1);
+    FrontendIr {
+        stmts: vec![
+            Stmt::Let {
+                index: 0,
+                declared_schema: Some(result_schema()),
+                expr: Expr::ResultConstruct {
+                    ok: true,
+                    payload: Box::new(Expr::Int(7)),
+                    result_schema: result_schema(),
+                    span,
+                    semantic_id: None,
+                },
+                line: 1,
+            },
+            Stmt::Expr {
+                expr: Expr::ResultMatch {
+                    value: Box::new(Expr::MoveVar(0)),
+                    value_slot: 1,
+                    ok_binding: Some(2),
+                    ok_expr: Box::new(Expr::Var(2)),
+                    err_binding: Some(3),
+                    err_expr: Box::new(Expr::Int(-1)),
+                    scrutinee_schema: result_schema(),
+                    span,
+                    semantic_id: None,
+                },
+                line: 2,
+            },
+        ],
+        locals: 4,
+        local_bindings: Vec::new(),
+        struct_schemas: Default::default(),
+        unknown_type_spans: Vec::new(),
+        functions: Vec::new(),
+        function_impls: Default::default(),
+        stmt_sources: Vec::new(),
+        function_sources: Default::default(),
+        use_declarations: Vec::new(),
+        implicit_extern_names: Vec::new(),
+        host_api_metadata: None,
+        semantic_index: None,
+        parsed_semantic_index: None,
+        catalog_visibility: None,
+        lexer_tokens: Vec::new(),
+    }
+}
+
+impl SourcePlugin for ResultIrPlugin {
+    fn descriptor(&self) -> SourceFrontendDescriptor {
+        SourceFrontendDescriptor {
+            id: FrontendId::new("result-ir"),
+            extensions: &["result-ir"],
+            typing_policy: FrontendTypingPolicy::Strict,
+            supports_ownership_checking: false,
+        }
+    }
+
+    fn parse_source(
+        &self,
+        _source: &str,
+        _context: &SourceFrontendContext<'_>,
+    ) -> Result<FrontendIr, ParseError> {
+        Ok(result_ir())
+    }
+
+    fn parse_module_imports(
+        &self,
+        _source: &str,
+        _path: &Path,
+        _context: &SourceFrontendContext<'_>,
+    ) -> Result<Vec<vm::ModuleImport>, vm::SourcePathError> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn synthetic_frontend_ir_result_match_returns_ok_payload() {
+    let path = plugin_source_path("result-ir");
+    let compiled = compile_source_file_with_options(
+        &path,
+        CompileSourceFileOptions::new().with_source_plugin(&RESULT_IR),
+    )
+    .expect("synthetic Result IR should compile");
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(
+        vm.run().expect("synthetic Result IR should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
+}
+
+struct ContextualResultIrPlugin;
+
+static CONTEXTUAL_RESULT_IR: ContextualResultIrPlugin = ContextualResultIrPlugin;
+
+fn contextual_result_ir() -> FrontendIr {
+    let span = vm::Span::new(0, 0, 1);
+    let result = vm::TypeSchema::Result {
+        ok: Box::new(vm::TypeSchema::Int),
+        err: Box::new(vm::TypeSchema::String),
+    };
+    FrontendIr {
+        stmts: vec![
+            Stmt::ClosureLet {
+                line: 1,
+                expected_schema: Some(vm::TypeSchema::Callable {
+                    params: Vec::new(),
+                    result: Box::new(result.clone()),
+                }),
+                closure: vm::ClosureExpr {
+                    param_slots: Vec::new(),
+                    capture_copies: Vec::new(),
+                    body: Box::new(Expr::ResultConstruct {
+                        ok: false,
+                        payload: Box::new(Expr::String("e".to_string())),
+                        result_schema: vm::TypeSchema::Unknown,
+                        span,
+                        semantic_id: None,
+                    }),
+                },
+            },
+            Stmt::Let {
+                index: 0,
+                declared_schema: Some(vm::TypeSchema::Callable {
+                    params: Vec::new(),
+                    result: Box::new(result.clone()),
+                }),
+                expr: Expr::Closure(vm::ClosureExpr {
+                    param_slots: Vec::new(),
+                    capture_copies: Vec::new(),
+                    body: Box::new(Expr::ResultConstruct {
+                        ok: true,
+                        payload: Box::new(Expr::Int(1)),
+                        result_schema: vm::TypeSchema::Unknown,
+                        span,
+                        semantic_id: None,
+                    }),
+                }),
+                line: 1,
+            },
+            Stmt::Let {
+                index: 4,
+                declared_schema: Some(vm::TypeSchema::Callable {
+                    params: Vec::new(),
+                    result: Box::new(result.clone()),
+                }),
+                expr: Expr::Closure(vm::ClosureExpr {
+                    param_slots: Vec::new(),
+                    capture_copies: Vec::new(),
+                    body: Box::new(Expr::ResultConstruct {
+                        ok: false,
+                        payload: Box::new(Expr::String("e".to_string())),
+                        result_schema: vm::TypeSchema::Unknown,
+                        span,
+                        semantic_id: None,
+                    }),
+                }),
+                line: 1,
+            },
+            Stmt::Expr {
+                expr: Expr::ResultMatch {
+                    value: Box::new(Expr::LocalCall(0, Vec::new(), Vec::new(), None)),
+                    value_slot: 1,
+                    ok_binding: Some(2),
+                    ok_expr: Box::new(Expr::Var(2)),
+                    err_binding: Some(3),
+                    err_expr: Box::new(Expr::Int(-1)),
+                    scrutinee_schema: result.clone(),
+                    span,
+                    semantic_id: None,
+                },
+                line: 2,
+            },
+            Stmt::Expr {
+                expr: Expr::ResultMatch {
+                    value: Box::new(Expr::LocalCall(4, Vec::new(), Vec::new(), None)),
+                    value_slot: 5,
+                    ok_binding: Some(6),
+                    ok_expr: Box::new(Expr::Var(6)),
+                    err_binding: Some(7),
+                    err_expr: Box::new(Expr::Int(-1)),
+                    scrutinee_schema: result,
+                    span,
+                    semantic_id: None,
+                },
+                line: 3,
+            },
+        ],
+        locals: 8,
+        local_bindings: Vec::new(),
+        struct_schemas: Default::default(),
+        unknown_type_spans: Vec::new(),
+        functions: Vec::new(),
+        function_impls: Default::default(),
+        stmt_sources: Vec::new(),
+        function_sources: Default::default(),
+        use_declarations: Vec::new(),
+        implicit_extern_names: Vec::new(),
+        host_api_metadata: None,
+        semantic_index: None,
+        parsed_semantic_index: None,
+        catalog_visibility: None,
+        lexer_tokens: Vec::new(),
+    }
+}
+
+impl SourcePlugin for ContextualResultIrPlugin {
+    fn descriptor(&self) -> SourceFrontendDescriptor {
+        SourceFrontendDescriptor {
+            id: FrontendId::new("contextual-result-ir"),
+            extensions: &["contextual-result-ir"],
+            typing_policy: FrontendTypingPolicy::Strict,
+            supports_ownership_checking: false,
+        }
+    }
+
+    fn parse_source(
+        &self,
+        _source: &str,
+        _context: &SourceFrontendContext<'_>,
+    ) -> Result<FrontendIr, ParseError> {
+        Ok(contextual_result_ir())
+    }
+
+    fn parse_module_imports(
+        &self,
+        _source: &str,
+        _path: &Path,
+        _context: &SourceFrontendContext<'_>,
+    ) -> Result<Vec<vm::ModuleImport>, vm::SourcePathError> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn synthetic_frontend_ir_closure_result_uses_expected_callable_schema() {
+    let path = plugin_source_path("contextual-result-ir");
+    let compiled = compile_source_file_with_options(
+        &path,
+        CompileSourceFileOptions::new().with_source_plugin(&CONTEXTUAL_RESULT_IR),
+    )
+    .expect("typed closure Result IR should compile from expected schema");
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(
+        vm.run().expect("typed closure Result IR should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(1), Value::Int(-1)]);
+}
+
+struct CapturedResultIrPlugin;
+static CAPTURED_RESULT_IR: CapturedResultIrPlugin = CapturedResultIrPlugin;
+
+fn captured_result_ir() -> FrontendIr {
+    let span = vm::Span::new(0, 0, 1);
+    let result = vm::TypeSchema::Result {
+        ok: Box::new(vm::TypeSchema::Int),
+        err: Box::new(vm::TypeSchema::String),
+    };
+    let callable = vm::TypeSchema::Callable {
+        params: Vec::new(),
+        result: Box::new(result.clone()),
+    };
+    let source_slot = 0;
+    let captured_slot = 1;
+    let closure = || vm::ClosureExpr {
+        param_slots: Vec::new(),
+        capture_copies: vec![(source_slot, captured_slot)],
+        body: Box::new(Expr::ResultConstruct {
+            ok: true,
+            payload: Box::new(Expr::Var(captured_slot)),
+            result_schema: vm::TypeSchema::Unknown,
+            span,
+            semantic_id: None,
+        }),
+    };
+    FrontendIr {
+        stmts: vec![
+            Stmt::Let {
+                index: source_slot,
+                declared_schema: Some(vm::TypeSchema::Int),
+                expr: Expr::Int(7),
+                line: 1,
+            },
+            Stmt::ClosureLet {
+                line: 1,
+                expected_schema: Some(callable.clone()),
+                closure: closure(),
+            },
+            Stmt::Let {
+                index: 2,
+                declared_schema: Some(callable),
+                expr: Expr::Closure(closure()),
+                line: 2,
+            },
+            Stmt::Expr {
+                expr: Expr::ResultMatch {
+                    value: Box::new(Expr::LocalCall(2, Vec::new(), Vec::new(), None)),
+                    value_slot: 3,
+                    ok_binding: Some(4),
+                    ok_expr: Box::new(Expr::Var(4)),
+                    err_binding: Some(5),
+                    err_expr: Box::new(Expr::Int(-1)),
+                    scrutinee_schema: result,
+                    span,
+                    semantic_id: None,
+                },
+                line: 3,
+            },
+        ],
+        locals: 6,
+        local_bindings: Vec::new(),
+        struct_schemas: Default::default(),
+        unknown_type_spans: Vec::new(),
+        functions: Vec::new(),
+        function_impls: Default::default(),
+        stmt_sources: Vec::new(),
+        function_sources: Default::default(),
+        use_declarations: Vec::new(),
+        implicit_extern_names: Vec::new(),
+        host_api_metadata: None,
+        semantic_index: None,
+        parsed_semantic_index: None,
+        catalog_visibility: None,
+        lexer_tokens: Vec::new(),
+    }
+}
+
+impl SourcePlugin for CapturedResultIrPlugin {
+    fn descriptor(&self) -> SourceFrontendDescriptor {
+        SourceFrontendDescriptor {
+            id: FrontendId::new("captured-result-ir"),
+            extensions: &["captured-result-ir"],
+            typing_policy: FrontendTypingPolicy::Strict,
+            supports_ownership_checking: false,
+        }
+    }
+
+    fn parse_source(
+        &self,
+        _source: &str,
+        _context: &SourceFrontendContext<'_>,
+    ) -> Result<FrontendIr, ParseError> {
+        Ok(captured_result_ir())
+    }
+
+    fn parse_module_imports(
+        &self,
+        _source: &str,
+        _path: &Path,
+        _context: &SourceFrontendContext<'_>,
+    ) -> Result<Vec<vm::ModuleImport>, vm::SourcePathError> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn contextual_captured_result_ir_executes_distinct_capture_slots() {
+    let ir = captured_result_ir();
+    let copies = match &ir.stmts[2] {
+        Stmt::Let {
+            expr: Expr::Closure(closure),
+            ..
+        } => closure.capture_copies.clone(),
+        other => panic!("executable closure missing: {other:?}"),
+    };
+    assert_eq!(copies, vec![(0, 1)]);
+    assert_ne!(copies[0].0, copies[0].1);
+    let path = plugin_source_path("captured-result-ir");
+    let compiled = compile_source_file_with_options(
+        &path,
+        CompileSourceFileOptions::new().with_source_plugin(&CAPTURED_RESULT_IR),
+    )
+    .expect("captured Result IR should compile");
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(
+        vm.run().expect("captured Result IR should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
+}
+
+struct GuestBoxClosurePlugin;
+static GUEST_BOX_CLOSURE: GuestBoxClosurePlugin = GuestBoxClosurePlugin;
+
+fn builtin_call(builtin: vm::BuiltinFunction, args: Vec<Expr>) -> Expr {
+    Expr::Call(builtin.call_index(), Vec::new(), args, None, None)
+}
+
+fn unknown_ok(payload: Expr) -> Expr {
+    Expr::ResultConstruct {
+        ok: true,
+        payload: Box::new(payload),
+        result_schema: vm::TypeSchema::Unknown,
+        span: vm::Span::new(0, 0, 1),
+        semantic_id: None,
+    }
+}
+
+fn guest_box_body(field: &str, payload: Expr) -> Expr {
+    unknown_ok(builtin_call(
+        vm::BuiltinFunction::Set,
+        vec![
+            builtin_call(vm::BuiltinFunction::MapNew, Vec::new()),
+            Expr::String(field.to_string()),
+            unknown_ok(payload),
+        ],
+    ))
+}
+
+fn guest_box_ir(field: &str, payload: Expr) -> FrontendIr {
+    let span = vm::Span::new(0, 0, 1);
+    let inner = vm::TypeSchema::Result {
+        ok: Box::new(vm::TypeSchema::Int),
+        err: Box::new(vm::TypeSchema::String),
+    };
+    let named = vm::TypeSchema::Named("Box".to_string(), Vec::new());
+    let outer = vm::TypeSchema::Result {
+        ok: Box::new(named.clone()),
+        err: Box::new(vm::TypeSchema::String),
+    };
+    let callable = vm::TypeSchema::Callable {
+        params: Vec::new(),
+        result: Box::new(outer.clone()),
+    };
+    let body = guest_box_body(field, payload);
+    FrontendIr {
+        stmts: vec![
+            Stmt::ClosureLet {
+                line: 1,
+                expected_schema: Some(callable.clone()),
+                closure: vm::ClosureExpr {
+                    param_slots: Vec::new(),
+                    capture_copies: Vec::new(),
+                    body: Box::new(body.clone()),
+                },
+            },
+            Stmt::Let {
+                index: 0,
+                declared_schema: Some(callable),
+                expr: Expr::Closure(vm::ClosureExpr {
+                    param_slots: Vec::new(),
+                    capture_copies: Vec::new(),
+                    body: Box::new(body),
+                }),
+                line: 2,
+            },
+            Stmt::Expr {
+                expr: Expr::ResultMatch {
+                    value: Box::new(Expr::LocalCall(0, Vec::new(), Vec::new(), None)),
+                    value_slot: 1,
+                    ok_binding: Some(2),
+                    ok_expr: Box::new(Expr::ResultMatch {
+                        value: Box::new(builtin_call(
+                            vm::BuiltinFunction::Get,
+                            vec![Expr::Var(2), Expr::String("value".to_string())],
+                        )),
+                        value_slot: 3,
+                        ok_binding: Some(4),
+                        ok_expr: Box::new(Expr::Var(4)),
+                        err_binding: Some(5),
+                        err_expr: Box::new(Expr::Int(-1)),
+                        scrutinee_schema: inner,
+                        span,
+                        semantic_id: None,
+                    }),
+                    err_binding: Some(6),
+                    err_expr: Box::new(Expr::Int(-2)),
+                    scrutinee_schema: outer,
+                    span,
+                    semantic_id: None,
+                },
+                line: 3,
+            },
+        ],
+        locals: 7,
+        local_bindings: Vec::new(),
+        struct_schemas: std::iter::once((
+            "Box".to_string(),
+            vm::compiler::ir::StructDecl {
+                name: "Box".to_string(),
+                type_params: Vec::new(),
+                body_schema: vm::TypeSchema::Object(
+                    std::iter::once(("value".to_string(), {
+                        vm::TypeSchema::Result {
+                            ok: Box::new(vm::TypeSchema::Int),
+                            err: Box::new(vm::TypeSchema::String),
+                        }
+                    }))
+                    .collect(),
+                ),
+                origin: vm::compiler::StructDeclOrigin::Guest,
+            },
+        ))
+        .collect(),
+        unknown_type_spans: Vec::new(),
+        functions: Vec::new(),
+        function_impls: Default::default(),
+        stmt_sources: Vec::new(),
+        function_sources: Default::default(),
+        use_declarations: Vec::new(),
+        implicit_extern_names: Vec::new(),
+        host_api_metadata: None,
+        semantic_index: None,
+        parsed_semantic_index: None,
+        catalog_visibility: None,
+        lexer_tokens: Vec::new(),
+    }
+}
+
+impl SourcePlugin for GuestBoxClosurePlugin {
+    fn descriptor(&self) -> SourceFrontendDescriptor {
+        SourceFrontendDescriptor {
+            id: FrontendId::new("guest-box-closure"),
+            extensions: &["guest-box"],
+            typing_policy: FrontendTypingPolicy::Strict,
+            supports_ownership_checking: false,
+        }
+    }
+
+    fn parse_source(
+        &self,
+        source: &str,
+        _context: &SourceFrontendContext<'_>,
+    ) -> Result<FrontendIr, ParseError> {
+        if source.contains("wrong-field") {
+            return Ok(guest_box_ir("other", Expr::Int(1)));
+        }
+        if source.contains("wrong-payload") {
+            return Ok(guest_box_ir("value", Expr::String("no".to_string())));
+        }
+        Ok(guest_box_ir("value", Expr::Int(1)))
+    }
+
+    fn parse_module_imports(
+        &self,
+        _source: &str,
+        _path: &Path,
+        _context: &SourceFrontendContext<'_>,
+    ) -> Result<Vec<vm::ModuleImport>, vm::SourcePathError> {
+        Ok(Vec::new())
+    }
+}
+
+fn guest_box_source(marker: &str) -> PluginSourceFixture {
+    let path = plugin_source_path("guest-box");
+    std::fs::write(&path.path, format!("{marker}\n")).expect("guest box source");
+    path
+}
+
+#[test]
+fn closure_let_guest_named_expected_schema_survives_canonical_remap() {
+    let path = guest_box_source("ok");
+    let compiled = compile_source_file_with_options(
+        &path,
+        CompileSourceFileOptions::new().with_source_plugin(&GUEST_BOX_CLOSURE),
+    )
+    .expect("guest Box ClosureLet should compile after canonical rename");
+    let decls = compiled.program.named_struct_decls();
+    let (name, decl) = decls
+        .iter()
+        .find(|(name, _)| name.starts_with("__guest_type_"))
+        .expect("canonical guest declaration");
+    assert_eq!(decl.name, name.as_str());
+    assert_ne!(*name, "Box");
+    let vm::TypeSchema::Object(fields) = &decl.body_schema else {
+        panic!("guest body should stay an object: {:?}", decl.body_schema);
+    };
+    match fields.get("value") {
+        Some(vm::TypeSchema::Result { ok, err }) => {
+            assert!(matches!(ok.as_ref(), vm::TypeSchema::Int));
+            assert!(matches!(err.as_ref(), vm::TypeSchema::String));
+        }
+        other => panic!("nested field schema was {other:?}"),
+    }
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(
+        vm.run().expect("guest Box closure should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(1)]);
+
+    for (marker, label) in [("wrong-field", "field"), ("wrong-payload", "payload")] {
+        let path = guest_box_source(marker);
+        let error = match compile_source_file_with_options(
+            &path,
+            CompileSourceFileOptions::new().with_source_plugin(&GUEST_BOX_CLOSURE),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("{label} must reject"),
+        };
+        let text = error.to_string();
+        let rejected = text.contains("schema")
+            || text.contains("field")
+            || text.contains("string")
+            || text.contains("assigned")
+            || text.contains("annotation")
+            || text.contains("inactive");
+        assert!(rejected, "{label} diagnostic was {text}");
+        if label == "payload" {
+            assert!(
+                text.contains("schema") || text.contains("string") || text.contains("assigned"),
+                "payload diagnostic was {text}"
+            );
+        }
+    }
+}

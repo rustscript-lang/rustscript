@@ -146,7 +146,7 @@ fn embedded_decoder_skips_named_host_schema_from_std_encode() {
 }
 
 #[test]
-fn embedded_decoder_reads_legacy_v11_without_schema_markers() {
+fn embedded_decoder_rejects_legacy_v11_without_schema_markers() {
     let program = Program::new(
         vec![Value::Int(7)],
         vec![OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8],
@@ -156,14 +156,16 @@ fn embedded_decoder_reads_legacy_v11_without_schema_markers() {
     bytes.truncate(bytes.len() - 4);
     bytes[4..6].copy_from_slice(&11u16.to_le_bytes());
 
-    let decoded = decode_program(&bytes).expect("embedded decoder should accept VMBC v11");
-    assert_eq!(decoded.constants()[0], EmbeddedValue::Int(7));
+    assert!(matches!(
+        decode_program(&bytes),
+        Err(WireError::UnsupportedVersion(11))
+    ));
 }
 
 fn minimal_vmbc_prefix(constant_count: u32, code: &[u8], import_count: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"VMBC");
-    bytes.extend_from_slice(&12u16.to_le_bytes());
+    bytes.extend_from_slice(&13u16.to_le_bytes());
     bytes.extend_from_slice(&0u16.to_le_bytes());
     bytes.extend_from_slice(&constant_count.to_le_bytes());
     bytes.extend_from_slice(&(code.len() as u32).to_le_bytes());
@@ -541,6 +543,7 @@ fn v12_with_named_host_return_schema(schema: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes
 }
 
@@ -685,7 +688,13 @@ fn embedded_decoder_rejects_v12_trailing_zero_named_struct_garbage() {
     assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
     bytes.truncate(bytes.len() - 4);
     bytes[4..6].copy_from_slice(&12u16.to_le_bytes());
-    decode_program(&bytes).expect("clean v12 should decode");
+    assert_eq!(
+        decode_program(&bytes),
+        Err(WireError::UnsupportedVersion(12))
+    );
     bytes.extend_from_slice(&0u32.to_le_bytes());
-    assert_eq!(decode_program(&bytes), Err(WireError::TrailingBytes));
+    assert_eq!(
+        decode_program(&bytes),
+        Err(WireError::UnsupportedVersion(12))
+    );
 }

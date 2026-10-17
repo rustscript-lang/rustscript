@@ -264,6 +264,10 @@ fn collect_named_host_types(
             }
             collect_named_host_types(result, catalog, visited, pending)
         }
+        HostTypeSchema::Result { ok, err } => {
+            collect_named_host_types(ok, catalog, visited, pending)?;
+            collect_named_host_types(err, catalog, visited, pending)
+        }
         HostTypeSchema::Unknown
         | HostTypeSchema::Null
         | HostTypeSchema::Int

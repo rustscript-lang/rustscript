@@ -186,8 +186,16 @@ fn prepare_typed_units_with_entry(
         let runtime_availability = repl
             .map(|(locals, moved)| build_entry_local_availability(&runtime, locals, moved))
             .unwrap_or_default();
-        let (runtime, error) =
+        let (mut runtime, error) =
             typing::legalize_for_admission(runtime, TypingMode::DynamicHints, &runtime_types);
+        if error.is_none() {
+            super::result::resolve_result_types(&mut runtime, &runtime_types).map_err(|error| {
+                SourcePathError::SourceWithMap {
+                    error: SourceError::Compile(error),
+                    sources: sources.clone(),
+                }
+            })?;
+        }
         if !behavior.recover_host_errors
             && let Some(error) = error
         {
@@ -351,8 +359,15 @@ fn prepare_owned_typed_ir(
     }
     // Legalization and inference do not impose the root's language policy on
     // dependencies. Admission below uses each producer's own descriptor.
-    let (legalized, host_error) =
+    let (mut legalized, host_error) =
         typing::legalize_for_admission(parsed, TypingMode::DynamicHints, entry.types);
+    // Host-call resolutions and merged module formals exist only after
+    // legalize. Fill Result schemas from those owners before ownership.
+    // A failed host resolution keeps its own diagnostic.
+    if host_error.is_none() {
+        super::result::resolve_result_types(&mut legalized, entry.types)
+            .map_err(SourceError::Compile)?;
+    }
     parsed = legalized;
     let type_info = typing::infer_types(&parsed, TypingMode::DynamicHints, entry.types);
     let mut analysis_errors = Vec::new();
@@ -584,7 +599,7 @@ fn record_stmt_local_debug_ranges(stmt: &Stmt, ranges: &mut HashMap<LocalSlot, L
             note_local_use(ranges, *index, *line);
             record_expr_local_debug_ranges(expr, *line, ranges);
         }
-        Stmt::ClosureLet { line, closure } => {
+        Stmt::ClosureLet { line, closure, .. } => {
             for (source_slot, captured_slot) in &closure.capture_copies {
                 note_local_use(ranges, *source_slot, *line);
                 note_local_use(ranges, *captured_slot, *line);
@@ -754,6 +769,12 @@ fn record_expr_local_debug_ranges(
             }
             record_expr_local_debug_ranges(default, line, ranges);
         }
+        other @ (Expr::ResultConstruct { .. }
+        | Expr::ResultQuery { .. }
+        | Expr::ResultMatch { .. }) => {
+            other
+                .visit_result_children(|child| record_expr_local_debug_ranges(child, line, ranges));
+        }
         Expr::Block { stmts, expr } => {
             for stmt in stmts {
                 record_stmt_local_debug_ranges(stmt, ranges);
@@ -886,6 +907,9 @@ fn compile_parsed_output_with_capture_output(
         reject_strict_unknown_annotations(&parsed).map_err(SourceError::Parse)?;
     }
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
+    let mut parsed = parsed;
+    super::result::resolve_result_types(&mut parsed, entry_local_types)
+        .map_err(SourceError::Compile)?;
     let parsed = typing::legalize_builtins_and_bind_types(parsed, typing_mode, entry_local_types)
         .map_err(SourceError::Compile)?;
     typing::validate_if_else_type_consistency(&parsed, typing_mode, entry_local_types)
@@ -1396,6 +1420,7 @@ fn schema_is_fully_known(schema: &TypeSchema) -> bool {
         TypeSchema::Callable { params, result } => {
             params.iter().all(schema_is_fully_known) && schema_is_fully_known(result)
         }
+        TypeSchema::Result { ok, err } => schema_is_fully_known(ok) && schema_is_fully_known(err),
     }
 }
 

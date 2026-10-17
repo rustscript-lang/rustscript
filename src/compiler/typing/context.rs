@@ -84,6 +84,9 @@ fn schema_mentions_generic_param(schema: &TypeSchema, name: &str) -> bool {
         }
         TypeSchema::Map(value) => schema_mentions_generic_param(value, name),
         TypeSchema::Optional(inner) => schema_mentions_generic_param(inner, name),
+        TypeSchema::Result { ok, err } => {
+            schema_mentions_generic_param(ok, name) || schema_mentions_generic_param(err, name)
+        }
         TypeSchema::Object(fields) => fields
             .values()
             .any(|value| schema_mentions_generic_param(value, name)),
@@ -124,6 +127,9 @@ pub(super) struct TypeContext<'a> {
     /// diagnostics. `None` for hand-built test IRs and plugin frontends that
     /// carry no parser index.
     parsed: Option<&'a crate::compiler::ir::ParsedSemanticIndex>,
+    /// Result payload checks reuse this context but must not treat
+    /// `GenericParam` or `Unknown` as compatible with every concrete schema.
+    pub(super) result_payload_strict: bool,
 }
 
 struct CallableBody<'a> {
@@ -170,6 +176,7 @@ impl<'a> TypeContext<'a> {
             active_observed_returns: Vec::new(),
             active_optional_returns: Vec::new(),
             parsed,
+            result_payload_strict: false,
         }
     }
 
@@ -293,6 +300,10 @@ impl<'a> TypeContext<'a> {
                     .map(|param| self.substitute_schema_generics(param))
                     .collect(),
                 result: Box::new(self.substitute_schema_generics(result)),
+            },
+            TypeSchema::Result { ok, err } => TypeSchema::Result {
+                ok: Box::new(self.substitute_schema_generics(ok)),
+                err: Box::new(self.substitute_schema_generics(err)),
             },
             _ => schema.clone(),
         }
@@ -466,6 +477,19 @@ impl<'a> TypeContext<'a> {
                 let (resolved, trip) =
                     self.resolve_schema_with_seen_tripped(inner, seen, reentries);
                 (TypeSchema::Optional(Box::new(resolved)), trip)
+            }
+            TypeSchema::Result { ok, err } => {
+                let (resolved_ok, ok_trip) =
+                    self.resolve_schema_with_seen_tripped(ok, seen, reentries);
+                let (resolved_err, err_trip) =
+                    self.resolve_schema_with_seen_tripped(err, seen, reentries);
+                (
+                    TypeSchema::Result {
+                        ok: Box::new(resolved_ok),
+                        err: Box::new(resolved_err),
+                    },
+                    ok_trip.or(err_trip),
+                )
             }
             TypeSchema::Object(fields) => {
                 let mut resolved_fields = HashMap::with_capacity(fields.len());
@@ -1307,6 +1331,47 @@ impl<'a> TypeContext<'a> {
                 self.apply_stmts(stmts, &mut nested);
                 self.infer_expr_schema(expr, &nested)
             }
+            Expr::ResultQuery { .. } => Some(TypeSchema::Bool),
+            Expr::ResultConstruct { result_schema, .. } => match result_schema {
+                TypeSchema::Unknown => None,
+                other => Some(self.substitute_schema_generics(other)),
+            },
+            Expr::ResultMatch {
+                ok_binding,
+                ok_expr,
+                err_binding,
+                err_expr,
+                scrutinee_schema,
+                ..
+            } => {
+                let TypeSchema::Result { ok, err } = scrutinee_schema else {
+                    return None;
+                };
+                let mut ok_state = state.clone();
+                if let Some(slot) = *ok_binding {
+                    ok_state.set_with_schema_origin(
+                        slot,
+                        self.bound_type_for_schema(ok),
+                        Some(ok.as_ref().clone()),
+                        true,
+                    );
+                }
+                let mut err_state = state.clone();
+                if let Some(slot) = *err_binding {
+                    err_state.set_with_schema_origin(
+                        slot,
+                        self.bound_type_for_schema(err),
+                        Some(err.as_ref().clone()),
+                        true,
+                    );
+                }
+                let ok_schema = self.infer_expr_schema(ok_expr, &ok_state);
+                let err_schema = self.infer_expr_schema(err_expr, &err_state);
+                match (ok_schema, err_schema) {
+                    (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -1430,6 +1495,56 @@ impl<'a> TypeContext<'a> {
                     default_ty
                 } else if arm_type != BoundType::Unknown && arm_type == default_ty {
                     arm_type
+                } else {
+                    BoundType::Unknown
+                }
+            }
+            Expr::ResultConstruct { payload, .. } => {
+                let _ = self.infer_expr_type(payload, state);
+                BoundType::Map
+            }
+            Expr::ResultQuery { value, .. } => {
+                let _ = self.infer_expr_type(value, state);
+                BoundType::Bool
+            }
+            Expr::ResultMatch {
+                value,
+                ok_binding,
+                ok_expr,
+                err_binding,
+                err_expr,
+                scrutinee_schema,
+                ..
+            } => {
+                let _ = self.infer_expr_type(value, state);
+                let (ok_schema, err_schema) = match scrutinee_schema {
+                    TypeSchema::Result { ok, err } => (ok.as_ref().clone(), err.as_ref().clone()),
+                    _ => (TypeSchema::Unknown, TypeSchema::Unknown),
+                };
+                let mut ok_state = state.clone();
+                if let Some(slot) = *ok_binding {
+                    ok_state.set_with_optional_schema_origin(
+                        slot,
+                        self.bound_type_for_schema(&ok_schema),
+                        Some(ok_schema),
+                        true,
+                        false,
+                    );
+                }
+                let mut err_state = state.clone();
+                if let Some(slot) = *err_binding {
+                    err_state.set_with_optional_schema_origin(
+                        slot,
+                        self.bound_type_for_schema(&err_schema),
+                        Some(err_schema),
+                        true,
+                        false,
+                    );
+                }
+                let ok_ty = self.infer_expr_type(ok_expr, &ok_state);
+                let err_ty = self.infer_expr_type(err_expr, &err_state);
+                if ok_ty == err_ty {
+                    ok_ty
                 } else {
                     BoundType::Unknown
                 }
@@ -2861,7 +2976,7 @@ pub(crate) fn bound_type_from_schema(schema: &TypeSchema) -> BoundType {
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
             BoundType::Array
         }
-        TypeSchema::Map(_) | TypeSchema::Object(_) => BoundType::Map,
+        TypeSchema::Map(_) | TypeSchema::Object(_) | TypeSchema::Result { .. } => BoundType::Map,
         // Resources are opaque (nominal) values: they are never reduced to the
         // `Map` bound or to an integral token in semantic inference.
         TypeSchema::Resource(_) => BoundType::Unknown,
@@ -3061,7 +3176,7 @@ pub(super) fn infer_access_schema(
     }
 }
 
-fn source_named_struct_field_schema(
+pub(super) fn source_named_struct_field_schema(
     struct_name: &str,
     type_args: &[TypeSchema],
     field_name: &str,
@@ -3115,7 +3230,7 @@ pub(super) fn schema_label(schema: &TypeSchema) -> &'static str {
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
             "array"
         }
-        TypeSchema::Map(_) | TypeSchema::Object(_) => "map",
+        TypeSchema::Map(_) | TypeSchema::Object(_) | TypeSchema::Result { .. } => "map",
         TypeSchema::Resource(_) => "resource",
     }
 }
@@ -3175,6 +3290,11 @@ pub(crate) fn render_schema_label(schema: &TypeSchema) -> String {
             format!("[{}]", parts.join(", "))
         }
         TypeSchema::Map(value) => format!("map<{}>", render_schema_label(value)),
+        TypeSchema::Result { ok, err } => format!(
+            "Result<{}, {}>",
+            render_schema_label(ok),
+            render_schema_label(err)
+        ),
         // Resources render as their nominal key (`resource<io.file>`), never as
         // their physical integer ABI token or a structural `map<...>` shape.
         TypeSchema::Resource(key) => format!("resource<{key}>"),
