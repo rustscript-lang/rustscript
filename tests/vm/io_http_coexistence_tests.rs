@@ -1,74 +1,20 @@
 //! IO and HTTP coexistence tests for the async host-adapter build.
 #![cfg(all(feature = "http-client", not(target_family = "wasm")))]
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
 
 use vm::{
-    CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput, HostOpId,
-    HttpConfig, HttpHostExt, IoHostExt, IoPolicy, Value, Vm, VmError, VmResult, VmStatus,
-    compile_source, register_http_builtin_module, standard_host_catalog,
+    HostFunctionRegistry, HttpConfig, HttpHostExt, IoHostExt, IoPolicy, ResourceTypeKey, Value, Vm,
+    VmResult, VmStatus, compile_source, register_http_builtin_module, standard_host_catalog,
 };
 
-#[derive(Default)]
-struct TokioHostDriver {
-    submitted: HashMap<HostOpId, HostFuture>,
-}
-
-impl HostAsyncBridge for TokioHostDriver {
-    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
-        self.submitted.insert(op_id, future);
-        Ok(())
-    }
-
-    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
-        Poll::Ready(Err(VmError::HostError(format!(
-            "unknown external host operation {op_id}"
-        ))))
-    }
-
-    fn poll_submitted_op(
-        &mut self,
-        op_id: HostOpId,
-        cx: &mut Context<'_>,
-    ) -> Poll<VmResult<HostFutureOutput>> {
-        let poll = self.submitted.get_mut(&op_id).map_or_else(
-            || {
-                Poll::Ready(Err(VmError::HostError(format!(
-                    "unknown submitted host operation {op_id}"
-                ))))
-            },
-            |future| future.as_mut().poll(cx),
-        );
-        if poll.is_ready() {
-            self.submitted.remove(&op_id);
-        }
-        poll
-    }
-
-    fn request_cancel_op(
-        &mut self,
-        op_id: HostOpId,
-        _reason: vm::operation::OperationCancelReason,
-    ) -> VmResult<()> {
-        self.submitted.remove(&op_id);
-        Ok(())
-    }
-
-    fn poll_cancel_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn cleanup_op(&mut self, op_id: HostOpId, _terminal: vm::HostAsyncOpTerminal) -> VmResult<()> {
-        self.submitted.remove(&op_id);
-        Ok(())
-    }
-}
+#[path = "../support/http_test_bridge.rs"]
+mod http_test_bridge;
+use http_test_bridge::TokioHostDriver;
 
 fn install_host_driver(vm: &mut Vm) {
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
@@ -167,6 +113,7 @@ async fn io_and_http_both_register_via_shared_vm() {
     )
     .expect("IO and HTTP source should compile");
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.configure_io(IoPolicy {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
@@ -197,6 +144,7 @@ async fn io_and_http_execute_together() {
     );
     let compiled = compile_source(&source).expect("combined source should compile");
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.configure_io(IoPolicy {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
@@ -224,6 +172,7 @@ async fn io_policy_persists_independently_of_http_config() {
     )
     .expect("source should compile");
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.configure_io(IoPolicy::default());
     vm.configure_http(HttpConfig::default())
         .expect("HTTP configuration should be valid");
@@ -248,6 +197,7 @@ async fn http_config_persists_independently_of_io_config() {
     let (port, server) = spawn_http_server(2);
     let compiled = compile_source(&http_request_source(port)).expect("HTTP source should compile");
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.configure_io(IoPolicy {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
@@ -280,6 +230,7 @@ async fn io_and_http_coexist_through_vm_reset_cycle() {
     )
     .expect("source should compile");
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.configure_io(IoPolicy {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
@@ -315,6 +266,7 @@ async fn worker_cleanup_reaches_quiescence_after_io_and_http() {
     );
     let compiled = compile_source(&source).expect("combined source should compile");
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.configure_io(IoPolicy {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()
@@ -334,15 +286,28 @@ async fn worker_cleanup_reaches_quiescence_after_io_and_http() {
 }
 
 #[test]
-fn http_transport_does_not_publish_guest_resources() {
+fn io_and_http_resource_type_keys_are_disjoint() {
     let catalog = standard_host_catalog();
-    assert!(
-        catalog
-            .resources()
-            .iter()
-            .all(|resource| !resource.key.as_str().starts_with("http.")),
-        "HTTP transport state must stay internal to macro-owned async calls"
-    );
+    let io_keys = ["io.file", "io.socket", "io.process", "io.worker", "io.pipe"];
+    let http_keys = ["http.request", "http.response", "http.sse"];
+    for key in catalog
+        .resources()
+        .iter()
+        .map(|resource| resource.key.as_str())
+    {
+        if io_keys.contains(&key) {
+            assert!(!http_keys.contains(&key));
+        }
+        if http_keys.contains(&key) {
+            assert!(!io_keys.contains(&key));
+        }
+    }
+    for key in io_keys {
+        let _ = ResourceTypeKey::new(key).expect("IO resource key should be valid");
+    }
+    for key in http_keys {
+        let _ = ResourceTypeKey::new(key).expect("HTTP resource key should be valid");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -356,6 +321,7 @@ async fn io_and_http_module_states_are_independent() {
     )
     .expect("source should compile");
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.configure_io(IoPolicy {
         allowed_roots: vec!["/safe".to_string()],
         max_read_bytes: 4096,
@@ -404,6 +370,7 @@ fn explicit_standard_catalog_emits_exact_http_import_schema() {
     let mut registry = HostFunctionRegistry::empty();
     register_http_builtin_module(&mut registry).expect("HTTP exact registration should succeed");
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     registry
         .bind_vm_cached(&mut vm)
         .expect("catalog-backed HTTP import should exact-bind");
@@ -438,6 +405,7 @@ async fn combined_standard_http_exact_bind_executes_with_io_surface_present() {
     let mut registry = HostFunctionRegistry::empty();
     register_http_builtin_module(&mut registry).expect("HTTP exact registration should succeed");
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.configure_io(IoPolicy {
         allowed_roots: vec!["/".to_string()],
         ..IoPolicy::default()

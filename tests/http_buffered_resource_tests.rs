@@ -1,5 +1,8 @@
 #![cfg(all(feature = "http-client", not(target_family = "wasm")))]
 
+#[path = "support/http_test_bridge.rs"]
+mod http_test_bridge;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
@@ -14,6 +17,7 @@ fn run_synchronous_http(
         .expect("resource source compiles")
         .program;
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(config).unwrap();
     if let Some(limit) = max_in_flight {
         vm.set_http_max_in_flight(limit);
@@ -99,6 +103,7 @@ async fn buffered_resource_reset_cancels_pending_worker_and_closes_transport() {
         http::client::request(req);"#
     );
     let mut vm = Vm::new(compile_source(&source).unwrap().program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(HttpConfig {
         allowed_schemes: vec!["http".to_string()],
         allowed_hosts: vec!["127.0.0.1".to_string()],
@@ -132,6 +137,7 @@ fn buffered_resource_default_direct_binding_returns_live_builder() {
     .unwrap()
     .program;
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     assert_eq!(vm.run().unwrap(), VmStatus::Halted);
     assert_eq!(vm.stack().last(), Some(&Value::Int(42)));
     assert_eq!(vm.host_context().resource_count(), 1);
@@ -151,6 +157,7 @@ fn buffered_resource_permissions_preflight_each_import() {
     .unwrap()
     .program;
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     let mut registry = HostFunctionRegistry::restricted();
     registry.set_capability_profile(
         CapabilityProfile::builder()
@@ -217,6 +224,7 @@ fn buffered_resource_request_reads_status_body_and_repeated_headers() {
         .expect("buffered resource program compiles")
         .program;
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(HttpConfig {
         allowed_schemes: vec!["http".to_string()],
         allowed_hosts: vec!["127.0.0.1".to_string()],
@@ -291,6 +299,7 @@ fn buffered_resource_header_values_recover_raw_response_octets() {
         http::response::header_values(&response, "X-Raw");"#
     );
     let mut vm = Vm::new(compile_source(&source).unwrap().program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(HttpConfig {
         allowed_schemes: vec!["http".to_string()],
         allowed_hosts: vec!["127.0.0.1".to_string()],
