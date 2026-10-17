@@ -1,5 +1,8 @@
 #![cfg(all(feature = "http-client", not(target_family = "wasm")))]
 
+#[path = "support/http_test_bridge.rs"]
+mod http_test_bridge;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
@@ -33,6 +36,7 @@ fn server(body: &'static [u8]) -> (u16, thread::JoinHandle<()>) {
 
 async fn run(source: &str, port: u16) -> Vm {
     let mut vm = Vm::new(compile_source(source).unwrap().program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(config(port)).unwrap();
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
     let mut status = vm.run().unwrap();
@@ -68,6 +72,7 @@ fn resource_sse_permission_and_timeout_admission_precede_network() {
         let req = http::request::new("GET", "http://127.0.0.1:1/events");
         http::client::sse(req, event, 0);"#;
     let mut vm = Vm::new(compile_source(source).unwrap().program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(config(1)).unwrap();
     vm.set_http_max_in_flight(0);
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
@@ -78,6 +83,7 @@ fn resource_sse_permission_and_timeout_admission_precede_network() {
 
     let program = compile_source(source).unwrap().program;
     let mut restricted = Vm::new(program);
+    http_test_bridge::install(&mut restricted);
     let mut registry = HostFunctionRegistry::restricted();
     registry.set_capability_profile(
         vm::CapabilityProfile::builder()
@@ -102,6 +108,7 @@ async fn resource_sse_default_binding_dispatches_open_overload() {
         http::sse_summary::status(&summary);"#
     );
     let mut vm = Vm::new(compile_source(&source).unwrap().program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(config(port)).unwrap();
     let mut status = vm.run().unwrap();
     loop {
@@ -165,6 +172,7 @@ async fn resource_sse_disconnect_aborts_and_releases_scope() {
         http::client::sse(req, event);"#
     );
     let mut vm = Vm::new(compile_source(&source).unwrap().program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(config(port)).unwrap();
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
     let mut status = vm.run().unwrap();
@@ -217,6 +225,7 @@ async fn resource_sse_reset_closes_pending_connection_and_scope() {
         http::client::sse(req, event);"#
     );
     let mut vm = Vm::new(compile_source(&source).unwrap().program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(config(port)).unwrap();
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
     assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
@@ -247,11 +256,11 @@ async fn resource_sse_post_redirect_counts_each_transmitted_body() {
                     let count = stream.read(&mut chunk).unwrap();
                     assert!(count > 0, "request ended before body");
                     request.extend_from_slice(&chunk[..count]);
-                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
-                        if request.len() >= end + 4 + 7 {
-                            assert_eq!(&request[end + 4..end + 11], b"payload");
-                            break;
-                        }
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        && request.len() >= end + 4 + 7
+                    {
+                        assert_eq!(&request[end + 4..end + 11], b"payload");
+                        break;
                     }
                 }
                 assert!(request.starts_with(if hop == 0 {
@@ -260,7 +269,7 @@ async fn resource_sse_post_redirect_counts_each_transmitted_body() {
                     b"POST /final "
                 }));
                 if hop == 0 {
-                    stream.write_all(format!("HTTP/1.1 {status} Redirect\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n").as_bytes()).unwrap();
+                    stream.write_all(format!("HTTP/1.1 {status} Redirect\r\nConnection: close\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n").as_bytes()).unwrap();
                 } else {
                     stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\n\r\n").unwrap();
                 }

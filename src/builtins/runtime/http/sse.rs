@@ -1,6 +1,5 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -8,12 +7,18 @@ use hyper::body::Bytes;
 use pd_host_function::pd_host_function;
 
 use super::request::{
-    HttpRequest, OwnedResponse, open_stream_response, parse_request, response_header_entries,
-    validate_request_header_budget,
+    HttpRequest, OwnedResponse, open_stream_response, validate_request_header_budget,
 };
+use super::resources::{HttpHeaders, SseSummary};
 use super::{CaptureAsyncHostContext, HostFutureOutput, HttpRequestContext, policy};
-use crate::builtins::runtime::typed::{VmCallable, VmMap, VmMapHandle};
-use crate::vm::async_host::{HostStreamAction, HostStreamDriver, HostStreamPoll};
+use crate::builtins::runtime::typed::VmCallable;
+use crate::compiler::TypeSchema;
+use crate::host_api::{
+    HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema, ResourceTypeKey,
+};
+use crate::vm::async_host::{
+    HostStreamAction, HostStreamCallback, HostStreamDriver, HostStreamPoll, HostVmCompletion,
+};
 use crate::vm::operation::OperationCancelReason;
 use crate::vm::{CallOutcome, Value, Vm, VmError, VmResult};
 
@@ -279,73 +284,109 @@ fn item_limit_error() -> VmError {
     VmError::HostError("SSE item exceeds byte limit".to_string())
 }
 
-fn map_value(entries: Vec<(&'static str, Value)>) -> Value {
-    Value::Map(std::sync::Arc::new(VmMap::from_entries(
-        entries
-            .into_iter()
-            .map(|(key, value)| (Value::string(key), value))
-            .collect(),
-    )))
+pub(super) fn sse_contract(open: bool, timeout: bool) -> HostFunctionSchema {
+    let resource = |key| HostTypeSchema::Resource(ResourceTypeKey::new(key).expect("static key"));
+    let callback = |params| HostTypeSchema::Callable {
+        params,
+        result: Box::new(HostTypeSchema::Bool),
+    };
+    let mut params = vec![
+        HostParamSchema::with_passing(
+            "request",
+            resource("http.request"),
+            HostParamPassing::TakeOwned,
+        ),
+        HostParamSchema::value("on_event", callback(vec![HostTypeSchema::String; 4])),
+    ];
+    if open {
+        params.push(HostParamSchema::with_passing(
+            "on_open",
+            callback(vec![
+                HostTypeSchema::Int,
+                resource("http.headers"),
+                HostTypeSchema::String,
+            ]),
+            HostParamPassing::TakeOwned,
+        ));
+    }
+    if timeout {
+        params.push(HostParamSchema::value("timeout_ms", HostTypeSchema::Int));
+    }
+    HostFunctionSchema::with_return("http::client::sse", params, resource("http.sse_summary"))
 }
 
-fn sse_open_event(status: u16, headers: Arc<Vec<Value>>, url: &str) -> Value {
-    map_value(vec![
-        ("kind", Value::string("open")),
-        ("status", Value::Int(i64::from(status))),
-        ("headers", Value::Array(headers)),
-        ("url", Value::string(url)),
-        ("event", Value::Null),
-        ("data", Value::Null),
-        ("id", Value::Null),
-        ("retry_ms", Value::Null),
-    ])
+fn event_params() -> [TypeSchema; 4] {
+    [
+        TypeSchema::String,
+        TypeSchema::String,
+        TypeSchema::String,
+        TypeSchema::String,
+    ]
+}
+fn open_params() -> [TypeSchema; 3] {
+    [
+        TypeSchema::Int,
+        TypeSchema::Resource(ResourceTypeKey::new("http.headers").expect("static key")),
+        TypeSchema::String,
+    ]
 }
 
-fn sse_data_event(event: SseEvent) -> Value {
-    map_value(vec![
-        ("kind", Value::string("event")),
-        ("status", Value::Null),
-        ("headers", Value::Null),
-        ("url", Value::Null),
-        ("event", event.event.map_or(Value::Null, Value::string)),
-        ("data", Value::string(event.data)),
-        ("id", event.id.map_or(Value::Null, Value::string)),
-        ("retry_ms", event.retry_ms.map_or(Value::Null, Value::Int)),
-    ])
+pub(super) struct SseRequestContext {
+    http: HttpRequestContext,
+    deadline: Instant,
+    request: HttpRequest,
 }
-
-fn sse_end_event() -> Value {
-    map_value(vec![
-        ("kind", Value::string("end")),
-        ("status", Value::Null),
-        ("headers", Value::Null),
-        ("url", Value::Null),
-        ("event", Value::Null),
-        ("data", Value::Null),
-        ("id", Value::Null),
-        ("retry_ms", Value::Null),
-    ])
-}
-
-fn parse_stream_timeout(request: &VmMap) -> VmResult<Option<Duration>> {
-    match request.get(&Value::string("timeout_ms")) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Int(milliseconds)) => {
-            let milliseconds = u64::try_from(*milliseconds)
-                .ok()
-                .filter(|milliseconds| *milliseconds > 0)
-                .ok_or_else(|| VmError::HostError("SSE timeout_ms must be positive".to_string()))?;
-            Ok(Some(Duration::from_millis(milliseconds)))
+impl CaptureAsyncHostContext for SseRequestContext {
+    fn capture(_vm: &mut Vm) -> VmResult<Self> {
+        Err(VmError::HostError(
+            "SSE context requires call arguments".into(),
+        ))
+    }
+    fn capture_with_args(vm: &mut Vm, args: &[Value]) -> VmResult<Self> {
+        let request = super::request::take_request(vm, args)?;
+        let callback = args.get(1).ok_or(VmError::StackUnderflow)?;
+        vm.validate_stream_positional_callback(callback, &event_params())?;
+        let mut timeout = None;
+        if let Some(arg) = args.get(2) {
+            if let Value::Int(ms) = arg {
+                timeout = Some(*ms);
+            } else {
+                vm.validate_stream_positional_callback(arg, &open_params())?;
+            }
         }
-        Some(_) => Err(VmError::TypeMismatch("SSE timeout_ms")),
+        if let Some(arg) = args.get(3) {
+            let Value::Int(ms) = arg else {
+                return Err(VmError::TypeMismatch("SSE timeout_ms"));
+            };
+            timeout = Some(*ms);
+        }
+        let timeout = timeout
+            .map(|ms| {
+                u64::try_from(ms)
+                    .ok()
+                    .filter(|ms| *ms > 0)
+                    .map(Duration::from_millis)
+                    .ok_or_else(|| VmError::HostError("SSE timeout_ms must be positive".into()))
+            })
+            .transpose()?;
+        let (http, deadline) = HttpRequestContext::capture_for(vm, timeout, "SSE")?;
+        let request = prepare_sse_request(&request, &http.config)?;
+        Ok(Self {
+            http,
+            deadline,
+            request,
+        })
     }
 }
 
-fn prepare_sse_request(request: &VmMap, config: &super::HttpConfig) -> VmResult<HttpRequest> {
-    let mut request = parse_request(request, config)?;
+fn prepare_sse_request(
+    request: &super::resources::HttpRequest,
+    config: &super::HttpConfig,
+) -> VmResult<HttpRequest> {
+    let mut request = super::request::prepare_resource_request(request, config)?;
     if request.method != hyper::Method::GET && request.method != hyper::Method::POST {
         return Err(VmError::HostError(
-            "SSE requests require GET or POST".to_string(),
+            "SSE requests require GET or POST".into(),
         ));
     }
     if !request
@@ -362,39 +403,13 @@ fn prepare_sse_request(request: &VmMap, config: &super::HttpConfig) -> VmResult<
     Ok(request)
 }
 
-/// Per-call state captured before the macro submits the async SSE future.
-pub(super) struct SseRequestContext {
-    http: HttpRequestContext,
-    deadline: Instant,
-    request: HttpRequest,
-}
-
-impl CaptureAsyncHostContext for SseRequestContext {
-    fn capture(_vm: &mut Vm) -> VmResult<Self> {
-        Err(VmError::HostError(
-            "SSE context requires call arguments".to_string(),
-        ))
-    }
-
-    fn capture_with_args(vm: &mut Vm, args: &[Value]) -> VmResult<Self> {
-        let request = match args.first() {
-            Some(Value::Map(request)) => request,
-            Some(_) => return Err(VmError::TypeMismatch("SSE request")),
-            None => return Err(VmError::HostError("missing SSE request".to_string())),
-        };
-        let callback = args
-            .get(1)
-            .ok_or_else(|| VmError::HostError("missing SSE callback".to_string()))?;
-        vm.validate_sse_callback_value(callback)?;
-        let script_timeout = parse_stream_timeout(request)?;
-        let (http, deadline) = HttpRequestContext::capture_for(vm, script_timeout, "SSE")?;
-        let request = prepare_sse_request(request, &http.config)?;
-        Ok(Self {
-            http,
-            deadline,
-            request,
-        })
-    }
+fn sse_data_event(event: SseEvent) -> Vec<Value> {
+    vec![
+        Value::string(event.event.unwrap_or_default()),
+        Value::string(event.data),
+        Value::string(event.id.unwrap_or_default()),
+        Value::string(event.retry_ms.map(|ms| ms.to_string()).unwrap_or_default()),
+    ]
 }
 
 struct RetainedSseFrame {
@@ -423,21 +438,22 @@ impl RetainedSseFrame {
 struct SseStreamDriver {
     response: OwnedResponse,
     parser: SseParser,
-    open_item: Option<Value>,
+    open_pending: bool,
+    has_open_callback: bool,
     retained_frame: Option<RetainedSseFrame>,
-    eof_event: Option<Value>,
+    eof_event: Option<Vec<Value>>,
     status: u16,
-    headers: Arc<Vec<Value>>,
+    headers: HttpHeaders,
     url: String,
     items: usize,
     bytes_received: usize,
+    bytes_sent: usize,
     deadline: Instant,
     total_sleep: Pin<Box<tokio::time::Sleep>>,
     idle_timeout: Duration,
     idle_sleep: Pin<Box<tokio::time::Sleep>>,
     body_started: bool,
     eof: bool,
-    end_emitted: bool,
     _permit: super::policy::ConnectionPermit,
 }
 
@@ -448,6 +464,8 @@ impl SseStreamDriver {
         config: &super::HttpConfig,
         deadline: Instant,
         permit: super::policy::ConnectionPermit,
+        bytes_sent: usize,
+        has_open_callback: bool,
     ) -> VmResult<Self> {
         let status = response.response().status();
         if !status.is_success() {
@@ -469,8 +487,7 @@ impl SseStreamDriver {
                     "SSE response Content-Type must be text/event-stream".to_string(),
                 )
             })?;
-        let headers = Arc::new(response_header_entries(response.response().headers()));
-        let open_item = sse_open_event(status.as_u16(), Arc::clone(&headers), url.as_str());
+        let headers = HttpHeaders::from_map(response.response().headers());
         let total_at = tokio::time::Instant::from_std(deadline);
         Ok(Self {
             response,
@@ -479,7 +496,8 @@ impl SseStreamDriver {
                 config.max_stream_item_bytes,
                 config.max_stream_total_bytes,
             ),
-            open_item: Some(open_item),
+            open_pending: true,
+            has_open_callback,
             retained_frame: None,
             eof_event: None,
             status: status.as_u16(),
@@ -487,6 +505,7 @@ impl SseStreamDriver {
             url: url.to_string(),
             items: 0,
             bytes_received: 0,
+            bytes_sent,
             deadline,
             total_sleep: Box::pin(tokio::time::sleep_until(total_at)),
             idle_timeout: config.stream_idle_timeout,
@@ -494,21 +513,27 @@ impl SseStreamDriver {
             idle_sleep: Box::pin(tokio::time::sleep_until(total_at)),
             body_started: false,
             eof: false,
-            end_emitted: false,
             _permit: permit,
         })
     }
 
-    fn summary(&self, outcome: &str) -> Value {
-        map_value(vec![
-            ("outcome", Value::string(outcome)),
-            ("status", Value::Int(i64::from(self.status))),
-            ("headers", Value::Array(Arc::clone(&self.headers))),
-            ("url", Value::string(&self.url)),
-            ("items", Value::Int(self.items as i64)),
-            ("bytes_received", Value::Int(self.bytes_received as i64)),
-            ("bytes_sent", Value::Int(0)),
-        ])
+    fn summary(&self, outcome: &str) -> HostVmCompletion<Value> {
+        let summary = SseSummary {
+            outcome: outcome.to_string(),
+            status: i64::from(self.status),
+            headers: self.headers.clone(),
+            url: self.url.clone(),
+            items: self.items as i64,
+            bytes_received: self.bytes_received as i64,
+            bytes_sent: i64::try_from(self.bytes_sent).unwrap_or(i64::MAX),
+        };
+        Box::new(move |vm| {
+            let token = vm
+                .host_context()
+                .push_resource(summary)
+                .map_err(super::request::host_boundary_error)?;
+            Ok(Value::Int(token.handle().raw() as i64))
+        })
     }
 
     fn reset_idle_deadline(&mut self) {
@@ -518,9 +543,9 @@ impl SseStreamDriver {
             .reset(tokio::time::Instant::from_std(idle_at));
     }
 
-    fn item(&mut self, item: Value) -> HostStreamPoll {
+    fn item(&mut self, item: Vec<Value>) -> HostStreamPoll {
         self.items = self.items.saturating_add(1);
-        HostStreamPoll::Item(item)
+        HostStreamPoll::Call(HostStreamCallback::Event, item)
     }
 
     fn poll_retained_frame(&mut self) -> VmResult<Option<HostStreamPoll>> {
@@ -537,10 +562,6 @@ impl SseStreamDriver {
     fn poll_eof_item(&mut self) -> Option<HostStreamPoll> {
         if let Some(event) = self.eof_event.take() {
             return Some(self.item(event));
-        }
-        if !self.end_emitted {
-            self.end_emitted = true;
-            return Some(self.item(sse_end_event()));
         }
         None
     }
@@ -560,8 +581,29 @@ impl HostStreamDriver for SseStreamDriver {
                 SSE_TOTAL_DEADLINE_ERROR.to_string(),
             )));
         }
-        if let Some(item) = self.open_item.take() {
-            return Poll::Ready(Ok(self.item(item)));
+        if self.open_pending {
+            self.open_pending = false;
+            if self.has_open_callback {
+                let status = self.status;
+                let headers = self.headers.clone();
+                let url = self.url.clone();
+                return Poll::Ready(Ok(HostStreamPoll::CallWithVm(
+                    HostStreamCallback::Open,
+                    Box::new(move |vm| {
+                        let token = vm
+                            .host_context()
+                            .push_resource(headers)
+                            .map_err(super::request::host_boundary_error)?;
+                        Ok(vec![
+                            Value::Int(i64::from(status)),
+                            Value::Int(token.handle().raw() as i64),
+                            Value::string(url),
+                        ])
+                    }),
+                )));
+            }
+            self.body_started = true;
+            self.reset_idle_deadline();
         }
         match self.poll_retained_frame() {
             Ok(Some(item)) => return Poll::Ready(Ok(item)),
@@ -572,7 +614,7 @@ impl HostStreamDriver for SseStreamDriver {
             if let Some(item) = self.poll_eof_item() {
                 return Poll::Ready(Ok(item));
             }
-            return Poll::Ready(Ok(HostStreamPoll::Complete(self.summary("eof"))));
+            return Poll::Ready(Ok(HostStreamPoll::CompleteWithVm(self.summary("eof"))));
         }
         if self.body_started && self.idle_sleep.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Err(VmError::HostError(
@@ -610,9 +652,9 @@ impl HostStreamDriver for SseStreamDriver {
                 };
                 self.eof = true;
                 self.eof_event = event.map(sse_data_event);
-                Poll::Ready(Ok(self
-                    .poll_eof_item()
-                    .expect("EOF always produces a pending event or end item")))
+                Poll::Ready(Ok(self.poll_eof_item().unwrap_or_else(|| {
+                    HostStreamPoll::CompleteWithVm(self.summary("eof"))
+                })))
             }
         }
     }
@@ -621,25 +663,13 @@ impl HostStreamDriver for SseStreamDriver {
         if Instant::now() >= self.deadline {
             return Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()));
         }
-        let Value::Map(action) = action else {
-            return Err(VmError::HostError(
-                "SSE callback action must be a map".to_string(),
-            ));
-        };
-        let Some(Value::String(action)) = action.get(&Value::string("action")) else {
-            return Err(VmError::HostError(
-                "SSE callback action must contain string 'action'".to_string(),
-            ));
-        };
-        match action.as_str() {
-            "continue" => Ok(HostStreamAction::Continue),
-            "stop" => Ok(HostStreamAction::Cancel(
+        match action {
+            Value::Bool(true) => Ok(HostStreamAction::Continue),
+            Value::Bool(false) => Ok(HostStreamAction::CancelWithVm(
                 self.summary("stopped"),
                 OperationCancelReason::Requested,
             )),
-            other => Err(VmError::HostError(format!(
-                "invalid SSE callback action '{other}'"
-            ))),
+            _ => Err(VmError::TypeMismatch("SSE callback bool")),
         }
     }
 }
@@ -647,6 +677,7 @@ impl HostStreamDriver for SseStreamDriver {
 async fn open_sse_response(
     context: &SseRequestContext,
     request: &HttpRequest,
+    bytes_sent: &mut usize,
 ) -> VmResult<(OwnedResponse, url::Url)> {
     let opening_idle_deadline =
         policy::phase_deadline(context.deadline, context.http.config.stream_idle_timeout);
@@ -666,6 +697,7 @@ async fn open_sse_response(
             &context.http.config,
             request,
             context.deadline,
+            bytes_sent,
         ) => opened.map_err(|error| {
             if error.to_string().contains("HTTP request deadline exceeded") {
                 let now = Instant::now();
@@ -685,32 +717,90 @@ async fn open_sse_response(
     }
 }
 
-/// Opens an SSE response with the shared client, then transfers the response
-/// body into the VM's generic callable-stream continuation.
-#[pd_host_function(name = "http::client::sse", contract = super::http_sse_contract)]
-pub(super) async fn builtin_http_client_sse(
-    #[pd_host_context] context: SseRequestContext,
-    request: VmMapHandle,
-    on_event: VmCallable<fn(VmMap) -> VmMap>,
-) -> VmResult<HostFutureOutput<VmMap>> {
-    let callback = on_event.into_value();
-    let _ = request;
-    let (response, url) = open_sse_response(&context, &context.request).await?;
+async fn stream_sse(
+    context: SseRequestContext,
+    callback: Value,
+    on_open: Option<Value>,
+) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
+    let mut bytes_sent = 0;
+    let (response, url) = open_sse_response(&context, &context.request, &mut bytes_sent).await?;
     let SseRequestContext {
         http,
         deadline,
         request: _,
     } = context;
-    let driver = SseStreamDriver::new(response, url, &http.config, deadline, http.permit)?;
+    let driver = SseStreamDriver::new(
+        response,
+        url,
+        &http.config,
+        deadline,
+        http.permit,
+        bytes_sent,
+        on_open.is_some(),
+    )?;
     Ok(HostFutureOutput::continue_with(move |vm| {
-        match vm.submit_callable_stream(callback, driver) {
-            Ok(CallOutcome::Pending(op_id)) => Ok(CallOutcome::Pending(op_id)),
+        match vm.submit_callable_stream_callbacks(
+            callback,
+            on_open,
+            &event_params(),
+            &open_params(),
+            driver,
+        ) {
+            Ok(CallOutcome::Pending(id)) => Ok(CallOutcome::Pending(id)),
             Ok(_) => Err(VmError::InvalidFrameState(
                 "callable stream admission returned a non-pending outcome",
             )),
             Err(rejection) => Err(vm.rollback_rejected_callable_stream(rejection)),
         }
     }))
+}
+
+/// Stream SSE events with an optional open callback and deadline.
+#[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
+#[pd_host_function(name = "http::client::sse", contract = super::http_sse_contract)]
+pub(super) async fn builtin_http_client_sse(
+    _request: i64,
+    #[pd_host_context] context: SseRequestContext,
+    on_event: VmCallable<fn(String, String, String, String) -> bool>,
+) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
+    stream_sse(context, on_event.into_value(), None).await
+}
+
+/// Stream events with an open callback.
+#[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
+#[pd_host_function(name = "http::client::sse", contract = super::http_sse_open_contract)]
+pub(super) async fn builtin_http_client_sse_open(
+    _request: i64,
+    #[pd_host_context] context: SseRequestContext,
+    on_event: VmCallable<fn(String, String, String, String) -> bool>,
+    on_open: VmCallable<fn(i64, i64, String) -> bool>,
+) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
+    stream_sse(context, on_event.into_value(), Some(on_open.into_value())).await
+}
+
+/// Stream events with a deadline and no open callback.
+#[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
+#[pd_host_function(name = "http::client::sse", contract = super::http_sse_only_timeout_contract)]
+pub(super) async fn builtin_http_client_sse_only_timeout(
+    _request: i64,
+    #[pd_host_context] context: SseRequestContext,
+    on_event: VmCallable<fn(String, String, String, String) -> bool>,
+    _timeout_ms: i64,
+) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
+    stream_sse(context, on_event.into_value(), None).await
+}
+
+/// Stream events with an optional open callback and timeout.
+#[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
+#[pd_host_function(name = "http::client::sse", contract = super::http_sse_timeout_contract)]
+pub(super) async fn builtin_http_client_sse_timeout(
+    _request: i64,
+    #[pd_host_context] context: SseRequestContext,
+    on_event: VmCallable<fn(String, String, String, String) -> bool>,
+    on_open: VmCallable<fn(i64, i64, String) -> bool>,
+    _timeout_ms: i64,
+) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
+    stream_sse(context, on_event.into_value(), Some(on_open.into_value())).await
 }
 
 #[cfg(test)]

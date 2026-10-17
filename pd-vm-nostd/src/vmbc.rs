@@ -8,7 +8,7 @@ use super::{
 };
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION: u16 = 14;
+const VERSION: u16 = 13;
 const FLAGS: u16 = 0;
 const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;

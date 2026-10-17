@@ -26,203 +26,101 @@ compiled runtime surface and generated metadata synchronized.
 
 ## Native API
 
-On a supported native target, enabling `http-client` preserves the source-level
-HTTP call signatures and embedding entry points:
+Native hosts expose four fully typed guest resources: `http.request`,
+`http.response`, `http.headers`, and `http.sse_summary`. HTTP declares no host
+named structs and accepts no map request/callback compatibility surface.
+`HttpConfig`, `HttpExtension`, `HttpHostExt`, `register_http_builtin_module`, and
+`http_host_catalog` provide embedding policy, registration, and metadata.
+Catalog fingerprints use format v3; VMBC and the internal bytecode ABI remain 13.
 
-- `HttpConfig` controls request and stream limits, redirects, timeouts, and
-  capability policy;
-- `HttpExtension` and `HttpHostExt` install the native HTTP host integration;
-- `register_http_builtin_module` and `http_host_catalog` expose the native
-  callable metadata;
-- `http::client::request` returns a bounded `HttpResponse`; and
-- `http::client::sse` drives a bounded SSE stream through a script callback.
-
-Both builtins are ordinary `#[pd_host_function] async fn` declarations. Their
-macro-generated wrappers own async-host submission; the HTTP module does not
-publish transient request, response, or stream resources.
-
-Catalog fingerprints use format v3, and bytecode/VMBC use ABI and wire version
-14. Function schemas receive exact validation at bind time.
-
-The HTTP and SSE behavior, cancellation, and native async bridge contracts are
-uniform across supported native targets. See
-[`callable-runtime.md`](callable-runtime.md) for the general callable and
-host-runtime contract.
+Both client calls are ordinary `#[pd_host_function] async fn` declarations. The
+embedding must install and drive a `HostAsyncBridge` on a live Tokio runtime.
+The generated wrappers capture owned policy, request, and callback state before
+submission; no VM borrow crosses an await. Builder ownership is consumed once,
+including when synchronous admission rejects the call. A buffered result is
+inserted on the VM thread by `HostFutureOutput::complete`.
 
 ```rust
 use http;
-
-let response = http::client::request({
-    method: "POST",
-    url: "https://example.test/v1/messages",
-    headers: [
-        { name: "content-type", value: "application/json" },
-    ],
-    body: { kind: "text", text: "{}" },
-});
-let status = response.status;
-let body = response.body;
+let mut request = http::request::new("POST", "https://example.test/v1/messages");
+http::request::set_header(&mut request, "content-type", "application/json");
+http::request::set_body_text(&mut request, "{}");
+let response = http::client::request(request);
+let status = http::response::status(&response);
+let body = http::response::body(&response);
+let final_url = http::response::url(&response);
+let names = http::response::header_names(&response);
+let values = http::response::header_values(&response, "set-cookie");
 ```
 
-`http::client::request` accepts an `HttpRequest` object with:
-
-- `method`: one of `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, or `OPTIONS`;
-- `url`: an `http` or `https` URL admitted by host policy;
-- `headers`: an optional ordered array of `{ name: string, value: string }` `HttpRequestHeader` values; repeated entries and their supplied order are retained by the runtime, while HTTP does not promise server-visible ordering across different names;
-- `body`: an optional `HttpRequestBody`, either `{ kind: "text", text: string }` or `{ kind: "bytes", bytes: bytes }`.
-
-The response is an `HttpResponse` with field access:
-
-```rust
-response.status   // int
-response.headers  // array<HttpResponseHeader>
-response.body     // bytes
-response.url      // string, the final validated URL after redirects
-```
-
-Each response header has a `name` and an `HttpHeaderValue`:
-
-```rust
-let header = response.headers[0];
-header.name          // string
-header.value.kind    // "text" or "bytes"
-header.value.text    // string or null
-header.value.bytes   // bytes or null
-```
-
-Response header arrays use deterministic canonical order by normalized header name. Repeated names remain separate entries, and stable sorting preserves the `HeaderMap`-provided order among duplicate values. The original cross-name wire order is not an API contract. Non-UTF-8 values use the `bytes` variant without loss. Use field access on
-named values; unknown fields and string indexes are rejected. The request body,
-response body, response head, redirect count, concurrent connection count,
-connect phase, and total request duration are bounded. `Host`,
-`Content-Length`, `Transfer-Encoding`, and `Connection` are client-managed
-request headers. A limit, policy, transport, TLS, redirect, or timeout failure
-is a host error and produces no response.
+A request builder accepts `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, or
+`OPTIONS`. `set_body_bytes` takes bytes; `set_body_text` takes a string. Mutators
+retain the builder's configured limits, and sending revalidates against the
+current HTTP policy. Headers are ordered entries, preserving duplicates and
+within-name value order. `Host`, `Content-Length`, `Transfer-Encoding`, and
+`Connection` are client-managed request headers. Response header names are
+normalized and canonically sorted. Each accessor string maps one raw octet to
+one Unicode scalar U+0000..U+00FF; encoding those scalars back to octets recovers
+the original bytes, including non-UTF-8 headers. The request and response bodies,
+response head, redirects, concurrency, and elapsed phases are bounded.
 
 ## Server-sent events
 
-`http::client::sse` is available with the `http-client` feature.
+SSE consumes the same request builder, restricted to `GET` or `POST`.
+`Accept: text/event-stream` is added if absent. A successful response must have
+an event-stream content type. The four overloads are:
 
-```rust
-fn on_sse(item: SseEvent) -> SseCallbackAction {
-    if item.kind == "event" {
-        print(item.data);
-    }
-    { action: "continue" }
-}
-
-let result = http::client::sse({
-    method: "GET",
-    url: "https://example.test/events",
-    headers: [
-        { name: "accept", value: "text/event-stream" },
-    ],
-}, on_sse);
-let outcome = result.outcome;
+```text
+sse(request, on_event)
+sse(request, on_event, timeout_ms)
+sse(request, on_event, on_open)
+sse(request, on_event, on_open, timeout_ms)
 ```
 
-`http::client::sse(request, on_event)` accepts an `SseRequest` object with the buffered request fields plus optional `timeout_ms`:
-
-| Field | Required | Accepted type and value | Bound or policy |
-| --- | --- | --- | --- |
-| `method` | yes | string: `GET` or `POST` | Other methods are rejected before transport admission |
-| `url` | yes | string containing an `http` or `https` URL | Protocol family and the configured scheme, host, port, and address policy must all admit it |
-| `headers` | no | ordered array of `{ name: string, value: string }` `HttpRequestHeader` values; repeated entries and supplied order are retained | HTTP does not promise server-visible ordering across different names; names and values must be syntactically valid, client-managed request headers remain forbidden, and `Accept: text/event-stream` is supplied when absent |
-| `body` | no | `HttpRequestBody`: `{ kind: "text", text: string }` or `{ kind: "bytes", bytes: bytes }`, including for `POST` | Bounded by `max_request_body_bytes` |
-| `timeout_ms` | no | positive integer milliseconds | Caps this optional shortening deadline by `HttpConfig::max_stream_duration` |
-
-The callback schema is `fn(SseEvent) -> SseCallbackAction`. `SseEvent` is a
-named tagged record with `kind` equal to `open`, `event`, or `end`. The response
-must have an event-stream content type. The response head remains bounded by
-the existing HTTP parser. Request headers retain their configured count and byte
-budgets.
-
-The callback receives exactly one `SseEvent` at a time, in this order:
+`on_event` has type `fn(string, string, string, string) -> bool`: event name,
+data, last event ID, and decimal retry interval. Missing event name, ID, or retry
+are empty strings. `on_open` has type
+`fn(int, resource<http.headers>, string) -> bool`: status, independently owned
+immutable headers, and final URL. Both callback kinds return `true` to continue
+or `false` to stop. The open callback, when present, runs before all events;
+there is no synthetic EOF callback. Clean EOF returns the summary after the last
+event callback. Timeout must be positive and can only shorten the host maximum.
 
 ```rust
-// The response was accepted; this precedes every event.
-{
-    kind: "open",
-    status: 200,
-    headers: [HttpResponseHeader, ...],
-    url: string,
-    event: null,
-    data: null,
-    id: null,
-    retry_ms: null,
+use http;
+fn on_event(event: string, data: string, id: string, retry: string) -> bool {
+    data != "[DONE]"
 }
-
-// One parsed event. "event" is per-dispatch state, reset to null at every
-// dispatch boundary; "id" and "retry_ms" retain the last valid values.
-{
-    kind: "event",
-    status: null,
-    headers: null,
-    url: null,
-    event: string | null,
-    data: string,
-    id: string | null,
-    retry_ms: int | null,
+fn on_open(status: int, headers: resource<http.headers>, url: string) -> bool {
+    status == 200
 }
-
-// Clean EOF, after every preceding event callback completed.
-{
-    kind: "end",
-    status: null,
-    headers: null,
-    url: null,
-    event: null,
-    data: null,
-    id: null,
-    retry_ms: null,
-}
+let request = http::request::new("GET", "https://example.test/events");
+let summary = http::client::sse(request, on_event, on_open, 30000);
+let outcome = http::sse_summary::outcome(&summary);
+let headers = http::sse_summary::headers(&summary);
+let content_types = http::headers::values(&headers, "content-type");
 ```
 
-`open.headers` and the summary's `headers` use deterministic canonical order by
-normalized header name. Repeated names remain separate entries, and stable
-sorting preserves the `HeaderMap`-provided order among duplicate values. Each
-entry's `value` is an `HttpHeaderValue` with `kind: "text"` and `text`, or
-`kind: "bytes"` and `bytes`. The unused optional payload field is `null`. The
-original cross-name wire order is not an API contract; raw non-UTF-8 values are
-preserved.
-
-The callback must return an `SseCallbackAction`:
-
-```rust
-{ action: "continue" }
-{ action: "stop" }
-```
-
-`continue` acknowledges the item and permits the next network poll. `stop` ends the call locally. Any other shape or action is a callback error.
-
-SSE parsing follows the event-stream grammar:
-
-- UTF-8 text may start with one byte-order mark;
-- `\r\n`, `\r`, and `\n` line endings are recognized;
-- repeated `data:` fields are joined with `\n`, with the final join newline removed at dispatch;
-- `event`, `id`, and decimal non-negative `retry` fields are normalized into the typed event record;
-- comments and unknown fields are ignored;
-- a blank line dispatches only after at least one `data:` field;
-- malformed UTF-8, an over-limit line or event, and cumulative received event-stream application bytes exceeding the call limit are host errors.
-
-There is no automatic reconnection. Values such as a provider's `[DONE]` marker remain ordinary event data.
+SSE parsing accepts an optional UTF-8 BOM and CRLF, CR, or LF lines. Repeated
+`data:` fields join with newlines. A blank line dispatches only when data was
+seen; partial events at EOF are discarded. Event names reset per dispatch,
+while valid IDs and nonnegative decimal retry values persist. Comments and
+unknown fields are ignored. Malformed UTF-8 and line, event, or entire-call byte
+limit violations are host errors. There is no automatic reconnection; provider
+markers such as `[DONE]` remain ordinary data.
 
 ## Terminal summaries and errors
 
-After callback processing terminates normally, the SSE call returns an `SseSummary`:
-
-```rust
-result.outcome        // "eof" | "stopped"
-result.status         // int
-result.headers        // array<HttpResponseHeader>
-result.url             // string
-result.items           // int
-result.bytes_received  // int
-result.bytes_sent      // int
-```
-
-`items` counts delivered callback items. `bytes_received` and `bytes_sent` are observational summary counters. Limit enforcement uses independent entire-call accounting and does not depend on whether or how these counters are displayed.
-
-Transport, parser, destination-policy, timeout, and callback failures stay errors. They are never converted into a successful terminal summary.
+`http::client::sse` returns an immutable `resource<http.sse_summary>`. Borrow it
+through `http::sse_summary::{outcome,status,headers,url,items,bytes_received,bytes_sent}`.
+`outcome` is `"eof"` or `"stopped"`; `items` counts delivered event callbacks,
+excluding the open callback. Header access returns an independently owned
+`http.headers` resource. `bytes_sent` counts each transmitted body across
+redirects, including preserved POST bodies; rewritten GET hops contribute zero.
+`bytes_received` counts received application body bytes. Limits use their own
+entire-call accounting. Policy, transport, timeout, parser, and callback errors
+never become successful summaries. Completion materializes and validates the
+resource on the VM thread and rolls back new resources if publication fails.
 
 ## Sequencing, backpressure, and lifecycle
 
@@ -296,7 +194,7 @@ machine.
 
 ## Deliberately absent APIs and semantics
 
-RustScript core provides no script-visible HTTP request ID, response/stream handle, `next`, `next_event`, or `cancel` callable. Streams cannot detach from their caller. There is no multiplexing, background reader, automatic reconnect, provider/model interpretation, agent loop, or platform retry policy. Applications implement provider-specific JSON, `[DONE]`, tool-call deltas, retry rules, and reconnect decisions in RSS or downstream hosts.
+The guest resource tokens represent request builders and immutable buffered values; they provide no live stream handle, request ID, `next`, `next_event`, or `cancel` callable. Streams cannot detach from their caller. There is no multiplexing, background reader, automatic reconnect, provider/model interpretation, agent loop, or platform retry policy. Applications implement provider-specific JSON, `[DONE]`, tool-call deltas, retry rules, and reconnect decisions in RSS or downstream hosts.
 
 ## Async ownership and cancellation
 

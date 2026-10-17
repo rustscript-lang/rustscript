@@ -58,7 +58,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
     });
 
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
     let decoded = decode_program(&encoded).expect("decode should succeed");
 
     assert_eq!(decoded.constants, program.constants);
@@ -71,7 +71,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
 fn minimal_vmbc_prefix(constant_count: u32, code: &[u8], import_count: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"VMBC");
-    bytes.extend_from_slice(&14u16.to_le_bytes());
+    bytes.extend_from_slice(&13u16.to_le_bytes());
     bytes.extend_from_slice(&0u16.to_le_bytes());
     bytes.extend_from_slice(&constant_count.to_le_bytes());
     bytes.extend_from_slice(&(code.len() as u32).to_le_bytes());
@@ -1003,10 +1003,10 @@ fn validate_rejects_call_script_targeting_host_import_prototype() {
 }
 
 #[test]
-fn call_script_wire_version_is_v14() {
+fn call_script_wire_version_is_v13() {
     let program = Program::new(vec![], vec![vm::OpCode::Ret as u8]);
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
 }
 
 #[test]
@@ -1018,14 +1018,14 @@ fn current_vmbc_preserves_code_bytes_without_script_calls() {
     bc.ret();
     let program = Program::new(vec![Value::Int(1), Value::Int(2)], bc.finish());
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
     let decoded = decode_program(&encoded).expect("decode should succeed");
     assert_eq!(decoded.code, program.code);
     assert_eq!(decoded.constants, program.constants);
 }
 
 #[test]
-fn v14_roundtrip_preserves_guest_named_struct_payload() {
+fn v13_roundtrip_preserves_guest_named_struct_payload() {
     let compiled = compile_source(
         r#"
         struct Point { x: int, y: int }
@@ -1039,11 +1039,11 @@ fn v14_roundtrip_preserves_guest_named_struct_payload() {
         "codegen should attach guest struct decls"
     );
     let encoded = encode_program(&compiled.program).expect("struct-bearing program should encode");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
-    assert_eq!(vm::bytecode::BYTECODE_ABI_VERSION, 14);
-    let decoded = decode_program(&encoded).expect("v14 named-struct section should decode");
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
+    assert_eq!(vm::bytecode::BYTECODE_ABI_VERSION, 13);
+    let decoded = decode_program(&encoded).expect("v13 named-struct section should decode");
     assert!(
         decoded.named_struct_decls().contains_key("Point"),
-        "VMBC v14 should preserve guest struct decls"
+        "VMBC v13 should preserve guest struct decls"
     );
 }

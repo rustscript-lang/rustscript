@@ -1,7 +1,6 @@
 use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -15,8 +14,8 @@ use tower_service::Service;
 
 use super::config::HttpConfig;
 use super::policy::{PolicyResolver, SchemeFamily, phase_deadline, resolve_url, with_deadline};
-use crate::builtins::runtime::typed::{VmMap, VmMapHandle};
-use crate::vm::{Value, VmError, VmResult};
+use super::resources::{HttpHeaders, HttpRequest as RequestBuilder, HttpResponse};
+use crate::vm::{VmError, VmResult};
 
 const HTTP_MAX_HEAD_BYTES: usize = 64 * 1024;
 const HTTP_MAX_HEADERS: usize = 100;
@@ -207,162 +206,42 @@ pub(super) fn validate_request_header_budget(
     budget.finish()
 }
 
-pub(super) fn parse_request(map: &VmMap, config: &HttpConfig) -> VmResult<HttpRequest> {
-    let method = map_string(map, "method")?.to_ascii_uppercase();
-    if !matches!(
-        method.as_str(),
-        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS"
-    ) {
-        return Err(VmError::HostError(format!(
-            "HTTP method '{method}' is not allowed"
-        )));
-    }
-    let method = hyper::Method::from_bytes(method.as_bytes())
-        .map_err(|_| VmError::HostError("invalid HTTP method".to_string()))?;
-    let url = map_string(map, "url")?
-        .parse::<url::Url>()
-        .map_err(|error| VmError::HostError(format!("invalid HTTP URL: {error}")))?;
-
-    let body = parse_request_body(map.get(&Value::string("body")), config)?;
-
-    let mut headers = Vec::new();
-    let mut header_budget = RequestHeaderBudget::from_config(config);
-    match map.get(&Value::string("headers")) {
-        None | Some(Value::Null) => {}
-        Some(Value::Array(header_entries)) => {
-            for entry in header_entries.iter() {
-                let Value::Map(header) = entry else {
-                    return Err(VmError::TypeMismatch("HTTP request header"));
-                };
-                reject_unexpected_fields(header, &["name", "value"], "HTTP request header")?;
-                let key = required_string_field(header, "name", "HTTP header name")?;
-                let value = required_string_field(header, "value", "HTTP header value")?;
-                // Admit raw bytes before normalizing/converting either component.
-                // This keeps a rejected value from triggering a HeaderValue copy.
-                header_budget.admit(key.as_bytes(), value.as_bytes())?;
-                if matches!(
-                    key.to_ascii_lowercase().as_str(),
-                    "host" | "content-length" | "transfer-encoding" | "connection"
-                ) {
-                    return Err(VmError::HostError(format!(
-                        "HTTP header '{key}' is managed by the client",
-                    )));
-                }
-                let name = hyper::header::HeaderName::from_bytes(key.as_bytes())
-                    .map_err(|_| VmError::HostError(format!("invalid HTTP header name '{key}'")))?;
-                let value = hyper::header::HeaderValue::from_str(&value).map_err(|_| {
-                    VmError::HostError(format!("invalid HTTP header value for '{key}'"))
-                })?;
-                headers.push((name, value));
-            }
-        }
-        Some(_) => return Err(VmError::TypeMismatch("HTTP headers")),
-    }
-    header_budget.finish()?;
-
-    Ok(HttpRequest {
-        method,
-        url,
-        headers,
-        body,
-    })
+pub(super) fn host_boundary_error(error: impl std::fmt::Display) -> VmError {
+    VmError::HostError(error.to_string())
 }
 
-fn parse_request_body(value: Option<&Value>, config: &HttpConfig) -> VmResult<Option<Vec<u8>>> {
-    let Some(value) = value else {
-        return Ok(None);
+/// The exact public descriptor admits TakeOwned; context capture consumes the
+/// builder once before any fallible async admission or submission.
+pub(super) fn take_request(
+    vm: &mut crate::vm::Vm,
+    args: &[crate::vm::Value],
+) -> VmResult<RequestBuilder> {
+    let raw = match args.first() {
+        Some(crate::vm::Value::Int(raw)) => *raw,
+        _ => return Err(VmError::TypeMismatch("HTTP request resource")),
     };
-    if matches!(value, Value::Null) {
-        return Ok(None);
-    }
-    let Value::Map(body) = value else {
-        return Err(VmError::TypeMismatch("HTTP request body"));
-    };
-    reject_unexpected_fields(body, &["kind", "text", "bytes"], "HTTP request body")?;
-    let kind = required_string_field(body, "kind", "HTTP request body kind")?;
-    let payload = match kind.as_str() {
-        "text" => {
-            if body
-                .get(&Value::string("bytes"))
-                .is_some_and(|value| !matches!(value, Value::Null))
-            {
-                return Err(VmError::HostError(
-                    "HTTP request body text variant cannot contain bytes".to_string(),
-                ));
-            }
-            let Some(Value::String(text)) = body.get(&Value::string("text")) else {
-                return Err(VmError::TypeMismatch("HTTP request body text payload"));
-            };
-            text.as_bytes()
-        }
-        "bytes" => {
-            if body
-                .get(&Value::string("text"))
-                .is_some_and(|value| !matches!(value, Value::Null))
-            {
-                return Err(VmError::HostError(
-                    "HTTP request body bytes variant cannot contain text".to_string(),
-                ));
-            }
-            let Some(Value::Bytes(bytes)) = body.get(&Value::string("bytes")) else {
-                return Err(VmError::TypeMismatch("HTTP request body bytes payload"));
-            };
-            bytes.as_ref()
-        }
-        _ => {
-            return Err(VmError::HostError(
-                "HTTP request body kind must be 'text' or 'bytes'".to_string(),
-            ));
-        }
-    };
-    if payload.len() > config.max_request_body_bytes {
-        return Err(VmError::HostError(
-            "HTTP request body exceeds limit".to_string(),
-        ));
-    }
-    Ok(Some(payload.to_vec()))
+    let handle =
+        crate::vm::resource::ResourceHandle::from_raw(raw as u64).map_err(host_boundary_error)?;
+    vm.host_context()
+        .take_resource::<RequestBuilder>(handle)
+        .map_err(host_boundary_error)
 }
 
-fn reject_unexpected_fields(map: &VmMap, allowed: &[&str], context: &'static str) -> VmResult<()> {
-    for (key, _) in map {
-        let Value::String(key) = key else {
-            return Err(VmError::TypeMismatch(context));
-        };
-        if !allowed.iter().any(|allowed| *allowed == key.as_str()) {
-            return Err(VmError::HostError(format!(
-                "{context} contains unknown field '{key}'"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn required_string_field(map: &VmMap, key: &str, context: &'static str) -> VmResult<String> {
-    match map.get(&Value::string(key)) {
-        Some(Value::String(value)) => Ok(value.as_ref().clone()),
-        Some(_) => Err(VmError::TypeMismatch(context)),
-        None => Err(VmError::HostError(format!("{context} is missing '{key}'"))),
-    }
-}
-
-fn map_string(map: &VmMap, key: &str) -> VmResult<String> {
-    match map.get(&Value::string(key)) {
-        Some(Value::String(value)) => Ok(value.as_ref().clone()),
-        Some(_) => Err(VmError::TypeMismatch("HTTP request string field")),
-        None => Err(VmError::HostError(format!(
-            "missing HTTP request field '{key}'"
-        ))),
-    }
-}
-
-/// Parses and validates a buffered request before async-host submission.
-pub(super) fn prepare_buffered_request(
+pub(super) fn prepare_resource_request(
+    request: &RequestBuilder,
     config: &HttpConfig,
-    request: &VmMapHandle,
-) -> VmResult<(HttpRequest, Instant)> {
-    let request = parse_request(request, config)?;
-    let deadline = super::policy::request_deadline(config.request_timeout)?;
-    Ok((request, deadline))
+) -> VmResult<HttpRequest> {
+    super::policy::validate_url_policy(config, SchemeFamily::Http, &request.url)?;
+    if request.body.len() > config.max_request_body_bytes {
+        return Err(VmError::HostError("HTTP request body exceeds limit".into()));
+    }
+    validate_request_header_budget(&request.headers, config)?;
+    Ok(HttpRequest {
+        method: request.method.clone(),
+        url: request.url.clone(),
+        headers: request.headers.clone(),
+        body: request.body.clone().into_bytes(),
+    })
 }
 
 /// Executes one bounded request with the shared Hyper client.
@@ -371,7 +250,7 @@ pub(super) async fn perform_buffered_request(
     config: &HttpConfig,
     request: &HttpRequest,
     deadline: Instant,
-) -> VmResult<VmMap> {
+) -> VmResult<HttpResponse> {
     with_deadline(
         deadline,
         execute_request_until(client, config, request, deadline),
@@ -384,7 +263,7 @@ async fn execute_request_until(
     config: &HttpConfig,
     request: &HttpRequest,
     request_deadline: Instant,
-) -> VmResult<VmMap> {
+) -> VmResult<HttpResponse> {
     let mut method = request.method.clone();
     let mut url = request.url.clone();
     let mut body = request.body.clone();
@@ -433,7 +312,7 @@ async fn execute_request_until(
         if has_body {
             reject_declared_oversize(response.response(), config.max_response_body_bytes)?;
         }
-        let response_headers = response_header_entries(response.response().headers());
+        let response_headers = HttpHeaders::from_map(response.response().headers());
         if !has_body {
             return Ok(response_map(status, response_headers, Vec::new(), &url));
         }
@@ -503,6 +382,7 @@ pub(super) async fn open_stream_response(
     config: &HttpConfig,
     request: &HttpRequest,
     opening_deadline: Instant,
+    bytes_sent: &mut usize,
 ) -> VmResult<(OwnedResponse, url::Url)> {
     let mut method = request.method.clone();
     let mut url = request.url.clone();
@@ -512,6 +392,7 @@ pub(super) async fn open_stream_response(
         let connect_deadline = phase_deadline(opening_deadline, config.connect_timeout);
         validate_target_until(config, &url, connect_deadline).await?;
         let response = send_request(client, &method, &url, &headers, body.as_deref()).await?;
+        *bytes_sent = bytes_sent.saturating_add(body.as_ref().map_or(0, Vec::len));
         validate_response_framing(response.response())?;
         if follows_location(response.response().status()) {
             if redirect_index == config.max_redirects {
@@ -645,54 +526,18 @@ fn prepare_redirect(
     }
 }
 
-pub(super) fn response_header_entries(headers: &hyper::HeaderMap) -> Vec<Value> {
-    // HeaderMap iteration does not promise original cross-name wire order.
-    // HeaderName::as_str() is normalized, and the stable sort retains the
-    // HeaderMap-provided order among repeated values of the same name.
-    let mut entries = headers.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-    entries
-        .into_iter()
-        .map(|(name, value)| {
-            let value = if let Ok(text) = value.to_str() {
-                Value::Map(Arc::new(VmMap::from_entries(vec![
-                    (Value::string("kind"), Value::string("text")),
-                    (Value::string("text"), Value::string(text)),
-                    (Value::string("bytes"), Value::Null),
-                ])))
-            } else {
-                Value::Map(Arc::new(VmMap::from_entries(vec![
-                    (Value::string("kind"), Value::string("bytes")),
-                    (Value::string("text"), Value::Null),
-                    (
-                        Value::string("bytes"),
-                        Value::bytes(value.as_bytes().to_vec()),
-                    ),
-                ])))
-            };
-            Value::Map(Arc::new(VmMap::from_entries(vec![
-                (Value::string("name"), Value::string(name.as_str())),
-                (Value::string("value"), value),
-            ])))
-        })
-        .collect()
-}
-
 fn response_map(
     status: hyper::StatusCode,
-    headers: Vec<Value>,
+    headers: HttpHeaders,
     body: Vec<u8>,
     url: &url::Url,
-) -> VmMap {
-    VmMap::from_entries(vec![
-        (
-            Value::string("status"),
-            Value::Int(i64::from(status.as_u16())),
-        ),
-        (Value::string("headers"), Value::array(headers)),
-        (Value::string("body"), Value::bytes(body)),
-        (Value::string("url"), Value::string(url.as_str())),
-    ])
+) -> HttpResponse {
+    HttpResponse {
+        status: i64::from(status.as_u16()),
+        headers,
+        body,
+        url: url.to_string(),
+    }
 }
 
 fn validate_response_head_size(response: &hyper::Response<Incoming>) -> VmResult<()> {
@@ -832,61 +677,44 @@ fn reject_declared_oversize(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use super::{
-        RequestHeaderBudget, parse_request, parse_request_body, validate_response_trailers,
+    use super::{RequestHeaderBudget, prepare_resource_request, validate_response_trailers};
+    use crate::builtins::runtime::http::{
+        HttpConfig,
+        resources::{HttpBody, HttpRequest},
     };
-    use crate::builtins::runtime::typed::VmMap;
-    use crate::vm::{Value, VmError};
-
-    fn value_map(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
-        Value::Map(Arc::new(VmMap::from_entries(
-            entries
-                .into_iter()
-                .map(|(key, value)| (Value::string(key), value))
-                .collect(),
-        )))
-    }
-
-    fn request_with_body(body: Value) -> VmMap {
-        VmMap::from_entries(vec![
-            (Value::string("method"), Value::string("POST")),
-            (Value::string("url"), Value::string("http://example.test/")),
-            (Value::string("body"), body),
-        ])
-    }
 
     #[test]
-    fn request_body_payload_checks_limit_before_copying() {
-        let config = crate::builtins::runtime::http::HttpConfig {
-            max_request_body_bytes: 6,
+    fn resource_request_revalidates_both_body_variants_against_current_policy() {
+        let limits = HttpConfig {
+            allowed_schemes: vec!["http".into()],
+            allowed_hosts: vec!["example.test".into()],
+            allowed_ports: vec![80],
             ..Default::default()
         };
-        let body = value_map([
-            ("kind", Value::string("text")),
-            ("text", Value::string("payload")),
-        ]);
-        let error = parse_request_body(Some(&body), &config).unwrap_err();
-        assert!(
-            matches!(error, VmError::HostError(message) if message == "HTTP request body exceeds limit")
-        );
-    }
-
-    #[test]
-    fn request_body_discriminator_rejects_invalid_variants() {
-        let config = crate::builtins::runtime::http::HttpConfig::default();
-        let body = value_map([
-            ("kind", Value::string("text")),
-            ("text", Value::string("payload")),
-            ("bytes", Value::bytes(b"raw".to_vec())),
-        ]);
-        let error = parse_request(&request_with_body(body), &config).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("text variant cannot contain bytes")
-        );
+        let current = HttpConfig {
+            max_request_body_bytes: 6,
+            ..limits.clone()
+        };
+        for body in [
+            HttpBody::Text("payload".into()),
+            HttpBody::Bytes(b"payload".to_vec()),
+        ] {
+            let request = HttpRequest {
+                method: hyper::Method::POST,
+                url: "http://example.test/".parse().unwrap(),
+                headers: vec![],
+                body,
+                limits: limits.clone(),
+            };
+            let error = prepare_resource_request(&request, &current).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("HTTP request body exceeds limit"),
+                "{error}"
+            );
+            assert!(prepare_resource_request(&request, &limits).is_ok());
+        }
     }
 
     #[test]

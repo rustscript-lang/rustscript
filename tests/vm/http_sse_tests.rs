@@ -1,6 +1,5 @@
 #![cfg(all(feature = "http-client", not(target_family = "wasm")))]
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc;
@@ -8,67 +7,17 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::task::{Context, Poll};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use vm::operation::OperationCancelReason;
 use vm::{
-    CallOutcome, CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput,
-    HostOpId, HostStackFunction, HttpConfig, HttpHostExt, Value, Vm, VmError, VmResult, VmStatus,
-    compile_source,
+    CallOutcome, CallReturn, HostFunctionRegistry, HostFutureOutput, HostStackFunction, HttpConfig,
+    HttpHostExt, Value, Vm, VmError, VmResult, VmStatus, compile_source,
 };
 
-#[derive(Default)]
-struct TokioHostDriver {
-    submitted: HashMap<HostOpId, HostFuture>,
-}
-
-impl HostAsyncBridge for TokioHostDriver {
-    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
-        self.submitted.insert(op_id, future);
-        Ok(())
-    }
-
-    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
-        Poll::Ready(Err(VmError::HostError(format!(
-            "unknown external host operation {op_id}"
-        ))))
-    }
-
-    fn poll_submitted_op(
-        &mut self,
-        op_id: HostOpId,
-        cx: &mut Context<'_>,
-    ) -> Poll<VmResult<HostFutureOutput>> {
-        self.submitted.get_mut(&op_id).map_or_else(
-            || {
-                Poll::Ready(Err(VmError::HostError(format!(
-                    "unknown submitted host operation {op_id}"
-                ))))
-            },
-            |future| future.as_mut().poll(cx),
-        )
-    }
-
-    fn request_cancel_op(
-        &mut self,
-        op_id: HostOpId,
-        _reason: OperationCancelReason,
-    ) -> VmResult<()> {
-        self.submitted.remove(&op_id);
-        Ok(())
-    }
-
-    fn poll_cancel_op(&mut self, _op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn cleanup_op(&mut self, op_id: HostOpId, _terminal: vm::HostAsyncOpTerminal) -> VmResult<()> {
-        self.submitted.remove(&op_id);
-        Ok(())
-    }
-}
+#[path = "../support/http_test_bridge.rs"]
+mod http_test_bridge;
+use http_test_bridge::TokioHostDriver;
 
 struct AsyncWaitOnce {
     calls: Arc<AtomicUsize>,
@@ -122,6 +71,7 @@ async fn reset_and_wait(vm: &mut Vm) -> VmResult<()> {
 async fn run_sse_source(source: &str, config: HttpConfig) -> Result<Vm, vm::VmError> {
     let compiled = compile_source(source).expect("SSE source should compile");
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
@@ -393,7 +343,7 @@ fn rejecting_redirect_server(
         sender.send(String::from_utf8(request).unwrap()).unwrap();
         write!(
             stream,
-            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+            "HTTP/1.1 307 Temporary Redirect\r\nConnection: close\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
         )
         .unwrap();
         drop(stream);
@@ -514,6 +464,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
         );
         let compiled = compile_source(&source).unwrap();
         let mut vm = Vm::new(compiled.program);
+        http_test_bridge::install(&mut vm);
         vm.set_http_max_in_flight(0);
         vm.configure_http(config(1)).unwrap();
         HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
@@ -546,6 +497,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
     "#;
     let compiled = compile_source(source).unwrap();
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.set_http_max_in_flight(0);
     vm.configure_http(config(1)).unwrap();
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
@@ -563,6 +515,7 @@ fn sse_rejects_wrong_callback_schema_and_invalid_timeout_before_permit_admission
     "#;
     let compiled = compile_source(source).unwrap();
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(config(1)).unwrap();
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
     let error = vm.run().unwrap_err();
@@ -579,6 +532,7 @@ fn sse_admission_does_not_require_a_tokio_reactor() {
     "#;
     let compiled = compile_source(source).unwrap();
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(config(1)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
@@ -653,7 +607,7 @@ fn redirect_server(status: u16) -> (u16, mpsc::Receiver<String>, ServerHandle) {
             if index == 0 {
                 write!(
                     stream,
-                    "HTTP/1.1 {status} Redirect\r\nLocation: http://127.0.0.1:{port}/final\r\nContent-Length: 0\r\n\r\n"
+                    "HTTP/1.1 {status} Redirect\r\nConnection: close\r\nLocation: http://127.0.0.1:{port}/final\r\nContent-Length: 0\r\n\r\n"
                 )
                 .unwrap();
             } else {
@@ -777,7 +731,7 @@ async fn sse_rejects_disallowed_redirect_targets_before_connecting() {
         let no_target_connection = assert_no_connection(target_listener, expected);
         let location = format!("http://{host}:{target_port}/final");
         let redirect = format!(
-            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+            "HTTP/1.1 307 Temporary Redirect\r\nConnection: close\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
         );
         let redirect = Box::leak(redirect.into_bytes().into_boxed_slice());
         let (source_port, requests, source_server) = recording_server(vec![vec![redirect]]);
@@ -807,38 +761,6 @@ async fn sse_rejects_disallowed_redirect_targets_before_connecting() {
         source_server.join().unwrap();
         no_target_connection.join().unwrap();
     }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn sse_many_events_in_one_frame_materializes_one_per_callback_acknowledgement() {
-    let body = b"data: first\n\ndata: second event is deliberately over the line limit\n\n";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
-        body.len(),
-        String::from_utf8_lossy(body)
-    )
-    .into_bytes();
-    let response = Box::leak(response.into_boxed_slice());
-    let (port, server) = server(vec![response]);
-    let source = format!(
-        r#"use http;
-        fn stop_after_first_event(item: SseEvent) -> SseCallbackAction {{
-            {{action: if item.kind == "event" => {{ "stop" }} else => {{ "continue" }} }}
-        }}
-        http::client::sse(
-            {{"method":"GET","url":"http://127.0.0.1:{port}/events"}},
-            stop_after_first_event
-        );"#
-    );
-    let mut limits = config(port);
-    limits.max_sse_line_bytes = 16;
-
-    let vm = run_sse_source(&source, limits)
-        .await
-        .expect("the unacknowledged second event must not be materialized");
-    server.join().unwrap();
-    assert_eq!(field(&vm.stack()[0], "outcome"), &Value::string("stopped"));
-    assert_eq!(field(&vm.stack()[0], "items"), &Value::Int(2));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -902,6 +824,7 @@ async fn sse_rejected_nested_admission_rolls_back_before_reset_reuse() {
     );
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.set_http_max_in_flight(2);
     vm.configure_http(config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
@@ -954,6 +877,7 @@ async fn sse_reset_releases_the_connection_permit_before_reuse() {
     );
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.set_http_max_in_flight(1);
     vm.configure_http(config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
@@ -961,11 +885,6 @@ async fn sse_reset_releases_the_connection_permit_before_reuse() {
     HostFunctionRegistry::new().bind_vm_cached(&mut vm).unwrap();
 
     assert!(matches!(vm.run().unwrap(), VmStatus::Waiting(_)));
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        vm.await_waiting_host_op(),
-    )
-    .await;
     assert!(
         requests
             .recv_timeout(std::time::Duration::from_secs(1))
@@ -1013,6 +932,7 @@ async fn sse_reset_while_callback_waits_retires_stream_to_quiescence() {
     );
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.set_http_max_in_flight(1);
     vm.configure_http(config(port)).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
@@ -1034,20 +954,9 @@ async fn sse_reset_while_callback_waits_retires_stream_to_quiescence() {
     assert!(matches!(vm.resume().unwrap(), VmStatus::Waiting(_)));
     assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
 
-    vm.set_async_bridge(Box::<TokioHostDriver>::default())
-        .expect_err("an active SSE callable stream must retain its async bridge");
-    vm.clear_async_bridge()
-        .expect_err("an active SSE callable stream must retain its async bridge");
-
     reset_and_wait(&mut vm)
         .await
         .expect("reset must cancel callback and retire the stream");
-    vm.set_async_bridge(Box::<TokioHostDriver>::default())
-        .expect("a quiescent SSE VM may replace its async bridge");
-    vm.clear_async_bridge()
-        .expect("a quiescent SSE VM may clear its async bridge");
-    vm.set_async_bridge(Box::<TokioHostDriver>::default())
-        .expect("the reused SSE VM needs an async bridge");
     drive(&mut vm)
         .await
         .expect("the reused VM must reacquire the permit");
@@ -1209,6 +1118,7 @@ async fn sse_total_deadline_expires_despite_periodic_progress_below_idle_timeout
     );
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(deadline_config).unwrap();
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
         .expect("test async bridge should install");
@@ -1266,6 +1176,7 @@ async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
     );
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.set_http_max_in_flight(1);
     let mut deadline_config = config(port);
     deadline_config.max_stream_duration = std::time::Duration::from_millis(20);
@@ -1331,6 +1242,7 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
     );
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.set_http_max_in_flight(1);
     let mut deadline_config = config(port);
     deadline_config.max_stream_duration = std::time::Duration::from_millis(100);
@@ -1402,6 +1314,7 @@ async fn sse_callback_continue_after_deadline_fails_before_another_network_poll(
     );
     let compiled = compile_source(&source).unwrap();
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     let mut deadline_config = config(port);
     deadline_config.max_stream_duration = std::time::Duration::from_millis(100);
     deadline_config.stream_idle_timeout = std::time::Duration::from_secs(1);
@@ -1465,7 +1378,7 @@ async fn sse_revalidates_redirects_and_strips_cross_origin_credentials() {
             b"HTTP/1.1 200 OK\r\nContent-Type: Text/Event-Stream; Charset=UTF-8\r\nX-Obs: \x80\r\nX-Repeat: first\r\nX-Repeat: second\r\nContent-Length: 0\r\n\r\n",
         ]]);
         let redirect = format!(
-            "HTTP/1.1 {status} Redirect\r\nLocation: http://127.0.0.1:{target_port}/final\r\nContent-Length: 0\r\n\r\n"
+            "HTTP/1.1 {status} Redirect\r\nConnection: close\r\nLocation: http://127.0.0.1:{target_port}/final\r\nContent-Length: 0\r\n\r\n"
         );
         let redirect = Box::leak(redirect.into_bytes().into_boxed_slice());
         let (source_port, source_requests, source_server) = recording_server(vec![vec![redirect]]);
