@@ -24,6 +24,10 @@ impl ParserDialect for RustScriptDialect {
     fn allow_for_in_loop(&self) -> bool {
         true
     }
+
+    fn allow_result_syntax(&self) -> bool {
+        true
+    }
 }
 
 static RUSTSCRIPT_DIALECT: RustScriptDialect = RustScriptDialect;

@@ -8,7 +8,7 @@ use super::{
 };
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION: u16 = 13;
+const VERSION_V13: u16 = 13;
 const FLAGS: u16 = 0;
 const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;
@@ -71,7 +71,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION {
+    if version != VERSION_V13 {
         return Err(WireError::UnsupportedVersion(version));
     }
     let flags = cursor.read_u16()?;
@@ -232,6 +232,10 @@ fn skip_host_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireErr
             }
             Ok(())
         }
+        14 => {
+            skip_host_schema(cursor, depth + 1)?;
+            skip_host_schema(cursor, depth + 1)
+        }
         value => Err(WireError::InvalidValueType(value)),
     }
 }
@@ -284,6 +288,10 @@ fn skip_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireError> {
             skip_schema(cursor, nested_depth)
         }
         17 => skip_resource_key(cursor),
+        18 => {
+            skip_schema(cursor, nested_depth)?;
+            skip_schema(cursor, nested_depth)
+        }
         value => Err(WireError::InvalidValueType(value)),
     }
 }

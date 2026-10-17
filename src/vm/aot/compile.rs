@@ -1191,6 +1191,14 @@ fn lower_aot_ssa_inst(
                 value: values[input],
             },
         )?,
+        AotSsaInstKind::TaggedToBool { input } => aot_lower_tagged_to_bool(
+            b,
+            ctx,
+            AotTaggedValueOp {
+                ip: inst.ip,
+                value: values[input],
+            },
+        )?,
         AotSsaInstKind::TaggedNumberToFloat { input } => aot_lower_tagged_number_to_float(
             b,
             ctx,
@@ -1902,6 +1910,51 @@ fn aot_load_checked_heap_ptr(
     b.switch_to_block(ok);
     let raw = ssa_load_heap_ptr(b, layout.value, tagged_value, pointer_type);
     b.ins().jump(cont, &[BlockArg::Value(raw)]);
+
+    b.switch_to_block(fail);
+    aot_emit_error_status(b, vm_ptr, exit_block, pointer_type, offsets, ip)?;
+
+    b.switch_to_block(cont);
+    Ok(b.block_params(cont)[0])
+}
+
+#[cfg(feature = "cranelift-jit")]
+fn aot_lower_tagged_to_bool(
+    b: &mut FunctionBuilder,
+    ctx: AotLowerCtx<'_>,
+    operand: AotTaggedValueOp,
+) -> Result<cranelift_codegen::ir::Value, AotCompileError> {
+    let AotLowerCtx {
+        vm_ptr,
+        exit_block,
+        pointer_type,
+        layout,
+        offsets,
+        ..
+    } = ctx;
+    let AotTaggedValueOp {
+        ip,
+        value: tagged_value,
+    } = operand;
+    let ok = b.create_block();
+    let fail = b.create_block();
+    let cont = b.create_block();
+    b.append_block_param(cont, types::I8);
+
+    let tag = ssa_load_tag_i32(b, layout.value, tagged_value);
+    let is_bool = b
+        .ins()
+        .icmp_imm(IntCC::Equal, tag, i64::from(layout.value.bool_tag));
+    b.ins().brif(is_bool, ok, &[], fail, &[]);
+
+    b.switch_to_block(ok);
+    let value = b.ins().load(
+        types::I8,
+        MemFlags::new(),
+        tagged_value,
+        layout.value.bool_payload_offset,
+    );
+    b.ins().jump(cont, &[BlockArg::Value(value)]);
 
     b.switch_to_block(fail);
     aot_emit_error_status(b, vm_ptr, exit_block, pointer_type, offsets, ip)?;

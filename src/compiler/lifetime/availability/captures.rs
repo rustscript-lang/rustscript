@@ -622,6 +622,13 @@ impl AvailabilityAnalyzer {
                 }
                 self.capture_mode_for_expr(default, captured_slot, context, implicit, scan);
             }
+            other @ (Expr::ResultConstruct { .. }
+            | Expr::ResultQuery { .. }
+            | Expr::ResultMatch { .. }) => {
+                other.visit_result_children(|child| {
+                    self.capture_mode_for_expr(child, captured_slot, context, implicit, scan);
+                });
+            }
             Expr::Block { stmts, expr } => {
                 self.capture_mode_for_stmts(stmts, captured_slot, context, implicit, scan);
                 self.capture_mode_for_expr(expr, captured_slot, context, implicit, scan);

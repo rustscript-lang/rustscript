@@ -18,7 +18,7 @@ use crate::host_api::{
 use crate::vm::{HostImport, OpCode, Program, Value};
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION: u16 = 13;
+const VERSION_V13: u16 = 13;
 const FLAGS: u16 = 0;
 const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;
@@ -304,7 +304,7 @@ fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireErr
 pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&VERSION_V13.to_le_bytes());
     out.extend_from_slice(&FLAGS.to_le_bytes());
     write_u32_count("constants", program.constants.len(), &mut out)?;
 
@@ -358,7 +358,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION {
+    if version != VERSION_V13 {
         return Err(WireError::UnsupportedVersion(version));
     }
 
@@ -1671,6 +1671,11 @@ fn write_host_type_schema(
                 write_host_type_schema(&field.ty, out, next_host_schema_depth(depth)?)?;
             }
         }
+        HostTypeSchema::Result { ok, err } => {
+            out.push(14);
+            write_host_type_schema(ok, out, next_host_schema_depth(depth)?)?;
+            write_host_type_schema(err, out, next_host_schema_depth(depth)?)?;
+        }
     }
     Ok(())
 }
@@ -1754,6 +1759,16 @@ fn read_host_type_schema(
             }
             Ok(HostTypeSchema::Named { name, fields })
         }
+        14 => Ok(HostTypeSchema::Result {
+            ok: Box::new(read_host_type_schema(
+                cursor,
+                next_host_schema_depth(depth)?,
+            )?),
+            err: Box::new(read_host_type_schema(
+                cursor,
+                next_host_schema_depth(depth)?,
+            )?),
+        }),
         other => Err(WireError::InvalidHostSchemaTag(other)),
     }
 }
@@ -1835,6 +1850,11 @@ fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(), WireError>
         TypeSchema::Resource(key) => {
             out.push(17);
             write_string("schema resource key", key.as_str(), out)?;
+        }
+        TypeSchema::Result { ok, err } => {
+            out.push(18);
+            write_schema(ok, out)?;
+            write_schema(err, out)?;
         }
     }
     Ok(())
@@ -1926,6 +1946,10 @@ fn read_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<TypeSchema, Wire
                 .map_err(|err| WireError::InvalidResourceKey(err.to_string()))?;
             Ok(TypeSchema::Resource(key))
         }
+        18 => Ok(TypeSchema::Result {
+            ok: Box::new(read_schema(cursor, nested_depth)?),
+            err: Box::new(read_schema(cursor, nested_depth)?),
+        }),
         other => Err(WireError::InvalidValueType(other)),
     }
 }

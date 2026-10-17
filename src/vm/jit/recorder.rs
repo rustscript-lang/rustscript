@@ -464,9 +464,10 @@ fn inline_schema_guard_type(schema: &TypeSchema) -> Option<Option<ValueType>> {
         TypeSchema::Bool => Some(Some(ValueType::Bool)),
         TypeSchema::String => Some(Some(ValueType::String)),
         TypeSchema::Bytes => Some(Some(ValueType::Bytes)),
-        TypeSchema::Named(_, _) | TypeSchema::Map(_) | TypeSchema::Object(_) => {
-            Some(Some(ValueType::Map))
-        }
+        TypeSchema::Named(_, _)
+        | TypeSchema::Map(_)
+        | TypeSchema::Object(_)
+        | TypeSchema::Result { .. } => Some(Some(ValueType::Map)),
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
             Some(Some(ValueType::Array))
         }

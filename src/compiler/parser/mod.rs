@@ -102,6 +102,10 @@ pub trait ParserDialect {
     fn allow_for_in_loop(&self) -> bool {
         false
     }
+
+    fn allow_result_syntax(&self) -> bool {
+        false
+    }
 }
 
 pub(super) fn lint_trailing_function_return_semicolons(

@@ -527,6 +527,15 @@ impl Parser {
             .get(self.pos.saturating_sub(1))
             .map(|token| token.span)
             .unwrap_or_else(|| self.current_span());
+        if self.dialect.allow_result_syntax() && name == "Result" {
+            return Err(ParseError {
+                span: Some(name_span),
+                code: None,
+                line: self.current_line(),
+                message: "Result is a built-in generic type and cannot be declared as a struct"
+                    .to_string(),
+            });
+        }
         let type_params = self.parse_type_params("struct", &name)?;
         self.push_active_type_params(&type_params);
         self.expect(&TokenKind::LBrace, "expected '{' after struct name")?;
@@ -993,6 +1002,17 @@ impl Parser {
                         TypeSchema::Map(Box::new(value))
                     } else {
                         TypeSchema::Map(Box::new(TypeSchema::Unknown))
+                    }
+                }
+                "Result" if self.dialect.allow_result_syntax() => {
+                    self.expect(&TokenKind::Less, "expected '<' after Result")?;
+                    let ok = self.parse_declared_type_schema()?;
+                    self.expect(&TokenKind::Comma, "expected ',' in Result<T, E>")?;
+                    let err = self.parse_declared_type_schema()?;
+                    self.expect(&TokenKind::Greater, "expected '>' after Result<T, E>")?;
+                    TypeSchema::Result {
+                        ok: Box::new(ok),
+                        err: Box::new(err),
                     }
                 }
                 "resource" => {

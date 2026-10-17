@@ -145,6 +145,23 @@ fn embedded_decoder_skips_named_host_schema_from_std_encode() {
     assert_eq!(decoded.imports()[0].name, "embedded::named");
 }
 
+#[test]
+fn embedded_decoder_rejects_legacy_v11_without_schema_markers() {
+    let program = Program::new(
+        vec![Value::Int(7)],
+        vec![OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8],
+    );
+    let mut bytes = encode_program(&program).expect("legacy fixture should encode");
+    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 4);
+    bytes[4..6].copy_from_slice(&11u16.to_le_bytes());
+
+    assert!(matches!(
+        decode_program(&bytes),
+        Err(WireError::UnsupportedVersion(11))
+    ));
+}
+
 fn minimal_vmbc_prefix(constant_count: u32, code: &[u8], import_count: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"VMBC");
@@ -664,4 +681,22 @@ fn embedded_decoder_rejects_duplicate_named_struct_names() {
     bytes.push(14);
     bytes.extend_from_slice(&0u32.to_le_bytes());
     assert_eq!(decode_program(&bytes), Err(WireError::InvalidValueType(0)));
+}
+
+#[test]
+fn embedded_decoder_rejects_v12_trailing_zero_named_struct_garbage() {
+    let mut bytes = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+        .expect("empty program should encode");
+    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 4);
+    bytes[4..6].copy_from_slice(&12u16.to_le_bytes());
+    assert_eq!(
+        decode_program(&bytes),
+        Err(WireError::UnsupportedVersion(12))
+    );
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(
+        decode_program(&bytes),
+        Err(WireError::UnsupportedVersion(12))
+    );
 }
