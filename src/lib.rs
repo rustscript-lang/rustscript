@@ -7,6 +7,10 @@ pub mod debug_info;
 #[cfg(feature = "runtime")]
 pub mod debugger;
 pub mod host_api;
+pub mod result;
+pub use result::GuestResult;
+#[cfg(feature = "runtime")]
+pub use result::{ScriptValueContext, VmScriptArgs, VmScriptValue};
 #[cfg(feature = "runtime")]
 pub mod jit {
     pub use crate::vm::jit::{
@@ -62,8 +66,8 @@ pub use builtins::runtime::http::{
 };
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
-    BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg,
-    return_one, take_arg,
+    BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, IntoVmValue, TakeVmValue, arg,
+    borrow_arg, return_one, take_arg,
 };
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{

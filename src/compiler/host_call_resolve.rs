@@ -612,6 +612,19 @@ fn score_pair(expected: &TypeSchema, actual: &TypeSchema) -> MatchScore {
     }
 
     match (expected, actual) {
+        (
+            Result {
+                ok: e_ok,
+                err: e_err,
+            },
+            Result {
+                ok: a_ok,
+                err: a_err,
+            },
+        ) => MatchScore::default()
+            .plus_exact()
+            .combined(score_pair(e_ok, a_ok))
+            .combined(score_pair(e_err, a_err)),
         (Optional(e), Optional(a)) => MatchScore::default()
             .plus_exact()
             .combined(score_pair(e, a)),
@@ -1129,6 +1142,64 @@ mod tests {
             HostTypeSchema::Int,
         ));
         b.build().expect("valid catalog")
+    }
+
+    #[test]
+    fn result_pair_scores_both_branches_with_existing_rules() {
+        fn result(ok: Ts, err: Ts) -> Ts {
+            Ts::Result {
+                ok: Box::new(ok),
+                err: Box::new(err),
+            }
+        }
+        let expected = result(Ts::Array(Box::new(Ts::Int)), Ts::Resource(io_file()));
+        let exact = score_pair(&expected, &expected);
+        assert_eq!(
+            exact,
+            MatchScore {
+                exact_structural: 4,
+                ..MatchScore::default()
+            }
+        );
+        let deferred = score_pair(
+            &expected,
+            &result(Ts::Array(Box::new(Ts::Unknown)), Ts::Resource(io_file())),
+        );
+        assert_eq!(deferred.deferred, 1);
+        assert_eq!(deferred.mismatches, 0);
+        assert_eq!(
+            score_pair(
+                &expected,
+                &result(Ts::Array(Box::new(Ts::Number)), Ts::Resource(io_file()))
+            )
+            .numeric_compat,
+            1
+        );
+        assert_eq!(
+            score_pair(
+                &expected,
+                &result(Ts::Array(Box::new(Ts::Int)), Ts::Resource(sqlite_conn()))
+            )
+            .mismatches,
+            1
+        );
+        assert_eq!(
+            score_pair(
+                &expected,
+                &result(Ts::Resource(io_file()), Ts::Array(Box::new(Ts::Int)))
+            )
+            .mismatches,
+            2
+        );
+        assert_eq!(
+            score_pair(
+                &result(Ts::GenericParam("T".into()), Ts::String),
+                &result(Ts::GenericParam("E".into()), Ts::String)
+            )
+            .mismatches,
+            1
+        );
+        assert_eq!(score_pair(&expected, &Ts::Int).mismatches, 1);
     }
 
     #[test]

@@ -1,0 +1,5 @@
+error: ResourceRef cannot appear in a host function return nested inside `VmResult` -> `GuestResult`; resource borrows cannot cross the host boundary
+ --> tests/ui/fail/guest_result_borrowed_ok.rs:7:17
+  |
+7 | fn invalid() -> VmResult<GuestResult<ResourceRef<'static, Counter>, i64>> {
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

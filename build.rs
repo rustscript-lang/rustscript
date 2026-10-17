@@ -172,6 +172,7 @@ fn main() {
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing manifest dir"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing OUT_DIR"));
+    emit_guest_result_schema_fixture(&manifest_dir, &out_dir);
 
     let namespace_manifest = manifest_dir
         .join("src")
@@ -338,7 +339,7 @@ fn parse_sources(
 }
 
 pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
-    if function.sig.asyncness.is_some() {
+    if function.sig.asyncness.is_some() || guest_result_uses_vm(function) {
         return HostBindingKind::StaticStack;
     }
     if function.sig.inputs.iter().any(|input| match input {
@@ -378,6 +379,21 @@ pub(crate) fn classify_host_binding(function: &ItemFn) -> HostBindingKind {
         return HostBindingKind::StaticNonYieldingArgs;
     }
     HostBindingKind::StaticArgs
+}
+
+fn guest_result_uses_vm(function: &ItemFn) -> bool {
+    let input = function.sig.inputs.iter().any(|arg| match arg {
+        FnArg::Typed(arg) => pd_host_schema::guest_result_shape(&arg.ty)
+            .expect("valid guest union")
+            .is_some_and(|shape| !shape.resources().is_empty()),
+        _ => false,
+    });
+    let output = normalized_return_type(&function.sig.output);
+    let output = sole_type_argument(&output, "VmResult").unwrap_or(output);
+    input
+        || pd_host_schema::guest_result_shape(&output)
+            .expect("valid guest union")
+            .is_some_and(|shape| !shape.resources().is_empty())
 }
 
 pub(crate) fn infer_host_execution(function: &ItemFn) -> HostExecutionKind {
@@ -2007,7 +2023,7 @@ fn host_wrapper_adapter_name(callable: &CallableDecl) -> String {
 }
 
 fn generated_wrapper_decl(function: &ItemFn) -> WrapperDecl {
-    let mut needs_vm = function.sig.asyncness.is_some();
+    let mut needs_vm = function.sig.asyncness.is_some() || guest_result_uses_vm(function);
     for input in &function.sig.inputs {
         let FnArg::Typed(pat_type) = input else {
             panic!("methods are not supported in #[pd_host_function] declarations");
@@ -2137,6 +2153,177 @@ fn callable_docs(name: &str, attrs: &[Attribute]) -> String {
         panic!("callable '{name}' is missing /// doc comments");
     }
     docs
+}
+
+/// Emits the typed host-schema fixture with the real build-script parser and
+/// emitter. The integration test compiles this output and the proc-macro
+/// descriptor from the same declaration, then compares their full structures.
+fn emit_guest_result_schema_fixture(manifest: &Path, out: &Path) {
+    for (input, output) in [
+        ("result_sdk_signature.rs", "result_sdk_build_schemas.rs"),
+        (
+            "result_sdk_resource_signature.rs",
+            "result_sdk_resource_build_schemas.rs",
+        ),
+    ] {
+        let fixture = manifest.join("tests/fixtures").join(input);
+        println!("cargo:rerun-if-changed={}", fixture.display());
+        let source = fs::read_to_string(&fixture).expect("typed guest schema fixture");
+        let parsed = syn::parse_file(&source).expect("typed guest schema fixture syntax");
+        let mut generated = String::new();
+        for item in parsed.items {
+            if let Item::Fn(function) = item {
+                generated.push_str(&render_guest_descriptor_model(&function));
+            }
+        }
+        fs::write(out.join(output), generated).expect("write typed guest schema fixture");
+    }
+}
+
+fn rust_schema_type(ty: &Type) -> String {
+    match ty {
+        Type::Path(path) => {
+            path.path
+                .segments
+                .iter()
+                .map(|segment| {
+                    let mut name = segment.ident.to_string();
+                    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                        let args = args.args.iter().map(|arg| match arg {
+                    syn::GenericArgument::Type(ty) => rust_schema_type(ty),
+                    _ => panic!("only concrete type arguments are supported in named schema paths"),
+                }).collect::<Vec<_>>();
+                        name.push('<');
+                        name.push_str(&args.join(", "));
+                        name.push('>');
+                    }
+                    name
+                })
+                .collect::<Vec<_>>()
+                .join("::")
+        }
+        Type::Tuple(tuple) if tuple.elems.is_empty() => "()".into(),
+        _ => panic!("unsupported named/resource schema path"),
+    }
+}
+
+fn guest_schema_expr(shape: &pd_host_schema::GuestTypeShape<'_>) -> String {
+    use pd_host_schema::GuestTypeShape as S;
+    match shape {
+        S::Result(ok, err) => format!(
+            "vm::HostTypeSchema::Result {{ ok: Box::new({}), err: Box::new({}) }}",
+            guest_schema_expr(ok),
+            guest_schema_expr(err)
+        ),
+        S::Optional(inner) => format!(
+            "vm::HostTypeSchema::Optional(Box::new({}))",
+            guest_schema_expr(inner)
+        ),
+        S::Array(inner) => format!(
+            "vm::HostTypeSchema::Array(Box::new({}))",
+            guest_schema_expr(inner)
+        ),
+        S::Resource(spec) => format!(
+            "vm::HostTypeSchema::Resource({})",
+            guest_resource_key_expr(spec)
+        ),
+        S::Named(ty) => format!(
+            "<{} as vm::HostNamedStruct>::host_type_schema()",
+            rust_schema_type(ty)
+        ),
+        S::Scalar(label) => format!(
+            "vm::HostTypeSchema::{}",
+            match *label {
+                "int" => "Int",
+                "float" => "Float",
+                "bool" => "Bool",
+                "string" => "String",
+                "bytes" => "Bytes",
+                "null" => "Null",
+                _ => unreachable!("shared typed scalar"),
+            }
+        ),
+    }
+}
+
+fn guest_resource_key_expr(spec: &pd_host_schema::ResourceSpec) -> String {
+    let key = match &spec.key {
+        Some(key) => format!("{key:?}"),
+        None => format!(
+            "<{} as vm::HostResourceType>::KEY",
+            rust_schema_type(&spec.inner)
+        ),
+    };
+    format!("vm::ResourceTypeKey::new({key}).expect(\"validated resource type key\")")
+}
+
+pub(crate) fn render_guest_descriptor_model(function: &ItemFn) -> String {
+    use pd_host_schema::ResourceMode;
+    let mut params = Vec::new();
+    let mut effects = Vec::new();
+    for arg in &function.sig.inputs {
+        let FnArg::Typed(arg) = arg else {
+            panic!("host method");
+        };
+        if is_vm_context_type(&arg.ty) || pd_host_schema::state_spec(&arg.ty).is_some() {
+            continue;
+        }
+        let Pat::Ident(name) = arg.pat.as_ref() else {
+            panic!("host parameter pattern");
+        };
+        let shape = pd_host_schema::guest_type_shape(&arg.ty).expect("fully typed host parameter");
+        let mode = shape.resource_mode().expect("unambiguous guest passing");
+        let passing = match mode {
+            Some(ResourceMode::Borrow) => "Borrow",
+            Some(ResourceMode::BorrowMut) => "BorrowMut",
+            Some(ResourceMode::TakeOwned) => "TakeOwned",
+            _ => "Value",
+        };
+        params.push(format!(
+            "vm::HostParamSchema::with_passing({:?}, {}, vm::HostParamPassing::{passing})",
+            name.ident.to_string(),
+            guest_schema_expr(&shape)
+        ));
+        for resource in shape.resources() {
+            let ctor = match resource.mode {
+                ResourceMode::Borrow => "borrow",
+                ResourceMode::BorrowMut => "borrow_mut",
+                ResourceMode::TakeOwned => "take_owned",
+                ResourceMode::Value => unreachable!(),
+            };
+            effects.push(format!(
+                "vm::HostEffect::GuestResource(vm::ResourceEffect::{ctor}({}))",
+                guest_resource_key_expr(resource)
+            ));
+        }
+    }
+    let output = normalized_return_type(&function.sig.output);
+    let output = sole_type_argument(&output, "VmResult").unwrap_or(output);
+    let shape = pd_host_schema::guest_type_shape(&output).expect("fully typed host return");
+    assert!(
+        pd_host_schema::borrowed_resource_return(&output).is_none(),
+        "borrowed resource return"
+    );
+    for resource in shape.resources() {
+        effects.push(format!(
+            "vm::HostEffect::GuestResource(vm::ResourceEffect::create({}))",
+            guest_resource_key_expr(resource)
+        ));
+    }
+    let binding = match classify_host_binding(function) {
+        HostBindingKind::StaticStack => "StaticStack",
+        HostBindingKind::StaticArgs => "StaticArgs",
+        HostBindingKind::StaticNonYieldingArgs => "StaticNonYieldingArgs",
+    };
+    format!(
+        "pub fn result_sdk_build_{}() -> (vm::HostFunctionSchema, Vec<vm::HostEffect>, vm::HostBindingKind) {{ (vm::HostFunctionSchema::with_return({:?}, vec![{}], {}).with_description({:?}), vec![{}], vm::HostBindingKind::{binding}) }}\n",
+        function.sig.ident,
+        pd_host_function_name(&function.attrs).expect("host name"),
+        params.join(","),
+        guest_schema_expr(&shape),
+        doc_string(&function.attrs),
+        effects.join(",")
+    )
 }
 
 fn return_type_label(output: &ReturnType) -> String {
