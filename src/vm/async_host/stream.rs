@@ -172,6 +172,8 @@ pub(crate) enum HostStreamPhase {
 pub(crate) struct HostStreamContinuation {
     pub(crate) op_id: HostOpId,
     pub(crate) callback: Value,
+    pub(crate) expected_return_type: Option<crate::bytecode::ValueType>,
+    pub(crate) expected_return_schema: Option<crate::host_api::HostImportSchema>,
     pub(crate) open_callback: Option<Value>,
     pub(crate) item: Option<Vec<Value>>,
     pub(crate) item_callback: HostStreamCallback,
@@ -185,30 +187,6 @@ pub(crate) struct HostStreamContinuation {
     pub(crate) parent_stack_base: usize,
     pub(crate) parent_frame_count: usize,
     pub(crate) parent_ip: usize,
-}
-
-/// HTTP SSE callback results retain the existing named action/object runtime
-/// compatibility, while callback inputs use the exact `SseEvent` named schema.
-#[cfg(feature = "http-client")]
-fn sse_callback_input_schema(params: &[TypeSchema]) -> bool {
-    matches!(
-        params,
-        [TypeSchema::Named(name, args)] if name == "SseEvent" && args.is_empty()
-    )
-}
-
-#[cfg(feature = "http-client")]
-fn sse_callback_action_result_schema(result: &TypeSchema) -> bool {
-    match result {
-        TypeSchema::Named(name, args) => name == "SseCallbackAction" && args.is_empty(),
-        TypeSchema::Object(fields) => {
-            fields.len() == 1
-                && fields
-                    .get("action")
-                    .is_some_and(|ty| matches!(ty, TypeSchema::String))
-        }
-        _ => false,
-    }
 }
 
 impl Vm {
@@ -294,6 +272,8 @@ impl Vm {
         self.instance.host_stream = Some(HostStreamContinuation {
             op_id,
             callback,
+            expected_return_type: None,
+            expected_return_schema: None,
             open_callback,
             item: None,
             item_callback: HostStreamCallback::Event,
@@ -395,25 +375,18 @@ impl Vm {
         Ok(())
     }
 
+    /// Validates the current positional SSE event callback contract.
     #[cfg(feature = "http-client")]
     pub fn validate_sse_callback_value(&self, callback: &Value) -> VmResult<()> {
-        self.validate_stream_callback_value(callback)?;
-        let Value::Callable(callable) = callback else {
-            return Ok(());
-        };
-        let Some(prototype) = self
-            .program
-            .callable_prototypes
-            .get(callable.prototype_id as usize)
-        else {
-            return Ok(());
-        };
-        if let Some(TypeSchema::Callable { params, result, .. }) = &prototype.schema
-            && (!sse_callback_input_schema(params) || !sse_callback_action_result_schema(result))
-        {
-            return Err(VmError::TypeMismatch("fn(SseEvent) -> SseCallbackAction"));
-        }
-        Ok(())
+        self.validate_stream_positional_callback(
+            callback,
+            &[
+                TypeSchema::String,
+                TypeSchema::String,
+                TypeSchema::String,
+                TypeSchema::String,
+            ],
+        )
     }
 
     pub(crate) fn cancel_callable_stream_with_reason(
@@ -878,6 +851,18 @@ impl Vm {
                         result
                     }
                 };
+                let result = result.and_then(|summary| {
+                    let stream = self.instance.host_stream.as_ref().expect("stream exists");
+                    let values = crate::vm::CallReturn::one(summary.clone());
+                    crate::vm::host::validate_host_call_return(
+                        &values,
+                        stream.expected_return_type,
+                        stream.expected_return_schema.as_ref(),
+                        &self.program,
+                        self.host.execution_scope.resources(),
+                    )
+                    .map(|()| summary)
+                });
                 match result {
                     Ok(summary) => {
                         let stream = self.instance.host_stream.take().expect("stream exists");
@@ -919,6 +904,13 @@ impl Vm {
                 .poll_close_added(before, cleanup_error, cx);
         match result {
             Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) if error.is_retryable() => {
+                // Retain the rollback snapshot, original failure and waiting
+                // operation until the embedding restores the cleanup context.
+                Poll::Ready(Err(VmError::ExecutionScope(ExecutionScopeError::Resource(
+                    error,
+                ))))
+            }
             Poll::Ready(cleanup) => {
                 let mut stream = self.instance.host_stream.take().expect("stream exists");
                 let (_, error, _) = stream.rollback.take().expect("rollback error exists");
@@ -958,6 +950,13 @@ impl Vm {
             .ok_or(VmError::InvalidFrameState(
                 "missing callable stream continuation",
             ))?;
+        let validation = crate::vm::host::validate_host_call_return(
+            &crate::vm::CallReturn::one(summary.clone()),
+            stream.expected_return_type,
+            stream.expected_return_schema.as_ref(),
+            &self.program,
+            self.host.execution_scope.resources(),
+        );
         let cleanup = self
             .host
             .begin_stream_termination(stream.op_id, termination)
@@ -972,7 +971,7 @@ impl Vm {
                 self.drop_value_with_contract(item);
             }
         }
-        if let Err(error) = cleanup {
+        if let Err(error) = validation.and(cleanup) {
             self.abort_host_invocation(stream.parent_stack_base, stream.parent_frame_count);
             self.drop_value_with_contract(summary);
             return Err(error);
@@ -1023,6 +1022,150 @@ impl Vm {
             }
         }
         cleanup
+    }
+}
+
+#[cfg(test)]
+mod return_contract_tests {
+    use super::*;
+    use crate::bytecode::{OpCode, Program, ValueType};
+
+    struct CompleteWith;
+    impl HostStreamDriver for CompleteWith {
+        fn poll_next(&mut self, _: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
+            Poll::Ready(Ok(HostStreamPoll::Complete(Value::string("malformed"))))
+        }
+        fn apply_action(&mut self, _: Value) -> VmResult<HostStreamAction> {
+            unreachable!("summary-only driver")
+        }
+    }
+
+    struct RetryClose(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl crate::vm::resource::HostResource for RetryClose {
+        fn begin_close(
+            &mut self,
+            _: crate::vm::resource::ResourceCloseReason,
+        ) -> crate::vm::resource::ResourceResult<crate::vm::resource::CloseProgress> {
+            Ok(crate::vm::resource::CloseProgress::Pending)
+        }
+        fn poll_close(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<crate::vm::resource::ResourceResult<()>> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(crate::vm::resource::ResourceError::new(
+                    crate::vm::resource::ResourceErrorCode::RuntimeRequired,
+                    "test::rollback",
+                    "cleanup context unavailable",
+                )
+                .with_retryable_disposition()))
+            }
+        }
+    }
+    struct CompleteWithRetry(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl HostStreamDriver for CompleteWithRetry {
+        fn poll_next(&mut self, _: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
+            let ready = std::sync::Arc::clone(&self.0);
+            Poll::Ready(Ok(HostStreamPoll::CompleteWithVm(Box::new(move |vm| {
+                let token = vm.host_context().push_resource(RetryClose(ready)).unwrap();
+                Ok(Value::Int(token.handle().raw() as i64))
+            }))))
+        }
+        fn apply_action(&mut self, _: Value) -> VmResult<HostStreamAction> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn rejected_completion_retains_retryable_rollback_until_cleanup_can_resume() {
+        let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut vm = waiting_vm();
+        vm.host.stream_drivers.insert(
+            41,
+            Box::new(CompleteWithRetry(std::sync::Arc::clone(&ready))),
+        );
+        vm.set_waiting_host_op_with_return(
+            41,
+            crate::vm::host::WaitingHostOpSource::CallableStream,
+            Some(ValueType::String),
+            None,
+        )
+        .unwrap();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let first = vm.poll_waiting_host_op(&mut cx);
+        assert!(
+            matches!(first, Poll::Ready(Err(VmError::ExecutionScope(ExecutionScopeError::Resource(ref error)))) if error.is_retryable()),
+            "{first:?}"
+        );
+        assert_eq!(vm.waiting_host_op_id(), Some(41));
+        assert!(vm.instance.host_stream.is_some());
+        assert_eq!(vm.host_context().resource_count(), 1);
+        ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = vm.poll_waiting_host_op(&mut cx);
+        assert!(
+            matches!(result, Poll::Ready(Err(VmError::TypeMismatch("string")))),
+            "{result:?}"
+        );
+        assert!(vm.instance.host_stream.is_none());
+        assert_eq!(vm.host_context().resource_count(), 0);
+        assert_eq!(vm.waiting_host_op_id(), None);
+        assert!(vm.stack().is_empty());
+    }
+
+    fn waiting_vm() -> Vm {
+        let mut vm = Vm::new(Program::new(vec![], vec![OpCode::Ret as u8]));
+        vm.host.stream_drivers.insert(41, Box::new(CompleteWith));
+        vm.instance.host_stream = Some(HostStreamContinuation {
+            op_id: 41,
+            callback: Value::Null,
+            open_callback: None,
+            expected_return_type: None,
+            expected_return_schema: None,
+            item: None,
+            item_callback: HostStreamCallback::Event,
+            summary: None,
+            rollback: None,
+            phase: HostStreamPhase::AwaitItem,
+            parent_stack_base: 0,
+            parent_frame_count: 0,
+            parent_ip: 0,
+        });
+        vm.set_waiting_host_op_with_return(
+            41,
+            crate::vm::host::WaitingHostOpSource::CallableStream,
+            Some(ValueType::Int),
+            None,
+        )
+        .unwrap();
+        vm
+    }
+
+    #[test]
+    fn eof_summary_validates_original_host_return_type() {
+        let mut vm = waiting_vm();
+        let result = vm.poll_waiting_host_op(&mut Context::from_waker(std::task::Waker::noop()));
+        assert!(matches!(
+            result,
+            Poll::Ready(Err(VmError::TypeMismatch("int")))
+        ));
+        assert!(vm.stack().is_empty());
+        assert!(vm.instance.host_stream.is_none());
+    }
+
+    #[test]
+    fn callback_stop_summary_validates_original_host_return_type() {
+        let mut vm = waiting_vm();
+        let error = vm
+            .finish_callable_stream_with_termination(
+                HostStreamSummary::Value(Value::string("malformed")),
+                HostStreamTermination::Cancelled(OperationCancelReason::Requested),
+            )
+            .expect_err("invalid stopped summary");
+        assert!(matches!(error, VmError::TypeMismatch("int")));
+        assert!(vm.stack().is_empty());
+        assert!(vm.instance.host_stream.is_none());
     }
 }
 
@@ -1144,8 +1287,7 @@ mod tests {
                 &[],
                 driver(),
             )
-            .err()
-            .expect("arity rejection");
+            .expect_err("arity rejection");
         assert!(matches!(
             rejection.primary,
             VmError::CallableArityMismatch { .. }
@@ -1159,8 +1301,7 @@ mod tests {
                 &[TypeSchema::Int, TypeSchema::String],
                 driver(),
             )
-            .err()
-            .expect("open result rejection");
+            .expect_err("open result rejection");
         assert!(matches!(rejection.primary, VmError::TypeMismatch(_)));
         vm.rollback_rejected_callable_stream(rejection);
         let rejection = vm
@@ -1171,8 +1312,7 @@ mod tests {
                 &[],
                 driver(),
             )
-            .err()
-            .expect("event parameter rejection");
+            .expect_err("event parameter rejection");
         assert!(matches!(rejection.primary, VmError::TypeMismatch(_)));
         vm.rollback_rejected_callable_stream(rejection);
     }

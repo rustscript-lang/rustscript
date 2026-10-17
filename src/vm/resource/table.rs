@@ -275,14 +275,23 @@ impl ResourceTable {
             if before.contains(&handle) {
                 continue;
             }
-            self.try_begin_close(
-                index,
-                ResourceCloseReason::Requested,
-                &mut closed,
-                &mut failed,
-                &mut first_error,
-            );
-            self.try_poll_close(index, cx, &mut closed, &mut failed, &mut first_error);
+            let result = self
+                .try_begin_close(
+                    index,
+                    ResourceCloseReason::Requested,
+                    &mut closed,
+                    &mut failed,
+                    &mut first_error,
+                )
+                .and_then(|_| {
+                    self.try_poll_close(index, cx, &mut closed, &mut failed, &mut first_error)
+                });
+            if let Err(error) = result {
+                if let Some(first) = first_error {
+                    cleanup_error.get_or_insert(first);
+                }
+                return Poll::Ready(Err(error));
+            }
         }
         if let Some(error) = first_error {
             cleanup_error.get_or_insert(error);
