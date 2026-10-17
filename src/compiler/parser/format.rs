@@ -180,9 +180,9 @@ impl<'a> SourceFormatter<'a> {
             if self.pending_code_break && !gap_result.saw_line_break {
                 self.request_newline(1);
             }
-            if gap_result.saw_line_break {
-                self.pending_code_break = false;
-            }
+            // The next token consumes this break whether the input supplied
+            // the newline or we generated it. emit_token may queue a new one.
+            self.pending_code_break = false;
 
             self.emit_token()?;
         }
