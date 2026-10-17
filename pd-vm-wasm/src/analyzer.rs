@@ -98,6 +98,35 @@ fn lint_compile_result(
                 LintReport { diagnostics }
             }
         }
+        Err(SourcePathError::SourceWithMap {
+            error: SourceError::Compile(err),
+            sources,
+        }) if matches!(
+            &err,
+            vm::CompileError::StrictTypingRequired { span: Some(_), .. }
+        ) =>
+        {
+            let vm::CompileError::StrictTypingRequired {
+                span: Some(span), ..
+            } = &err
+            else {
+                unreachable!();
+            };
+            let lint_span = lint_span_from_source_span(&sources, span.source_id, span.lo, span.hi);
+            let mut diagnostics =
+                lint_trailing_function_return_semicolon_diagnostics(source, flavor);
+            diagnostics.extend(lint_unknown_inferred_local_diagnostics(
+                source, flavor, path, options,
+            ));
+            diagnostics.push(LintDiagnostic {
+                line: lint_span.as_ref().map_or(0, |span| span.start_line),
+                severity: LintSeverity::Error,
+                message: err.diagnostic_message(),
+                span: lint_span,
+                rendered: render_compile_error(&sources, &err, true),
+            });
+            LintReport { diagnostics }
+        }
         // Milestone 5+ load/merge errors carry the compilation-wide source
         // map; unwrap it so the branch below renders from the owning source.
         Err(SourcePathError::SourceWithMap { error, .. }) => lint_compile_result(

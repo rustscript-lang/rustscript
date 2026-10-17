@@ -10,6 +10,10 @@ use std::path::Path;
 #[path = "../tests/fixtures/coherent_typehint.rs"]
 mod coherent_typehint;
 
+#[cfg(test)]
+#[path = "../tests/fixtures/result_consumer.rs"]
+mod result_consumer;
+
 use serde::{Deserialize, Serialize};
 use vm::{
     CompileSourceFileOptions, InferredLocalTypeHint, SourceFlavor,
@@ -96,6 +100,9 @@ fn type_schema_to_json(schema: &vm::TypeSchema) -> serde_json::Value {
         TypeSchema::Bytes => json!({"kind": "bytes"}),
         TypeSchema::GenericParam(name) => json!({"kind": "generic_param", "name": name}),
         TypeSchema::Resource(key) => json!({"kind": "resource", "key": key.as_str()}),
+        TypeSchema::Result { ok, err } => {
+            json!({"kind": "result", "ok": type_schema_to_json(ok), "err": type_schema_to_json(err)})
+        }
         TypeSchema::Optional(inner) => {
             json!({"kind": "optional", "inner": type_schema_to_json(inner)})
         }
