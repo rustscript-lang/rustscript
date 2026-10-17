@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use vm::compiler::TypeSchema;
 use vm::{
     ArgInfo, Assembler, BuiltinFunction, BytecodeBuilder, CallableKind, CallablePrototype,
     CallableTarget, DebugFunction, DebugInfo, DisassembleOptions, HostApiBuilder,
@@ -9,7 +10,6 @@ use vm::{
     compile_source, decode_program, disassemble_vmbc, disassemble_vmbc_with_options,
     encode_program, infer_local_count, validate_program,
 };
-use vm::compiler::TypeSchema;
 
 #[test]
 fn wire_roundtrip_preserves_constants_and_code() {
@@ -91,7 +91,10 @@ fn wire_v11_legacy_imports_decode_without_schema_metadata() {
     legacy[4..6].copy_from_slice(&11u16.to_le_bytes());
 
     assert!(
-        matches!(decode_program(&legacy), Err(WireError::UnsupportedVersion(11))),
+        matches!(
+            decode_program(&legacy),
+            Err(WireError::UnsupportedVersion(11))
+        ),
         "v11 payloads are not a supported reader"
     );
 }
@@ -111,15 +114,15 @@ fn wire_v11_zero_import_program_decodes_by_version() {
 
 fn strip_empty_named_struct_section(encoded: &mut Vec<u8>) {
     assert!(
-        encoded.len() >= 4,
-        "encoded VMBC is too short to contain a named-struct section"
+        encoded.len() >= 8,
+        "encoded VMBC is too short to contain named-struct and ret-cleanup sections"
     );
     assert_eq!(
-        &encoded[encoded.len() - 4..],
-        &[0, 0, 0, 0],
-        "expected an empty named-struct count trailer on current encode"
+        &encoded[encoded.len() - 8..],
+        &[0, 0, 0, 0, 0, 0, 0, 0],
+        "expected empty named-struct and ret-cleanup count trailers on current encode"
     );
-    encoded.truncate(encoded.len() - 4);
+    encoded.truncate(encoded.len() - 8);
 }
 
 fn minimal_vmbc_prefix(constant_count: u32, code: &[u8], import_count: u32) -> Vec<u8> {
@@ -1114,7 +1117,10 @@ fn v12_trailing_zero_count_is_not_a_named_struct_table() {
     let mut garbage = encoded;
     garbage.extend_from_slice(&0u32.to_le_bytes());
     assert!(
-        matches!(decode_program(&garbage), Err(WireError::UnsupportedVersion(12))),
+        matches!(
+            decode_program(&garbage),
+            Err(WireError::UnsupportedVersion(12))
+        ),
         "v12 is rejected before trailing bytes are interpreted"
     );
 }

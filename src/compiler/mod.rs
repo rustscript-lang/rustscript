@@ -27,6 +27,7 @@ mod result;
 mod semantic_model;
 mod source_loader;
 pub mod source_map;
+mod try_anf;
 mod typing;
 
 #[cfg(test)]

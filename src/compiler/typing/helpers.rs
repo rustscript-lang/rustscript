@@ -1932,7 +1932,8 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
         }
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
-        | Expr::ResultMatch { .. }) => {
+        | Expr::ResultMatch { .. }
+        | Expr::ResultTry { .. }) => {
             let mut found = false;
             other.visit_result_children(|child| {
                 found |= expr_contains_param_add(child, param_slots)
@@ -2013,7 +2014,8 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
         }
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
-        | Expr::ResultMatch { .. }) => {
+        | Expr::ResultMatch { .. }
+        | Expr::ResultTry { .. }) => {
             let mut found = false;
             other.visit_result_children(|child| found |= expr_uses_param(child, param_slots));
             found
@@ -2221,6 +2223,17 @@ pub(super) fn legalize_expr(
         Expr::ResultQuery { value, .. } => {
             let _ = legalize_expr(value, state, context, site, host_resolution);
             BoundType::Bool
+        }
+        Expr::ResultTry {
+            value,
+            operand_schema,
+            ..
+        } => {
+            let _ = legalize_expr(value, state, context, site, host_resolution);
+            context
+                .selected_result_success_schema(value, operand_schema, state)
+                .map(|schema| context.bound_type_for_schema(&schema))
+                .unwrap_or(BoundType::Unknown)
         }
         Expr::ResultMatch {
             value,

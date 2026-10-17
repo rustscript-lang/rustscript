@@ -3,6 +3,7 @@ mod callable_identity;
 use super::*;
 use crate::BuiltinFunction;
 use crate::bytecode::TypeMap;
+use crate::compiler::{StructDecl, TypeSchema};
 use crate::host_api::{
     HostApiBuilder, HostFunctionSchema, HostImportSchema, HostTypeSchema, ResourceTypeKey,
     ResourceTypeSchema,
@@ -10,7 +11,7 @@ use crate::host_api::{
 use crate::vm::host::WaitingHostOpSource;
 use crate::vm::operation::driver::{HostOperation, OperationSpec};
 use crate::vm::operation::{OperationCancelReason, OperationResult};
-use crate::{BytecodeBuilder, decode_program, encode_program};
+use crate::{BytecodeBuilder, RetCleanupLocal, RetCleanupPlan, decode_program, encode_program};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -54,6 +55,30 @@ fn program_cache_key_includes_full_host_import_schema() {
         compute_program_cache_key(&first),
         compute_program_cache_key(&second),
         "host schema changes must invalidate program-semantic caches"
+    );
+}
+
+#[test]
+fn program_cache_key_changes_when_only_ret_cleanup_schema_changes() {
+    let key = ResourceTypeKey::new("ret.cleanup.a").expect("key");
+    let other = ResourceTypeKey::new("ret.cleanup.b").expect("key");
+    let mut program = Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_local_count(1);
+    program.ret_cleanups = vec![RetCleanupPlan {
+        site: 0,
+        locals: vec![RetCleanupLocal {
+            slot: 0,
+            schema: crate::compiler::TypeSchema::Resource(key),
+        }],
+    }];
+    let first = compute_program_cache_key(&program);
+    program.ret_cleanups[0].locals[0].schema = crate::compiler::TypeSchema::Resource(other);
+    let second = compute_program_cache_key(&program);
+    program.ret_cleanups[0].site = 1;
+    let moved_site = compute_program_cache_key(&program);
+    assert_ne!(first, second, "cleanup schema is part of program identity");
+    assert_ne!(
+        second, moved_site,
+        "cleanup site is part of program identity"
     );
 }
 
@@ -4460,4 +4485,1368 @@ mod callable_resource_schema_tests {
         );
         assert_eq!(vm.stack(), &[point_value(8, 9)]);
     }
+}
+
+#[test]
+fn sol_try_waiting_operand_reset_cancels_once_without_running_guest_err_arm() {
+    struct Wait;
+    impl crate::HostFunction for Wait {
+        fn call(&mut self, vm: &mut Vm, _: &[Value]) -> VmResult<crate::CallOutcome> {
+            vm.submit_host_future(empty_host_future())
+        }
+    }
+    let mut catalog = crate::HostApiBuilder::new();
+    catalog.function(crate::HostFunctionSchema::with_return(
+        "test::wait",
+        Vec::new(),
+        crate::HostTypeSchema::Result {
+            ok: Box::new(crate::HostTypeSchema::Int),
+            err: Box::new(crate::HostTypeSchema::String),
+        },
+    ));
+    let compiled = crate::compile_source_with_flavor_and_options(
+        r#"
+        fn relay() -> Result<int, string> { let n = test::wait()?; Result::Ok(n) }
+        let caught = match relay() { Result::Ok(_) => 1, Result::Err(_) => 2, }; caught;
+    "#,
+        crate::SourceFlavor::RustScript,
+        crate::CompileSourceFileOptions::new()
+            .with_host_api_catalog(Arc::new(catalog.build().unwrap())),
+    )
+    .expect("waiting Try admission");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_fuel(100_000);
+    let cleanups = Arc::new(Mutex::new(Vec::new()));
+    struct Bridge {
+        future: Option<HostFuture>,
+        requests: Arc<Mutex<Vec<(HostOpId, OperationCancelReason)>>>,
+        terminals: Arc<AtomicU64>,
+    }
+    impl HostAsyncBridge for Bridge {
+        fn submit_op(&mut self, _: HostOpId, future: HostFuture) -> VmResult<()> {
+            self.future = Some(future);
+            Ok(())
+        }
+        fn poll_op(&mut self, _: HostOpId, _: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
+            Poll::Pending
+        }
+        fn request_cancel_op(
+            &mut self,
+            op: HostOpId,
+            reason: OperationCancelReason,
+        ) -> VmResult<()> {
+            self.requests.lock().unwrap().push((op, reason));
+            self.future.take();
+            Ok(())
+        }
+        fn poll_cancel_op(&mut self, _: HostOpId, _: &mut Context<'_>) -> Poll<VmResult<()>> {
+            if self.future.is_none() {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }
+        fn cleanup_op(&mut self, _: HostOpId, terminal: HostAsyncOpTerminal) -> VmResult<()> {
+            assert_eq!(terminal, HostAsyncOpTerminal::Cancelled);
+            self.terminals.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let terminals = Arc::new(AtomicU64::new(0));
+    vm.set_async_bridge(Box::new(Bridge {
+        future: None,
+        requests: cleanups.clone(),
+        terminals: terminals.clone(),
+    }))
+    .unwrap();
+    vm.bind_function("test::wait", Box::new(Wait));
+    let VmStatus::Waiting(op) = vm.run().expect("operand must suspend") else {
+        panic!("expected actual host Pending")
+    };
+    assert_eq!(vm.host.submitted_host_ops.len(), 1);
+    assert!(!vm.stack().contains(&Value::Int(2)));
+    vm.reset_for_reuse()
+        .expect("cancel pending operand on reset");
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        vm.poll_reset_for_reuse(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(
+        *cleanups.lock().unwrap(),
+        vec![(op, OperationCancelReason::VmReset)]
+    );
+    assert!(vm.host.submitted_host_ops.is_empty());
+    assert!(vm.stack().is_empty());
+    assert_eq!(vm.execution_scope().operations().len(), 0);
+    drop(vm);
+    assert_eq!(cleanups.lock().unwrap().len(), 1);
+    assert_eq!(terminals.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Default)]
+struct SolLifecycleStats {
+    begins: [std::sync::atomic::AtomicUsize; 3],
+    polls: [std::sync::atomic::AtomicUsize; 3],
+    handles: Mutex<Vec<(usize, u64)>>,
+    fail_first: AtomicBool,
+    pending: AtomicBool,
+    ready: AtomicBool,
+}
+
+struct SolLifecycleResource {
+    id: usize,
+    stats: Arc<SolLifecycleStats>,
+}
+impl crate::resource::HostResource for SolLifecycleResource {
+    fn resource_type_key() -> Option<ResourceTypeKey> {
+        Some(cleanup_key("ret.cleanup.a"))
+    }
+    fn begin_close(
+        &mut self,
+        _: crate::ResourceCloseReason,
+    ) -> crate::resource::error::ResourceResult<crate::resource::CloseProgress> {
+        self.stats.begins[self.id].fetch_add(1, Ordering::SeqCst);
+        if self.id == 0 && self.stats.fail_first.load(Ordering::SeqCst) {
+            return Err(crate::resource::error::ResourceError::new(
+                crate::resource::error::ResourceErrorCode::ResourceCleanupFailed,
+                "sol.first",
+                "first close failed",
+            ));
+        }
+        Ok(
+            if self.id < 2 && self.stats.pending.load(Ordering::SeqCst) {
+                crate::resource::CloseProgress::Pending
+            } else {
+                crate::resource::CloseProgress::Ready
+            },
+        )
+    }
+    fn poll_close(
+        &mut self,
+        _: &mut Context<'_>,
+    ) -> Poll<crate::resource::error::ResourceResult<()>> {
+        self.stats.polls[self.id].fetch_add(1, Ordering::SeqCst);
+        if self.stats.ready.load(Ordering::SeqCst) {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+const SOL_LIFECYCLE_SOURCE: &str = r#"
+    fn relay() -> Result<int, resource<ret.cleanup.a>> {
+        let first: resource<ret.cleanup.a> = test::open(0);
+        let second: resource<ret.cleanup.a> = test::open(1);
+        let n = test::fail()?;
+        test::consume(first);
+        test::consume(second);
+        Result::Ok(n)
+    }
+    let carried = relay();
+    carried;
+"#;
+
+fn sol_lifecycle_vm(source: &str, stats: &Arc<SolLifecycleStats>) -> Vm {
+    struct Factory {
+        stats: Arc<SolLifecycleStats>,
+        fail: bool,
+    }
+    impl crate::HostFunction for Factory {
+        fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<crate::CallOutcome> {
+            let id = if self.fail {
+                2
+            } else {
+                match args[0] {
+                    Value::Int(id) => id as usize,
+                    _ => unreachable!(),
+                }
+            };
+            let resource = vm
+                .execution_scope()
+                .push_resource(SolLifecycleResource {
+                    id,
+                    stats: self.stats.clone(),
+                })
+                .map_err(VmError::ExecutionScope)?;
+            let raw = resource.handle().raw();
+            self.stats.handles.lock().unwrap().push((id, raw));
+            let value = if self.fail {
+                let mut carrier = crate::VmMap::new();
+                carrier.insert(Value::string("tag"), Value::Bool(false));
+                carrier.insert(Value::string("payload"), Value::Int(raw as i64));
+                Value::Map(carrier.into())
+            } else {
+                Value::Int(raw as i64)
+            };
+            Ok(crate::CallOutcome::Return(crate::CallReturn::one(value)))
+        }
+    }
+    let key = cleanup_key("ret.cleanup.a");
+    let mut catalog = crate::HostApiBuilder::new();
+    catalog.resource(crate::ResourceTypeSchema::new(
+        key.clone(),
+        "Sol lifecycle probe",
+    ));
+    catalog.function(crate::HostFunctionSchema::with_return(
+        "test::open",
+        vec![crate::HostParamSchema::value(
+            "id",
+            crate::HostTypeSchema::Int,
+        )],
+        crate::HostTypeSchema::Resource(key.clone()),
+    ));
+    catalog.function(crate::HostFunctionSchema::with_return(
+        "test::consume",
+        vec![crate::HostParamSchema::with_passing(
+            "value",
+            crate::HostTypeSchema::Resource(key.clone()),
+            crate::HostParamPassing::TakeOwned,
+        )],
+        crate::HostTypeSchema::Null,
+    ));
+    catalog.function(crate::HostFunctionSchema::with_return(
+        "test::fail",
+        Vec::new(),
+        crate::HostTypeSchema::Result {
+            ok: Box::new(crate::HostTypeSchema::Int),
+            err: Box::new(crate::HostTypeSchema::Resource(key)),
+        },
+    ));
+    let compiled = crate::compile_source_with_flavor_and_options(
+        source,
+        crate::SourceFlavor::RustScript,
+        crate::CompileSourceFileOptions::new()
+            .with_host_api_catalog(Arc::new(catalog.build().unwrap())),
+    )
+    .expect("lifecycle source admission");
+    let mut vm = Vm::new(compiled.program.with_local_count(compiled.locals));
+    vm.set_fuel(100_000);
+    vm.bind_function(
+        "test::open",
+        Box::new(Factory {
+            stats: stats.clone(),
+            fail: false,
+        }),
+    );
+    vm.bind_function(
+        "test::fail",
+        Box::new(Factory {
+            stats: stats.clone(),
+            fail: true,
+        }),
+    );
+    struct Consume;
+    impl crate::HostFunction for Consume {
+        fn call(&mut self, _: &mut Vm, _: &[Value]) -> VmResult<crate::CallOutcome> {
+            panic!("Ok-only consumer must be skipped on these Err paths")
+        }
+    }
+    vm.bind_function("test::consume", Box::new(Consume));
+    vm
+}
+
+#[test]
+fn sol_try_pending_cleanup_retains_handles_until_real_poll_then_reset() {
+    let stats = Arc::new(SolLifecycleStats::default());
+    stats.pending.store(true, Ordering::SeqCst);
+    let mut vm = sol_lifecycle_vm(SOL_LIFECYCLE_SOURCE, &stats);
+    assert_eq!(vm.run().expect("Pending Err return"), VmStatus::Halted);
+    assert_eq!(vm.execution_scope().resources().len(), 3);
+    assert!(
+        vm.execution_scope().is_active(),
+        "ordinary Err does not close the scope"
+    );
+    let handles = stats.handles.lock().unwrap().clone();
+    let mut cx = Context::from_waker(Waker::noop());
+    for &(id, raw) in &handles {
+        assert_eq!(stats.begins[id].load(Ordering::SeqCst), usize::from(id < 2));
+        if id < 2 {
+            let handle = crate::ResourceHandle::from_raw(raw).unwrap();
+            assert!(
+                vm.execution_scope()
+                    .resources()
+                    .typed::<SolLifecycleResource>(handle)
+                    .is_err(),
+                "Closing resource is not Open"
+            );
+            assert!(matches!(
+                vm.execution_scope().resources_mut().poll_close(
+                    crate::resource::Resource::<SolLifecycleResource>::from_handle(handle),
+                    &mut cx
+                ),
+                Poll::Pending
+            ));
+            assert_eq!(stats.begins[id].load(Ordering::SeqCst), 1);
+            assert_eq!(stats.polls[id].load(Ordering::SeqCst), 1);
+        }
+    }
+    stats.ready.store(true, Ordering::SeqCst);
+    for &(id, raw) in &handles {
+        if id < 2 {
+            let handle = crate::ResourceHandle::from_raw(raw).unwrap();
+            assert!(matches!(
+                vm.execution_scope().resources_mut().poll_close(
+                    crate::resource::Resource::<SolLifecycleResource>::from_handle(handle),
+                    &mut cx
+                ),
+                Poll::Ready(Ok(()))
+            ));
+            assert!(
+                vm.execution_scope()
+                    .resources()
+                    .typed::<SolLifecycleResource>(handle)
+                    .is_err()
+            );
+            assert_eq!(stats.begins[id].load(Ordering::SeqCst), 1);
+            assert_eq!(stats.polls[id].load(Ordering::SeqCst), 2);
+        }
+    }
+    assert_eq!(
+        vm.execution_scope().resources().len(),
+        1,
+        "returned E remains caller-owned"
+    );
+    vm.reset_for_reuse().expect("reset start");
+    assert!(matches!(
+        vm.poll_reset_for_reuse(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(vm.execution_scope().resources().len(), 0);
+    for &(id, raw) in &handles {
+        assert_eq!(stats.begins[id].load(Ordering::SeqCst), 1);
+        assert!(
+            vm.execution_scope()
+                .resources()
+                .typed::<SolLifecycleResource>(crate::ResourceHandle::from_raw(raw).unwrap())
+                .is_err(),
+            "old generation/arena must be stale after reset"
+        );
+    }
+    drop(vm);
+    for count in &stats.begins {
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn sol_try_close_failure_is_fatal_attempts_sibling_and_preserves_err_until_abort() {
+    let stats = Arc::new(SolLifecycleStats::default());
+    stats.fail_first.store(true, Ordering::SeqCst);
+    let mut vm = sol_lifecycle_vm(SOL_LIFECYCLE_SOURCE, &stats);
+    let error = vm.run().expect_err("cleanup failure must be fatal VmError");
+    assert!(
+        matches!(error, VmError::ExecutionScope(ExecutionScopeError::Resource(ref e)) if e.operation() == "sol.first"),
+        "{error:?}"
+    );
+    assert_eq!(stats.begins[0].load(Ordering::SeqCst), 1);
+    assert_eq!(stats.begins[1].load(Ordering::SeqCst), 1);
+    assert_eq!(stats.begins[2].load(Ordering::SeqCst), 0);
+    assert_eq!(vm.execution_scope().resources().len(), 2);
+    assert!(vm.execution_scope().is_active());
+    stats.fail_first.store(false, Ordering::SeqCst);
+    vm.execution_scope()
+        .begin_close(crate::ResourceCloseReason::Requested)
+        .expect("explicit abort after observing fatal failure");
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        vm.execution_scope().poll_close(&mut cx),
+        Poll::Ready(_)
+    ));
+    assert!(vm.execution_scope().is_quiescent());
+    assert!(vm.execution_scope().terminal().is_some());
+    assert_eq!(
+        vm.execution_scope().failed_count(),
+        0,
+        "failed begin_close was retried only by explicit abort"
+    );
+    assert_eq!(vm.execution_scope().resources().len(), 0);
+    assert_eq!(stats.begins[0].load(Ordering::SeqCst), 2);
+    assert_eq!(stats.begins[1].load(Ordering::SeqCst), 1);
+    assert_eq!(stats.begins[2].load(Ordering::SeqCst), 1);
+    for &(_, raw) in stats.handles.lock().unwrap().iter() {
+        assert!(
+            vm.execution_scope()
+                .resources()
+                .typed::<SolLifecycleResource>(crate::ResourceHandle::from_raw(raw).unwrap())
+                .is_err()
+        );
+    }
+    drop(vm);
+    assert_eq!(stats.begins[0].load(Ordering::SeqCst), 2);
+    assert_eq!(stats.begins[1].load(Ordering::SeqCst), 1);
+    assert_eq!(stats.begins[2].load(Ordering::SeqCst), 1);
+}
+
+const SOL_TRACE_RESOURCE_SOURCE: &str = r#"
+        fn relay() -> Result<int, resource<ret.cleanup.a>> {
+            let first: resource<ret.cleanup.a> = test::open(0);
+            let second: resource<ret.cleanup.a> = test::open(1);
+            let mut carrier: Result<int, resource<ret.cleanup.a>> = Result::Ok(1);
+            let mut i = 0;
+            let mut total = 0;
+            while i < 100 {
+                let n = carrier?;
+                total = total + n;
+                i = i + 1;
+                if i == 80 { carrier = test::fail(); } else { carrier = Result::Ok(1); }
+            }
+            test::consume(first);
+            test::consume(second);
+            Result::Ok(total)
+        }
+        relay();
+    "#;
+
+#[test]
+fn sol_try_trace_guard_exit_uses_interpreter_ret_cleanup_without_scope_abort() {
+    let stats = Arc::new(SolLifecycleStats::default());
+    let mut vm = sol_lifecycle_vm(SOL_TRACE_RESOURCE_SOURCE, &stats);
+    vm.set_jit_config(crate::JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    let outcome = vm.run();
+    let snapshot = vm.jit_snapshot();
+    println!(
+        "native={} outcome={outcome:?}\n{}",
+        vm.jit_native_exec_count(),
+        vm.dump_jit_info()
+    );
+    assert_eq!(
+        outcome.expect("Trace resource Try execution"),
+        VmStatus::Halted
+    );
+    assert!(vm.jit_native_exec_count() > 0);
+    // Resource carrier detachment exits at the move-helper call before Try's
+    // tag read. This proves Trace-enabled/interpreter-Ret parity, not native
+    // Try execution (the scalar-E test below retains the real tag SSA guard).
+    assert!(snapshot.traces.iter().any(
+        |trace| trace.executions > 0 && trace.op_names().last().is_some_and(|op| op == "call")
+    ));
+    assert!(
+        snapshot
+            .traces
+            .iter()
+            .all(|trace| trace.executions == 0 || !trace.ssa_text().contains("String(\"tag\")"))
+    );
+    assert_eq!(stats.begins[0].load(Ordering::SeqCst), 1);
+    assert_eq!(stats.begins[1].load(Ordering::SeqCst), 1);
+    assert_eq!(stats.begins[2].load(Ordering::SeqCst), 0);
+    assert_eq!(vm.execution_scope().resources().len(), 1);
+    assert!(vm.execution_scope().is_active());
+    let raw = stats
+        .handles
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(id, _)| *id == 2)
+        .unwrap()
+        .1;
+    let Value::Map(carrier) = vm.stack().last().expect("Err carrier") else {
+        panic!("Result carrier")
+    };
+    assert_eq!(
+        carrier.get(&Value::string("tag")),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(
+        carrier.get(&Value::string("payload")),
+        Some(&Value::Int(raw as i64))
+    );
+    assert!(
+        vm.execution_scope()
+            .resources()
+            .typed::<SolLifecycleResource>(crate::ResourceHandle::from_raw(raw).unwrap())
+            .is_ok()
+    );
+    drop(vm);
+    assert_eq!(stats.begins[2].load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn sol_try_scalar_err_trace_guard_closes_local_resources_before_drop() {
+    let stats = Arc::new(SolLifecycleStats::default());
+    let source = SOL_TRACE_RESOURCE_SOURCE
+        .replace("Result<int, resource<ret.cleanup.a>>", "Result<int, int>")
+        .replace("carrier = test::fail();", "carrier = Result::Err(total);");
+    let mut vm = sol_lifecycle_vm(&source, &stats);
+    vm.set_jit_config(crate::JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    assert_eq!(
+        vm.run().expect("scalar Err Trace with owned locals"),
+        VmStatus::Halted
+    );
+    println!("{}", vm.dump_jit_info());
+    assert!(vm.jit_native_exec_count() > 0);
+    assert!(
+        vm.jit_snapshot()
+            .traces
+            .iter()
+            .any(|trace| trace.executions > 0
+                && trace.op_names().iter().any(|op| op == "map_get")
+                && trace.ssa_text().contains("String(\"tag\")"))
+    );
+    let Value::Map(carrier) = vm.stack().last().unwrap() else {
+        panic!("Result carrier")
+    };
+    assert_eq!(
+        carrier.get(&Value::string("tag")),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(
+        carrier.get(&Value::string("payload")),
+        Some(&Value::Int(80))
+    );
+    assert_eq!(stats.begins[0].load(Ordering::SeqCst), 1);
+    assert_eq!(stats.begins[1].load(Ordering::SeqCst), 1);
+    assert_eq!(vm.execution_scope().resources().len(), 0);
+    assert!(vm.execution_scope().is_active());
+    drop(vm);
+    assert_eq!(stats.begins[0].load(Ordering::SeqCst), 1);
+    assert_eq!(stats.begins[1].load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn sol_try_resource_err_operand_carrier_excludes_moved_source_in_interpreter() {
+    let stats = Arc::new(SolLifecycleStats::default());
+    let mut vm = sol_lifecycle_vm(SOL_TRACE_RESOURCE_SOURCE, &stats);
+    vm.set_jit_config(crate::JitConfig {
+        enabled: false,
+        hot_loop_threshold: 1,
+        max_trace_len: 512,
+    });
+    assert_eq!(
+        vm.run().expect("resource Err operand under interpreter"),
+        VmStatus::Halted
+    );
+    assert_eq!(stats.begins[0].load(Ordering::SeqCst), 1);
+    assert_eq!(stats.begins[1].load(Ordering::SeqCst), 1);
+    assert_eq!(stats.begins[2].load(Ordering::SeqCst), 0);
+    assert_eq!(vm.jit_native_exec_count(), 0);
+    sol_assert_returned_err_owner(&mut vm, &stats);
+    drop(vm);
+    assert_eq!(stats.begins[0].load(Ordering::SeqCst), 1);
+    assert_eq!(stats.begins[1].load(Ordering::SeqCst), 1);
+    assert_eq!(stats.begins[2].load(Ordering::SeqCst), 1);
+}
+
+fn sol_assert_returned_err_owner(vm: &mut Vm, stats: &SolLifecycleStats) {
+    assert!(vm.execution_scope().is_active());
+    assert_eq!(vm.execution_scope().resources().len(), 1);
+    let raw = stats
+        .handles
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(id, _)| *id == 2)
+        .unwrap()
+        .1;
+    let Value::Map(carrier) = vm.stack().last().expect("returned Err") else {
+        panic!("Result carrier")
+    };
+    assert_eq!(
+        carrier.get(&Value::string("tag")),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(
+        carrier.get(&Value::string("payload")),
+        Some(&Value::Int(raw as i64))
+    );
+    assert!(
+        vm.execution_scope()
+            .resources()
+            .typed::<SolLifecycleResource>(crate::ResourceHandle::from_raw(raw).unwrap())
+            .is_ok()
+    );
+}
+
+#[test]
+fn sol_try_postoperand_fresh_block_owners_close_before_return() {
+    let source = r#"
+        fn relay() -> Result<int, resource<ret.cleanup.a>> {
+            let n = (if true => {
+                let first: resource<ret.cleanup.a> = test::open(0);
+                let second: resource<ret.cleanup.a> = test::open(1);
+                let carrier: Result<int, resource<ret.cleanup.a>> = test::fail();
+                carrier
+            } else => { test::fail() })?;
+            Result::Ok(n)
+        }
+        relay();
+    "#;
+    for flag in [true, false] {
+        let stats = Arc::new(SolLifecycleStats::default());
+        let source = source.replace("if true", &format!("if {flag}"));
+        let mut vm = sol_lifecycle_vm(&source, &stats);
+        assert_eq!(vm.run().expect("fresh operand owners"), VmStatus::Halted);
+        assert_eq!(
+            stats.handles.lock().unwrap().len(),
+            if flag { 3 } else { 1 },
+            "operand evaluated once"
+        );
+        let closes = usize::from(flag);
+        assert_eq!(stats.begins[0].load(Ordering::SeqCst), closes);
+        assert_eq!(stats.begins[1].load(Ordering::SeqCst), closes);
+        assert_eq!(stats.begins[2].load(Ordering::SeqCst), 0);
+        sol_assert_returned_err_owner(&mut vm, &stats);
+        drop(vm);
+        assert_eq!(stats.begins[0].load(Ordering::SeqCst), closes);
+        assert_eq!(stats.begins[1].load(Ordering::SeqCst), closes);
+        assert_eq!(stats.begins[2].load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn sol_try_resource_quota_is_fatal_before_operand_returns_guest_result() {
+    let stats = Arc::new(SolLifecycleStats::default());
+    let source = SOL_LIFECYCLE_SOURCE
+        .replace("let second: resource<ret.cleanup.a> = test::open(1);", "")
+        .replace("test::consume(second);", "");
+    let mut vm = sol_lifecycle_vm(&source, &stats);
+    *vm.execution_scope().resources_mut() = crate::resource::ResourceTable::with_limit(1).unwrap();
+    let error = vm.run().expect_err("resource quota is not guest Err");
+    assert!(
+        matches!(
+            error,
+            VmError::ExecutionScope(ExecutionScopeError::Resource(_))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(stats.handles.lock().unwrap().len(), 1);
+    assert_eq!(stats.begins[0].load(Ordering::SeqCst), 0);
+    assert_eq!(vm.execution_scope().resources().len(), 1);
+    vm.reset_for_reuse().unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        vm.poll_reset_for_reuse(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(stats.begins[0].load(Ordering::SeqCst), 1);
+    assert_eq!(vm.execution_scope().resources().len(), 0);
+}
+
+fn cleanup_key(name: &str) -> ResourceTypeKey {
+    ResourceTypeKey::new(name).expect("cleanup resource key")
+}
+
+fn resource_schema(key: &ResourceTypeKey) -> crate::compiler::TypeSchema {
+    crate::compiler::TypeSchema::Resource(key.clone())
+}
+
+fn cleanup_program(local_count: usize, locals: Vec<RetCleanupLocal>) -> Program {
+    let mut program =
+        Program::new(Vec::new(), vec![OpCode::Ret as u8]).with_local_count(local_count);
+    program.ret_cleanups = vec![RetCleanupPlan { site: 0, locals }];
+    program
+}
+
+struct CloseProbe {
+    begins: Arc<AtomicU64>,
+    fail: bool,
+    pending: bool,
+    ready: Arc<AtomicBool>,
+}
+
+fn probe(begins: &Arc<AtomicU64>, fail: bool, pending: bool) -> CloseProbe {
+    CloseProbe {
+        begins: Arc::clone(begins),
+        fail,
+        pending,
+        ready: Arc::new(AtomicBool::new(false)),
+    }
+}
+
+macro_rules! keyed_probe {
+    ($name:ident, $key:literal) => {
+        struct $name(CloseProbe);
+        impl crate::vm::resource::HostResource for $name {
+            fn resource_type_key() -> Option<ResourceTypeKey> {
+                Some(cleanup_key($key))
+            }
+            fn begin_close(
+                &mut self,
+                reason: crate::ResourceCloseReason,
+            ) -> crate::vm::resource::error::ResourceResult<crate::vm::resource::CloseProgress>
+            {
+                self.0.begin_close(reason)
+            }
+            fn poll_close(
+                &mut self,
+                cx: &mut Context<'_>,
+            ) -> Poll<crate::vm::resource::error::ResourceResult<()>> {
+                self.0.poll_close(cx)
+            }
+        }
+    };
+}
+
+keyed_probe!(CleanupA, "ret.cleanup.a");
+keyed_probe!(CleanupB, "ret.cleanup.b");
+
+impl CloseProbe {
+    fn begin_close(
+        &mut self,
+        _reason: crate::ResourceCloseReason,
+    ) -> crate::vm::resource::error::ResourceResult<crate::vm::resource::CloseProgress> {
+        self.begins.fetch_add(1, Ordering::SeqCst);
+        if self.fail {
+            return Err(crate::vm::resource::error::ResourceError::new(
+                crate::vm::resource::error::ResourceErrorCode::ResourceCleanupFailed,
+                "ret.cleanup",
+                "begin_close failed",
+            ));
+        }
+        if self.pending {
+            Ok(crate::vm::resource::CloseProgress::Pending)
+        } else {
+            Ok(crate::vm::resource::CloseProgress::Ready)
+        }
+    }
+
+    fn poll_close(
+        &mut self,
+        _cx: &mut Context<'_>,
+    ) -> Poll<crate::vm::resource::error::ResourceResult<()>> {
+        if self.ready.load(Ordering::SeqCst) {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+fn push_probe<T: crate::vm::resource::HostResource>(vm: &mut Vm, value: T) -> u64 {
+    vm.execution_scope()
+        .push_resource(value)
+        .expect("probe resource")
+        .handle()
+        .raw()
+}
+
+fn still_open(vm: &mut Vm, raw: u64, key: &ResourceTypeKey) -> bool {
+    let handle = crate::ResourceHandle::from_raw(raw).expect("handle");
+    vm.execution_scope()
+        .resources()
+        .validate_resource_type_key(handle, key)
+        .is_ok()
+}
+
+#[test]
+fn ret_cleanup_rejects_stale_second_handle_with_zero_closes() {
+    let key = cleanup_key("ret.cleanup.a");
+    let begins = Arc::new(AtomicU64::new(0));
+    let program = cleanup_program(
+        2,
+        vec![
+            RetCleanupLocal {
+                slot: 0,
+                schema: resource_schema(&key),
+            },
+            RetCleanupLocal {
+                slot: 1,
+                schema: resource_schema(&key),
+            },
+        ],
+    );
+    let mut vm = Vm::new(program);
+    let live = push_probe(&mut vm, CleanupA(probe(&begins, false, false)));
+    let live_handle = crate::ResourceHandle::from_raw(live).expect("live handle");
+    let stale = crate::ResourceHandle::encode(
+        live_handle.arena_id(),
+        live_handle.slot_index().expect("slot"),
+        live_handle.generation().saturating_add(1),
+    )
+    .expect("stale generation")
+    .raw();
+    begins.store(0, Ordering::SeqCst);
+    vm.instance.locals[0] = Value::Int(live as i64);
+    vm.instance.locals[1] = Value::Int(stale as i64);
+    let error = vm
+        .close_ret_owned_resources(0)
+        .expect_err("stale handle must reject the plan");
+    assert!(matches!(
+        error,
+        VmError::ExecutionScope(ExecutionScopeError::Resource(ref resource))
+            if resource.code() == crate::vm::resource::error::ResourceErrorCode::ResourceStale
+    ));
+    assert_eq!(begins.load(Ordering::SeqCst), 0);
+    assert!(still_open(&mut vm, live, &key));
+}
+
+#[test]
+fn ret_cleanup_rejects_wrong_key_and_wrong_arena_with_zero_closes() {
+    let key_a = cleanup_key("ret.cleanup.a");
+    let begins = Arc::new(AtomicU64::new(0));
+    let program = cleanup_program(
+        2,
+        vec![
+            RetCleanupLocal {
+                slot: 0,
+                schema: resource_schema(&key_a),
+            },
+            RetCleanupLocal {
+                slot: 1,
+                schema: resource_schema(&key_a),
+            },
+        ],
+    );
+    let mut vm = Vm::new(program);
+    let live = push_probe(&mut vm, CleanupA(probe(&begins, false, false)));
+    let other = push_probe(&mut vm, CleanupB(probe(&begins, false, false)));
+    begins.store(0, Ordering::SeqCst);
+    vm.instance.locals[0] = Value::Int(live as i64);
+    vm.instance.locals[1] = Value::Int(other as i64);
+    let error = vm
+        .close_ret_owned_resources(0)
+        .expect_err("wrong key must reject before close");
+    assert!(matches!(
+        error,
+        VmError::ExecutionScope(ExecutionScopeError::Resource(ref resource))
+            if resource.code()
+                == crate::vm::resource::error::ResourceErrorCode::ResourceTypeKeyMismatch
+    ));
+    assert_eq!(begins.load(Ordering::SeqCst), 0);
+    assert!(still_open(&mut vm, live, &key_a));
+
+    let live_handle = crate::ResourceHandle::from_raw(live).expect("live handle");
+    let foreign_arena = if live_handle.arena_id() == 1 { 2 } else { 1 };
+    let foreign = crate::ResourceHandle::encode(foreign_arena, 0, 1).expect("foreign handle");
+    vm.instance.locals[1] = Value::Int(foreign.raw() as i64);
+    let error = vm
+        .close_ret_owned_resources(0)
+        .expect_err("wrong arena must reject before close");
+    assert!(matches!(
+        error,
+        VmError::ExecutionScope(ExecutionScopeError::Resource(ref resource))
+            if resource.code()
+                == crate::vm::resource::error::ResourceErrorCode::ResourceHandleWrongTable
+    ));
+    assert_eq!(begins.load(Ordering::SeqCst), 0);
+    assert!(still_open(&mut vm, live, &key_a));
+}
+
+#[test]
+fn ret_cleanup_rejects_duplicate_and_return_alias_with_zero_closes() {
+    let key = cleanup_key("ret.cleanup.a");
+    let begins = Arc::new(AtomicU64::new(0));
+    let mut program = cleanup_program(
+        2,
+        vec![
+            RetCleanupLocal {
+                slot: 0,
+                schema: resource_schema(&key),
+            },
+            RetCleanupLocal {
+                slot: 1,
+                schema: resource_schema(&key),
+            },
+        ],
+    );
+    program = program.with_callable_metadata(
+        Vec::new(),
+        vec![crate::CallablePrototype {
+            kind: crate::CallableKind::FunctionItem,
+            target: crate::CallableTarget::ScriptFunction(0),
+            arity: 0,
+            frame_local_count: 2,
+            parameter_slots: Vec::new(),
+            capture_source_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
+            self_slot: None,
+            schema: Some(crate::compiler::TypeSchema::Callable {
+                params: Vec::new(),
+                result: Box::new(crate::compiler::TypeSchema::Result {
+                    ok: Box::new(crate::compiler::TypeSchema::Int),
+                    err: Box::new(resource_schema(&key)),
+                }),
+            }),
+        }],
+        Vec::new(),
+        Vec::new(),
+    );
+    program.ret_cleanups = vec![RetCleanupPlan {
+        site: 0,
+        locals: vec![
+            RetCleanupLocal {
+                slot: 0,
+                schema: resource_schema(&key),
+            },
+            RetCleanupLocal {
+                slot: 1,
+                schema: resource_schema(&key),
+            },
+        ],
+    }];
+    let mut vm = Vm::new(program);
+    let raw = push_probe(&mut vm, CleanupA(probe(&begins, false, false)));
+    begins.store(0, Ordering::SeqCst);
+    vm.instance.locals[0] = Value::Int(raw as i64);
+    vm.instance.locals[1] = Value::Int(raw as i64);
+    let error = vm
+        .close_ret_owned_resources(0)
+        .expect_err("duplicate ownership must reject");
+    assert!(matches!(
+        error,
+        VmError::InvalidFrameState("cleanup plan has duplicate resource ownership")
+    ));
+    assert_eq!(begins.load(Ordering::SeqCst), 0);
+    assert!(still_open(&mut vm, raw, &key));
+}
+
+#[test]
+fn ret_cleanup_rejects_return_alias_with_zero_closes() {
+    let key = cleanup_key("ret.cleanup.a");
+    let begins = Arc::new(AtomicU64::new(0));
+    let mut program = cleanup_program(
+        1,
+        vec![RetCleanupLocal {
+            slot: 0,
+            schema: resource_schema(&key),
+        }],
+    );
+    program = program.with_callable_metadata(
+        Vec::new(),
+        vec![crate::CallablePrototype {
+            kind: crate::CallableKind::FunctionItem,
+            target: crate::CallableTarget::ScriptFunction(0),
+            arity: 0,
+            frame_local_count: 1,
+            parameter_slots: Vec::new(),
+            capture_source_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
+            self_slot: None,
+            schema: Some(crate::compiler::TypeSchema::Callable {
+                params: Vec::new(),
+                result: Box::new(crate::compiler::TypeSchema::Result {
+                    ok: Box::new(crate::compiler::TypeSchema::Int),
+                    err: Box::new(resource_schema(&key)),
+                }),
+            }),
+        }],
+        Vec::new(),
+        Vec::new(),
+    );
+    program.ret_cleanups = vec![RetCleanupPlan {
+        site: 0,
+        locals: vec![RetCleanupLocal {
+            slot: 0,
+            schema: resource_schema(&key),
+        }],
+    }];
+    let mut vm = Vm::new(program);
+    let raw = push_probe(&mut vm, CleanupA(probe(&begins, false, false)));
+    begins.store(0, Ordering::SeqCst);
+    vm.instance.locals[0] = Value::Int(raw as i64);
+    vm.instance.execution_frames[0].prototype_id = Some(0);
+    vm.instance.stack.push(Value::map(vec![
+        (Value::string("tag"), Value::Bool(false)),
+        (Value::string("payload"), Value::Int(raw as i64)),
+    ]));
+    let error = vm
+        .close_ret_owned_resources(0)
+        .expect_err("returned resource must stay protected");
+    assert!(matches!(
+        error,
+        VmError::InvalidFrameState("cleanup plan overlaps the returned resource graph")
+    ));
+    assert_eq!(begins.load(Ordering::SeqCst), 0);
+    assert!(still_open(&mut vm, raw, &key));
+}
+
+#[test]
+fn ret_cleanup_rejects_capture_slot_before_close() {
+    let key = cleanup_key("ret.cleanup.a");
+    let begins = Arc::new(AtomicU64::new(0));
+    let program = cleanup_program(
+        1,
+        vec![RetCleanupLocal {
+            slot: 0,
+            schema: resource_schema(&key),
+        }],
+    );
+    let mut vm = Vm::new(program);
+    let raw = push_probe(&mut vm, CleanupA(probe(&begins, false, false)));
+    begins.store(0, Ordering::SeqCst);
+    vm.instance.locals[0] = Value::Int(raw as i64);
+    vm.instance.shared_capture_slots.insert(0);
+    let error = vm
+        .close_ret_owned_resources(0)
+        .expect_err("capture slot must be excluded");
+    assert!(matches!(
+        error,
+        VmError::InvalidFrameState("cleanup plan targets a persistent capture")
+    ));
+    assert_eq!(begins.load(Ordering::SeqCst), 0);
+    assert!(still_open(&mut vm, raw, &key));
+}
+
+#[test]
+fn ret_cleanup_first_close_failure_still_closes_later_resource() {
+    let key = cleanup_key("ret.cleanup.a");
+    let first_begins = Arc::new(AtomicU64::new(0));
+    let second_begins = Arc::new(AtomicU64::new(0));
+    let program = cleanup_program(
+        2,
+        vec![
+            RetCleanupLocal {
+                slot: 0,
+                schema: resource_schema(&key),
+            },
+            RetCleanupLocal {
+                slot: 1,
+                schema: resource_schema(&key),
+            },
+        ],
+    );
+    let mut vm = Vm::new(program);
+    let failed = push_probe(&mut vm, CleanupA(probe(&first_begins, true, false)));
+    let later = push_probe(&mut vm, CleanupA(probe(&second_begins, false, false)));
+    vm.instance.locals[0] = Value::Int(failed as i64);
+    vm.instance.locals[1] = Value::Int(later as i64);
+    let error = vm
+        .close_ret_owned_resources(0)
+        .expect_err("first close failure is fatal");
+    assert!(matches!(
+        error,
+        VmError::ExecutionScope(ExecutionScopeError::Resource(ref resource))
+            if resource.code()
+                == crate::vm::resource::error::ResourceErrorCode::ResourceCleanupFailed
+    ));
+    assert_eq!(first_begins.load(Ordering::SeqCst), 1);
+    assert_eq!(second_begins.load(Ordering::SeqCst), 1);
+    assert!(still_open(&mut vm, failed, &key));
+    assert!(!still_open(&mut vm, later, &key));
+}
+
+#[test]
+fn ret_cleanup_pending_begins_once_and_completes_on_real_poll() {
+    let key = cleanup_key("ret.cleanup.a");
+    let begins = Arc::new(AtomicU64::new(0));
+    let ready = Arc::new(AtomicBool::new(false));
+    let program = cleanup_program(
+        1,
+        vec![RetCleanupLocal {
+            slot: 0,
+            schema: resource_schema(&key),
+        }],
+    );
+    let mut vm = Vm::new(program);
+    let raw = push_probe(
+        &mut vm,
+        CleanupA(CloseProbe {
+            begins: Arc::clone(&begins),
+            fail: false,
+            pending: true,
+            ready: Arc::clone(&ready),
+        }),
+    );
+    vm.instance.locals[0] = Value::Int(raw as i64);
+    vm.close_ret_owned_resources(0)
+        .expect("pending close is not a guest error or synchronous wait");
+    assert_eq!(begins.load(Ordering::SeqCst), 1);
+    let handle = crate::ResourceHandle::from_raw(raw).expect("handle");
+    let token = crate::vm::resource::Resource::<CleanupA>::from_handle(handle);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        vm.execution_scope()
+            .resources_mut()
+            .poll_close(token, &mut cx),
+        Poll::Pending
+    ));
+    assert_eq!(begins.load(Ordering::SeqCst), 1);
+    ready.store(true, Ordering::SeqCst);
+    let token = crate::vm::resource::Resource::<CleanupA>::from_handle(handle);
+    assert!(matches!(
+        vm.execution_scope()
+            .resources_mut()
+            .poll_close(token, &mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(begins.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn ret_cleanup_shared_array_dag_closes_once_and_deep_schema_closes_nothing() {
+    let key = cleanup_key("ret.cleanup.a");
+    let begins = Arc::new(AtomicU64::new(0));
+    let child_schema = crate::compiler::TypeSchema::Array(Box::new(resource_schema(&key)));
+    let program = cleanup_program(
+        1,
+        vec![RetCleanupLocal {
+            slot: 0,
+            schema: crate::compiler::TypeSchema::Array(Box::new(child_schema)),
+        }],
+    );
+    let mut vm = Vm::new(program);
+    let raw = push_probe(&mut vm, CleanupA(probe(&begins, false, false)));
+    let child = Value::array(vec![Value::Int(raw as i64)]);
+    vm.instance.locals[0] = Value::array(vec![child.clone(), child]);
+    vm.close_ret_owned_resources(0)
+        .expect("shared array dag must terminate");
+    assert_eq!(begins.load(Ordering::SeqCst), 1);
+
+    let mut deep = resource_schema(&key);
+    for _ in 0..crate::host_api::MAX_HOST_SCHEMA_DEPTH {
+        deep = crate::compiler::TypeSchema::Array(Box::new(deep));
+    }
+    let begins = Arc::new(AtomicU64::new(0));
+    let program = cleanup_program(
+        1,
+        vec![RetCleanupLocal {
+            slot: 0,
+            schema: deep,
+        }],
+    );
+    let mut vm = Vm::new(program);
+    let raw = push_probe(&mut vm, CleanupA(probe(&begins, false, false)));
+    vm.instance.locals[0] = Value::Int(raw as i64);
+    let error = vm
+        .close_ret_owned_resources(0)
+        .expect_err("schema deeper than the budget must fail before close");
+    assert!(matches!(
+        error,
+        VmError::InvalidFrameState("cleanup walk exceeded schema depth")
+    ));
+    assert_eq!(begins.load(Ordering::SeqCst), 0);
+    assert!(still_open(&mut vm, raw, &key));
+}
+
+fn guest_decl(name: &str, params: &[&str], body: TypeSchema) -> (String, StructDecl) {
+    (
+        name.to_string(),
+        StructDecl {
+            name: name.to_string(),
+            type_params: params.iter().map(|param| (*param).to_string()).collect(),
+            body_schema: body,
+            origin: crate::compiler::StructDeclOrigin::Guest,
+        },
+    )
+}
+
+fn close_schema(
+    schema: TypeSchema,
+    build: impl FnOnce(u64) -> Value,
+    decls: Vec<(String, StructDecl)>,
+) -> (usize, Result<(), String>, bool) {
+    let key = cleanup_key("ret.cleanup.a");
+    let begins = Arc::new(AtomicU64::new(0));
+    let mut program = cleanup_program(1, vec![RetCleanupLocal { slot: 0, schema }]);
+    program.named_struct_decls.extend(decls);
+    let mut vm = Vm::new(program);
+    let raw = push_probe(&mut vm, CleanupA(probe(&begins, false, false)));
+    vm.instance.locals[0] = build(raw);
+    let result = vm
+        .close_ret_owned_resources(0)
+        .map_err(|error| error.to_string());
+    let open = still_open(&mut vm, raw, &key);
+    (begins.load(Ordering::SeqCst) as usize, result, open)
+}
+
+#[test]
+fn ret_cleanup_rejects_null_for_required_resource_and_result_with_zero_closes() {
+    let owned = resource_schema(&cleanup_key("ret.cleanup.a"));
+    for schema in [
+        owned.clone(),
+        TypeSchema::Result {
+            ok: Box::new(TypeSchema::Int),
+            err: Box::new(owned),
+        },
+    ] {
+        let (closes, result, open) = close_schema(schema, |_| Value::Null, Vec::new());
+        assert!(result.is_err(), "required cleanup schema must reject Null");
+        assert_eq!(closes, 0);
+        assert!(open, "strict preflight must not close any resource");
+    }
+}
+
+#[test]
+fn ret_cleanup_walks_map_object_named_tuple_and_active_result() {
+    let key = cleanup_key("ret.cleanup.a");
+    let owned = resource_schema(&key);
+    let (closes, result, _) = close_schema(
+        TypeSchema::Map(Box::new(owned.clone())),
+        |raw| {
+            let handle = Value::Int(raw as i64);
+            Value::map(vec![(handle.clone(), handle)])
+        },
+        Vec::new(),
+    );
+    assert_eq!(result, Ok(()), "map values are owned resources");
+    assert_eq!(closes, 1, "map keys must not be closed as handles");
+
+    let mut fields = HashMap::new();
+    fields.insert("handle".to_string(), owned.clone());
+    fields.insert("note".to_string(), TypeSchema::Int);
+    let (closes, result, _) = close_schema(
+        TypeSchema::Object(fields),
+        |raw| {
+            let handle = Value::Int(raw as i64);
+            Value::map(vec![
+                (Value::string("handle"), handle.clone()),
+                (Value::string("note"), Value::Int(4)),
+                (Value::string("decoy"), handle),
+            ])
+        },
+        Vec::new(),
+    );
+    assert_eq!(result, Ok(()));
+    assert_eq!(closes, 1, "only declared object fields are owned");
+
+    let (closes, result, _) = close_schema(
+        TypeSchema::Named("Holder".to_string(), Vec::new()),
+        |raw| Value::Int(raw as i64),
+        vec![guest_decl("Holder", &[], owned.clone())],
+    );
+    assert_eq!(result, Ok(()), "nongeneric named body must be recognized");
+    assert_eq!(closes, 1);
+
+    let (closes, result, _) = close_schema(
+        TypeSchema::ArrayTupleRest {
+            prefix: vec![owned.clone(), TypeSchema::Int],
+            rest: Box::new(TypeSchema::Int),
+        },
+        |raw| {
+            Value::array(vec![
+                Value::Int(raw as i64),
+                Value::Int(7),
+                Value::Int(raw as i64),
+            ])
+        },
+        Vec::new(),
+    );
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        closes, 1,
+        "tuple rest must not treat trailing scalars as handles"
+    );
+
+    let (closes, result, open) = close_schema(
+        TypeSchema::ArrayTupleRest {
+            prefix: vec![TypeSchema::Int],
+            rest: Box::new(owned.clone()),
+        },
+        |raw| Value::array(vec![Value::Int(9), Value::Int(raw as i64)]),
+        Vec::new(),
+    );
+    assert_eq!(result, Ok(()), "tuple rest handles close");
+    assert_eq!(closes, 1);
+    assert!(!open, "rest handle must close");
+
+    let (closes, result, _) = close_schema(
+        TypeSchema::Optional(Box::new(owned.clone())),
+        |_| Value::Null,
+        Vec::new(),
+    );
+    assert_eq!(result, Ok(()));
+    assert_eq!(closes, 0, "optional null is absence");
+
+    let (closes, result, open) = close_schema(
+        TypeSchema::Result {
+            ok: Box::new(owned.clone()),
+            err: Box::new(TypeSchema::Int),
+        },
+        |raw| {
+            Value::map(vec![
+                (Value::string("tag"), Value::Bool(false)),
+                (Value::string("payload"), Value::Int(raw as i64)),
+            ])
+        },
+        Vec::new(),
+    );
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        closes, 0,
+        "inactive resource schema must not close an int payload"
+    );
+    assert!(open, "inactive branch must leave the handle open");
+
+    let (closes, result, _) = close_schema(
+        TypeSchema::Result {
+            ok: Box::new(TypeSchema::Int),
+            err: Box::new(owned.clone()),
+        },
+        |raw| {
+            Value::map(vec![
+                (Value::string("tag"), Value::Bool(false)),
+                (Value::string("payload"), Value::Int(raw as i64)),
+            ])
+        },
+        Vec::new(),
+    );
+    assert_eq!(result, Ok(()));
+    assert_eq!(closes, 1);
+
+    let (_, result, open) = close_schema(
+        TypeSchema::Result {
+            ok: Box::new(owned),
+            err: Box::new(TypeSchema::Named("Missing".to_string(), Vec::new())),
+        },
+        |raw| {
+            Value::map(vec![
+                (Value::string("tag"), Value::Bool(true)),
+                (Value::string("payload"), Value::Int(raw as i64)),
+            ])
+        },
+        Vec::new(),
+    );
+    let message = result.expect_err("inactive unresolved named must fail");
+    assert!(
+        message.contains("unresolved") || message.contains("wrong arity"),
+        "{message}"
+    );
+    assert!(
+        open,
+        "malformed inactive branch must not close the active handle"
+    );
+}
+fn nested_array_schema(depth: usize) -> TypeSchema {
+    let mut schema = TypeSchema::Int;
+    for _ in 0..depth {
+        schema = TypeSchema::Array(Box::new(schema));
+    }
+    schema
+}
+
+#[test]
+fn ret_cleanup_rejects_duplicate_owned_aliases_and_bounds_resource_free_dags() {
+    let key = cleanup_key("ret.cleanup.a");
+    let owned = resource_schema(&key);
+    let (closes, result, open) = close_schema(
+        TypeSchema::Array(Box::new(owned.clone())),
+        |raw| Value::array(vec![Value::Int(raw as i64), Value::Int(raw as i64)]),
+        Vec::new(),
+    );
+    let message = result.expect_err("duplicate owners reject");
+    assert!(message.contains("duplicate"), "{message}");
+    assert_eq!(closes, 0);
+    assert!(open);
+
+    let (closes, result, _) = close_schema(
+        TypeSchema::ArrayTuple(vec![owned.clone(), nested_array_schema(20)]),
+        |raw| {
+            let mut noise_schema_value = Value::Int(0);
+            for _ in 0..20 {
+                noise_schema_value =
+                    Value::array(vec![noise_schema_value.clone(), noise_schema_value]);
+            }
+            Value::array(vec![Value::Int(raw as i64), noise_schema_value])
+        },
+        Vec::new(),
+    );
+    assert_eq!(result, Ok(()), "shared resource-free containers must dedup");
+    assert_eq!(closes, 1);
+
+    let (closes, result, open) = close_schema(owned, |_| Value::Null, Vec::new());
+    let message = result.expect_err("null is not a resource handle");
+    assert!(message.contains("resource handle"), "{message}");
+    assert_eq!(closes, 0);
+    assert!(open);
 }

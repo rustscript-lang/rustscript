@@ -488,7 +488,10 @@ impl Classifier {
                 }
                 self.expr(frame, default);
             }
-            other @ (Expr::ResultConstruct { .. } | Expr::ResultQuery { .. } | Expr::ResultMatch { .. }) => {
+            other @ (Expr::ResultConstruct { .. }
+            | Expr::ResultQuery { .. }
+            | Expr::ResultMatch { .. }
+            | Expr::ResultTry { .. }) => {
                 other.visit_result_children(|child| self.expr(frame, child));
             }
             Expr::Block { stmts, expr } => {

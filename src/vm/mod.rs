@@ -463,6 +463,15 @@ fn compute_program_cache_key(program: &Program) -> u64 {
         decl.type_params.hash(&mut hasher);
         hash_type_schema(&decl.body_schema, &mut hasher);
     }
+    program.ret_cleanups.len().hash(&mut hasher);
+    for plan in &program.ret_cleanups {
+        plan.site.hash(&mut hasher);
+        plan.locals.len().hash(&mut hasher);
+        for local in &plan.locals {
+            local.slot.hash(&mut hasher);
+            hash_type_schema(&local.schema, &mut hasher);
+        }
+    }
     hasher.finish()
 }
 
@@ -2191,7 +2200,142 @@ impl Vm {
         }
     }
 
-    fn complete_active_frame(&mut self) -> VmResult<ExecOutcome> {
+    fn close_ret_owned_resources(&mut self, ret_site: usize) -> VmResult<()> {
+        let Some(plan) = self
+            .program
+            .ret_cleanups
+            .iter()
+            .find(|plan| plan.site as usize == ret_site)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if !ret_cleanup_site_is_boundary(&self.program.code, ret_site) {
+            return Err(VmError::InvalidFrameState(
+                "cleanup site is not a Ret instruction",
+            ));
+        }
+        let frame = self
+            .instance
+            .execution_frames
+            .last()
+            .ok_or(VmError::InvalidFrameState(
+                "cleanup frame is missing before resource close",
+            ))?;
+        for local in &plan.locals {
+            if local.slot as usize >= frame.local_count {
+                return Err(VmError::InvalidFrameState(
+                    "cleanup local is outside the active frame",
+                ));
+            }
+            let absolute = frame
+                .local_base
+                .checked_add(local.slot as usize)
+                .ok_or(VmError::InvalidFrameState("cleanup local frame overflow"))?;
+            if self.instance.capture_cells.contains_key(&absolute)
+                || self.instance.shared_capture_slots.contains(&absolute)
+            {
+                return Err(VmError::InvalidFrameState(
+                    "cleanup plan targets a persistent capture",
+                ));
+            }
+        }
+        let return_schema = frame.prototype_id.and_then(|prototype_id| {
+            self.program
+                .callable_prototypes
+                .get(prototype_id as usize)
+                .and_then(|prototype| prototype.schema.as_ref())
+                .and_then(|schema| match schema {
+                    crate::compiler::TypeSchema::Callable { result, .. } => {
+                        Some(result.as_ref().clone())
+                    }
+                    _ => None,
+                })
+        });
+        let return_value = if self.instance.stack.len() > frame.operand_stack_base {
+            self.instance.stack.last().cloned()
+        } else {
+            None
+        };
+        let lookup = NamedStructLookup {
+            host: &self.host.named_struct_schemas,
+            guest: &self.program.named_struct_decls,
+        };
+        let mut cleanup_nodes = 0usize;
+        let mut protected = HashSet::new();
+        if let (Some(schema), Some(value)) = (return_schema, return_value) {
+            let mut returned = Vec::new();
+            collect_ret_resource_handles(
+                &value,
+                &schema,
+                lookup,
+                &mut cleanup_nodes,
+                &mut returned,
+            )?;
+            for (raw, _) in returned {
+                protected.insert(raw);
+            }
+        }
+        let mut pending = Vec::new();
+        for local in &plan.locals {
+            let index = u8::try_from(local.slot).map_err(|_| VmError::InvalidLocal(0))?;
+            let value = self.load_local_value(index)?;
+            collect_ret_resource_handles(
+                &value,
+                &local.schema,
+                lookup,
+                &mut cleanup_nodes,
+                &mut pending,
+            )?;
+        }
+        let mut seen = HashSet::new();
+        let mut validated = Vec::with_capacity(pending.len());
+        for (raw, key) in pending {
+            if !seen.insert(raw) {
+                return Err(VmError::InvalidFrameState(
+                    "cleanup plan has duplicate resource ownership",
+                ));
+            }
+            if protected.contains(&raw) {
+                return Err(VmError::InvalidFrameState(
+                    "cleanup plan overlaps the returned resource graph",
+                ));
+            }
+            let handle = crate::ResourceHandle::from_raw(raw)
+                .map_err(|error| VmError::ExecutionScope(ExecutionScopeError::Resource(error)))?;
+            validated.push((handle, key));
+        }
+        {
+            let table = self.execution_scope().resources();
+            for (handle, key) in &validated {
+                table
+                    .validate_resource_type_key(*handle, key)
+                    .map_err(|error| {
+                        VmError::ExecutionScope(ExecutionScopeError::Resource(error))
+                    })?;
+            }
+        }
+        let mut first_error = None;
+        for (handle, key) in validated {
+            if let Err(error) = self
+                .execution_scope()
+                .resources_mut()
+                .close_erased_open_slot(handle, &key, crate::ResourceCloseReason::Parent)
+                && first_error.is_none()
+            {
+                first_error = Some(VmError::ExecutionScope(ExecutionScopeError::Resource(
+                    error,
+                )));
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn complete_active_frame(&mut self, ret_site: usize) -> VmResult<ExecOutcome> {
+        self.close_ret_owned_resources(ret_site)?;
         let frame = self
             .instance
             .execution_frames
@@ -3255,7 +3399,10 @@ impl Vm {
     ) -> VmResult<ExecOutcome> {
         match opcode {
             x if x == OpCode::Nop as u8 => {}
-            x if x == OpCode::Ret as u8 => return self.complete_active_frame(),
+            x if x == OpCode::Ret as u8 => {
+                let ret_site = self.instance.ip - 1;
+                return self.complete_active_frame(ret_site);
+            }
             x if x == OpCode::Ldc as u8 => {
                 let opcode_ip = self.instance.ip - 1;
                 let value = if let Some(value) = self.decoded_ldc_value_at(opcode_ip).cloned() {
@@ -3562,7 +3709,8 @@ impl Vm {
                                 self.charge_interrupt_tick()?;
                             }
                             self.instance.ip = self.instance.ip.saturating_add(1);
-                            return self.complete_active_frame();
+                            let ret_site = self.instance.ip - 1;
+                            return self.complete_active_frame(ret_site);
                         }
                     }
                     HostCallExecOutcome::Halted => return Ok(ExecOutcome::Halted),
@@ -4066,5 +4214,334 @@ impl Vm {
                 prototype_id: frame.prototype_id,
             })
             .collect()
+    }
+}
+
+fn ret_cleanup_site_is_boundary(code: &[u8], ret_site: usize) -> bool {
+    let mut ip = 0usize;
+    while ip < code.len() {
+        let Ok(opcode) = crate::OpCode::try_from(code[ip]) else {
+            return false;
+        };
+        if ip == ret_site {
+            return opcode == crate::OpCode::Ret;
+        }
+        let Some(next) = ip
+            .checked_add(1)
+            .and_then(|value| value.checked_add(opcode.operand_len()))
+        else {
+            return false;
+        };
+        if next > code.len() {
+            return false;
+        }
+        ip = next;
+    }
+    false
+}
+
+const RET_CLEANUP_MAX_HANDLES: usize = resource::handle::DEFAULT_MAX_RESOURCES;
+
+fn collect_ret_resource_handles<'a>(
+    value: &Value,
+    schema: &crate::compiler::TypeSchema,
+    lookup: NamedStructLookup<'a>,
+    nodes: &'a mut usize,
+    out: &'a mut Vec<(u64, crate::ResourceTypeKey)>,
+) -> VmResult<()> {
+    let mut walk = RetCleanupWalk {
+        lookup,
+        nodes,
+        seen_containers: HashSet::new(),
+        seen_handles: HashSet::new(),
+        active_named: HashSet::new(),
+        out,
+    };
+    walk.collect(value, schema, 0)
+}
+
+struct RetCleanupWalk<'a> {
+    lookup: NamedStructLookup<'a>,
+    nodes: &'a mut usize,
+    seen_containers: HashSet<(usize, crate::compiler::TypeSchema)>,
+    seen_handles: HashSet<u64>,
+    active_named: HashSet<String>,
+    out: &'a mut Vec<(u64, crate::ResourceTypeKey)>,
+}
+
+impl RetCleanupWalk<'_> {
+    fn collect(
+        &mut self,
+        value: &Value,
+        schema: &crate::compiler::TypeSchema,
+        depth: usize,
+    ) -> VmResult<()> {
+        if !self.schema_owns(schema, depth)? {
+            return Ok(());
+        }
+        self.walk(value, schema, depth)
+    }
+
+    fn charge(&mut self, depth: usize) -> VmResult<()> {
+        if depth >= crate::host_api::MAX_HOST_SCHEMA_DEPTH {
+            return Err(VmError::InvalidFrameState(
+                "cleanup walk exceeded schema depth",
+            ));
+        }
+        *self.nodes = self.nodes.checked_add(1).ok_or(VmError::InvalidFrameState(
+            "cleanup walk node budget overflow",
+        ))?;
+        if *self.nodes > crate::host_api::MAX_HOST_SCHEMA_NODES {
+            return Err(VmError::InvalidFrameState(
+                "cleanup walk exceeded node budget",
+            ));
+        }
+        Ok(())
+    }
+
+    fn schema_owns(
+        &mut self,
+        schema: &crate::compiler::TypeSchema,
+        depth: usize,
+    ) -> VmResult<bool> {
+        use crate::compiler::TypeSchema;
+        self.charge(depth)?;
+        let next = depth + 1;
+        match schema {
+            TypeSchema::Resource(_) => Ok(true),
+            TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
+                self.schema_owns(inner, next)
+            }
+            TypeSchema::ArrayTuple(items) => {
+                let mut owned = false;
+                for item in items {
+                    owned |= self.schema_owns(item, next)?;
+                }
+                Ok(owned)
+            }
+            TypeSchema::ArrayTupleRest { prefix, rest } => {
+                let mut owned = self.schema_owns(rest, next)?;
+                for item in prefix {
+                    owned |= self.schema_owns(item, next)?;
+                }
+                Ok(owned)
+            }
+            TypeSchema::Object(fields) => {
+                let mut owned = false;
+                for field in fields.values() {
+                    owned |= self.schema_owns(field, next)?;
+                }
+                Ok(owned)
+            }
+            TypeSchema::Result { ok, err } => {
+                let ok_owned = self.schema_owns(ok, next)?;
+                let err_owned = self.schema_owns(err, next)?;
+                Ok(ok_owned || err_owned)
+            }
+            TypeSchema::Callable { params, result } => {
+                for param in params {
+                    self.schema_owns(param, next)?;
+                }
+                self.schema_owns(result, next)?;
+                Ok(false)
+            }
+            TypeSchema::Named(name, args) => {
+                if !self.active_named.insert(name.clone()) {
+                    return Err(VmError::InvalidFrameState("cleanup named schema is cyclic"));
+                }
+                let resolved = self.lookup.body(name, args);
+                let owned = match resolved {
+                    Some((body, _)) => self.schema_owns(&body, next)?,
+                    None => {
+                        self.active_named.remove(name);
+                        return Err(VmError::InvalidFrameState(
+                            "cleanup named schema is unresolved or has the wrong arity",
+                        ));
+                    }
+                };
+                self.active_named.remove(name);
+                Ok(owned)
+            }
+            TypeSchema::Unknown
+            | TypeSchema::Null
+            | TypeSchema::Int
+            | TypeSchema::Float
+            | TypeSchema::Number
+            | TypeSchema::Bool
+            | TypeSchema::String
+            | TypeSchema::Bytes
+            | TypeSchema::GenericParam(_) => Ok(false),
+        }
+    }
+
+    fn note_handle(&mut self, raw: u64, key: &crate::ResourceTypeKey) -> VmResult<()> {
+        if self.out.len() >= RET_CLEANUP_MAX_HANDLES {
+            return Err(VmError::InvalidFrameState(
+                "cleanup walk exceeded resource budget",
+            ));
+        }
+        if !self.seen_handles.insert(raw) {
+            return Err(VmError::InvalidFrameState(
+                "cleanup plan has duplicate resource ownership",
+            ));
+        }
+        self.out.push((raw, key.clone()));
+        Ok(())
+    }
+
+    fn walk(
+        &mut self,
+        value: &Value,
+        schema: &crate::compiler::TypeSchema,
+        depth: usize,
+    ) -> VmResult<()> {
+        use crate::compiler::TypeSchema;
+        if let Some(ptr) = container_identity(value)
+            && !self.seen_containers.insert((ptr, schema.clone()))
+        {
+            return Ok(());
+        }
+        self.charge(depth)?;
+        let next = depth + 1;
+        match schema {
+            TypeSchema::Resource(key) => match value {
+                Value::Int(raw) if *raw > 0 => self.note_handle(*raw as u64, key),
+                other => Err(VmError::HostError(format!(
+                    "Err cleanup expected a resource handle, got {other:?}"
+                ))),
+            },
+            TypeSchema::Optional(inner) => {
+                if matches!(value, Value::Null) {
+                    return Ok(());
+                }
+                self.walk(value, inner, next)
+            }
+            TypeSchema::Array(inner) => {
+                let Value::Array(items) = value else {
+                    return Err(VmError::HostError(
+                        "Err cleanup expected an array owning resources".to_string(),
+                    ));
+                };
+                for item in items.iter() {
+                    self.walk(item, inner, next)?;
+                }
+                Ok(())
+            }
+            TypeSchema::ArrayTuple(items_schema) => {
+                let Value::Array(items) = value else {
+                    return Err(VmError::HostError(
+                        "Err cleanup expected a tuple owning resources".to_string(),
+                    ));
+                };
+                if items.len() != items_schema.len() {
+                    return Err(VmError::InvalidFrameState(
+                        "cleanup tuple length does not match its schema",
+                    ));
+                }
+                for (item, item_schema) in items.iter().zip(items_schema.iter()) {
+                    self.walk(item, item_schema, next)?;
+                }
+                Ok(())
+            }
+            TypeSchema::ArrayTupleRest { prefix, rest } => {
+                let Value::Array(items) = value else {
+                    return Err(VmError::HostError(
+                        "Err cleanup expected a tuple owning resources".to_string(),
+                    ));
+                };
+                if items.len() < prefix.len() {
+                    return Err(VmError::InvalidFrameState(
+                        "cleanup tuple is shorter than its prefix",
+                    ));
+                }
+                for (item, item_schema) in items.iter().zip(prefix.iter()) {
+                    self.walk(item, item_schema, next)?;
+                }
+                for item in items.iter().skip(prefix.len()) {
+                    self.walk(item, rest, next)?;
+                }
+                Ok(())
+            }
+            TypeSchema::Map(inner) => {
+                let Value::Map(map) = value else {
+                    return Err(VmError::HostError(
+                        "Err cleanup expected a map owning resources".to_string(),
+                    ));
+                };
+                for (_, item) in map.iter() {
+                    self.walk(item, inner, next)?;
+                }
+                Ok(())
+            }
+            TypeSchema::Object(fields) => {
+                let Value::Map(map) = value else {
+                    return Err(VmError::HostError(
+                        "Err cleanup expected an object owning resources".to_string(),
+                    ));
+                };
+                let mut names = fields.keys().collect::<Vec<_>>();
+                names.sort_unstable();
+                for name in names {
+                    let Some(field) = map.get(&Value::string(name)) else {
+                        return Err(VmError::InvalidFrameState(
+                            "cleanup object is missing a declared field",
+                        ));
+                    };
+                    self.walk(field, &fields[name], next)?;
+                }
+                Ok(())
+            }
+            TypeSchema::Named(name, args) => {
+                if !self.active_named.insert(name.clone()) {
+                    return Err(VmError::InvalidFrameState("cleanup named schema is cyclic"));
+                }
+                let Some((body, _)) = self.lookup.body(name, args) else {
+                    self.active_named.remove(name);
+                    return Err(VmError::InvalidFrameState(
+                        "cleanup named schema is unresolved or has the wrong arity",
+                    ));
+                };
+                let result = self.walk(value, &body, next);
+                self.active_named.remove(name);
+                result
+            }
+            TypeSchema::Result { ok, err } => {
+                let Value::Map(map) = value else {
+                    return Err(VmError::HostError(
+                        "Err cleanup expected a Result map".to_string(),
+                    ));
+                };
+                let tag = map.get(&Value::string("tag")).cloned();
+                let payload = map
+                    .get(&Value::string("payload"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                match tag {
+                    Some(Value::Bool(true)) => self.walk(&payload, ok, next),
+                    Some(Value::Bool(false)) => self.walk(&payload, err, next),
+                    _ => Err(VmError::HostError(
+                        "Err cleanup Result is missing a bool tag".to_string(),
+                    )),
+                }
+            }
+            TypeSchema::Callable { .. }
+            | TypeSchema::Unknown
+            | TypeSchema::Null
+            | TypeSchema::Int
+            | TypeSchema::Float
+            | TypeSchema::Number
+            | TypeSchema::Bool
+            | TypeSchema::String
+            | TypeSchema::Bytes
+            | TypeSchema::GenericParam(_) => Ok(()),
+        }
+    }
+}
+
+fn container_identity(value: &Value) -> Option<usize> {
+    match value {
+        Value::Array(items) => Some(Arc::as_ptr(items) as usize),
+        Value::Map(map) => Some(Arc::as_ptr(map) as usize),
+        _ => None,
     }
 }

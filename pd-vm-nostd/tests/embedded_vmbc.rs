@@ -152,8 +152,8 @@ fn embedded_decoder_rejects_legacy_v11_without_schema_markers() {
         vec![OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8],
     );
     let mut bytes = encode_program(&program).expect("legacy fixture should encode");
-    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
-    bytes.truncate(bytes.len() - 4);
+    assert_eq!(&bytes[bytes.len() - 8..], &[0, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 8);
     bytes[4..6].copy_from_slice(&11u16.to_le_bytes());
 
     assert!(matches!(
@@ -544,6 +544,8 @@ fn v12_with_named_host_return_schema(schema: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
+    // Mandatory current-v13 ret-cleanup section: empty plan count after named structs.
+    bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes
 }
 
@@ -651,14 +653,15 @@ fn embedded_decoder_reads_v13_guest_named_struct_payload() {
 fn embedded_decoder_rejects_duplicate_named_struct_generic_params() {
     let mut bytes = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
         .expect("empty program should encode");
-    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
-    bytes.truncate(bytes.len() - 4);
+    assert_eq!(&bytes[bytes.len() - 8..], &[0, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 8);
     bytes.extend_from_slice(&1u32.to_le_bytes());
     append_wire_string(&mut bytes, "Holder");
     bytes.extend_from_slice(&2u32.to_le_bytes());
     append_wire_string(&mut bytes, "T");
     append_wire_string(&mut bytes, "T");
     bytes.push(14);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     assert_eq!(decode_program(&bytes), Err(WireError::InvalidValueType(0)));
 }
@@ -667,8 +670,8 @@ fn embedded_decoder_rejects_duplicate_named_struct_generic_params() {
 fn embedded_decoder_rejects_duplicate_named_struct_names() {
     let mut bytes = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
         .expect("empty program should encode");
-    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
-    bytes.truncate(bytes.len() - 4);
+    assert_eq!(&bytes[bytes.len() - 8..], &[0, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 8);
     bytes.extend_from_slice(&2u32.to_le_bytes());
     append_wire_string(&mut bytes, "Dup");
     bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -678,6 +681,7 @@ fn embedded_decoder_rejects_duplicate_named_struct_names() {
     bytes.extend_from_slice(&0u32.to_le_bytes());
     bytes.push(14);
     bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
     assert_eq!(decode_program(&bytes), Err(WireError::InvalidValueType(0)));
 }
 
@@ -685,8 +689,8 @@ fn embedded_decoder_rejects_duplicate_named_struct_names() {
 fn embedded_decoder_rejects_v12_trailing_zero_named_struct_garbage() {
     let mut bytes = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
         .expect("empty program should encode");
-    assert_eq!(&bytes[bytes.len() - 4..], &[0, 0, 0, 0]);
-    bytes.truncate(bytes.len() - 4);
+    assert_eq!(&bytes[bytes.len() - 8..], &[0, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.truncate(bytes.len() - 8);
     bytes[4..6].copy_from_slice(&12u16.to_le_bytes());
     assert_eq!(
         decode_program(&bytes),

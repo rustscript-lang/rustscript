@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -115,7 +116,14 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         root_callable_bindings,
         exported_callables,
     ) = read_callable_metadata(&mut cursor)?;
-    skip_named_struct_decls(&mut cursor)?;
+    let named_decls = read_named_cleanup_decls(&mut cursor)?;
+    read_ret_cleanups(
+        &mut cursor,
+        &code,
+        &callable_prototypes,
+        &function_regions,
+        &named_decls,
+    )?;
     if !cursor.is_empty() {
         return Err(WireError::TrailingBytes);
     }
@@ -296,29 +304,453 @@ fn skip_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireError> {
     }
 }
 
-fn skip_named_struct_decls(cursor: &mut Cursor<'_>) -> Result<(), WireError> {
+fn read_named_cleanup_decls(cursor: &mut Cursor<'_>) -> Result<Vec<NamedCleanupDecl>, WireError> {
     let count = cursor.read_count("named struct decls", 1)?;
-    let mut seen_names = Vec::new();
-    reserve(&mut seen_names, "named struct decls", count)?;
+    let mut decls: Vec<NamedCleanupDecl> = Vec::new();
+    reserve(&mut decls, "named struct decls", count)?;
     for _ in 0..count {
         let name = cursor.read_string()?;
-        if seen_names.iter().any(|existing| existing == &name) {
+        if decls.iter().any(|existing| existing.name == name) {
             return Err(WireError::InvalidValueType(0));
         }
-        seen_names.push(name);
         let param_count = cursor.read_count("named struct type params", 1)?;
-        let mut seen = Vec::new();
-        reserve(&mut seen, "named struct type params", param_count)?;
+        let mut type_params: Vec<String> = Vec::new();
+        reserve(&mut type_params, "named struct type params", param_count)?;
         for _ in 0..param_count {
             let param = cursor.read_string()?;
-            if seen.iter().any(|existing| existing == &param) {
+            if type_params.iter().any(|existing| existing == &param) {
                 return Err(WireError::InvalidValueType(0));
             }
-            seen.push(param);
+            type_params.push(param);
         }
-        skip_schema(cursor, 0)?;
+        let body = read_cleanup_schema(cursor, 0)?;
+        decls.push(NamedCleanupDecl {
+            name,
+            type_params,
+            body,
+        });
+    }
+    Ok(decls)
+}
+
+fn read_ret_cleanups(
+    cursor: &mut Cursor<'_>,
+    code: &[u8],
+    prototypes: &[CallablePrototype],
+    regions: &[FunctionRegion],
+    decls: &[NamedCleanupDecl],
+) -> Result<(), WireError> {
+    let plan_count = cursor.read_count_with_overhead("ret cleanup plans", 8, 0)?;
+    if plan_count > code.len() {
+        return Err(WireError::LengthTooLarge("ret cleanup plans", plan_count));
+    }
+    let ret_sites = if plan_count == 0 {
+        Vec::new()
+    } else {
+        ret_instruction_sites(code)?
+    };
+    let mut previous_site = None;
+    let mut saw_resource = false;
+    for _ in 0..plan_count {
+        let site = cursor.read_u32()?;
+        if previous_site.is_some_and(|previous| site <= previous) {
+            return Err(WireError::InvalidRetCleanup(
+                "cleanup sites are not canonical",
+            ));
+        }
+        previous_site = Some(site);
+        let frame_locals = cleanup_frame_local_count(prototypes, regions, &ret_sites, site)?;
+        let local_count = cursor.read_u32()? as usize;
+        if local_count > frame_locals || local_count > MAX_FRAME_LOCAL_COUNT {
+            return Err(WireError::LengthTooLarge("ret cleanup locals", local_count));
+        }
+        cursor.validate_count("ret cleanup locals", local_count, 3)?;
+        cursor.debit_count("ret cleanup locals", local_count)?;
+        let mut previous_slot = None;
+        for _ in 0..local_count {
+            let slot = cursor.read_u16()?;
+            if previous_slot.is_some_and(|previous| slot <= previous) {
+                return Err(WireError::InvalidRetCleanup(
+                    "cleanup locals are not canonical",
+                ));
+            }
+            if slot as usize >= frame_locals {
+                return Err(WireError::InvalidRetCleanup(
+                    "cleanup local is outside the frame",
+                ));
+            }
+            previous_slot = Some(slot);
+            let schema = read_cleanup_schema(cursor, 0)?;
+            if !cleanup_schema_owns(&schema, decls, &[], &[], 0, &mut 0, &mut Vec::new())? {
+                return Err(WireError::InvalidRetCleanup(
+                    "cleanup schema has no owned resource",
+                ));
+            }
+            saw_resource = true;
+        }
+    }
+    if saw_resource {
+        return Err(WireError::UnsupportedCapability(
+            "ret cleanup resource plans",
+        ));
     }
     Ok(())
+}
+
+fn ret_instruction_sites(code: &[u8]) -> Result<Vec<u32>, WireError> {
+    let mut ip = 0usize;
+    let mut sites = Vec::new();
+    while ip < code.len() {
+        let opcode = OpCode::try_from(code[ip])
+            .map_err(|_| WireError::InvalidRetCleanup("cleanup bytecode has an invalid opcode"))?;
+        if opcode == OpCode::Ret {
+            let site = u32::try_from(ip).map_err(|_| WireError::LengthTooLarge("code", ip))?;
+            sites.push(site);
+        }
+        let next = ip
+            .checked_add(1)
+            .and_then(|value| value.checked_add(opcode.operand_len()))
+            .ok_or(WireError::LengthTooLarge("code", ip))?;
+        if next > code.len() {
+            return Err(WireError::InvalidRetCleanup("truncated instruction"));
+        }
+        ip = next;
+    }
+    Ok(sites)
+}
+
+fn cleanup_frame_local_count(
+    prototypes: &[CallablePrototype],
+    regions: &[FunctionRegion],
+    ret_sites: &[u32],
+    site: u32,
+) -> Result<usize, WireError> {
+    if !ret_sites.contains(&site) {
+        return Err(WireError::InvalidRetCleanup(
+            "cleanup site is not a Ret instruction",
+        ));
+    }
+    let mut frame_locals = None;
+    for region in regions {
+        if site < region.start_ip || site >= region.end_ip {
+            continue;
+        }
+        let Some(prototype_id) = region.prototype_id else {
+            continue;
+        };
+        let Some(prototype) = prototypes.get(prototype_id as usize) else {
+            return Err(WireError::InvalidRetCleanup(
+                "cleanup frame prototype is missing",
+            ));
+        };
+        if !matches!(prototype.target, CallableTarget::ScriptFunction(_)) {
+            return Err(WireError::InvalidRetCleanup(
+                "cleanup frame is not a script function",
+            ));
+        }
+        if frame_locals.replace(prototype.frame_local_count).is_some() {
+            return Err(WireError::InvalidRetCleanup(
+                "cleanup site matches multiple frames",
+            ));
+        }
+    }
+    frame_locals.ok_or(WireError::InvalidRetCleanup(
+        "cleanup site is not in a callable frame",
+    ))
+}
+
+const CLEANUP_SCHEMA_WALK_NODES: usize = 16_384;
+
+struct NamedCleanupDecl {
+    name: String,
+    type_params: Vec<String>,
+    body: WireSchema,
+}
+
+#[derive(Clone)]
+enum WireSchema {
+    Scalar,
+    Generic(String),
+    Named {
+        name: String,
+        args: Vec<WireSchema>,
+    },
+    Array(Box<WireSchema>),
+    Tuple(Vec<WireSchema>),
+    TupleRest {
+        prefix: Vec<WireSchema>,
+        rest: Box<WireSchema>,
+    },
+    Map(Box<WireSchema>),
+    Object(Vec<(String, WireSchema)>),
+    Callable {
+        params: Vec<WireSchema>,
+        result: Box<WireSchema>,
+    },
+    Optional(Box<WireSchema>),
+    Resource,
+    Result {
+        ok: Box<WireSchema>,
+        err: Box<WireSchema>,
+    },
+}
+
+fn read_cleanup_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<WireSchema, WireError> {
+    if depth >= MAX_SCHEMA_DEPTH {
+        return Err(WireError::SchemaTooDeep);
+    }
+    cursor.debit_count("schema nodes", 1)?;
+    let nested = depth.checked_add(1).ok_or(WireError::SchemaTooDeep)?;
+    Ok(match cursor.read_u8()? {
+        0..=7 => WireSchema::Scalar,
+        8 => WireSchema::Generic(cursor.read_string()?),
+        9 => {
+            let name = cursor.read_string()?;
+            let count = cursor.read_count("schema type args", 1)?;
+            let mut args = Vec::new();
+            reserve(&mut args, "schema type args", count)?;
+            for _ in 0..count {
+                args.push(read_cleanup_schema(cursor, nested)?);
+            }
+            WireSchema::Named { name, args }
+        }
+        10 => WireSchema::Array(Box::new(read_cleanup_schema(cursor, nested)?)),
+        11 => {
+            let count = cursor.read_count("schema tuple items", 1)?;
+            let mut items = Vec::new();
+            reserve(&mut items, "schema tuple items", count)?;
+            for _ in 0..count {
+                items.push(read_cleanup_schema(cursor, nested)?);
+            }
+            WireSchema::Tuple(items)
+        }
+        12 => {
+            let count = cursor.read_count_with_overhead("schema tuple prefix", 1, 1)?;
+            let mut prefix = Vec::new();
+            reserve(&mut prefix, "schema tuple prefix", count)?;
+            for _ in 0..count {
+                prefix.push(read_cleanup_schema(cursor, nested)?);
+            }
+            WireSchema::TupleRest {
+                prefix,
+                rest: Box::new(read_cleanup_schema(cursor, nested)?),
+            }
+        }
+        13 => WireSchema::Map(Box::new(read_cleanup_schema(cursor, nested)?)),
+        14 => {
+            let count = cursor.read_count("schema object fields", 5)?;
+            let mut fields = Vec::new();
+            reserve(&mut fields, "schema object fields", count)?;
+            for _ in 0..count {
+                fields.push((cursor.read_string()?, read_cleanup_schema(cursor, nested)?));
+            }
+            WireSchema::Object(fields)
+        }
+        15 => {
+            let count = cursor.read_count_with_overhead("schema callable params", 1, 1)?;
+            let mut params = Vec::new();
+            reserve(&mut params, "schema callable params", count)?;
+            for _ in 0..count {
+                params.push(read_cleanup_schema(cursor, nested)?);
+            }
+            WireSchema::Callable {
+                params,
+                result: Box::new(read_cleanup_schema(cursor, nested)?),
+            }
+        }
+        16 => WireSchema::Optional(Box::new(read_cleanup_schema(cursor, nested)?)),
+        17 => {
+            skip_resource_key(cursor)?;
+            WireSchema::Resource
+        }
+        18 => WireSchema::Result {
+            ok: Box::new(read_cleanup_schema(cursor, nested)?),
+            err: Box::new(read_cleanup_schema(cursor, nested)?),
+        },
+        value => return Err(WireError::InvalidValueType(value)),
+    })
+}
+
+fn cleanup_schema_owns(
+    schema: &WireSchema,
+    decls: &[NamedCleanupDecl],
+    param_names: &[String],
+    param_args: &[WireSchema],
+    depth: usize,
+    nodes: &mut usize,
+    active: &mut Vec<String>,
+) -> Result<bool, WireError> {
+    if depth >= MAX_SCHEMA_DEPTH {
+        return Err(WireError::SchemaTooDeep);
+    }
+    *nodes = nodes
+        .checked_add(1)
+        .ok_or(WireError::LengthTooLarge("schema nodes", usize::MAX))?;
+    if *nodes > CLEANUP_SCHEMA_WALK_NODES {
+        return Err(WireError::LengthTooLarge("schema nodes", *nodes));
+    }
+    let next = depth + 1;
+    match schema {
+        WireSchema::Scalar => Ok(false),
+        WireSchema::Generic(name) => {
+            let Some(index) = param_names.iter().position(|param| param == name) else {
+                return Ok(false);
+            };
+            cleanup_schema_owns(&param_args[index], decls, &[], &[], next, nodes, active)
+        }
+        WireSchema::Resource => Ok(true),
+        WireSchema::Array(inner) | WireSchema::Map(inner) | WireSchema::Optional(inner) => {
+            cleanup_schema_owns(inner, decls, param_names, param_args, next, nodes, active)
+        }
+        WireSchema::Tuple(items) => {
+            any_owns(items, decls, param_names, param_args, next, nodes, active)
+        }
+        WireSchema::TupleRest { prefix, rest } => {
+            let mut owned = any_owns(prefix, decls, param_names, param_args, next, nodes, active)?;
+            owned |=
+                cleanup_schema_owns(rest, decls, param_names, param_args, next, nodes, active)?;
+            Ok(owned)
+        }
+        WireSchema::Object(fields) => {
+            let mut owned = false;
+            for (_, field) in fields {
+                owned |= cleanup_schema_owns(
+                    field,
+                    decls,
+                    param_names,
+                    param_args,
+                    next,
+                    nodes,
+                    active,
+                )?;
+            }
+            Ok(owned)
+        }
+        WireSchema::Callable { params, result } => {
+            any_owns(params, decls, param_names, param_args, next, nodes, active)?;
+            cleanup_schema_owns(result, decls, param_names, param_args, next, nodes, active)?;
+            Ok(false)
+        }
+        WireSchema::Result { ok, err } => {
+            let ok_owned =
+                cleanup_schema_owns(ok, decls, param_names, param_args, next, nodes, active)?;
+            let err_owned =
+                cleanup_schema_owns(err, decls, param_names, param_args, next, nodes, active)?;
+            Ok(ok_owned || err_owned)
+        }
+        WireSchema::Named { name, args } => {
+            let Some(decl) = decls.iter().find(|decl| decl.name == *name) else {
+                return Err(WireError::InvalidRetCleanup(
+                    "unresolved named cleanup schema",
+                ));
+            };
+            if decl.type_params.len() != args.len() {
+                return Err(WireError::InvalidRetCleanup("named cleanup schema arity"));
+            }
+            if active.iter().any(|active_name| active_name == name) {
+                return Err(WireError::InvalidRetCleanup("named cleanup schema cycle"));
+            }
+            let resolved = args
+                .iter()
+                .map(|arg| substitute_schema(arg, param_names, param_args))
+                .collect::<Vec<_>>();
+            active.push(name.clone());
+            let mut owned = cleanup_schema_owns(
+                &decl.body,
+                decls,
+                &decl.type_params,
+                &resolved,
+                next,
+                nodes,
+                active,
+            )?;
+            owned |= any_owns(&resolved, decls, &[], &[], next, nodes, active)?;
+            active.pop();
+            Ok(owned)
+        }
+    }
+}
+
+fn any_owns(
+    items: &[WireSchema],
+    decls: &[NamedCleanupDecl],
+    param_names: &[String],
+    param_args: &[WireSchema],
+    depth: usize,
+    nodes: &mut usize,
+    active: &mut Vec<String>,
+) -> Result<bool, WireError> {
+    let mut owned = false;
+    for item in items {
+        owned |= cleanup_schema_owns(item, decls, param_names, param_args, depth, nodes, active)?;
+    }
+    Ok(owned)
+}
+
+fn substitute_schema(
+    schema: &WireSchema,
+    param_names: &[String],
+    param_args: &[WireSchema],
+) -> WireSchema {
+    match schema {
+        WireSchema::Generic(name) => param_names
+            .iter()
+            .position(|param| param == name)
+            .map(|index| param_args[index].clone())
+            .unwrap_or_else(|| schema.clone()),
+        WireSchema::Named { name, args } => WireSchema::Named {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| substitute_schema(arg, param_names, param_args))
+                .collect(),
+        },
+        WireSchema::Array(inner) => {
+            WireSchema::Array(Box::new(substitute_schema(inner, param_names, param_args)))
+        }
+        WireSchema::Optional(inner) => {
+            WireSchema::Optional(Box::new(substitute_schema(inner, param_names, param_args)))
+        }
+        WireSchema::Map(inner) => {
+            WireSchema::Map(Box::new(substitute_schema(inner, param_names, param_args)))
+        }
+        WireSchema::Tuple(items) => WireSchema::Tuple(
+            items
+                .iter()
+                .map(|item| substitute_schema(item, param_names, param_args))
+                .collect(),
+        ),
+        WireSchema::TupleRest { prefix, rest } => WireSchema::TupleRest {
+            prefix: prefix
+                .iter()
+                .map(|item| substitute_schema(item, param_names, param_args))
+                .collect(),
+            rest: Box::new(substitute_schema(rest, param_names, param_args)),
+        },
+        WireSchema::Object(fields) => WireSchema::Object(
+            fields
+                .iter()
+                .map(|(name, field)| {
+                    (
+                        name.clone(),
+                        substitute_schema(field, param_names, param_args),
+                    )
+                })
+                .collect(),
+        ),
+        WireSchema::Callable { params, result } => WireSchema::Callable {
+            params: params
+                .iter()
+                .map(|param| substitute_schema(param, param_names, param_args))
+                .collect(),
+            result: Box::new(substitute_schema(result, param_names, param_args)),
+        },
+        WireSchema::Result { ok, err } => WireSchema::Result {
+            ok: Box::new(substitute_schema(ok, param_names, param_args)),
+            err: Box::new(substitute_schema(err, param_names, param_args)),
+        },
+        WireSchema::Scalar | WireSchema::Resource => schema.clone(),
+    }
 }
 
 fn skip_resource_key(cursor: &mut Cursor<'_>) -> Result<(), WireError> {

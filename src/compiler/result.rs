@@ -23,6 +23,9 @@ struct Env {
     function_list: Vec<FunctionDecl>,
     function_impls: HashMap<u16, FunctionImpl>,
     struct_schemas: HashMap<String, super::ir::StructDecl>,
+    /// Return schema of the function or closure currently being resolved.
+    /// `None` at root and inside a callable that does not return `Result`.
+    lexical_return: Option<TypeSchema>,
 }
 
 pub(crate) fn resolve_result_types(
@@ -46,6 +49,7 @@ pub(crate) fn resolve_result_types(
         function_list,
         function_impls: ir.function_impls.clone(),
         struct_schemas: ir.struct_schemas.clone(),
+        lexical_return: None,
     };
     resolve_stmts(&mut ir.stmts, None, &mut env)?;
     let mut impls = std::mem::take(&mut ir.function_impls);
@@ -62,7 +66,9 @@ fn resolve_function(
     env: &mut Env,
 ) -> Result<(), CompileError> {
     let saved = env.slots.clone();
+    let saved_return = env.lexical_return.clone();
     if let Some(function) = env.functions.get(&index).cloned() {
+        env.lexical_return = function.return_schema.clone();
         for (slot, schema) in function_impl
             .param_slots
             .iter()
@@ -87,6 +93,7 @@ fn resolve_function(
         resolve_expr(&mut function_impl.body_expr, None, env)?;
     }
     env.slots = saved;
+    env.lexical_return = saved_return;
     Ok(())
 }
 
@@ -233,6 +240,13 @@ fn resolve_expr(
                 "is_ok/is_err",
             )
         }
+        Expr::ResultTry {
+            value,
+            operand_schema,
+            return_schema,
+            span,
+            ..
+        } => resolve_try(value, operand_schema, return_schema, *span, env),
         Expr::Block { stmts, expr } => {
             resolve_stmts(stmts, expected.cloned(), env)?;
             resolve_expr(expr, expected, env)
@@ -484,6 +498,163 @@ fn resolve_match(
     Ok(())
 }
 
+fn resolve_try(
+    value: &mut Expr,
+    operand_schema: &mut TypeSchema,
+    return_schema: &mut TypeSchema,
+    span: Span,
+    env: &mut Env,
+) -> Result<(), CompileError> {
+    resolve_expr(value, None, env)?;
+    let operand = operand_schema_of(value, env).ok_or_else(|| {
+        result_error(
+            span,
+            "? operand must be Result<T, E>, found an untyped value".to_string(),
+        )
+    })?;
+    let (operand_ok, operand_err) = match &operand {
+        TypeSchema::Result { ok, err } => ((**ok).clone(), (**err).clone()),
+        other => {
+            return Err(result_error(
+                span,
+                format!(
+                    "? operand must be Result<T, E>, found {}",
+                    render_schema(other)
+                ),
+            ));
+        }
+    };
+    let function_return = env.lexical_return.clone().ok_or_else(|| {
+        result_error(
+            span,
+            "? requires the enclosing function to return Result<U, E>".to_string(),
+        )
+    })?;
+    let function_err = match &function_return {
+        TypeSchema::Result { err, .. } => (**err).clone(),
+        other => {
+            return Err(result_error(
+                span,
+                format!(
+                    "? requires the enclosing function to return Result<U, E>, found {}",
+                    render_schema(other)
+                ),
+            ));
+        }
+    };
+    if operand_err != function_err {
+        return Err(result_error(
+            span,
+            format!(
+                "? error type {} is not {}",
+                render_schema(&operand_err),
+                render_schema(&function_err)
+            ),
+        ));
+    }
+    *operand_schema = TypeSchema::Result {
+        ok: Box::new(operand_ok),
+        err: Box::new(operand_err),
+    };
+    *return_schema = function_return;
+    Ok(())
+}
+
+fn operand_schema_of(expr: &Expr, env: &Env) -> Option<TypeSchema> {
+    if let Some(schema) = authoritative_schema(expr, env) {
+        return Some(schema);
+    }
+    match expr {
+        Expr::Call(index, type_args, _, resolution, _) => {
+            if let Some(resolved) = resolution.as_deref() {
+                return Some(resolved.return_type.clone());
+            }
+            let function = env.functions.get(index)?;
+            Some(substitute_schema(
+                function.return_schema.clone()?,
+                &function.type_params,
+                type_args,
+            ))
+        }
+        Expr::LocalCall(slot, type_args, _, _) => {
+            let schema = env.slots.get(slot).cloned()?;
+            callable_result_schema(&schema, type_args)
+        }
+        Expr::ModuleCall(symbol, type_args, _, _) => {
+            let function = env
+                .function_list
+                .iter()
+                .find(|function| function.symbol == Some(*symbol))?;
+            Some(substitute_schema(
+                function.return_schema.clone()?,
+                &function.type_params,
+                type_args,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn callable_result_schema(schema: &TypeSchema, _type_args: &[TypeSchema]) -> Option<TypeSchema> {
+    match schema {
+        TypeSchema::Callable { result, .. } => Some((**result).clone()),
+        _ => None,
+    }
+}
+
+fn substitute_schema(schema: TypeSchema, params: &[String], args: &[TypeSchema]) -> TypeSchema {
+    if params.is_empty() || args.is_empty() {
+        return schema;
+    }
+    let bindings: Vec<(&str, &TypeSchema)> = params
+        .iter()
+        .zip(args.iter())
+        .map(|(name, schema)| (name.as_str(), schema))
+        .collect();
+    substitute_schema_bindings(schema, &bindings)
+}
+
+fn substitute_schema_bindings(schema: TypeSchema, bindings: &[(&str, &TypeSchema)]) -> TypeSchema {
+    match schema {
+        TypeSchema::GenericParam(name) => bindings
+            .iter()
+            .find(|(param, _)| *param == name)
+            .map(|(_, replacement)| (*replacement).clone())
+            .unwrap_or(TypeSchema::GenericParam(name)),
+        TypeSchema::Result { ok, err } => TypeSchema::Result {
+            ok: Box::new(substitute_schema_bindings(*ok, bindings)),
+            err: Box::new(substitute_schema_bindings(*err, bindings)),
+        },
+        TypeSchema::Optional(inner) => {
+            TypeSchema::Optional(Box::new(substitute_schema_bindings(*inner, bindings)))
+        }
+        TypeSchema::Array(inner) => {
+            TypeSchema::Array(Box::new(substitute_schema_bindings(*inner, bindings)))
+        }
+        TypeSchema::Map(inner) => {
+            TypeSchema::Map(Box::new(substitute_schema_bindings(*inner, bindings)))
+        }
+        TypeSchema::Named(name, args) => TypeSchema::Named(
+            name,
+            args.into_iter()
+                .map(|schema| substitute_schema_bindings(schema, bindings))
+                .collect(),
+        ),
+        TypeSchema::Callable { params, result } => TypeSchema::Callable {
+            params: params
+                .into_iter()
+                .map(|schema| substitute_schema_bindings(schema, bindings))
+                .collect(),
+            result: Box::new(substitute_schema_bindings(*result, bindings)),
+        },
+        other => other,
+    }
+}
+
+fn render_schema(schema: &TypeSchema) -> String {
+    super::typing::render_schema_label(schema)
+}
+
 fn authoritative_schema(expr: &Expr, env: &Env) -> Option<TypeSchema> {
     infer_schema(expr, env)
         .or_else(|| {
@@ -519,8 +690,14 @@ fn resolve_closure(
         &closure.capture_copies,
     );
     let saved = std::mem::replace(&mut env.slots, nested);
+    let saved_return = env.lexical_return.clone();
+    env.lexical_return = match expected_return {
+        Some(schema @ TypeSchema::Result { .. }) => Some(schema.clone()),
+        _ => None,
+    };
     let resolved = resolve_expr(&mut closure.body, expected_return, env);
     env.slots = saved;
+    env.lexical_return = saved_return;
     resolved
 }
 

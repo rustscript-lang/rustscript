@@ -567,6 +567,27 @@ impl<'a> TypeContext<'a> {
         }
     }
 
+    pub(super) fn selected_result_success_schema(
+        &mut self,
+        operand: &Expr,
+        operand_schema: &TypeSchema,
+        state: &LocalTypeState,
+    ) -> Option<TypeSchema> {
+        let schema = if matches!(operand_schema, TypeSchema::Result { .. }) {
+            operand_schema.clone()
+        } else {
+            self.infer_expr_schema(operand, state)?
+        };
+        // Optional<Result> is not a try operand. Unknown has no success authority.
+        if schema.is_optional() || matches!(schema, TypeSchema::Unknown) {
+            return None;
+        }
+        match schema {
+            TypeSchema::Result { ok, .. } => Some(*ok),
+            _ => None,
+        }
+    }
+
     pub(super) fn bound_type_for_schema(&mut self, schema: &TypeSchema) -> BoundType {
         bound_type_from_schema(&self.resolve_schema(schema))
     }
@@ -782,6 +803,13 @@ impl<'a> TypeContext<'a> {
                 self.apply_stmts(stmts, &mut nested);
                 self.expr_is_optional(expr, &nested)
             }
+            Expr::ResultTry {
+                value,
+                operand_schema,
+                ..
+            } => self
+                .selected_result_success_schema(value, operand_schema, state)
+                .is_some_and(|schema| schema.is_optional()),
             _ => false,
         }
     }
@@ -853,6 +881,7 @@ impl<'a> TypeContext<'a> {
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.infer_optional_expr_inner_type(inner, state)
             }
+            Expr::ResultTry { .. } => self.infer_expr_type(expr, state),
             _ => self.infer_expr_type(expr, state),
         }
     }
@@ -884,6 +913,13 @@ impl<'a> TypeContext<'a> {
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.infer_optional_expr_inner_schema(inner, state)
             }
+            Expr::ResultTry {
+                value,
+                operand_schema,
+                ..
+            } => self
+                .selected_result_success_schema(value, operand_schema, state)
+                .map(|schema| schema.clone_inner_if_optional()),
             _ => self.infer_expr_schema(expr, state),
         }
     }
@@ -1332,6 +1368,11 @@ impl<'a> TypeContext<'a> {
                 self.infer_expr_schema(expr, &nested)
             }
             Expr::ResultQuery { .. } => Some(TypeSchema::Bool),
+            Expr::ResultTry {
+                value,
+                operand_schema,
+                ..
+            } => self.selected_result_success_schema(value, operand_schema, state),
             Expr::ResultConstruct { result_schema, .. } => match result_schema {
                 TypeSchema::Unknown => None,
                 other => Some(self.substitute_schema_generics(other)),
@@ -1506,6 +1547,16 @@ impl<'a> TypeContext<'a> {
             Expr::ResultQuery { value, .. } => {
                 let _ = self.infer_expr_type(value, state);
                 BoundType::Bool
+            }
+            Expr::ResultTry {
+                value,
+                operand_schema,
+                ..
+            } => {
+                let _ = self.infer_expr_type(value, state);
+                self.selected_result_success_schema(value, operand_schema, state)
+                    .map(|schema| self.bound_type_for_schema(&schema))
+                    .unwrap_or(BoundType::Unknown)
             }
             Expr::ResultMatch {
                 value,
