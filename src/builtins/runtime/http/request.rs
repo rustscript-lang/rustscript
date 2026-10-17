@@ -9,7 +9,6 @@ use hyper::body::{Body as _, Bytes, Frame, Incoming};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
 use tower_service::Service;
 
 use super::config::HttpConfig;
@@ -22,10 +21,37 @@ const HTTP_MAX_HEADERS: usize = 100;
 
 type BoxConnectError = Box<dyn Error + Send + Sync>;
 
+tokio::task_local! {
+    /// Immutable per-hop budget, including policy preflight. Never keyed by host.
+    static CONNECT_DEADLINE: Instant;
+}
+
+/// Hyper can move a started connection race into its executor when pool checkout
+/// wins (hyper-util 0.1.20, legacy/client.rs). Capture at submission, not polling:
+/// connector readiness/call may then run on another task. Dispatcher tasks carry
+/// context only; response headers and bodies are not timed by this deadline.
+#[derive(Clone, Copy)]
+struct HttpExecutor;
+
+impl<F> hyper::rt::Executor<F> for HttpExecutor
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, future: F) {
+        let deadline = CONNECT_DEADLINE.try_with(|deadline| *deadline).ok();
+        tokio::spawn(async move {
+            match deadline {
+                Some(deadline) => CONNECT_DEADLINE.scope(deadline, future).await,
+                None => future.await,
+            }
+        });
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ConnectTimeout<C> {
     inner: C,
-    timeout: std::time::Duration,
 }
 
 impl<C> Service<hyper::Uri> for ConnectTimeout<C>
@@ -44,10 +70,19 @@ where
     }
 
     fn call(&mut self, destination: hyper::Uri) -> Self::Future {
+        let Ok(deadline) = CONNECT_DEADLINE.try_with(|deadline| *deadline) else {
+            // Missing propagation must fail closed, never restart a full budget.
+            return Box::pin(async {
+                Err(BoxConnectError::from(std::io::Error::other(
+                    "HTTP connect phase deadline context missing",
+                )))
+            });
+        };
         let future = self.inner.call(destination);
-        let timeout = self.timeout;
+        #[cfg(test)]
+        let future = deadline_tests::delay_connect(future);
         Box::pin(async move {
-            tokio::time::timeout(timeout, future)
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), future)
                 .await
                 .map_err(|_| {
                     BoxConnectError::from(std::io::Error::new(
@@ -75,11 +110,8 @@ pub(super) fn build_client(config: &HttpConfig) -> HttpClient {
         .https_or_http()
         .enable_http1()
         .wrap_connector(http);
-    let connector = ConnectTimeout {
-        inner: connector,
-        timeout: config.connect_timeout,
-    };
-    let mut builder = Client::builder(TokioExecutor::new());
+    let connector = ConnectTimeout { inner: connector };
+    let mut builder = Client::builder(HttpExecutor);
     builder
         .http1_max_buf_size(HTTP_MAX_HEAD_BYTES)
         .http1_max_headers(HTTP_MAX_HEADERS);
@@ -91,7 +123,12 @@ async fn validate_target_until(
     url: &url::Url,
     deadline: Instant,
 ) -> VmResult<()> {
-    let resolved = with_deadline(deadline, resolve_url(config, SchemeFamily::Http, url)).await?;
+    let resolved = with_deadline(deadline, async {
+        #[cfg(test)]
+        deadline_tests::delay_preflight().await;
+        resolve_url(config, SchemeFamily::Http, url).await
+    })
+    .await?;
     debug_assert_eq!(resolved.host, url.host_str().unwrap_or_default());
     debug_assert_eq!(
         resolved.address.port(),
@@ -312,7 +349,15 @@ async fn execute_request_until(
         // policy resolver repeats the private-address check for the address
         // used by any newly opened pooled connection.
         validate_target_until(config, &url, connect_deadline).await?;
-        let mut response = send_request(client, &method, &url, &headers, body.as_deref()).await?;
+        let mut response = send_request(
+            client,
+            &method,
+            &url,
+            &headers,
+            body.as_deref(),
+            connect_deadline,
+        )
+        .await?;
         validate_response_framing(response.response())?;
         if follows_location(response.response().status()) {
             if redirect_index == config.max_redirects {
@@ -428,7 +473,15 @@ pub(super) async fn open_stream_response(
     for redirect_index in 0..=config.max_redirects {
         let connect_deadline = phase_deadline(opening_deadline, config.connect_timeout);
         validate_target_until(config, &url, connect_deadline).await?;
-        let response = send_request(client, &method, &url, &headers, body.as_deref()).await?;
+        let response = send_request(
+            client,
+            &method,
+            &url,
+            &headers,
+            body.as_deref(),
+            connect_deadline,
+        )
+        .await?;
         *bytes_sent = bytes_sent.saturating_add(body.as_ref().map_or(0, Vec::len));
         validate_response_framing(response.response())?;
         if follows_location(response.response().status()) {
@@ -473,6 +526,7 @@ async fn send_request(
     url: &url::Url,
     headers: &[(hyper::header::HeaderName, hyper::header::HeaderValue)],
     body: Option<&[u8]>,
+    connect_deadline: Instant,
 ) -> VmResult<OwnedResponse> {
     let uri = url
         .as_str()
@@ -485,16 +539,19 @@ async fn send_request(
     let request = builder
         .body(Full::new(Bytes::copy_from_slice(body.unwrap_or_default())))
         .map_err(|error| VmError::HostError(format!("HTTP request setup failed: {error}")))?;
-    let response = client.request(request).await.map_err(|error| {
-        let mut message = format!("HTTP request failed: {error}");
-        let mut source = error.source();
-        while let Some(error) = source {
-            message.push_str(": ");
-            message.push_str(&error.to_string());
-            source = error.source();
-        }
-        VmError::HostError(message)
-    })?;
+    let response = CONNECT_DEADLINE
+        .scope(connect_deadline, client.request(request))
+        .await
+        .map_err(|error| {
+            let mut message = format!("HTTP request failed: {error}");
+            let mut source = error.source();
+            while let Some(error) = source {
+                message.push_str(": ");
+                message.push_str(&error.to_string());
+                source = error.source();
+            }
+            VmError::HostError(message)
+        })?;
     Ok(OwnedResponse { response })
 }
 
@@ -711,6 +768,9 @@ fn reject_declared_oversize(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod deadline_tests;
 
 #[cfg(test)]
 mod tests {

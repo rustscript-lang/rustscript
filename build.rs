@@ -732,10 +732,7 @@ fn parse_namespace_manifest(path: &Path) -> Vec<NamespaceDecl> {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
     let mut decls = Vec::new();
     let mut rest = source.as_str();
-    loop {
-        let Some(index) = rest.find("builtin_namespace!(") else {
-            break;
-        };
+    while let Some(index) = rest.find("builtin_namespace!(") {
         rest = &rest[index + "builtin_namespace!(".len()..];
         let end = find_matching_paren(rest);
         let args = &rest[..end];
