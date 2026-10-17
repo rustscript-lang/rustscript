@@ -31,9 +31,9 @@ fn encoded_scalar_program() -> Vec<u8> {
 }
 
 #[test]
-fn embedded_decoder_reads_host_generated_v14() {
+fn embedded_decoder_reads_host_generated_v13() {
     let bytes = encoded_scalar_program();
-    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v14");
+    let program = decode_program(&bytes).expect("embedded decoder should accept VMBC v13");
 
     assert_eq!(
         program.code(),
@@ -139,7 +139,7 @@ fn embedded_decoder_skips_named_host_schema_from_std_encode() {
         .with_host_import_schemas(vec![schema])
         .expect("schema alignment");
     let bytes = encode_program(&program).expect("named host schema should encode");
-    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 14);
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
     let decoded = decode_program(&bytes).expect("embedded decoder should skip Named host schemas");
     assert_eq!(decoded.imports().len(), 1);
     assert_eq!(decoded.imports()[0].name, "embedded::named");
@@ -148,7 +148,7 @@ fn embedded_decoder_skips_named_host_schema_from_std_encode() {
 fn minimal_vmbc_prefix(constant_count: u32, code: &[u8], import_count: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"VMBC");
-    bytes.extend_from_slice(&14u16.to_le_bytes());
+    bytes.extend_from_slice(&13u16.to_le_bytes());
     bytes.extend_from_slice(&0u16.to_le_bytes());
     bytes.extend_from_slice(&constant_count.to_le_bytes());
     bytes.extend_from_slice(&(code.len() as u32).to_le_bytes());
@@ -617,7 +617,7 @@ fn embedded_decoder_rejects_oversized_nested_named_host_depth() {
 }
 
 #[test]
-fn embedded_decoder_reads_v14_guest_named_struct_payload() {
+fn embedded_decoder_reads_v13_guest_named_struct_payload() {
     let compiled = compile_source(
         r#"
         struct Point { x: int, y: int }
@@ -627,7 +627,7 @@ fn embedded_decoder_reads_v14_guest_named_struct_payload() {
     )
     .expect("guest Named source should compile");
     let bytes = encode_program(&compiled.program).expect("struct-bearing program should encode");
-    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 14);
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
     let program = decode_program(&bytes).expect("embedded decoder should skip guest named structs");
     assert_eq!(program.code().last().copied(), Some(OpCode::Ret as u8));
 }
