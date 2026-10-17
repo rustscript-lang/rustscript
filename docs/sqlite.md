@@ -13,21 +13,16 @@ arguments are borrowed for operations and consumed by `sqlite::close`.
 - `sqlite::close`
 
 The embedding policy controls the allowed database root, unsafe-SQL capability, and host
-ceilings. Configure that policy before opening a connection. Each operation is asynchronous;
-the VM resumes after the host operation completes.
+ceilings. Configure that policy before opening a connection. Each operation is an ordinary
+macro-owned async host function. It captures owned call data and awaits `tokio-rusqlite`, which
+serializes work on the connection and owns the blocking SQLite execution thread.
 
 ## Compiler and editor catalog boundary
 
-The typed SQLite catalog is a schema-only surface and does not construct a VM or link
-`rusqlite`. `sqlite_host_catalog` and the SQLite entries in `standard_host_catalog` remain
-available whenever the `runtime` feature is compiled, including builds without the `sqlite`
-feature. Catalog-aware compiler callers and the LSP use these declarations for named-struct
-field access and exact host signatures.
-
-The `sqlite` feature controls the executable SQLite module, generated SQLite namespace and
-callables, the `rusqlite` dependency, and SQLite registration exports. A runtime build without
-that feature can inspect the editor/compiler contract but has no SQLite implementation to bind;
-execution requires a build with `sqlite` enabled and the SQLite module registered.
+The `sqlite` feature publishes the complete SQLite module: its typed catalog, generated namespace
+and callables, `rusqlite` and `tokio-rusqlite` dependencies, and registration exports. Builds
+without that feature, and wasm-family builds, omit the SQLite namespace and catalog entirely.
+Execution also requires an async host bridge and the SQLite module registered.
 
 ## Open options (`SqliteOpenOptions`)
 
@@ -133,7 +128,7 @@ let rowid = inserted.last_insert_rowid;
 | `last_insert_rowid` | int |
 
 The parameter count and decoded text/blob byte length are checked against the connection
-limits before the operation is scheduled.
+limits before the adapter call is awaited.
 
 ## Query (`SqliteQueryResult` and `SqliteRow`)
 
@@ -206,11 +201,18 @@ SqliteTransactionResult {
 An execute statement produces `{ kind: "execute", execute: ... }`; a query statement produces
 `{ kind: "query", query: ... }`. The unselected envelope field is `null`. Discriminate with
 `kind` before using `execute` or `query`. The transaction remains atomic: statement order,
-rollback on failure, cancellation, deadlines, and result limits are preserved.
+rollback on failure, transaction deadlines, and result limits are preserved. A SQLite progress
+handler interrupts a transaction after its configured deadline so the transaction rolls back.
 
 ## Resource lifecycle
 
-`sqlite::close(db)` consumes the connection, cancels pending operations on it, and waits for
-worker cleanup through the VM execution scope. VM reset closes remaining connections and retires
-pending SQLite operations. Handles are VM-local and generation-checked, so a closed or foreign
-handle cannot be reused.
+`sqlite::close(db)` consumes the connection, begins adapter close before suspension, and removes
+the VM resource after close completes. Cancelling a blocked close leaves its resource-owned close
+lifecycle available for a later close call to poll to completion.
+VM reset interrupts active SQLite work and remains pending while the resource polls
+`tokio-rusqlite`'s `Connection::close`; the connection permit is released only after the adapter
+confirms that queued and running work has drained and the connection has closed. Cancelling an
+individual submitted future only drops that waiter. Its pending-operation lease remains owned by
+the queued adapter closure until the closure runs or is discarded, so canceled work still counts
+toward `max_pending_operations`. The host layer adds no worker or stronger cancellation mechanism.
+Handles are VM-local and generation-checked, so a closed or foreign handle cannot be reused.

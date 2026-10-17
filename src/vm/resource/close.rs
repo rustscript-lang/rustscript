@@ -29,10 +29,16 @@ pub enum CloseProgress {
 /// Contract:
 /// - [`begin_close`](HostResource::begin_close) must be idempotent and must
 ///   synchronously issue any cancel/close request.
+/// - [`begin_close_for_drop`](HostResource::begin_close_for_drop) is the abrupt
+///   teardown counterpart. It must only issue immediate, nonblocking requests:
+///   no waiting, polling, executor entry, or background work launch.
 /// - [`poll_close`](HostResource::poll_close) is called only after
 ///   `begin_close` returns [`CloseProgress::Pending`].
 /// - A concrete `Drop` remains the last-resort guard, but the VM may only reuse
 ///   a resource and its slot once `poll_close` completes.
+/// - Abrupt Drop must stay nonblocking. Resources that require asynchronous
+///   cleanup may issue an immediate best-effort cancellation/kill request, but
+///   must not poll, wait, or enter an executor from Drop.
 ///
 /// The `Any` supertrait lets the table reconnect each erased value to its
 /// concrete `TypeId` without ever naming a concrete class.
@@ -56,6 +62,19 @@ pub trait HostResource: Any + Send + 'static {
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         let _ = reason;
         Ok(CloseProgress::Ready)
+    }
+
+    /// Begins best-effort cleanup from an abrupt owner `Drop`.
+    ///
+    /// The default preserves existing behavior for resources whose
+    /// `begin_close` already obeys the nonblocking contract. Resources with a
+    /// synchronous explicit-close path must override this method and report
+    /// `Pending` whenever cleanup has only been launched.
+    fn begin_close_for_drop(
+        &mut self,
+        reason: ResourceCloseReason,
+    ) -> ResourceResult<CloseProgress> {
+        self.begin_close(reason)
     }
 
     /// Polls an in-progress close to completion.

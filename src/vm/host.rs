@@ -11,7 +11,9 @@ use crate::vm::resource::error::{ResourceError, ResourceErrorCode};
 use crate::vm::resource::handle::ResourceHandle;
 use crate::vm::resource::table::ResourceTable;
 
-use super::async_host::{HostFuture, HostFutureOutput, preserve_stream_cleanup};
+use super::async_host::{
+    HostFuture, HostFutureOutput, HostFutureResolution, preserve_stream_cleanup,
+};
 use super::capability::CapabilityProfile;
 use super::*;
 
@@ -802,21 +804,6 @@ pub enum HostAsyncOpTerminal {
     Failed,
 }
 
-impl HostAsyncOpTerminal {
-    /// Returns the reason used when default cleanup finalizes this terminal
-    /// operation. Cleanup is a terminal resource-release action rather than a
-    /// new cancellation request, so every terminal state uses the stable
-    /// `Requested` compatibility reason; an actual cancellation reason is
-    /// delivered earlier through `request_cancel_op`.
-    pub const fn cleanup_reason(self) -> OperationCancelReason {
-        match self {
-            Self::Completed => OperationCancelReason::Requested,
-            Self::Cancelled => OperationCancelReason::Requested,
-            Self::Failed => OperationCancelReason::Requested,
-        }
-    }
-}
-
 pub trait HostAsyncBridge: Send {
     fn submit_op(&mut self, _op_id: HostOpId, _future: HostFuture) -> VmResult<()> {
         Err(VmError::HostError(
@@ -830,38 +817,18 @@ pub trait HostAsyncBridge: Send {
         &mut self,
         op_id: HostOpId,
         cx: &mut Context<'_>,
-    ) -> Poll<VmResult<HostFutureOutput>> {
-        self.poll_op(op_id, cx)
-            .map(|result| result.map(HostFutureOutput::Return))
-    }
-
-    /// Legacy cancellation hook kept for bridge implementations that do not
-    /// need a lifecycle reason. It is used as a best-effort fallback by the
-    /// default [`request_cancel_op`](Self::request_cancel_op) implementation.
-    fn cancel_op(&mut self, _op_id: HostOpId) {}
-
-    /// Legacy cancellation hook kept for bridge implementations that do not
-    /// need a lifecycle reason. New bridges should implement
-    /// [`request_cancel_op`](Self::request_cancel_op) and
-    /// [`poll_cancel_op`](Self::poll_cancel_op) instead.
-    fn cancel_op_with_reason(&mut self, op_id: HostOpId, _reason: OperationCancelReason) {
-        self.cancel_op(op_id);
-    }
+    ) -> Poll<VmResult<HostFutureOutput>>;
 
     /// Requests cancellation of one bridge-owned operation.
     ///
     /// Returning `Ok(())` only records that the request was accepted. It does
     /// not mean that the operation has stopped; callers must poll
     /// [`poll_cancel_op`](Self::poll_cancel_op) until it returns `Ready(Ok(()))`.
-    /// The default invokes the legacy best-effort hook, then fails explicitly so
-    /// an adapter that has not opted into acknowledgement can never claim
-    /// quiescence.
     fn request_cancel_op(
         &mut self,
         op_id: HostOpId,
-        reason: OperationCancelReason,
+        _reason: OperationCancelReason,
     ) -> VmResult<()> {
-        self.cancel_op_with_reason(op_id, reason);
         Err(VmError::HostError(format!(
             "async host bridge does not provide cancellation acknowledgement for op {op_id}"
         )))
@@ -879,13 +846,7 @@ pub trait HostAsyncBridge: Send {
 
     /// Runs bridge-side cleanup after a terminal/quiescent outcome has been
     /// reported. The VM invokes this at most once for each tracked operation.
-    /// The default preserves compatibility with bridges whose legacy
-    /// `cancel_op` method also removes completed operation state while routing
-    /// through the reason-aware hook for newer bridges.
-    fn cleanup_op(&mut self, op_id: HostOpId, terminal: HostAsyncOpTerminal) -> VmResult<()> {
-        self.cancel_op_with_reason(op_id, terminal.cleanup_reason());
-        Ok(())
-    }
+    fn cleanup_op(&mut self, op_id: HostOpId, terminal: HostAsyncOpTerminal) -> VmResult<()>;
 }
 
 pub type StaticHostFunction = fn(&mut Vm, &[Value]) -> VmResult<CallOutcome>;
@@ -1571,18 +1532,6 @@ impl HostFunctionRegistry {
     pub fn authorize_registered_builtin_import(&mut self, name: &str) {
         self.capability_profile = Arc::new(self.capability_profile.with_host_import(name));
         self.invalidate_plan_cache();
-    }
-
-    /// Marks an exact import as owning its pending operation. Pending
-    /// dispatch is resolved from the generic VM operation/stream registries;
-    /// the marker is intentionally a registration hook with no domain state.
-    pub fn mark_exact_runtime_owned_pending(&mut self, name: &str) -> VmResult<()> {
-        if !self.contains_name(name) {
-            return Err(VmError::HostError(format!(
-                "cannot mark unregistered host import '{name}' as runtime-owned"
-            )));
-        }
-        Ok(())
     }
 
     pub fn register_catalog_stack<F>(
@@ -2752,46 +2701,32 @@ impl Vm {
             .insert(builtin_call_index, host_slot);
     }
 
-    pub fn set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) -> VmResult<()> {
-        if self.host.has_active_bridge_operations()
-            || self
-                .instance
-                .waiting_host_op
-                .as_ref()
-                .is_some_and(|waiting| {
-                    matches!(
-                        waiting.source,
-                        crate::vm::host::WaitingHostOpSource::HostBridge
-                    )
-                })
+    fn ensure_async_bridge_mutation_is_quiescent(&self, action: &str) -> VmResult<()> {
+        if self.instance.waiting_host_op.is_some()
+            || self.instance.host_stream.is_some()
+            || !self.host.async_work_is_quiescent()
         {
-            return Err(VmError::HostError(
-                "cannot replace async bridge while an active host operation is present".to_string(),
-            ));
+            return Err(VmError::HostError(format!(
+                "cannot {action} async bridge while VM async work, an active host operation, or execution scope lifecycle is not quiescent"
+            )));
         }
-        self.cancel_waiting_host_op_with_reason(OperationCancelReason::Requested)?;
+        Ok(())
+    }
+
+    pub fn set_async_bridge(&mut self, bridge: Box<dyn HostAsyncBridge>) -> VmResult<()> {
+        self.ensure_async_bridge_mutation_is_quiescent("replace")?;
         self.host.async_bridge = Some(bridge);
         Ok(())
     }
 
+    /// Removes the embedding async bridge after all bridge work and the
+    /// execution scope are quiescent.
+    ///
+    /// Live resources/operations and a pending reset retain the bridge because
+    /// process-backed async IO may still need the embedding Tokio runtime to
+    /// complete cleanup and reap its direct child.
     pub fn clear_async_bridge(&mut self) -> VmResult<()> {
-        if self.host.has_active_bridge_operations()
-            || self
-                .instance
-                .waiting_host_op
-                .as_ref()
-                .is_some_and(|waiting| {
-                    matches!(
-                        waiting.source,
-                        crate::vm::host::WaitingHostOpSource::HostBridge
-                    )
-                })
-        {
-            return Err(VmError::HostError(
-                "cannot clear async bridge while an active host operation is present".to_string(),
-            ));
-        }
-        self.cancel_waiting_host_op_with_reason(OperationCancelReason::Requested)?;
+        self.ensure_async_bridge_mutation_is_quiescent("clear")?;
         self.host.async_bridge = None;
         Ok(())
     }
@@ -3130,8 +3065,8 @@ impl Vm {
         match poll_result {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(output)) => {
-                let values = match output.finish(self) {
-                    Ok(values) => values,
+                let resolution = match output.finish(self) {
+                    Ok(resolution) => resolution,
                     Err(err) => {
                         if bridge_owned {
                             let cleanup = self.host.complete_bridge_operation(
@@ -3147,36 +3082,117 @@ impl Vm {
                         return Poll::Ready(Err(err));
                     }
                 };
-                if bridge_owned {
-                    let validation = validate_host_call_return(
-                        &values,
-                        waiting.expected_return_type,
-                        waiting.expected_return_schema.as_ref(),
-                        &self.program,
-                        self.host.execution_scope.resources(),
-                    );
-                    if let Err(error) = validation {
-                        let cleanup = self
-                            .host
-                            .complete_bridge_operation(waiting.op_id, HostAsyncOpTerminal::Failed);
-                        self.instance.waiting_host_op = None;
-                        return Poll::Ready(Err(cleanup.err().unwrap_or(error)));
+                match resolution {
+                    HostFutureResolution::Return(values) => {
+                        if bridge_owned {
+                            let validation = validate_host_call_return(
+                                &values,
+                                waiting.expected_return_type,
+                                waiting.expected_return_schema.as_ref(),
+                                &self.program,
+                                self.host.execution_scope.resources(),
+                            );
+                            if let Err(error) = validation {
+                                let cleanup = self.host.complete_bridge_operation(
+                                    waiting.op_id,
+                                    HostAsyncOpTerminal::Failed,
+                                );
+                                self.instance.waiting_host_op = None;
+                                return Poll::Ready(Err(cleanup.err().unwrap_or(error)));
+                            }
+                            if let Err(error) = self.host.complete_bridge_operation(
+                                waiting.op_id,
+                                HostAsyncOpTerminal::Completed,
+                            ) {
+                                self.instance.waiting_host_op = None;
+                                return Poll::Ready(Err(error));
+                            }
+                            self.instance.waiting_host_op = None;
+                            values.push_onto_stack(&mut self.instance.stack);
+                            return Poll::Ready(Ok(()));
+                        }
+                        if let Err(error) = self.complete_waiting_host_op(waiting.op_id, values) {
+                            return Poll::Ready(Err(error));
+                        }
+                        Poll::Ready(Ok(()))
                     }
-                    if let Err(error) = self
-                        .host
-                        .complete_bridge_operation(waiting.op_id, HostAsyncOpTerminal::Completed)
-                    {
-                        self.instance.waiting_host_op = None;
-                        return Poll::Ready(Err(error));
-                    }
-                    self.instance.waiting_host_op = None;
-                    values.push_onto_stack(&mut self.instance.stack);
-                    return Poll::Ready(Ok(()));
+                    HostFutureResolution::Continue(outcome) => match outcome {
+                        CallOutcome::Return(values) => {
+                            let validation = validate_host_call_return(
+                                &values,
+                                waiting.expected_return_type,
+                                waiting.expected_return_schema.as_ref(),
+                                &self.program,
+                                self.host.execution_scope.resources(),
+                            );
+                            let terminal = if validation.is_ok() {
+                                HostAsyncOpTerminal::Completed
+                            } else {
+                                HostAsyncOpTerminal::Failed
+                            };
+                            if bridge_owned
+                                && let Err(error) =
+                                    self.host.complete_bridge_operation(waiting.op_id, terminal)
+                            {
+                                self.instance.waiting_host_op = None;
+                                return Poll::Ready(Err(error));
+                            }
+                            self.instance.waiting_host_op = None;
+                            if let Err(error) = validation {
+                                return Poll::Ready(Err(error));
+                            }
+                            values.push_onto_stack(&mut self.instance.stack);
+                            Poll::Ready(Ok(()))
+                        }
+                        CallOutcome::Pending(op_id) => {
+                            if bridge_owned
+                                && let Err(error) = self.host.complete_bridge_operation(
+                                    waiting.op_id,
+                                    HostAsyncOpTerminal::Completed,
+                                )
+                            {
+                                self.instance.waiting_host_op = None;
+                                return Poll::Ready(Err(error));
+                            }
+                            self.instance.waiting_host_op = None;
+                            let source = self.host_call_pending_source(op_id);
+                            if let Err(error) = self.set_waiting_host_op_with_return(
+                                op_id,
+                                source,
+                                waiting.expected_return_type,
+                                waiting.expected_return_schema.as_ref(),
+                            ) {
+                                let cleanup =
+                                    if matches!(source, WaitingHostOpSource::CallableStream) {
+                                        self.cancel_callable_stream_with_reason(
+                                            OperationCancelReason::Requested,
+                                        )
+                                    } else {
+                                        Ok(())
+                                    };
+                                return Poll::Ready(Err(preserve_stream_cleanup(error, cleanup)));
+                            }
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                        CallOutcome::Halt | CallOutcome::Yield => {
+                            if bridge_owned
+                                && let Err(error) = self.host.complete_bridge_operation(
+                                    waiting.op_id,
+                                    HostAsyncOpTerminal::Failed,
+                                )
+                            {
+                                self.instance.waiting_host_op = None;
+                                return Poll::Ready(Err(error));
+                            }
+                            self.instance.waiting_host_op = None;
+                            Poll::Ready(Err(VmError::HostError(
+                                "async host continuation returned a control-flow outcome"
+                                    .to_string(),
+                            )))
+                        }
+                    },
                 }
-                if let Err(error) = self.complete_waiting_host_op(waiting.op_id, values) {
-                    return Poll::Ready(Err(error));
-                }
-                Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(err)) => {
                 if matches!(waiting.source, WaitingHostOpSource::HostBridge) {
@@ -3237,11 +3253,11 @@ impl Vm {
             match self.poll_waiting_host_op(&mut cx) {
                 Poll::Ready(result) => return result,
                 Poll::Pending => {
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(not(target_family = "wasm"))]
                     {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
-                    #[cfg(target_arch = "wasm32")]
+                    #[cfg(target_family = "wasm")]
                     {
                         return Err(VmError::HostError(
                             "blocking host-op wait is unsupported on wasm32 runtime".to_string(),
@@ -4412,6 +4428,18 @@ impl Vm {
             self.host.track_bridge_host_op(op_id)?;
         }
         let expected_return_schema = expected_return_schema.cloned();
+        if matches!(source, WaitingHostOpSource::CallableStream) {
+            let stream = self
+                .instance
+                .host_stream
+                .as_mut()
+                .filter(|stream| stream.op_id == op_id)
+                .ok_or(VmError::InvalidFrameState(
+                    "missing callable stream continuation for waiting operation",
+                ))?;
+            stream.expected_return_type = expected_return_type;
+            stream.expected_return_schema = expected_return_schema.clone();
+        }
         self.instance.waiting_host_op = Some(WaitingHostOp {
             op_id,
             source,

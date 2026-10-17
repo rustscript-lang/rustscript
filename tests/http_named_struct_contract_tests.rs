@@ -12,6 +12,9 @@
 
 #![cfg(all(feature = "http-client", not(target_family = "wasm")))]
 
+#[path = "support/http_test_bridge.rs"]
+mod http_test_bridge;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
@@ -33,10 +36,7 @@ fn resource(name: &str) -> HostTypeSchema {
     HostTypeSchema::Resource(key(name))
 }
 
-const RESOURCE_KEYS: [&str; 7] = [
-    "http.internal.request_worker",
-    "http.internal.response_stream",
-    "http.sse",
+const RESOURCE_KEYS: [&str; 4] = [
     "http.request",
     "http.response",
     "http.headers",
@@ -907,6 +907,7 @@ fn default_compile_source_emits_the_exact_http_module_schema() {
     assert_eq!(schema.return_type, resource("http.sse_summary"));
 
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
         .expect("default registry must exact-bind catalog-backed SSE");
@@ -956,6 +957,7 @@ fn default_registry_binds_the_resource_surface_and_reports_a_live_builder() {
     .expect("resource source compiles")
     .program;
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
         .expect("default registry must bind the resource surface");
@@ -977,6 +979,7 @@ fn method_validation_happens_at_the_host_boundary_not_the_call_site() {
             .expect("the method string is a guest value, so it must compile")
             .program;
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
         .expect("bind");
@@ -1002,6 +1005,7 @@ fn permissions_preflight_every_http_import_before_any_mutation() {
     .expect("resource source compiles")
     .program;
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     let mut registry = HostFunctionRegistry::restricted();
     registry.set_capability_profile(
         CapabilityProfile::builder()
@@ -1035,6 +1039,7 @@ fn full_grant_preflight_binds_every_http_import() {
     .expect("resource source compiles")
     .program;
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     let mut registry = HostFunctionRegistry::restricted();
     registry.set_capability_profile(
         CapabilityProfile::builder()
@@ -1048,11 +1053,12 @@ fn full_grant_preflight_binds_every_http_import() {
 }
 
 #[test]
-fn sse_runtime_callback_validators_keep_the_named_legacy_contract() {
+fn sse_runtime_callback_validator_uses_current_positional_contract() {
     let program = compile_source(r#"pub fn callback(item: map) -> map { { action: "continue" } }"#)
         .expect("map callback compiles in isolation")
         .program;
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     assert_eq!(vm.run().expect("run"), VmStatus::Halted);
     let callback = vm
         .resolve_exported_callable("callback")
@@ -1065,10 +1071,20 @@ fn sse_runtime_callback_validators_keep_the_named_legacy_contract() {
     assert!(
         matches!(
             error,
-            VmError::TypeMismatch("fn(SseEvent) -> SseCallbackAction")
+            VmError::CallableArityMismatch {
+                expected: 4,
+                got: 1,
+                ..
+            }
         ),
-        "the SSE callback diagnostic must name the removed named contract, got {error:?}"
+        "{error:?}"
     );
+    let mut current = Vm::new(compile_source("pub fn callback(event: string, data: string, id: string, retry: string) -> bool { true }").unwrap().program);
+    assert_eq!(current.run().unwrap(), VmStatus::Halted);
+    let callback = current.resolve_exported_callable("callback").unwrap();
+    current
+        .validate_sse_callback_value(&callback)
+        .expect("current event callback");
 }
 
 #[test]
@@ -1077,6 +1093,7 @@ fn generic_stream_callback_mismatch_describes_named_compatibility() {
         .expect("mismatched callback compiles in isolation")
         .program;
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     assert_eq!(vm.run().expect("run"), VmStatus::Halted);
     let callback = vm
         .resolve_exported_callable("callback")
@@ -1112,6 +1129,7 @@ fn local_http_config(port: u16) -> HttpConfig {
 fn bind_resource_vm(source: &str, port: u16) -> Vm {
     let compiled = compile_source(source).expect("source should compile");
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(local_http_config(port)).expect("config");
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)

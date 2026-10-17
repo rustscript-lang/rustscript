@@ -1,59 +1,19 @@
 #![cfg(all(feature = "http-client", not(target_family = "wasm")))]
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
-use std::task::{Context, Poll};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use vm::{
-    CallOutcome, CallReturn, HostAsyncBridge, HostFunctionRegistry, HostFuture, HostFutureOutput,
-    HostOpId, HttpConfig, HttpHostExt, Program, Value, Vm, VmError, VmResult, VmStatus,
-    compile_source,
+    CallOutcome, CallReturn, HostFunctionRegistry, HttpConfig, HttpHostExt, Program, Value, Vm,
+    VmError, VmStatus, compile_source,
 };
 
-#[derive(Default)]
-struct TokioHostDriver {
-    submitted: HashMap<HostOpId, HostFuture>,
-}
-
-impl HostAsyncBridge for TokioHostDriver {
-    fn submit_op(&mut self, op_id: HostOpId, future: HostFuture) -> VmResult<()> {
-        self.submitted.insert(op_id, future);
-        Ok(())
-    }
-
-    fn poll_op(&mut self, op_id: HostOpId, _cx: &mut Context<'_>) -> Poll<VmResult<CallReturn>> {
-        Poll::Ready(Err(VmError::HostError(format!(
-            "unknown external host operation {op_id}"
-        ))))
-    }
-
-    fn poll_submitted_op(
-        &mut self,
-        op_id: HostOpId,
-        cx: &mut Context<'_>,
-    ) -> Poll<VmResult<HostFutureOutput>> {
-        let poll = self.submitted.get_mut(&op_id).map_or_else(
-            || {
-                Poll::Ready(Err(VmError::HostError(format!(
-                    "unknown submitted host operation {op_id}"
-                ))))
-            },
-            |future| future.as_mut().poll(cx),
-        );
-        if poll.is_ready() {
-            self.submitted.remove(&op_id);
-        }
-        poll
-    }
-
-    fn cancel_op(&mut self, op_id: HostOpId) {
-        self.submitted.remove(&op_id);
-    }
-}
+#[path = "../support/http_test_bridge.rs"]
+mod http_test_bridge;
+use http_test_bridge::TokioHostDriver;
 
 fn install_host_driver(vm: &mut Vm) {
     vm.set_async_bridge(Box::<TokioHostDriver>::default())
@@ -319,7 +279,7 @@ fn spawn_redirect_server(
                 };
                 write!(
                     stream,
-                    "HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+                    "HTTP/1.1 {status} Redirect\r\nConnection: close\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
                 )
                 .expect("redirect response should be writable");
             } else {
@@ -427,7 +387,7 @@ fn spawn_cross_origin_redirect_servers(
         source_sender.send(request).expect("source request record");
         write!(
             stream,
-            "HTTP/1.1 {status} Redirect\r\nLocation: http://127.0.0.1:{target_port}/final\r\nContent-Length: 0\r\n\r\n"
+            "HTTP/1.1 {status} Redirect\r\nConnection: close\r\nLocation: http://127.0.0.1:{target_port}/final\r\nContent-Length: 0\r\n\r\n"
         )
         .expect("redirect response should be writable");
     });
@@ -509,6 +469,7 @@ async fn run_raw_response(response: Vec<u8>, mut config: HttpConfig) -> Result<V
         &[],
         PROBE_STATUS_AND_HEADERS,
     ));
+    http_test_bridge::install(&mut vm);
     vm.configure_http(config)
         .expect("raw-response HTTP configuration should be valid");
     install_host_driver(&mut vm);
@@ -530,6 +491,7 @@ async fn http_host_executes_a_bounded_request_and_returns_a_response_map() {
         &[],
         PROBE_STATUS_AND_BODY,
     ));
+    http_test_bridge::install(&mut vm);
     vm.configure_http(local_http_config(port))
         .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
@@ -600,6 +562,7 @@ async fn buffered_request_preserves_duplicate_header_order() {
         PROBE_STATUS_AND_BODY,
     );
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     vm.configure_http(local_http_config(port))
         .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
@@ -633,6 +596,7 @@ async fn buffered_redirect_rewrites_only_post_for_301_and_302() {
                 &[],
                 PROBE_STATUS_AND_BODY,
             ));
+            http_test_bridge::install(&mut vm);
             vm.configure_http(local_http_config(port))
                 .expect("HTTP configuration should be valid");
             install_host_driver(&mut vm);
@@ -684,6 +648,7 @@ async fn buffered_cross_origin_redirect_strips_credentials_and_custom_headers() 
         let mut vm = Vm::new(build_redirect_fixture_program(&format!(
             "http://127.0.0.1:{source_port}/start"
         )));
+        http_test_bridge::install(&mut vm);
         vm.configure_http(http_config)
             .expect("HTTP configuration should be valid");
         install_host_driver(&mut vm);
@@ -770,6 +735,7 @@ async fn buffered_same_origin_redirect_preserves_caller_header_values() {
         let mut vm = Vm::new(build_redirect_fixture_program(&format!(
             "http://127.0.0.1:{port}/start"
         )));
+        http_test_bridge::install(&mut vm);
         vm.configure_http(local_http_config(port))
             .expect("HTTP configuration should be valid");
         install_host_driver(&mut vm);
@@ -894,6 +860,7 @@ async fn buffered_redirect_chain_reaches_final_body() {
     let mut vm = Vm::new(build_request_program(format!(
         "http://127.0.0.1:{port}/start"
     )));
+    http_test_bridge::install(&mut vm);
     vm.configure_http(local_http_config(port))
         .expect("HTTP configuration should be valid");
     install_host_driver(&mut vm);
@@ -918,6 +885,7 @@ async fn buffered_redirect_chain_reaches_final_body() {
 #[test]
 fn http_host_rejects_targets_until_an_explicit_policy_allows_them() {
     let mut vm = Vm::new(build_capability_program("http://127.0.0.1:1/"));
+    http_test_bridge::install(&mut vm);
     HostFunctionRegistry::new()
         .bind_vm_cached(&mut vm)
         .expect("default host registry should bind HTTP");
@@ -957,6 +925,7 @@ fn empty_registry_keeps_language_builtins_but_rejects_http_capability() {
             .expect("language builtin program should compile")
             .program,
     );
+    http_test_bridge::install(&mut language_vm);
     HostFunctionRegistry::empty()
         .bind_vm_cached(&mut language_vm)
         .expect("empty registry should bind a program without host imports");
@@ -966,6 +935,7 @@ fn empty_registry_keeps_language_builtins_but_rejects_http_capability() {
     );
 
     let mut http_vm = Vm::new(build_capability_program("http://127.0.0.1:1/"));
+    http_test_bridge::install(&mut http_vm);
     let error = HostFunctionRegistry::restricted()
         .bind_vm_cached(&mut http_vm)
         .expect_err("unapproved HTTP capability must fail during preflight");
@@ -986,6 +956,7 @@ io::open("/tmp/rustscript-capability-test", "r");"#,
     )
     .expect("namespaced host builtin should compile");
     let mut vm = Vm::new(compiled.program);
+    http_test_bridge::install(&mut vm);
     let error = HostFunctionRegistry::restricted()
         .bind_vm_cached(&mut vm)
         .expect_err("ungranted namespaced builtin must fail during preflight");
@@ -1000,6 +971,7 @@ fn capability_binding_plan_cannot_cross_registry_profiles() {
         .prepare_plan_with_schemas(&program.imports, program.host_import_schemas())
         .expect("unrestricted registry should prepare HTTP plan");
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     let error = HostFunctionRegistry::restricted()
         .bind_vm_with_plan(&mut vm, &plan)
         .expect_err("capability plan must not cross registry profiles");
@@ -1017,6 +989,7 @@ fn capability_binding_plan_cannot_outlive_registry_mutation() {
         .allow_builtin("io::open")
         .expect("io capability should be a known builtin");
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     let error = registry
         .bind_vm_with_plan(&mut vm, &plan)
         .expect_err("stale capability plan must not bind");
@@ -1036,6 +1009,7 @@ fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
         .expect("restricted registry should prepare HTTP plan");
     let unchanged_clone = unchanged_registry.clone();
     let mut unchanged_vm = Vm::new(unchanged_program);
+    http_test_bridge::install(&mut unchanged_vm);
     unchanged_clone
         .bind_vm_with_plan(&mut unchanged_vm, &unchanged_plan)
         .expect("an unchanged registry clone should reuse the plan");
@@ -1055,6 +1029,7 @@ fn capability_binding_plan_detects_divergent_registry_clone_mutations() {
         )
         .expect("first capability branch should prepare HTTP plan");
     let mut mutated_vm = Vm::new(branch_program);
+    http_test_bridge::install(&mut mutated_vm);
     let error = second_mutation
         .bind_vm_with_plan(&mut mutated_vm, &plan)
         .expect_err("divergent capability branches must reject each other's plan");
@@ -1074,6 +1049,7 @@ fn registry_state_rejects_structural_sibling_mutations() {
         .prepare_plan_with_schemas(&program.imports, program.host_import_schemas())
         .expect("mutated source registry should prepare HTTP plan");
     let mut vm = Vm::new(program);
+    http_test_bridge::install(&mut vm);
     let error = destination
         .bind_vm_with_plan(&mut vm, &plan)
         .expect_err("structural sibling mutation must reject the plan");
@@ -1088,6 +1064,7 @@ fn cached_plan_refreshes_after_a_sibling_registry_mutation() {
     let destination = registry;
 
     let mut priming_vm = Vm::new(build_capability_program("http://127.0.0.1:1/"));
+    http_test_bridge::install(&mut priming_vm);
     destination
         .bind_vm_cached(&mut priming_vm)
         .expect("destination should prime its plan cache");
@@ -1096,6 +1073,7 @@ fn cached_plan_refreshes_after_a_sibling_registry_mutation() {
     });
 
     let mut refreshed_vm = Vm::new(program);
+    http_test_bridge::install(&mut refreshed_vm);
     destination
         .bind_vm_cached(&mut refreshed_vm)
         .expect("destination should rebuild a plan after sibling mutation");
@@ -1115,6 +1093,7 @@ async fn max_stream_duration_does_not_shorten_buffered_requests() {
             .unwrap();
     });
     let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+    http_test_bridge::install(&mut vm);
     let mut buffered_config = local_http_config(port);
     buffered_config.max_stream_duration = std::time::Duration::from_millis(1);
     buffered_config.request_timeout = std::time::Duration::from_millis(200);
@@ -1129,6 +1108,7 @@ async fn max_stream_duration_does_not_shorten_buffered_requests() {
 #[tokio::test(flavor = "current_thread")]
 async fn explicitly_allowed_http_capability_reaches_http_policy() {
     let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
+    http_test_bridge::install(&mut vm);
     vm.configure_http(HttpConfig {
         allowed_schemes: vec!["http".to_string()],
         allowed_hosts: vec!["127.0.0.1".to_string()],
@@ -1152,6 +1132,7 @@ async fn explicitly_allowed_http_capability_reaches_http_policy() {
 #[test]
 fn http_in_flight_limit_rejects_before_starting_a_request() {
     let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
+    http_test_bridge::install(&mut vm);
     vm.set_http_max_in_flight(0);
     vm.configure_http(HttpConfig {
         allowed_schemes: vec!["http".to_string()],
@@ -1220,6 +1201,7 @@ fn http_config_accepts_bounded_stream_defaults_and_rejects_zero_bounds() {
     }
 
     let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    http_test_bridge::install(&mut vm);
     let error = vm
         .configure_http(HttpConfig {
             max_stream_item_bytes: 0,
@@ -1242,6 +1224,7 @@ fn http_config_rejects_request_timeout_that_cannot_form_a_deadline() {
     assert!(validation_error.to_string().contains("request_timeout"));
 
     let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    http_test_bridge::install(&mut vm);
     let configure_error = vm
         .configure_http(invalid)
         .expect_err("configuration must reject an overflowing request timeout");
@@ -1258,6 +1241,7 @@ fn http_config_rejects_request_timeout_that_cannot_form_a_deadline() {
     assert!(validation_error.to_string().contains("max_stream_duration"));
 
     let mut vm = Vm::new(Program::new(Vec::new(), Vec::new()));
+    http_test_bridge::install(&mut vm);
     let configure_error = vm
         .configure_http(invalid)
         .expect_err("configuration must reject an overflowing stream duration");
@@ -1361,6 +1345,7 @@ async fn reset_and_wait(vm: &mut Vm) -> Result<(), vm::VmError> {
 async fn reset_retires_buffered_http_future_and_releases_its_permit() {
     let (port, ready, server) = spawn_pending_then_response_server();
     let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+    http_test_bridge::install(&mut vm);
     vm.set_http_max_in_flight(1);
     vm.configure_http(local_http_config(port))
         .expect("HTTP configuration should be valid");
@@ -1394,6 +1379,7 @@ fn shutdown_and_drop_retire_buffered_http_futures() {
     for shutdown in [true, false] {
         let (port, ready, server) = spawn_pending_server();
         let mut vm = Vm::new(build_request_program(format!("http://127.0.0.1:{port}/")));
+        http_test_bridge::install(&mut vm);
         vm.set_http_max_in_flight(1);
         vm.configure_http(local_http_config(port))
             .expect("HTTP configuration should be valid");
@@ -1420,6 +1406,7 @@ fn shutdown_and_drop_retire_buffered_http_futures() {
 #[test]
 fn http_config_and_max_policy_are_persistent_while_clear_removes_only_config() {
     let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
+    http_test_bridge::install(&mut vm);
     vm.set_http_max_in_flight(2);
     vm.configure_http(local_http_config(1))
         .expect("HTTP config should be valid");
@@ -1456,6 +1443,7 @@ fn set_max_in_flight_updates_policy_without_eagerly_creating_runtime_state() {
     struct Probe;
 
     let mut vm = Vm::new(build_request_program("http://127.0.0.1:1/".to_string()));
+    http_test_bridge::install(&mut vm);
     // No scope runtime state exists yet: set_http_max_in_flight must not
     // eagerly create any arena state or ordinary resource.
     vm.set_http_max_in_flight(5);

@@ -111,10 +111,6 @@ pub enum HostBindingKind {
     Static,
     /// Stack-mutating adapter with `&mut Vm`.
     StaticStack,
-    /// Stack-mutating adapter whose pending operation is owned by the generic
-    /// runtime operation/stream registries rather than by a registered
-    /// operation driver.
-    StaticStackRuntimeOwned,
     /// Args-slice adapter without `&mut Vm`.
     StaticArgs,
     /// Non-yielding args-slice adapter.
@@ -154,8 +150,6 @@ pub enum HostAdapterDescriptor {
     Static(super::host::StaticHostFunction),
     /// [`super::host::StaticHostStackFunction`].
     StaticStack(super::host::StaticHostStackFunction),
-    /// Pending-operation-owning [`super::host::StaticHostStackFunction`].
-    StaticStackRuntimeOwned(super::host::StaticHostStackFunction),
     /// [`super::host::StaticHostArgsFunction`].
     StaticArgs(super::host::StaticHostArgsFunction),
     /// Non-yielding [`super::host::StaticHostArgsFunction`].
@@ -534,7 +528,6 @@ fn install_descriptor_adapter(
     descriptor: &HostFunctionDescriptor,
     schema: HostImportSchema,
 ) -> VmResult<()> {
-    let mut runtime_owned_pending: Option<String> = None;
     let result = match (&descriptor.binding.kind, &descriptor.adapter) {
         (HostBindingKind::Static, HostAdapterDescriptor::Static(function)) => {
             registry.register_catalog_static(schema, *function)
@@ -542,13 +535,7 @@ fn install_descriptor_adapter(
         (HostBindingKind::StaticStack, HostAdapterDescriptor::StaticStack(function)) => {
             registry.register_catalog_static_stack(schema, *function)
         }
-        (
-            HostBindingKind::StaticStackRuntimeOwned,
-            HostAdapterDescriptor::StaticStackRuntimeOwned(function),
-        ) => {
-            runtime_owned_pending = Some(schema.name.clone());
-            registry.register_catalog_static_stack(schema, *function)
-        }
+
         (HostBindingKind::StaticArgs, HostAdapterDescriptor::StaticArgs(function)) => {
             registry.register_catalog_static_args(schema, *function)
         }
@@ -572,12 +559,6 @@ fn install_descriptor_adapter(
             descriptor.schema.name
         ))
     })?;
-    if let Some(name) = runtime_owned_pending {
-        // The pending operation is resolved from the generic VM
-        // operation/stream registries, which requires the registered import to
-        // be marked runtime-owned.
-        registry.mark_exact_runtime_owned_pending(&name)?;
-    }
     let _ = registered;
     Ok(())
 }

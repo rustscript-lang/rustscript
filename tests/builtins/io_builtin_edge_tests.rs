@@ -28,6 +28,31 @@ fn run_source_host_error(source: &str) -> String {
     }
 }
 
+fn run_vm_to_error(vm: &mut Vm) -> VmError {
+    let mut status = match vm.run() {
+        Ok(status) => status,
+        Err(error) => return error,
+    };
+    loop {
+        status = match status {
+            VmStatus::Halted => panic!("expected host error, VM halted"),
+            VmStatus::Yielded => match vm.resume() {
+                Ok(status) => status,
+                Err(error) => return error,
+            },
+            VmStatus::Waiting(_) => {
+                if let Err(error) = vm.wait_for_host_op_blocking() {
+                    return error;
+                }
+                match vm.resume() {
+                    Ok(status) => status,
+                    Err(error) => return error,
+                }
+            }
+        };
+    }
+}
+
 #[test]
 fn io_open_rejects_unsupported_mode() {
     let err = run_source_host_error(
@@ -235,13 +260,7 @@ fn io_policy_limits_write_size() {
         .bind_vm_cached(&mut vm)
         .expect("profile should bind");
 
-    assert!(matches!(
-        vm.run().expect("open should start"),
-        VmStatus::Waiting(_)
-    ));
-    vm.wait_for_host_op_blocking()
-        .expect("open should complete");
-    let error = vm.resume().expect_err("oversized write should be denied");
+    let error = run_vm_to_error(&mut vm);
     assert!(matches!(error, VmError::HostError(message) if message.contains("write limit")));
     let _ = std::fs::remove_file(path);
 }

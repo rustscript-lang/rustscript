@@ -165,8 +165,7 @@ pub fn standard_host_modules() -> &'static [StandardHostModule] {
         #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
         modules.push(super::http::http_host_module());
         modules.push(super::io::io_host_module());
-        // The SQLite catalog surface is composed in every build; the feature
-        // only selects whether the adapters are the real host functions.
+        #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
         modules.push(super::sqlite_schema::sqlite_standard_host_module());
         modules.push(super::timer::timer_host_module());
         modules.sort_by_key(|module| module.name);

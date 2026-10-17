@@ -1,0 +1,1284 @@
+{
+  "resources": [
+    {
+      "key": "sqlite.connection",
+      "description": "An open SQLite connection"
+    }
+  ],
+  "structs": [
+    {
+      "name": "SqliteOpenOptions",
+      "fields": [
+        {
+          "name": "path",
+          "ty": {
+            "Optional": "String"
+          }
+        },
+        {
+          "name": "mode",
+          "ty": {
+            "Optional": "String"
+          }
+        },
+        {
+          "name": "root",
+          "ty": {
+            "Optional": "String"
+          }
+        },
+        {
+          "name": "limits",
+          "ty": {
+            "Optional": {
+              "Named": {
+                "name": "SqliteLimits",
+                "fields": [
+                  {
+                    "name": "max_connections",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_statements",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_rows",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_columns",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_result_bytes",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_statement_bytes",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_parameters",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_parameter_bytes",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_pending_operations",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_transaction_ms",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "busy_timeout_ms",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "description": ""
+    },
+    {
+      "name": "SqliteLimits",
+      "fields": [
+        {
+          "name": "max_connections",
+          "ty": {
+            "Optional": "Int"
+          }
+        },
+        {
+          "name": "max_statements",
+          "ty": {
+            "Optional": "Int"
+          }
+        },
+        {
+          "name": "max_rows",
+          "ty": {
+            "Optional": "Int"
+          }
+        },
+        {
+          "name": "max_columns",
+          "ty": {
+            "Optional": "Int"
+          }
+        },
+        {
+          "name": "max_result_bytes",
+          "ty": {
+            "Optional": "Int"
+          }
+        },
+        {
+          "name": "max_statement_bytes",
+          "ty": {
+            "Optional": "Int"
+          }
+        },
+        {
+          "name": "max_parameters",
+          "ty": {
+            "Optional": "Int"
+          }
+        },
+        {
+          "name": "max_parameter_bytes",
+          "ty": {
+            "Optional": "Int"
+          }
+        },
+        {
+          "name": "max_pending_operations",
+          "ty": {
+            "Optional": "Int"
+          }
+        },
+        {
+          "name": "max_transaction_ms",
+          "ty": {
+            "Optional": "Int"
+          }
+        },
+        {
+          "name": "busy_timeout_ms",
+          "ty": {
+            "Optional": "Int"
+          }
+        }
+      ],
+      "description": ""
+    },
+    {
+      "name": "SqliteValue",
+      "fields": [
+        {
+          "name": "kind",
+          "ty": "String"
+        },
+        {
+          "name": "int_value",
+          "ty": {
+            "Optional": "Int"
+          }
+        },
+        {
+          "name": "float_value",
+          "ty": {
+            "Optional": "Float"
+          }
+        },
+        {
+          "name": "text_value",
+          "ty": {
+            "Optional": "String"
+          }
+        },
+        {
+          "name": "blob_value",
+          "ty": {
+            "Optional": "Bytes"
+          }
+        }
+      ],
+      "description": ""
+    },
+    {
+      "name": "SqliteExecuteResult",
+      "fields": [
+        {
+          "name": "rows_affected",
+          "ty": "Int"
+        },
+        {
+          "name": "last_insert_rowid",
+          "ty": "Int"
+        }
+      ],
+      "description": ""
+    },
+    {
+      "name": "SqliteQueryResult",
+      "fields": [
+        {
+          "name": "columns",
+          "ty": {
+            "Array": "String"
+          }
+        },
+        {
+          "name": "rows",
+          "ty": {
+            "Array": {
+              "Named": {
+                "name": "SqliteRow",
+                "fields": [
+                  {
+                    "name": "cells",
+                    "ty": {
+                      "Array": {
+                        "Named": {
+                          "name": "SqliteValue",
+                          "fields": [
+                            {
+                              "name": "kind",
+                              "ty": "String"
+                            },
+                            {
+                              "name": "int_value",
+                              "ty": {
+                                "Optional": "Int"
+                              }
+                            },
+                            {
+                              "name": "float_value",
+                              "ty": {
+                                "Optional": "Float"
+                              }
+                            },
+                            {
+                              "name": "text_value",
+                              "ty": {
+                                "Optional": "String"
+                              }
+                            },
+                            {
+                              "name": "blob_value",
+                              "ty": {
+                                "Optional": "Bytes"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "name": "truncated",
+          "ty": "Bool"
+        },
+        {
+          "name": "next_cursor",
+          "ty": {
+            "Optional": "Int"
+          }
+        }
+      ],
+      "description": ""
+    },
+    {
+      "name": "SqliteRow",
+      "fields": [
+        {
+          "name": "cells",
+          "ty": {
+            "Array": {
+              "Named": {
+                "name": "SqliteValue",
+                "fields": [
+                  {
+                    "name": "kind",
+                    "ty": "String"
+                  },
+                  {
+                    "name": "int_value",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "float_value",
+                    "ty": {
+                      "Optional": "Float"
+                    }
+                  },
+                  {
+                    "name": "text_value",
+                    "ty": {
+                      "Optional": "String"
+                    }
+                  },
+                  {
+                    "name": "blob_value",
+                    "ty": {
+                      "Optional": "Bytes"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "description": ""
+    },
+    {
+      "name": "SqliteStatement",
+      "fields": [
+        {
+          "name": "sql",
+          "ty": "String"
+        },
+        {
+          "name": "params",
+          "ty": {
+            "Optional": {
+              "Array": {
+                "Named": {
+                  "name": "SqliteValue",
+                  "fields": [
+                    {
+                      "name": "kind",
+                      "ty": "String"
+                    },
+                    {
+                      "name": "int_value",
+                      "ty": {
+                        "Optional": "Int"
+                      }
+                    },
+                    {
+                      "name": "float_value",
+                      "ty": {
+                        "Optional": "Float"
+                      }
+                    },
+                    {
+                      "name": "text_value",
+                      "ty": {
+                        "Optional": "String"
+                      }
+                    },
+                    {
+                      "name": "blob_value",
+                      "ty": {
+                        "Optional": "Bytes"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "query",
+          "ty": {
+            "Optional": "Bool"
+          }
+        },
+        {
+          "name": "limits",
+          "ty": {
+            "Optional": {
+              "Named": {
+                "name": "SqliteLimits",
+                "fields": [
+                  {
+                    "name": "max_connections",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_statements",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_rows",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_columns",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_result_bytes",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_statement_bytes",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_parameters",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_parameter_bytes",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_pending_operations",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "max_transaction_ms",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "busy_timeout_ms",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "description": ""
+    },
+    {
+      "name": "SqliteTransactionResult",
+      "fields": [
+        {
+          "name": "kind",
+          "ty": "String"
+        },
+        {
+          "name": "execute",
+          "ty": {
+            "Optional": {
+              "Named": {
+                "name": "SqliteExecuteResult",
+                "fields": [
+                  {
+                    "name": "rows_affected",
+                    "ty": "Int"
+                  },
+                  {
+                    "name": "last_insert_rowid",
+                    "ty": "Int"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "name": "query",
+          "ty": {
+            "Optional": {
+              "Named": {
+                "name": "SqliteQueryResult",
+                "fields": [
+                  {
+                    "name": "columns",
+                    "ty": {
+                      "Array": "String"
+                    }
+                  },
+                  {
+                    "name": "rows",
+                    "ty": {
+                      "Array": {
+                        "Named": {
+                          "name": "SqliteRow",
+                          "fields": [
+                            {
+                              "name": "cells",
+                              "ty": {
+                                "Array": {
+                                  "Named": {
+                                    "name": "SqliteValue",
+                                    "fields": [
+                                      {
+                                        "name": "kind",
+                                        "ty": "String"
+                                      },
+                                      {
+                                        "name": "int_value",
+                                        "ty": {
+                                          "Optional": "Int"
+                                        }
+                                      },
+                                      {
+                                        "name": "float_value",
+                                        "ty": {
+                                          "Optional": "Float"
+                                        }
+                                      },
+                                      {
+                                        "name": "text_value",
+                                        "ty": {
+                                          "Optional": "String"
+                                        }
+                                      },
+                                      {
+                                        "name": "blob_value",
+                                        "ty": {
+                                          "Optional": "Bytes"
+                                        }
+                                      }
+                                    ]
+                                  }
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "name": "truncated",
+                    "ty": "Bool"
+                  },
+                  {
+                    "name": "next_cursor",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "description": ""
+    }
+  ],
+  "functions": [
+    {
+      "name": "sqlite::open",
+      "params": [
+        {
+          "name": "options",
+          "ty": {
+            "Named": {
+              "name": "SqliteOpenOptions",
+              "fields": [
+                {
+                  "name": "path",
+                  "ty": {
+                    "Optional": "String"
+                  }
+                },
+                {
+                  "name": "mode",
+                  "ty": {
+                    "Optional": "String"
+                  }
+                },
+                {
+                  "name": "root",
+                  "ty": {
+                    "Optional": "String"
+                  }
+                },
+                {
+                  "name": "limits",
+                  "ty": {
+                    "Optional": {
+                      "Named": {
+                        "name": "SqliteLimits",
+                        "fields": [
+                          {
+                            "name": "max_connections",
+                            "ty": {
+                              "Optional": "Int"
+                            }
+                          },
+                          {
+                            "name": "max_statements",
+                            "ty": {
+                              "Optional": "Int"
+                            }
+                          },
+                          {
+                            "name": "max_rows",
+                            "ty": {
+                              "Optional": "Int"
+                            }
+                          },
+                          {
+                            "name": "max_columns",
+                            "ty": {
+                              "Optional": "Int"
+                            }
+                          },
+                          {
+                            "name": "max_result_bytes",
+                            "ty": {
+                              "Optional": "Int"
+                            }
+                          },
+                          {
+                            "name": "max_statement_bytes",
+                            "ty": {
+                              "Optional": "Int"
+                            }
+                          },
+                          {
+                            "name": "max_parameters",
+                            "ty": {
+                              "Optional": "Int"
+                            }
+                          },
+                          {
+                            "name": "max_parameter_bytes",
+                            "ty": {
+                              "Optional": "Int"
+                            }
+                          },
+                          {
+                            "name": "max_pending_operations",
+                            "ty": {
+                              "Optional": "Int"
+                            }
+                          },
+                          {
+                            "name": "max_transaction_ms",
+                            "ty": {
+                              "Optional": "Int"
+                            }
+                          },
+                          {
+                            "name": "busy_timeout_ms",
+                            "ty": {
+                              "Optional": "Int"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "passing": "Value"
+        }
+      ],
+      "return_type": {
+        "Resource": "sqlite.connection"
+      },
+      "description": ""
+    },
+    {
+      "name": "sqlite::execute",
+      "params": [
+        {
+          "name": "connection",
+          "ty": {
+            "Resource": "sqlite.connection"
+          },
+          "passing": "Borrow"
+        },
+        {
+          "name": "sql",
+          "ty": "String",
+          "passing": "Value"
+        },
+        {
+          "name": "params",
+          "ty": {
+            "Array": {
+              "Named": {
+                "name": "SqliteValue",
+                "fields": [
+                  {
+                    "name": "kind",
+                    "ty": "String"
+                  },
+                  {
+                    "name": "int_value",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "float_value",
+                    "ty": {
+                      "Optional": "Float"
+                    }
+                  },
+                  {
+                    "name": "text_value",
+                    "ty": {
+                      "Optional": "String"
+                    }
+                  },
+                  {
+                    "name": "blob_value",
+                    "ty": {
+                      "Optional": "Bytes"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "passing": "Value"
+        }
+      ],
+      "return_type": {
+        "Named": {
+          "name": "SqliteExecuteResult",
+          "fields": [
+            {
+              "name": "rows_affected",
+              "ty": "Int"
+            },
+            {
+              "name": "last_insert_rowid",
+              "ty": "Int"
+            }
+          ]
+        }
+      },
+      "description": ""
+    },
+    {
+      "name": "sqlite::query",
+      "params": [
+        {
+          "name": "connection",
+          "ty": {
+            "Resource": "sqlite.connection"
+          },
+          "passing": "Borrow"
+        },
+        {
+          "name": "sql",
+          "ty": "String",
+          "passing": "Value"
+        },
+        {
+          "name": "params",
+          "ty": {
+            "Array": {
+              "Named": {
+                "name": "SqliteValue",
+                "fields": [
+                  {
+                    "name": "kind",
+                    "ty": "String"
+                  },
+                  {
+                    "name": "int_value",
+                    "ty": {
+                      "Optional": "Int"
+                    }
+                  },
+                  {
+                    "name": "float_value",
+                    "ty": {
+                      "Optional": "Float"
+                    }
+                  },
+                  {
+                    "name": "text_value",
+                    "ty": {
+                      "Optional": "String"
+                    }
+                  },
+                  {
+                    "name": "blob_value",
+                    "ty": {
+                      "Optional": "Bytes"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "passing": "Value"
+        },
+        {
+          "name": "limits",
+          "ty": {
+            "Named": {
+              "name": "SqliteLimits",
+              "fields": [
+                {
+                  "name": "max_connections",
+                  "ty": {
+                    "Optional": "Int"
+                  }
+                },
+                {
+                  "name": "max_statements",
+                  "ty": {
+                    "Optional": "Int"
+                  }
+                },
+                {
+                  "name": "max_rows",
+                  "ty": {
+                    "Optional": "Int"
+                  }
+                },
+                {
+                  "name": "max_columns",
+                  "ty": {
+                    "Optional": "Int"
+                  }
+                },
+                {
+                  "name": "max_result_bytes",
+                  "ty": {
+                    "Optional": "Int"
+                  }
+                },
+                {
+                  "name": "max_statement_bytes",
+                  "ty": {
+                    "Optional": "Int"
+                  }
+                },
+                {
+                  "name": "max_parameters",
+                  "ty": {
+                    "Optional": "Int"
+                  }
+                },
+                {
+                  "name": "max_parameter_bytes",
+                  "ty": {
+                    "Optional": "Int"
+                  }
+                },
+                {
+                  "name": "max_pending_operations",
+                  "ty": {
+                    "Optional": "Int"
+                  }
+                },
+                {
+                  "name": "max_transaction_ms",
+                  "ty": {
+                    "Optional": "Int"
+                  }
+                },
+                {
+                  "name": "busy_timeout_ms",
+                  "ty": {
+                    "Optional": "Int"
+                  }
+                }
+              ]
+            }
+          },
+          "passing": "Value"
+        }
+      ],
+      "return_type": {
+        "Named": {
+          "name": "SqliteQueryResult",
+          "fields": [
+            {
+              "name": "columns",
+              "ty": {
+                "Array": "String"
+              }
+            },
+            {
+              "name": "rows",
+              "ty": {
+                "Array": {
+                  "Named": {
+                    "name": "SqliteRow",
+                    "fields": [
+                      {
+                        "name": "cells",
+                        "ty": {
+                          "Array": {
+                            "Named": {
+                              "name": "SqliteValue",
+                              "fields": [
+                                {
+                                  "name": "kind",
+                                  "ty": "String"
+                                },
+                                {
+                                  "name": "int_value",
+                                  "ty": {
+                                    "Optional": "Int"
+                                  }
+                                },
+                                {
+                                  "name": "float_value",
+                                  "ty": {
+                                    "Optional": "Float"
+                                  }
+                                },
+                                {
+                                  "name": "text_value",
+                                  "ty": {
+                                    "Optional": "String"
+                                  }
+                                },
+                                {
+                                  "name": "blob_value",
+                                  "ty": {
+                                    "Optional": "Bytes"
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "name": "truncated",
+              "ty": "Bool"
+            },
+            {
+              "name": "next_cursor",
+              "ty": {
+                "Optional": "Int"
+              }
+            }
+          ]
+        }
+      },
+      "description": ""
+    },
+    {
+      "name": "sqlite::transaction",
+      "params": [
+        {
+          "name": "connection",
+          "ty": {
+            "Resource": "sqlite.connection"
+          },
+          "passing": "Borrow"
+        },
+        {
+          "name": "statements",
+          "ty": {
+            "Array": {
+              "Named": {
+                "name": "SqliteStatement",
+                "fields": [
+                  {
+                    "name": "sql",
+                    "ty": "String"
+                  },
+                  {
+                    "name": "params",
+                    "ty": {
+                      "Optional": {
+                        "Array": {
+                          "Named": {
+                            "name": "SqliteValue",
+                            "fields": [
+                              {
+                                "name": "kind",
+                                "ty": "String"
+                              },
+                              {
+                                "name": "int_value",
+                                "ty": {
+                                  "Optional": "Int"
+                                }
+                              },
+                              {
+                                "name": "float_value",
+                                "ty": {
+                                  "Optional": "Float"
+                                }
+                              },
+                              {
+                                "name": "text_value",
+                                "ty": {
+                                  "Optional": "String"
+                                }
+                              },
+                              {
+                                "name": "blob_value",
+                                "ty": {
+                                  "Optional": "Bytes"
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "name": "query",
+                    "ty": {
+                      "Optional": "Bool"
+                    }
+                  },
+                  {
+                    "name": "limits",
+                    "ty": {
+                      "Optional": {
+                        "Named": {
+                          "name": "SqliteLimits",
+                          "fields": [
+                            {
+                              "name": "max_connections",
+                              "ty": {
+                                "Optional": "Int"
+                              }
+                            },
+                            {
+                              "name": "max_statements",
+                              "ty": {
+                                "Optional": "Int"
+                              }
+                            },
+                            {
+                              "name": "max_rows",
+                              "ty": {
+                                "Optional": "Int"
+                              }
+                            },
+                            {
+                              "name": "max_columns",
+                              "ty": {
+                                "Optional": "Int"
+                              }
+                            },
+                            {
+                              "name": "max_result_bytes",
+                              "ty": {
+                                "Optional": "Int"
+                              }
+                            },
+                            {
+                              "name": "max_statement_bytes",
+                              "ty": {
+                                "Optional": "Int"
+                              }
+                            },
+                            {
+                              "name": "max_parameters",
+                              "ty": {
+                                "Optional": "Int"
+                              }
+                            },
+                            {
+                              "name": "max_parameter_bytes",
+                              "ty": {
+                                "Optional": "Int"
+                              }
+                            },
+                            {
+                              "name": "max_pending_operations",
+                              "ty": {
+                                "Optional": "Int"
+                              }
+                            },
+                            {
+                              "name": "max_transaction_ms",
+                              "ty": {
+                                "Optional": "Int"
+                              }
+                            },
+                            {
+                              "name": "busy_timeout_ms",
+                              "ty": {
+                                "Optional": "Int"
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "passing": "Value"
+        }
+      ],
+      "return_type": {
+        "Array": {
+          "Named": {
+            "name": "SqliteTransactionResult",
+            "fields": [
+              {
+                "name": "kind",
+                "ty": "String"
+              },
+              {
+                "name": "execute",
+                "ty": {
+                  "Optional": {
+                    "Named": {
+                      "name": "SqliteExecuteResult",
+                      "fields": [
+                        {
+                          "name": "rows_affected",
+                          "ty": "Int"
+                        },
+                        {
+                          "name": "last_insert_rowid",
+                          "ty": "Int"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "name": "query",
+                "ty": {
+                  "Optional": {
+                    "Named": {
+                      "name": "SqliteQueryResult",
+                      "fields": [
+                        {
+                          "name": "columns",
+                          "ty": {
+                            "Array": "String"
+                          }
+                        },
+                        {
+                          "name": "rows",
+                          "ty": {
+                            "Array": {
+                              "Named": {
+                                "name": "SqliteRow",
+                                "fields": [
+                                  {
+                                    "name": "cells",
+                                    "ty": {
+                                      "Array": {
+                                        "Named": {
+                                          "name": "SqliteValue",
+                                          "fields": [
+                                            {
+                                              "name": "kind",
+                                              "ty": "String"
+                                            },
+                                            {
+                                              "name": "int_value",
+                                              "ty": {
+                                                "Optional": "Int"
+                                              }
+                                            },
+                                            {
+                                              "name": "float_value",
+                                              "ty": {
+                                                "Optional": "Float"
+                                              }
+                                            },
+                                            {
+                                              "name": "text_value",
+                                              "ty": {
+                                                "Optional": "String"
+                                              }
+                                            },
+                                            {
+                                              "name": "blob_value",
+                                              "ty": {
+                                                "Optional": "Bytes"
+                                              }
+                                            }
+                                          ]
+                                        }
+                                      }
+                                    }
+                                  }
+                                ]
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "name": "truncated",
+                          "ty": "Bool"
+                        },
+                        {
+                          "name": "next_cursor",
+                          "ty": {
+                            "Optional": "Int"
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "description": ""
+    },
+    {
+      "name": "sqlite::close",
+      "params": [
+        {
+          "name": "connection",
+          "ty": {
+            "Resource": "sqlite.connection"
+          },
+          "passing": "TakeOwned"
+        }
+      ],
+      "return_type": "Null",
+      "description": ""
+    }
+  ]
+}

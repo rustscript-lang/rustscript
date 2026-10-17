@@ -22,40 +22,30 @@ use std::path::{Path, PathBuf};
 /// surface).
 const HTTP_SURFACE_ENABLED: bool = cfg!(all(feature = "http-client", not(target_family = "wasm")));
 
-/// Fingerprint of the published standard host catalog **with** the HTTP
-/// surface.
-///
-/// Both fingerprints are exact goldens of the descriptor migration: the whole
-/// point of the change is that guest contracts did not move. The standard
-/// catalog is the merge of the composed module surfaces, so the golden depends
-/// on the composed set — the default build (no `http-client`) composes one
-/// module fewer and must reproduce [`STANDARD_CATALOG_FINGERPRINT_NO_HTTP`].
-///
-/// The HTTP surface moved from named-struct request/response/event types to
-/// resources, so its guest contract intentionally changed: the composed
-/// goldens below are the resource-API values.
-const STANDARD_CATALOG_FINGERPRINT: &str = "df4072aba04d62fa";
-/// Fingerprint of the published standard host catalog **without** the HTTP
-/// surface: the `--workspace` default build and every wasm build.
-const STANDARD_CATALOG_FINGERPRINT_NO_HTTP: &str = "a6b4b2dcadc5df14";
-const IO_CATALOG_FINGERPRINT: &str = "234a7fdc3aaa3f95";
-const SQLITE_CATALOG_FINGERPRINT: &str = "b6d4c278145edacf";
-const JIT_CATALOG_FINGERPRINT: &str = "d0a3efbca2d0923c";
-const TIMER_CATALOG_FINGERPRINT: &str = "4af2dfa2aee1f42e";
+// Current descriptor identities, selected for the actual native feature set.
+const SQLITE_SURFACE_ENABLED: bool = cfg!(all(feature = "sqlite", not(target_family = "wasm")));
+const STANDARD_CATALOG_FINGERPRINT_HTTP_SQLITE: &str = "21d1dc351d613184";
+const STANDARD_CATALOG_FINGERPRINT_SQLITE: &str = "8afd8a69c58f02bd";
+const STANDARD_CATALOG_FINGERPRINT_HTTP: &str = "7a89a8dee2df6de7";
+const STANDARD_CATALOG_FINGERPRINT_BASE: &str = "8254b00d727494b4";
+const IO_CATALOG_FINGERPRINT: &str = "a16730bd11bf5e10";
+#[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
+const SQLITE_CATALOG_FINGERPRINT: &str = "dce61460a46c421a";
+const JIT_CATALOG_FINGERPRINT: &str = "ae81318e8a018681";
+const TIMER_CATALOG_FINGERPRINT: &str = "7ecc0517cea3570b";
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
-const HTTP_CATALOG_FINGERPRINT: &str = "2fe866ea86b2d79e";
-
-/// The standard catalog fingerprint this build must reproduce exactly.
+const HTTP_CATALOG_FINGERPRINT: &str = "642cb941ab966eb8";
 fn standard_catalog_fingerprint() -> &'static str {
-    if HTTP_SURFACE_ENABLED {
-        STANDARD_CATALOG_FINGERPRINT
-    } else {
-        STANDARD_CATALOG_FINGERPRINT_NO_HTTP
+    match (HTTP_SURFACE_ENABLED, SQLITE_SURFACE_ENABLED) {
+        (true, true) => STANDARD_CATALOG_FINGERPRINT_HTTP_SQLITE,
+        (false, true) => STANDARD_CATALOG_FINGERPRINT_SQLITE,
+        (true, false) => STANDARD_CATALOG_FINGERPRINT_HTTP,
+        (false, false) => STANDARD_CATALOG_FINGERPRINT_BASE,
     }
 }
 
 /// Resource keys the standard catalog always publishes.
-const STANDARD_RESOURCE_KEYS: &[&str] = &["io.file", "sqlite.connection"];
+const STANDARD_RESOURCE_KEYS: &[&str] = &["io.file"];
 
 /// Resource keys the HTTP module publishes when it is composed.
 ///
@@ -66,18 +56,10 @@ const HTTP_RESOURCE_KEYS: &[&str] = &[
     "http.response",
     "http.headers",
     "http.sse_summary",
-    "http.sse",
-    "http.internal.request_worker",
-    "http.internal.response_stream",
 ];
 
 /// Named structs the standard catalog always declares.
-const STANDARD_NAMED_STRUCTS: &[&str] = &[
-    "JitConfig",
-    "SqliteValue",
-    "SqliteQueryResult",
-    "SqliteTransactionResult",
-];
+const STANDARD_NAMED_STRUCTS: &[&str] = &["JitConfig"];
 
 /// Former HTTP named-struct names that must no longer be catalog names.
 const REMOVED_HTTP_NAMED_STRUCTS: &[&str] = &[
@@ -95,11 +77,7 @@ const REMOVED_HTTP_NAMED_STRUCTS: &[&str] = &[
 
 /// HTTP resource keys that stay internal to the module and must not appear in
 /// any guest-visible signature.
-const HTTP_INTERNAL_RESOURCE_KEYS: &[&str] = &[
-    "http.internal.request_worker",
-    "http.internal.response_stream",
-    "http.sse",
-];
+const HTTP_INTERNAL_RESOURCE_KEYS: &[&str] = &[];
 
 /// The public HTTP resource surface: the only keys an HTTP guest signature may
 /// name.
@@ -839,6 +817,9 @@ fn disabled_standard_modules() -> BTreeSet<String> {
     if !HTTP_SURFACE_ENABLED {
         disabled.insert("http".to_string());
     }
+    if !SQLITE_SURFACE_ENABLED {
+        disabled.insert("sqlite".to_string());
+    }
     disabled
 }
 
@@ -1167,12 +1148,13 @@ fn module_catalogs_keep_their_published_fingerprints() {
             TIMER_CATALOG_FINGERPRINT,
             vm::timer_host_catalog().fingerprint(),
         ),
-        (
-            "sqlite",
-            SQLITE_CATALOG_FINGERPRINT,
-            vm::sqlite_host_catalog().fingerprint(),
-        ),
     ];
+    #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
+    surfaces.push((
+        "sqlite",
+        SQLITE_CATALOG_FINGERPRINT,
+        vm::sqlite_host_catalog().fingerprint(),
+    ));
     surfaces.extend(http_catalog_surface());
     for (name, golden, fingerprint) in surfaces {
         assert_eq!(
@@ -1199,6 +1181,11 @@ fn every_catalog_resource_key_has_a_declaration() {
 
     let expected: BTreeSet<String> = [
         STANDARD_RESOURCE_KEYS,
+        if SQLITE_SURFACE_ENABLED {
+            &["sqlite.connection"]
+        } else {
+            &[]
+        },
         if HTTP_SURFACE_ENABLED {
             HTTP_RESOURCE_KEYS
         } else {
@@ -1302,21 +1289,30 @@ fn typed_named_struct_contract_is_preserved() {
         "the standard catalog must publish no HTTP/Sse named structs, got {declared:?}"
     );
 
-    // The typed shapes themselves are unchanged, not just the names.
-    let query = catalog
-        .struct_named("SqliteQueryResult")
-        .expect("SqliteQueryResult");
-    assert_eq!(
-        query.fields.len(),
-        4,
-        "SqliteQueryResult keeps columns/rows/truncated/next_cursor"
-    );
-    let value = catalog.struct_named("SqliteValue").expect("SqliteValue");
-    assert_eq!(
-        value.fields.len(),
-        5,
-        "SqliteValue keeps kind plus four typed payload slots"
-    );
+    for name in [
+        "SqliteValue",
+        "SqliteQueryResult",
+        "SqliteTransactionResult",
+    ] {
+        assert_eq!(declared.contains(name), SQLITE_SURFACE_ENABLED, "{name}");
+    }
+    if SQLITE_SURFACE_ENABLED {
+        // The typed shapes themselves are unchanged, not just the names.
+        let query = catalog
+            .struct_named("SqliteQueryResult")
+            .expect("SqliteQueryResult");
+        assert_eq!(
+            query.fields.len(),
+            4,
+            "SqliteQueryResult keeps columns/rows/truncated/next_cursor"
+        );
+        let value = catalog.struct_named("SqliteValue").expect("SqliteValue");
+        assert_eq!(
+            value.fields.len(),
+            5,
+            "SqliteValue keeps kind plus four typed payload slots"
+        );
+    }
 
     // No public standard function regressed to a dynamic return.
     let mut dynamic = Vec::new();
@@ -1352,11 +1348,10 @@ fn feature_gates_select_whole_modules_deterministically() {
         "the http module must be excluded when the feature is disabled"
     );
 
-    // The SQLite catalog surface is composed in every build: the feature only
-    // selects whether its adapters are the real host functions.
-    assert!(
+    assert_eq!(
         names.contains("sqlite"),
-        "the sqlite catalog surface must be composed in every build"
+        SQLITE_SURFACE_ENABLED,
+        "SQLite module follows its native feature gate"
     );
 
     // A gated module must not leak into the derived guest catalog.
@@ -1370,12 +1365,13 @@ fn feature_gates_select_whole_modules_deterministically() {
         cfg!(all(feature = "http-client", not(target_family = "wasm"))),
         "the guest catalog must follow the same gate as the module"
     );
-    assert!(
+    assert_eq!(
         catalog
             .functions()
             .iter()
             .any(|function| function.name.starts_with("sqlite::")),
-        "the SQLite guest imports must resolve in every build"
+        SQLITE_SURFACE_ENABLED,
+        "SQLite guest imports follow their native feature gate"
     );
 }
 

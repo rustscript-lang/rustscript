@@ -1,55 +1,28 @@
 use std::future::Future;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use futures_util::task::AtomicWaker;
+use hyper::body::Bytes;
 use pd_host_function::pd_host_function;
-use tokio::sync::{Notify, mpsc};
 
 use super::request::{
-    HttpRequest, OwnedResponse, ResponseReadObserver, open_stream_response,
-    validate_request_header_budget,
+    HttpRequest, OwnedResponse, open_stream_response, validate_request_header_budget,
 };
 use super::resources::{HttpHeaders, SseSummary};
-use super::{HttpRequestContext, policy};
-use crate::builtins::runtime::HostCallResult;
+use super::{CaptureAsyncHostContext, HostFutureOutput, HttpRequestContext, policy};
 use crate::builtins::runtime::typed::VmCallable;
 use crate::compiler::TypeSchema;
 use crate::host_api::{
     HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema, ResourceTypeKey,
 };
 use crate::vm::async_host::{
-    HostStreamAction, HostStreamDriver, HostStreamPoll, HostStreamTermination,
+    HostStreamAction, HostStreamCallback, HostStreamDriver, HostStreamPoll, HostVmCompletion,
 };
-use crate::vm::operation::{
-    HostOperation, OperationCancelReason, OperationError, OperationErrorCode, OperationId,
-    OperationResult, OperationSpec,
-};
-use crate::vm::resource::{
-    CloseProgress, HostResource, Resource, ResourceCloseReason, ResourceError, ResourceErrorCode,
-    ResourceHandle, ResourceResult,
-};
-use crate::vm::{
-    CallOutcome, Value, Vm, VmError, VmResult,
-    execution_scope::{ExecutionScope, ExecutionScopeError},
-};
+use crate::vm::operation::OperationCancelReason;
+use crate::vm::{CallOutcome, Value, Vm, VmError, VmResult};
 
-/// Maximum number of SSE items buffered between the worker and the stream
-/// driver before publishing applies backpressure. A small bounded queue
-/// preserves ordering without letting the worker run arbitrarily far ahead of
-/// the per-item callback, and without unbounded memory growth on a slow or
-/// stalled callback. The worker blocks on an under-capacity send, which keeps
-/// it in sync with the driver and prevents both event loss and runaway queue
-/// growth.
-const SSE_CHANNEL_CAPACITY: usize = 1;
-
-#[cfg(test)]
-const _: () = assert!(SSE_CHANNEL_CAPACITY == 1);
-
-/// The error surfaced when the absolute stream deadline (the minimum of the
-/// host maximum stream duration and the script `timeout_ms`) is exceeded.
+/// The error surfaced when the absolute stream deadline is exceeded.
 const SSE_TOTAL_DEADLINE_ERROR: &str = "SSE total deadline exceeded";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -160,31 +133,31 @@ impl SseParser {
         Ok((consumed, None))
     }
 
-    fn finish(&mut self) -> VmResult<Vec<SseEvent>> {
+    fn finish(&mut self) -> VmResult<Option<SseEvent>> {
         if self.finished {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         self.finished = true;
-        let mut events = Vec::new();
+        let mut event = None;
         if !self.prefix.is_empty() {
             let prefix = std::mem::take(&mut self.prefix);
             for byte in prefix {
-                if let Some(event) = self.process_byte(byte)? {
-                    events.push(event);
+                if let Some(next) = self.process_byte(byte)? {
+                    event = Some(next);
                 }
             }
         }
         if !self.line.is_empty()
-            && let Some(event) = self.process_line()?
+            && let Some(next) = self.process_line()?
         {
-            events.push(event);
+            event = Some(next);
         }
         // EventSource dispatches only on a blank line. EOF discards a partial
         // event, including a final unterminated data line.
         self.data.clear();
         self.has_data = false;
         self.event = None;
-        Ok(events)
+        Ok(event)
     }
 
     fn process_byte(&mut self, byte: u8) -> VmResult<Option<SseEvent>> {
@@ -311,1017 +284,6 @@ fn item_limit_error() -> VmError {
     VmError::HostError("SSE item exceeds byte limit".to_string())
 }
 
-enum SseMessage {
-    Open(u16, HttpHeaders, String),
-    Event(SseEvent),
-}
-
-fn parse_stream_timeout(milliseconds: Option<i64>) -> VmResult<Option<Duration>> {
-    milliseconds
-        .map(|milliseconds| {
-            u64::try_from(milliseconds)
-                .ok()
-                .filter(|milliseconds| *milliseconds > 0)
-                .map(Duration::from_millis)
-                .ok_or_else(|| VmError::HostError("SSE timeout_ms must be positive".to_string()))
-        })
-        .transpose()
-}
-
-/// Shared SSE stream state owned by the child [`SseStreamResource`].
-///
-/// The child resource is registered under the opened response stream
-/// resource, so the generic child-first scope shutdown closes the SSE reader
-/// before its underlying response stream. The stop flag is set by the child's
-/// [`HostResource::begin_close`] and by the SSE poll operation's cancel; the
-/// worker observes it between items and stops promptly.
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SseWorkerLifecycle {
-    NotStarted = 0,
-    Running = 1,
-    Finished = 2,
-}
-
-pub(super) struct SseShared {
-    /// Set on close/cancel; the worker stops polling the network.
-    pub(super) stopping: AtomicBool,
-    /// Notified on close/cancel so the worker can break out of a
-    /// blocking network read. Race-free: if notify_one() arrives before
-    /// the worker starts waiting, the next notified() completes immediately.
-    pub(super) cancel: Notify,
-    /// The first cancellation reason is retained for the producer and cleanup
-    /// diagnostics. Later cancellation requests cannot overwrite it.
-    pub(super) cancellation_reason: std::sync::Mutex<Option<OperationCancelReason>>,
-    /// One acknowledgement is issued by the VM after each callback. The
-    /// acknowledgement arrives.
-    pub(super) item_ack: Notify,
-    /// Waker registered by a pending stream poll. Channel readiness is handled
-    /// by `Receiver::poll_recv`; this waker covers stop and terminal state.
-    pub(super) waker: AtomicWaker,
-    /// Bounded FIFO of published items awaiting the stream driver.
-    /// The worker `send`s with backpressure; the driver `try_recv`s.
-    /// This preserves item ordering and never drops events, unlike a
-    /// single-slot overwrite slot.
-    items: mpsc::Sender<SseMessage>,
-    /// Set when the worker thread has finished running.
-    pub(super) done: AtomicBool,
-    /// Set by the spawned closure after the worker entry has returned.
-    pub(super) thread_finished: AtomicBool,
-    /// Explicit worker lifecycle. Workerless rollback may transition only from
-    /// `NotStarted` to `Finished`.
-    pub(super) worker_lifecycle: std::sync::atomic::AtomicU8,
-    /// The final result from the worker thread (Ok or error).
-    pub(super) result: std::sync::Mutex<Option<VmResult<()>>>,
-    /// The worker thread handle, taken during close to join.
-    pub(super) join_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// Waker registered by the close poll when the worker is still running.
-    pub(super) close_waker: AtomicWaker,
-    /// Waker registered by the scoped operation while the producer is still
-    /// running.
-    pub(super) quiescence_waker: AtomicWaker,
-    /// The permit is owned by shared stream state, so dropping the driver
-    /// cannot release admission while the worker or transport is alive.
-    pub(super) _permit: super::ConnectionPermit,
-    /// Set after rollback has retired both the operation and resource.
-    pub(super) rollback_finished: AtomicBool,
-}
-
-impl SseShared {
-    fn mark_worker_running(&self) {
-        let _ = self.worker_lifecycle.compare_exchange(
-            SseWorkerLifecycle::NotStarted as u8,
-            SseWorkerLifecycle::Running as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-    }
-
-    fn mark_worker_finished(&self) {
-        self.thread_finished.store(true, Ordering::Release);
-        self.worker_lifecycle
-            .store(SseWorkerLifecycle::Finished as u8, Ordering::Release);
-        self.close_waker.wake();
-        self.quiescence_waker.wake();
-    }
-
-    fn terminalize_workerless(&self, reason: OperationCancelReason, result: VmResult<()>) -> bool {
-        if self
-            .worker_lifecycle
-            .compare_exchange(
-                SseWorkerLifecycle::NotStarted as u8,
-                SseWorkerLifecycle::Finished as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return false;
-        }
-        self.request_stop(reason);
-        self.publish(result);
-        self.thread_finished.store(true, Ordering::Release);
-        self.close_waker.wake();
-        self.quiescence_waker.wake();
-        true
-    }
-
-    fn request_stop(&self, reason: OperationCancelReason) {
-        self.stopping.store(true, Ordering::Release);
-        let mut cancellation = self
-            .cancellation_reason
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cancellation.is_none() {
-            *cancellation = Some(reason);
-        }
-        self.cancel.notify_one();
-        self.cancel.notify_waiters();
-        self.waker.wake();
-        self.close_waker.wake();
-        self.quiescence_waker.wake();
-    }
-
-    fn publish(&self, result: VmResult<()>) {
-        *self
-            .result
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
-        // The result mutex write happens-before this release publication.
-        self.done.store(true, Ordering::Release);
-        self.waker.wake();
-        self.close_waker.wake();
-        self.quiescence_waker.wake();
-    }
-
-    fn take_result(&self) -> Option<VmResult<()>> {
-        self.result
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-    }
-
-    fn is_quiescent(&self) -> bool {
-        self.worker_lifecycle.load(Ordering::Acquire) == SseWorkerLifecycle::Finished as u8
-            && self.done.load(Ordering::Acquire)
-            && self.thread_finished.load(Ordering::Acquire)
-            && self
-                .join_handle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none()
-    }
-
-    fn join_worker(&self) -> Result<(), String> {
-        if self.worker_lifecycle.load(Ordering::Acquire) != SseWorkerLifecycle::Finished as u8
-            || !self.done.load(Ordering::Acquire)
-            || !self.thread_finished.load(Ordering::Acquire)
-        {
-            return Err("SSE worker is still running".to_string());
-        }
-        if self
-            .join_handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished())
-        {
-            return Err("SSE worker thread has not exited".to_string());
-        }
-        let handle = self
-            .join_handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let Some(handle) = handle else {
-            return Ok(());
-        };
-        handle.join().map_err(|panic| {
-            let message = worker_panic_message(&panic);
-            match self.cancellation_reason() {
-                Some(reason) => format!("{message} (cancellation reason: {reason})"),
-                None => message,
-            }
-        })
-    }
-
-    fn try_join_finished(&self) -> ResourceResult<bool> {
-        if self.worker_lifecycle.load(Ordering::Acquire) != SseWorkerLifecycle::Finished as u8
-            || !self.done.load(Ordering::Acquire)
-            || !self.thread_finished.load(Ordering::Acquire)
-        {
-            return Ok(false);
-        }
-        let handle = {
-            let mut guard = self
-                .join_handle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.as_ref().is_some_and(|handle| !handle.is_finished()) {
-                return Ok(false);
-            }
-            guard.take()
-        };
-        let Some(handle) = handle else {
-            return Ok(true);
-        };
-        handle
-            .join()
-            .map(|_| true)
-            .map_err(|panic| resource_cleanup_error(&worker_panic_message(&panic)))
-    }
-
-    fn cancellation_reason(&self) -> Option<OperationCancelReason> {
-        self.cancellation_reason
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .copied()
-    }
-}
-
-fn worker_panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = panic.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = panic.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "SSE worker thread panicked".to_string()
-    }
-}
-
-#[cfg(test)]
-static FAIL_NEXT_WORKER_SPAWN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-fn spawn_worker<F>(name: &str, function: F) -> std::io::Result<std::thread::JoinHandle<()>>
-where
-    F: FnOnce() + Send + 'static,
-{
-    #[cfg(test)]
-    if FAIL_NEXT_WORKER_SPAWN.swap(false, Ordering::AcqRel) {
-        return Err(std::io::Error::other("injected SSE worker spawn failure"));
-    }
-    std::thread::Builder::new()
-        .name(name.to_string())
-        .spawn(function)
-}
-
-#[cfg(test)]
-static REJECT_NEXT_OPERATION_ADMISSION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[allow(clippy::result_large_err)]
-fn start_operation<T: HostOperation>(
-    vm: &mut Vm,
-    operation: T,
-) -> crate::vm::host_context::HostContextResult<OperationId> {
-    #[cfg(test)]
-    if REJECT_NEXT_OPERATION_ADMISSION.swap(false, Ordering::AcqRel) {
-        return Err(crate::vm::host_context::HostContextError::new(
-            "http::operation",
-            "injected operation admission rejection",
-        ));
-    }
-    vm.host_context()
-        .start_operation(OperationSpec::new(operation))
-}
-
-fn resource_cleanup_error(message: &str) -> ResourceError {
-    ResourceError::new(
-        ResourceErrorCode::ResourceCleanupFailed,
-        "http::sse::resource",
-        message,
-    )
-}
-
-/// Runs the whole SSE lifecycle on a worker thread: open the response stream
-/// (following redirects), validate it, read body frames, parse events and
-/// publish each item into the shared completion channel. The guest callback
-/// is invoked by the VM between items via the pending-result adapter.
-struct SseWorker {
-    config: super::HttpConfig,
-    request: HttpRequest,
-    /// The one absolute stream deadline captured at stream admission. It is
-    /// passed unchanged through opening, redirects, body reads, and delivery.
-    deadline: Instant,
-    shared: Arc<SseShared>,
-    items: Arc<AtomicUsize>,
-    bytes_received: Arc<AtomicUsize>,
-    bytes_sent: Arc<AtomicUsize>,
-    status: std::sync::Mutex<Option<u16>>,
-    headers: std::sync::Mutex<Option<HttpHeaders>>,
-    url: std::sync::Mutex<Option<String>>,
-}
-
-impl SseWorker {
-    fn run(self: Arc<Self>) {
-        // The permit is held by shared stream state until cleanup completes.
-        let result =
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_inner())) {
-                Ok(result) => result,
-                Err(panic) => Err(VmError::HostError(format!(
-                    "SSE worker panicked: {}",
-                    worker_panic_message(&panic)
-                ))),
-            };
-        self.shared.publish(result);
-    }
-
-    fn run_inner(&self) -> VmResult<()> {
-        // The entire SSE network lifecycle (open the response stream, then
-        // read every body frame) MUST run inside a single Tokio runtime. The
-        // owned response ties the hyper connection future and body receiver to
-        // one I/O driver; recreating a fresh current-thread runtime per frame
-        // moves a live socket across reactors and corrupts the body framing,
-        // surfacing hyper errors like "error reading a body from connection".
-        runtime_block_on(self.stream_lifecycle())?
-    }
-
-    async fn stream_lifecycle(self: &SseWorker) -> VmResult<()> {
-        let mut parser = SseParser::new(
-            self.config.max_sse_line_bytes,
-            self.config.max_stream_item_bytes,
-            self.config.max_stream_total_bytes,
-        );
-        let observer = ResponseReadObserver::default();
-
-        // The absolute deadline was captured before admission and is shared by
-        // every opening hop, body read, and callback publication.
-        let deadline = self.deadline;
-
-        // Opening response headers must arrive before the earlier of the
-        // captured total deadline and this opening phase's idle boundary.
-        let opening_idle_deadline =
-            super::policy::phase_deadline(deadline, self.config.stream_idle_timeout);
-        let (mut response, url) = self
-            .open_response(observer.clone(), opening_idle_deadline)
-            .await?;
-        let status = response.response().status();
-        if !status.is_success() {
-            return Err(VmError::HostError(format!(
-                "SSE response status {} is not successful",
-                status.as_u16()
-            )));
-        }
-        let content_type = response
-            .response()
-            .headers()
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.split(';').next())
-            .map(str::trim)
-            .filter(|value| value.eq_ignore_ascii_case("text/event-stream"))
-            .ok_or_else(|| {
-                VmError::HostError(
-                    "SSE response Content-Type must be text/event-stream".to_string(),
-                )
-            })?;
-        let _ = content_type;
-        let headers = HttpHeaders::from_map(response.response().headers());
-        *self
-            .status
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(status.as_u16());
-        *self
-            .headers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(headers.clone());
-        *self
-            .url
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(url.to_string());
-        observer.admit_body(self.config.max_stream_total_bytes);
-        self.publish(
-            SseMessage::Open(status.as_u16(), headers, url.to_string()),
-            deadline,
-        )
-        .await?;
-
-        // Body phase: every delivered frame resets the idle deadline, while
-        // the absolute total deadline is computed once and never reset by
-        // progress.
-        let mut idle_deadline =
-            super::policy::phase_deadline(deadline, self.config.stream_idle_timeout);
-        loop {
-            if self.shared.stopping.load(Ordering::SeqCst) {
-                return Err(VmError::HostError("SSE stream closed".to_string()));
-            }
-            let frame = self
-                .next_frame(&mut response, idle_deadline, deadline)
-                .await?;
-            let Some(frame) = frame else {
-                break;
-            };
-            let Ok(data) = frame.into_data() else {
-                continue;
-            };
-            // Any delivered body bytes count as progress: reset the idle
-            // deadline, but never touch the absolute total deadline.
-            idle_deadline =
-                super::policy::phase_deadline(deadline, self.config.stream_idle_timeout);
-            parser.admit_chunk(data.len())?;
-            observer.observe_application_chunk(data.len());
-            self.bytes_received.fetch_add(data.len(), Ordering::SeqCst);
-            let mut offset = 0;
-            while offset < data.len() {
-                let (consumed, event) = parser.push_until_event(&data[offset..])?;
-                offset += consumed;
-                if let Some(event) = event {
-                    self.items.fetch_add(1, Ordering::SeqCst);
-                    self.publish(SseMessage::Event(event), deadline).await?;
-                }
-            }
-        }
-        parser.finish()?;
-        Ok(())
-    }
-
-    /// Opens the response stream with one absolute deadline shared by DNS,
-    /// connection setup, TLS, request/response headers, and every redirect.
-    /// The outer select also applies the opening idle phase limit; whichever
-    /// boundary is earlier wins.
-    ///
-    /// Cancellation is selected alongside the opening deadlines. Dropping the
-    /// whole opening future also drops every DNS/connect/TLS/header future and
-    /// every redirect hop owned by `open_stream_response`.
-    async fn open_response(
-        &self,
-        observer: ResponseReadObserver,
-        opening_idle_deadline: Instant,
-    ) -> VmResult<(OwnedResponse, url::Url)> {
-        if self.shared.stopping.load(Ordering::Acquire) {
-            return Err(VmError::HostError("SSE stream cancelled".to_string()));
-        }
-        tokio::select! {
-            biased;
-            _ = self.shared.cancel.notified() => {
-                Err(VmError::HostError("SSE stream cancelled".to_string()))
-            }
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(opening_idle_deadline)) => {
-                if self.deadline <= opening_idle_deadline {
-                    Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()))
-                } else {
-                    Err(VmError::HostError(
-                        "SSE stream idle timeout while opening response".to_string(),
-                    ))
-                }
-            }
-            opened = open_stream_response(
-                &self.config,
-                &self.request,
-                observer,
-                self.deadline,
-                opening_idle_deadline,
-                &self.bytes_sent,
-            ) => {
-                opened.map_err(|error| {
-                    if error.to_string().contains("HTTP request deadline exceeded") {
-                        let now = Instant::now();
-                        if now >= self.deadline {
-                            VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string())
-                        } else if now >= opening_idle_deadline {
-                            VmError::HostError(
-                                "SSE stream idle timeout while opening response".to_string(),
-                            )
-                        } else {
-                            error
-                        }
-                    } else {
-                        error
-                    }
-                })
-            }
-        }
-    }
-
-    /// Reads one body frame bounded by cancel, the absolute total deadline and
-    /// the current idle deadline. Simultaneous boundary expiry is resolved
-    /// deterministically in favour of the total deadline.
-    async fn next_frame(
-        &self,
-        response: &mut OwnedResponse,
-        idle_deadline: Instant,
-        deadline: Instant,
-    ) -> VmResult<Option<hyper::body::Frame<hyper::body::Bytes>>> {
-        if self.shared.stopping.load(Ordering::Acquire) {
-            return Err(VmError::HostError("SSE stream cancelled".to_string()));
-        }
-        let boundary = deadline.min(idle_deadline);
-        tokio::select! {
-            biased;
-            _ = self.shared.cancel.notified() => {
-                Err(VmError::HostError("SSE stream cancelled".to_string()))
-            }
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(boundary)) => {
-                if deadline <= idle_deadline {
-                    Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()))
-                } else {
-                    Err(VmError::HostError("SSE stream idle timeout".to_string()))
-                }
-            }
-            frame = response.next_frame() => frame,
-        }
-    }
-
-    /// Publishes one item into the bounded FIFO with backpressure. The send is
-    /// bounded by cancel and the absolute total deadline, so a stalled
-    /// callback or full queue cannot extend the stream past its deadline.
-    /// Wakes the stream driver's waker so the VM re-polls and drains the item.
-    async fn publish(&self, item: SseMessage, deadline: Instant) -> VmResult<()> {
-        if self.shared.stopping.load(Ordering::Acquire) {
-            return Err(VmError::HostError("SSE stream cancelled".to_string()));
-        }
-        let sender = &self.shared.items;
-        tokio::select! {
-            biased;
-            _ = self.shared.cancel.notified() => {
-                Err(VmError::HostError("SSE stream cancelled".to_string()))
-            }
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()))
-            }
-            sent = sender.send(item) => {
-                sent.map_err(|_| VmError::HostError("SSE stream closed".to_string()))?;
-                self.shared.waker.wake();
-                if self.shared.stopping.load(Ordering::Acquire) {
-                    return Err(VmError::HostError("SSE stream cancelled".to_string()));
-                }
-                tokio::select! {
-                    biased;
-                    _ = self.shared.cancel.notified() => {
-                        Err(VmError::HostError("SSE stream cancelled".to_string()))
-                    }
-                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                        Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()))
-                    }
-                    _ = self.shared.item_ack.notified() => Ok(()),
-                }
-            }
-        }
-    }
-}
-
-fn runtime_block_on<F: Future>(future: F) -> VmResult<F::Output> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| VmError::HostError(format!("SSE worker runtime build failed: {error}")))?;
-    Ok(runtime.block_on(future))
-}
-
-/// Stream driver for the SSE stream: the VM's async host polls this driver
-/// through [`submit_callable_stream`] for each item, then invokes the script
-/// callback and calls [`apply_action`](Self::apply_action) with the result.
-struct SseStreamDriver {
-    shared: Arc<SseShared>,
-    /// Bounded FIFO receiver for items published by the worker.
-    receiver: mpsc::Receiver<SseMessage>,
-    status: u16,
-    headers: HttpHeaders,
-    url: String,
-    items: usize,
-    bytes_received: Arc<AtomicUsize>,
-    bytes_sent: Arc<AtomicUsize>,
-    has_open_callback: bool,
-    /// The absolute total deadline; the driver enforces it in
-    /// [`apply_action`](Self::apply_action) so a slow callback cannot extend
-    /// the stream past its deadline.
-    deadline: Instant,
-    scope_operation: crate::vm::operation::OperationId,
-    resource: ResourceHandle,
-    termination: Option<SseTerminationState>,
-}
-
-struct SseTerminationState {
-    operation_done: bool,
-    resource_done: bool,
-    first_error: Option<VmError>,
-}
-
-impl SseStreamDriver {
-    fn summary(&self, outcome: &str) -> crate::vm::async_host::HostVmCompletion<Value> {
-        let summary = SseSummary {
-            outcome: outcome.to_string(),
-            status: i64::from(self.status),
-            headers: self.headers.clone(),
-            url: self.url.clone(),
-            items: self.items as i64,
-            bytes_received: self.bytes_received.load(Ordering::Acquire) as i64,
-            bytes_sent: i64::try_from(self.bytes_sent.load(Ordering::Acquire)).unwrap_or(i64::MAX),
-        };
-        Box::new(move |vm| {
-            let token = vm
-                .host_context()
-                .push_resource(summary)
-                .map_err(super::request::host_boundary_error)?;
-            Ok(Value::Int(token.handle().raw() as i64))
-        })
-    }
-}
-
-impl HostStreamDriver for SseStreamDriver {
-    fn acknowledge_item(&mut self) {
-        self.shared.item_ack.notify_one();
-    }
-
-    fn terminate(
-        &mut self,
-        scope: &mut ExecutionScope,
-        termination: HostStreamTermination,
-    ) -> VmResult<()> {
-        self.begin_termination(scope, termination)?;
-        let waker = std::task::Waker::noop();
-        let mut cx = Context::from_waker(waker);
-        match self.poll_termination(scope, termination, &mut cx) {
-            Poll::Ready(result) => result,
-            Poll::Pending => Err(VmError::HostError(
-                "SSE stream termination is still pending".to_string(),
-            )),
-        }
-    }
-
-    fn begin_termination(
-        &mut self,
-        scope: &mut ExecutionScope,
-        termination: HostStreamTermination,
-    ) -> VmResult<()> {
-        if self.termination.is_some() {
-            return Ok(());
-        }
-        if let HostStreamTermination::Cancelled(reason) = termination {
-            self.shared.request_stop(reason);
-        }
-        match termination {
-            HostStreamTermination::Completed => scope
-                .complete_operation(self.scope_operation)
-                .map_err(VmError::ExecutionScope)?,
-            HostStreamTermination::Cancelled(reason) => scope
-                .cancel_operation(self.scope_operation, reason)
-                .map_err(VmError::ExecutionScope)?,
-        };
-        let resource_reason = sse_resource_close_reason(termination);
-        let resource_done = match scope
-            .close_resource::<SseStreamResource>(self.resource, resource_reason)
-            .map_err(VmError::ExecutionScope)?
-        {
-            CloseProgress::Ready => true,
-            CloseProgress::Pending => false,
-        };
-        self.termination = Some(SseTerminationState {
-            operation_done: false,
-            resource_done,
-            first_error: None,
-        });
-        Ok(())
-    }
-
-    fn poll_termination(
-        &mut self,
-        scope: &mut ExecutionScope,
-        _termination: HostStreamTermination,
-        cx: &mut Context<'_>,
-    ) -> Poll<VmResult<()>> {
-        let Some(state) = self.termination.as_mut() else {
-            return Poll::Ready(Err(VmError::HostError(
-                "SSE stream termination was not started".to_string(),
-            )));
-        };
-        if !state.operation_done {
-            match scope.poll_operation_quiescence(self.scope_operation, cx) {
-                Poll::Pending => {}
-                Poll::Ready(Ok(_)) => state.operation_done = true,
-                Poll::Ready(Err(ExecutionScopeError::Operation(error)))
-                    if !scope.is_active() && error.code() == OperationErrorCode::OperationStale =>
-                {
-                    // Scope close may have drained this terminal operation before
-                    // the stream worker finished its independent teardown.
-                    state.operation_done = true;
-                }
-                Poll::Ready(Err(error)) => {
-                    state.operation_done = true;
-                    if state.first_error.is_none() {
-                        state.first_error = Some(VmError::ExecutionScope(error));
-                    }
-                }
-            }
-        }
-        if !state.resource_done {
-            match scope.poll_resource_close::<SseStreamResource>(self.resource, cx) {
-                Poll::Pending => {}
-                Poll::Ready(Ok(())) => state.resource_done = true,
-                Poll::Ready(Err(ExecutionScopeError::Resource(error)))
-                    if error.code() == ResourceErrorCode::ResourceAlreadyClosed =>
-                {
-                    state.resource_done = true;
-                }
-                Poll::Ready(Err(error)) => {
-                    state.resource_done = true;
-                    if state.first_error.is_none() {
-                        state.first_error = Some(VmError::ExecutionScope(error));
-                    }
-                }
-            }
-        }
-        if state.operation_done && state.resource_done {
-            let state = self.termination.take().expect("termination state exists");
-            match state.first_error {
-                Some(error) => Poll::Ready(Err(error)),
-                None => Poll::Ready(Ok(())),
-            }
-        } else {
-            Poll::Pending
-        }
-    }
-
-    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
-        match self.receiver.poll_recv(cx) {
-            Poll::Ready(Some(SseMessage::Open(status, headers, url))) => {
-                self.status = status;
-                self.headers = headers.clone();
-                self.url = url.clone();
-                if self.has_open_callback {
-                    Poll::Ready(Ok(HostStreamPoll::CallWithVm(
-                        crate::vm::async_host::HostStreamCallback::Open,
-                        Box::new(move |vm| {
-                            let token = vm
-                                .host_context()
-                                .push_resource(headers)
-                                .map_err(super::request::host_boundary_error)?;
-                            Ok(vec![
-                                Value::Int(i64::from(status)),
-                                Value::Int(token.handle().raw() as i64),
-                                Value::string(url),
-                            ])
-                        }),
-                    )))
-                } else {
-                    self.acknowledge_item();
-                    self.poll_next(cx)
-                }
-            }
-            Poll::Ready(Some(SseMessage::Event(event))) => {
-                self.items = self.items.saturating_add(1);
-                Poll::Ready(Ok(HostStreamPoll::Call(
-                    crate::vm::async_host::HostStreamCallback::Event,
-                    vec![
-                        Value::string(event.event.unwrap_or_default()),
-                        Value::string(event.data),
-                        Value::string(event.id.unwrap_or_default()),
-                        Value::string(
-                            event
-                                .retry_ms
-                                .map_or(String::new(), |retry| retry.to_string()),
-                        ),
-                    ],
-                )))
-            }
-            Poll::Ready(None) => self.poll_terminal("eof"),
-            Poll::Pending => {
-                if self.shared.done.load(Ordering::Acquire) {
-                    return self.poll_terminal(if self.shared.stopping.load(Ordering::Acquire) {
-                        "stopped"
-                    } else {
-                        "eof"
-                    });
-                }
-                self.shared.waker.register(cx.waker());
-                if self.shared.done.load(Ordering::Acquire) {
-                    self.poll_terminal(if self.shared.stopping.load(Ordering::Acquire) {
-                        "stopped"
-                    } else {
-                        "eof"
-                    })
-                } else {
-                    // A stop is terminal only after the worker publishes its
-                    // result. The stop notification wakes this poll through
-                    // the atomic waker while the worker is still unwinding.
-                    Poll::Pending
-                }
-            }
-        }
-    }
-
-    fn apply_action(&mut self, action: Value) -> VmResult<HostStreamAction> {
-        // The absolute total deadline is enforced here too: a slow callback
-        // (e.g. one awaiting a host future) must not extend the stream past
-        // its deadline. Once the deadline has passed, every callback action
-        // fails deterministically.
-        if Instant::now() >= self.deadline {
-            return Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()));
-        }
-        let Value::Bool(continue_stream) = action else {
-            return Err(VmError::TypeMismatch("SSE callback bool result"));
-        };
-        if continue_stream {
-            Ok(HostStreamAction::Continue)
-        } else {
-            Ok(HostStreamAction::CancelWithVm(
-                self.summary("stopped"),
-                OperationCancelReason::Requested,
-            ))
-        }
-    }
-}
-
-impl SseStreamDriver {
-    fn poll_terminal(&mut self, outcome: &str) -> Poll<VmResult<HostStreamPoll>> {
-        match self.shared.take_result() {
-            Some(Ok(())) => Poll::Ready(Ok(HostStreamPoll::CompleteWithVm(self.summary(outcome)))),
-            Some(Err(error)) => Poll::Ready(Err(error)),
-            None => Poll::Ready(Err(VmError::HostError(
-                "SSE worker completed without a terminal result".to_string(),
-            ))),
-        }
-    }
-}
-
-fn sse_resource_close_reason(termination: HostStreamTermination) -> ResourceCloseReason {
-    match termination {
-        HostStreamTermination::Completed => ResourceCloseReason::ResourceClosed,
-        HostStreamTermination::Cancelled(reason) => match reason {
-            OperationCancelReason::Requested => ResourceCloseReason::Requested,
-            OperationCancelReason::Deadline => ResourceCloseReason::Deadline,
-            OperationCancelReason::VmReset => ResourceCloseReason::VmReset,
-            OperationCancelReason::Parent => ResourceCloseReason::Parent,
-            OperationCancelReason::ResourceClosed => ResourceCloseReason::ResourceClosed,
-            OperationCancelReason::VmDrop => ResourceCloseReason::VmDrop,
-        },
-    }
-}
-
-fn close_sse_resource(vm: &mut Vm, resource: ResourceHandle) -> VmResult<()> {
-    let progress = vm
-        .host_context()
-        .close_resource::<SseStreamResource>(resource, ResourceCloseReason::ResourceClosed)
-        .map_err(|error| VmError::HostError(format!("failed to close SSE resource: {error}")))?;
-    match progress {
-        CloseProgress::Ready => Ok(()),
-        CloseProgress::Pending => Err(VmError::HostError(
-            "SSE resource close remained pending after producer retirement".to_string(),
-        )),
-    }
-}
-
-fn rollback_sse_admission(
-    vm: &mut Vm,
-    shared: &Arc<SseShared>,
-    resource: ResourceHandle,
-    operation: Option<OperationId>,
-    primary: VmError,
-) -> VmError {
-    if shared.rollback_finished.load(Ordering::Acquire) {
-        return primary;
-    }
-    let mut cleanup_errors = Vec::new();
-    let _ = shared.terminalize_workerless(
-        OperationCancelReason::Requested,
-        Err(VmError::HostError("SSE worker was not started".to_string())),
-    );
-    if let Some(operation) = operation
-        && let Err(error) = vm
-            .host_context()
-            .abort_operation(operation, OperationCancelReason::Requested)
-    {
-        cleanup_errors.push(VmError::HostError(format!(
-            "failed to abort SSE operation: {error}"
-        )));
-    }
-    if let Err(error) = shared.join_worker() {
-        cleanup_errors.push(VmError::HostError(format!(
-            "failed to join SSE worker: {error}"
-        )));
-    }
-    if let Err(error) = close_sse_resource(vm, resource) {
-        cleanup_errors.push(error);
-    }
-    if cleanup_errors.is_empty() {
-        shared.rollback_finished.store(true, Ordering::Release);
-    }
-    cleanup_errors
-        .into_iter()
-        .fold(primary, |primary, cleanup| {
-            crate::vm::async_host::preserve_stream_cleanup(primary, Err(cleanup))
-        })
-}
-
-/// The SSE stream reader registered as a child resource in the execution
-/// scope. Closing it via the scope lifecycle sets `stopping` on the shared
-/// state, which the worker observes between items and stops promptly.
-pub(crate) struct SseStreamResource {
-    shared: Arc<SseShared>,
-}
-
-impl crate::host_extension::HostResourceType for SseStreamResource {
-    const KEY: &'static str = "http.sse";
-    const DESCRIPTION: &'static str =
-        "An incremental SSE stream reader over an open response body stream";
-}
-
-impl HostResource for SseStreamResource {
-    fn resource_type_key() -> Option<ResourceTypeKey> {
-        ResourceTypeKey::new("http.sse").ok()
-    }
-
-    fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
-        self.shared.request_stop(match reason {
-            ResourceCloseReason::Requested => OperationCancelReason::Requested,
-            ResourceCloseReason::Deadline => OperationCancelReason::Deadline,
-            ResourceCloseReason::VmReset => OperationCancelReason::VmReset,
-            ResourceCloseReason::Parent => OperationCancelReason::Parent,
-            ResourceCloseReason::ResourceClosed => OperationCancelReason::ResourceClosed,
-            ResourceCloseReason::VmDrop => OperationCancelReason::VmDrop,
-        });
-        match self.shared.try_join_finished()? {
-            true => Ok(CloseProgress::Ready),
-            false => Ok(CloseProgress::Pending),
-        }
-    }
-
-    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<ResourceResult<()>> {
-        match self.shared.try_join_finished() {
-            Ok(true) => Poll::Ready(Ok(())),
-            Ok(false) => {
-                self.shared.close_waker.register(cx.waker());
-                match self.shared.try_join_finished() {
-                    Ok(true) => Poll::Ready(Ok(())),
-                    Ok(false) => Poll::Pending,
-                    Err(error) => Poll::Ready(Err(error)),
-                }
-            }
-            Err(error) => Poll::Ready(Err(error)),
-        }
-    }
-}
-
-/// Scope operation that tracks the pending SSE network poll. Cancel sets
-/// `stopping` on the shared state so the worker stops promptly. The actual
-/// item delivery is driven by the `SseStreamDriver` through the callable
-/// stream path; this operation exists only for scope lifecycle management.
-pub(super) struct SseScopeOperation {
-    shared: Arc<SseShared>,
-}
-
-impl HostOperation for SseScopeOperation {
-    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<OperationResult<()>> {
-        if self.shared.done.load(Ordering::SeqCst) {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
-    }
-
-    fn cancel(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
-        self.shared.request_stop(reason);
-        Ok(())
-    }
-
-    fn cancel_and_wait(&mut self, reason: OperationCancelReason) -> OperationResult<()> {
-        self.shared.request_stop(reason);
-        if !self.shared.is_quiescent() {
-            return Err(OperationError::new(
-                OperationErrorCode::OperationDriverFailed,
-                "http::sse",
-                "SSE worker cancellation is still pending",
-            ));
-        }
-        self.shared.join_worker().map_err(|message| {
-            OperationError::new(
-                OperationErrorCode::OperationDriverFailed,
-                "http::sse",
-                message,
-            )
-        })
-    }
-
-    fn is_quiescent(&self) -> bool {
-        self.shared.is_quiescent()
-    }
-
-    fn register_quiescence_waker(&mut self, cx: &Context<'_>) {
-        self.shared.quiescence_waker.register(cx.waker());
-    }
-
-    fn poll_quiescent(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.shared.is_quiescent() {
-            return Poll::Ready(());
-        }
-        self.shared.waker.register(cx.waker());
-        self.shared.close_waker.register(cx.waker());
-        self.shared.quiescence_waker.register(cx.waker());
-        if self.shared.is_quiescent() {
-            Poll::Ready(())
-        } else {
-            let _ = self.shared.try_join_finished();
-            if self.shared.is_quiescent() {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        }
-    }
-}
-
 pub(super) fn sse_contract(open: bool, timeout: bool) -> HostFunctionSchema {
     let resource = |key| HostTypeSchema::Resource(ResourceTypeKey::new(key).expect("static key"));
     let callback = |params| HostTypeSchema::Callable {
@@ -1353,278 +315,510 @@ pub(super) fn sse_contract(open: bool, timeout: bool) -> HostFunctionSchema {
     HostFunctionSchema::with_return("http::client::sse", params, resource("http.sse_summary"))
 }
 
-fn builtin_sse_start(
-    vm: &mut Vm,
-    request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
-    callback: Value,
-    on_open: Option<Value>,
-    timeout_ms: Option<i64>,
-) -> VmResult<HostCallResult<Resource<SseSummary>>> {
-    vm.validate_stream_positional_callback(
-        &callback,
-        &[
-            TypeSchema::String,
-            TypeSchema::String,
-            TypeSchema::String,
-            TypeSchema::String,
-        ],
-    )?;
-    if let Some(open) = on_open.as_ref() {
-        vm.validate_stream_positional_callback(
-            open,
-            &[
-                TypeSchema::Int,
-                TypeSchema::Resource(ResourceTypeKey::new("http.headers").expect("static key")),
-                TypeSchema::String,
-            ],
-        )?;
+fn event_params() -> [TypeSchema; 4] {
+    [
+        TypeSchema::String,
+        TypeSchema::String,
+        TypeSchema::String,
+        TypeSchema::String,
+    ]
+}
+fn open_params() -> [TypeSchema; 3] {
+    [
+        TypeSchema::Int,
+        TypeSchema::Resource(ResourceTypeKey::new("http.headers").expect("static key")),
+        TypeSchema::String,
+    ]
+}
+
+pub(super) struct SseRequestContext {
+    http: HttpRequestContext,
+    deadline: Instant,
+}
+impl CaptureAsyncHostContext for SseRequestContext {
+    fn capture(_vm: &mut Vm) -> VmResult<Self> {
+        Err(VmError::HostError(
+            "SSE context requires call arguments".into(),
+        ))
     }
-    let script_timeout = parse_stream_timeout(timeout_ms)?;
-    let (context, deadline) = HttpRequestContext::capture(vm, script_timeout, "SSE")?;
-    let mut request = HttpRequest {
-        method: request.method.clone(),
-        url: request.url.clone(),
-        headers: request.headers.clone(),
-        body: request.body.clone().into_bytes(),
-    };
-    policy::validate_url_policy(&context.config, policy::SchemeFamily::Http, &request.url)?;
+    fn capture_with_args(vm: &mut Vm, args: &[Value]) -> VmResult<Self> {
+        let result = (|| {
+            let callback = args.get(1).ok_or(VmError::StackUnderflow)?;
+            vm.validate_stream_positional_callback(callback, &event_params())?;
+            let mut timeout = None;
+            if let Some(arg) = args.get(2) {
+                if let Value::Int(ms) = arg {
+                    timeout = Some(*ms);
+                } else {
+                    vm.validate_stream_positional_callback(arg, &open_params())?;
+                }
+            }
+            if let Some(arg) = args.get(3) {
+                let Value::Int(ms) = arg else {
+                    return Err(VmError::TypeMismatch("SSE timeout_ms"));
+                };
+                timeout = Some(*ms);
+            }
+            let timeout = timeout
+                .map(|ms| {
+                    u64::try_from(ms)
+                        .ok()
+                        .filter(|ms| *ms > 0)
+                        .map(Duration::from_millis)
+                        .ok_or_else(|| VmError::HostError("SSE timeout_ms must be positive".into()))
+                })
+                .transpose()?;
+            let (http, deadline) = HttpRequestContext::capture_for(vm, timeout, "SSE")?;
+            super::request::with_request(vm, args, |request| {
+                validate_sse_request(request, &http.config)
+            })?;
+            Ok(Self { http, deadline })
+        })();
+        super::request::finish_capture(vm, args, result)
+    }
+}
+
+fn validate_sse_request(
+    request: &super::resources::HttpRequest,
+    config: &super::HttpConfig,
+) -> VmResult<()> {
+    super::request::validate_resource_request(request, config)?;
     if request.method != hyper::Method::GET && request.method != hyper::Method::POST {
         return Err(VmError::HostError(
-            "SSE requests require GET or POST".to_string(),
+            "SSE requests require GET or POST".into(),
         ));
     }
-    if request
-        .body
-        .as_ref()
-        .is_some_and(|body| body.len() > context.config.max_request_body_bytes)
-    {
-        return Err(VmError::HostError(
-            "HTTP request body exceeds limit".to_string(),
-        ));
-    }
-    if !request
-        .headers
+    let mut headers = request.headers.clone();
+    add_accept_header(&mut headers);
+    validate_request_header_budget(&headers, config)
+}
+
+fn add_accept_header(headers: &mut Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>) {
+    if !headers
         .iter()
         .any(|(name, _)| name == hyper::header::ACCEPT)
     {
-        request.headers.push((
+        headers.push((
             hyper::header::ACCEPT,
             hyper::header::HeaderValue::from_static("text/event-stream"),
         ));
     }
-    validate_request_header_budget(&request.headers, &context.config)?;
+}
 
-    let config = context.config.clone();
-    let permit = context.into_permit();
-    let (items, receiver) = mpsc::channel(SSE_CHANNEL_CAPACITY);
-    let shared = Arc::new(SseShared {
-        stopping: AtomicBool::new(false),
-        cancel: Notify::new(),
-        cancellation_reason: std::sync::Mutex::new(None),
-        item_ack: Notify::new(),
-        waker: AtomicWaker::new(),
-        items,
-        done: AtomicBool::new(false),
-        thread_finished: AtomicBool::new(false),
-        worker_lifecycle: std::sync::atomic::AtomicU8::new(SseWorkerLifecycle::NotStarted as u8),
-        result: std::sync::Mutex::new(None),
-        join_handle: std::sync::Mutex::new(None),
-        close_waker: AtomicWaker::new(),
-        quiescence_waker: AtomicWaker::new(),
-        _permit: permit,
-        rollback_finished: AtomicBool::new(false),
-    });
+fn sse_data_event(event: SseEvent) -> Vec<Value> {
+    vec![
+        Value::string(event.event.unwrap_or_default()),
+        Value::string(event.data),
+        Value::string(event.id.unwrap_or_default()),
+        Value::string(event.retry_ms.map(|ms| ms.to_string()).unwrap_or_default()),
+    ]
+}
 
-    // The SSE stream itself is a typed scope resource. The underlying response
-    // is owned by the stream worker and is closed after producer quiescence.
-    let sse_token = vm
-        .host_context()
-        .push_resource(SseStreamResource {
-            shared: Arc::clone(&shared),
-        })
-        .map_err(|error| {
-            VmError::HostError(format!("failed to push SSE child resource: {error}"))
-        })?;
-    let resource = sse_token.handle();
-    let op = SseScopeOperation {
-        shared: Arc::clone(&shared),
-    };
-    let scope_operation = match start_operation(vm, op) {
-        Ok(operation) => operation,
-        Err(error) => {
-            return Err(rollback_sse_admission(
-                vm,
-                &shared,
-                resource,
-                None,
-                VmError::HostError(format!("failed to start SSE operation: {error}")),
-            ));
-        }
-    };
+struct RetainedSseFrame {
+    data: Bytes,
+    offset: usize,
+}
 
-    let worker = Arc::new(SseWorker {
-        config: config.clone(),
-        request,
-        deadline,
-        shared: Arc::clone(&shared),
-        items: Arc::new(AtomicUsize::new(0)),
-        bytes_received: Arc::new(AtomicUsize::new(0)),
-        bytes_sent: Arc::new(AtomicUsize::new(0)),
-        status: std::sync::Mutex::new(None),
-        headers: std::sync::Mutex::new(None),
-        url: std::sync::Mutex::new(None),
-    });
-    let bytes_received = worker.bytes_received.clone();
-    let bytes_sent = worker.bytes_sent.clone();
-
-    let join_handle = match spawn_worker("rustscript-sse-worker", {
-        let worker_shared = Arc::clone(&shared);
-        move || {
-            worker_shared.mark_worker_running();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                worker.run();
-            }));
-            if let Err(panic) = result {
-                worker_shared.publish(Err(VmError::HostError(format!(
-                    "SSE worker panicked: {}",
-                    worker_panic_message(&panic)
-                ))));
-            }
-            worker_shared.mark_worker_finished();
-            worker_shared.waker.wake();
-        }
-    }) {
-        Ok(handle) => handle,
-        Err(error) => {
-            return Err(rollback_sse_admission(
-                vm,
-                &shared,
-                resource,
-                Some(scope_operation),
-                VmError::HostError(format!("failed to start SSE worker: {error}")),
-            ));
-        }
-    };
-    shared.mark_worker_running();
-    *shared
-        .join_handle
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(join_handle);
-
-    let driver = SseStreamDriver {
-        shared: Arc::clone(&shared),
-        receiver,
-        status: 0,
-        headers: HttpHeaders(Vec::new()),
-        url: String::new(),
-        items: 0,
-        bytes_received,
-        bytes_sent,
-        has_open_callback: on_open.is_some(),
-        deadline,
-        scope_operation,
-        resource,
-        termination: None,
-    };
-
-    match vm.submit_callable_stream_callbacks(
-        callback,
-        on_open,
-        &[
-            TypeSchema::String,
-            TypeSchema::String,
-            TypeSchema::String,
-            TypeSchema::String,
-        ],
-        &[
-            TypeSchema::Int,
-            TypeSchema::Resource(ResourceTypeKey::new("http.headers").expect("static key")),
-            TypeSchema::String,
-        ],
-        driver,
-    ) {
-        Ok(CallOutcome::Pending(op_id)) => Ok(HostCallResult::Pending(op_id)),
-        Ok(_) => Err(rollback_sse_admission(
-            vm,
-            &shared,
-            resource,
-            Some(scope_operation),
-            VmError::InvalidFrameState("callable stream admission returned a non-pending outcome"),
-        )),
-        Err(rejection) => Err(vm.rollback_rejected_callable_stream(rejection)),
+impl RetainedSseFrame {
+    fn new(data: Bytes) -> Self {
+        Self { data, offset: 0 }
     }
+
+    fn next_event(&mut self, parser: &mut SseParser) -> VmResult<Option<SseEvent>> {
+        let (consumed, event) = parser.push_until_event(&self.data[self.offset..])?;
+        self.offset += consumed;
+        Ok(event)
+    }
+
+    fn is_consumed(&self) -> bool {
+        self.offset == self.data.len()
+    }
+}
+
+/// Generic callable-stream continuation that owns only the Hyper response,
+/// parser, one retained body frame, deadlines, and the in-flight permit.
+struct SseStreamDriver {
+    response: OwnedResponse,
+    parser: SseParser,
+    open_pending: bool,
+    has_open_callback: bool,
+    retained_frame: Option<RetainedSseFrame>,
+    eof_event: Option<Vec<Value>>,
+    status: u16,
+    headers: HttpHeaders,
+    url: String,
+    items: usize,
+    bytes_received: usize,
+    bytes_sent: usize,
+    deadline: Instant,
+    total_sleep: Pin<Box<tokio::time::Sleep>>,
+    idle_timeout: Duration,
+    idle_sleep: Pin<Box<tokio::time::Sleep>>,
+    body_started: bool,
+    eof: bool,
+    _permit: super::policy::ConnectionPermit,
+}
+
+impl SseStreamDriver {
+    fn new(
+        response: OwnedResponse,
+        url: url::Url,
+        config: &super::HttpConfig,
+        deadline: Instant,
+        permit: super::policy::ConnectionPermit,
+        bytes_sent: usize,
+        has_open_callback: bool,
+    ) -> VmResult<Self> {
+        let status = response.response().status();
+        if !status.is_success() {
+            return Err(VmError::HostError(format!(
+                "SSE response status {} is not successful",
+                status.as_u16()
+            )));
+        }
+        response
+            .response()
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .filter(|value| value.eq_ignore_ascii_case("text/event-stream"))
+            .ok_or_else(|| {
+                VmError::HostError(
+                    "SSE response Content-Type must be text/event-stream".to_string(),
+                )
+            })?;
+        let headers = HttpHeaders::from_map(response.response().headers());
+        let total_at = tokio::time::Instant::from_std(deadline);
+        Ok(Self {
+            response,
+            parser: SseParser::new(
+                config.max_sse_line_bytes,
+                config.max_stream_item_bytes,
+                config.max_stream_total_bytes,
+            ),
+            open_pending: true,
+            has_open_callback,
+            retained_frame: None,
+            eof_event: None,
+            status: status.as_u16(),
+            headers,
+            url: url.to_string(),
+            items: 0,
+            bytes_received: 0,
+            bytes_sent,
+            deadline,
+            total_sleep: Box::pin(tokio::time::sleep_until(total_at)),
+            idle_timeout: config.stream_idle_timeout,
+            // Opening callback time is excluded from the first body idle window.
+            idle_sleep: Box::pin(tokio::time::sleep_until(total_at)),
+            body_started: false,
+            eof: false,
+            _permit: permit,
+        })
+    }
+
+    fn summary(&self, outcome: &str) -> HostVmCompletion<Value> {
+        let summary = SseSummary {
+            outcome: outcome.to_string(),
+            status: i64::from(self.status),
+            headers: self.headers.clone(),
+            url: self.url.clone(),
+            items: self.items as i64,
+            bytes_received: self.bytes_received as i64,
+            bytes_sent: i64::try_from(self.bytes_sent).unwrap_or(i64::MAX),
+        };
+        Box::new(move |vm| {
+            let token = vm
+                .host_context()
+                .push_resource(summary)
+                .map_err(super::request::host_boundary_error)?;
+            Ok(Value::Int(token.handle().raw() as i64))
+        })
+    }
+
+    fn reset_idle_deadline(&mut self) {
+        let idle_at = policy::phase_deadline(self.deadline, self.idle_timeout);
+        self.idle_sleep
+            .as_mut()
+            .reset(tokio::time::Instant::from_std(idle_at));
+    }
+
+    fn item(&mut self, item: Vec<Value>) -> HostStreamPoll {
+        self.items = self.items.saturating_add(1);
+        HostStreamPoll::Call(HostStreamCallback::Event, item)
+    }
+
+    fn poll_retained_frame(&mut self) -> VmResult<Option<HostStreamPoll>> {
+        let Some(frame) = self.retained_frame.as_mut() else {
+            return Ok(None);
+        };
+        let event = frame.next_event(&mut self.parser)?;
+        if frame.is_consumed() {
+            self.retained_frame = None;
+        }
+        Ok(event.map(|event| self.item(sse_data_event(event))))
+    }
+
+    fn poll_eof_item(&mut self) -> Option<HostStreamPoll> {
+        if let Some(event) = self.eof_event.take() {
+            return Some(self.item(event));
+        }
+        None
+    }
+}
+
+impl HostStreamDriver for SseStreamDriver {
+    fn acknowledge_item(&mut self) {
+        if !self.body_started {
+            self.body_started = true;
+            self.reset_idle_deadline();
+        }
+    }
+
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
+        if self.total_sleep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(VmError::HostError(
+                SSE_TOTAL_DEADLINE_ERROR.to_string(),
+            )));
+        }
+        if self.open_pending {
+            self.open_pending = false;
+            if self.has_open_callback {
+                let status = self.status;
+                let headers = self.headers.clone();
+                let url = self.url.clone();
+                return Poll::Ready(Ok(HostStreamPoll::CallWithVm(
+                    HostStreamCallback::Open,
+                    Box::new(move |vm| {
+                        let token = vm
+                            .host_context()
+                            .push_resource(headers)
+                            .map_err(super::request::host_boundary_error)?;
+                        Ok(vec![
+                            Value::Int(i64::from(status)),
+                            Value::Int(token.handle().raw() as i64),
+                            Value::string(url),
+                        ])
+                    }),
+                )));
+            }
+            self.body_started = true;
+            self.reset_idle_deadline();
+        }
+        match self.poll_retained_frame() {
+            Ok(Some(item)) => return Poll::Ready(Ok(item)),
+            Err(error) => return Poll::Ready(Err(error)),
+            Ok(None) => {}
+        }
+        if self.eof {
+            if let Some(item) = self.poll_eof_item() {
+                return Poll::Ready(Ok(item));
+            }
+            return Poll::Ready(Ok(HostStreamPoll::CompleteWithVm(self.summary("eof"))));
+        }
+        if self.body_started && self.idle_sleep.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(VmError::HostError(
+                "SSE stream idle timeout".to_string(),
+            )));
+        }
+
+        match self.response.poll_next_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(Some(frame))) => {
+                let Ok(data) = frame.into_data() else {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                };
+                self.reset_idle_deadline();
+                if let Err(error) = self.parser.admit_chunk(data.len()) {
+                    return Poll::Ready(Err(error));
+                }
+                self.bytes_received = self.bytes_received.saturating_add(data.len());
+                self.retained_frame = Some(RetainedSseFrame::new(data));
+                match self.poll_retained_frame() {
+                    Ok(Some(item)) => Poll::Ready(Ok(item)),
+                    Ok(None) => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    Err(error) => Poll::Ready(Err(error)),
+                }
+            }
+            Poll::Ready(Ok(None)) => {
+                let event = match self.parser.finish() {
+                    Ok(event) => event,
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
+                self.eof = true;
+                self.eof_event = event.map(sse_data_event);
+                Poll::Ready(Ok(self.poll_eof_item().unwrap_or_else(|| {
+                    HostStreamPoll::CompleteWithVm(self.summary("eof"))
+                })))
+            }
+        }
+    }
+
+    fn apply_action(&mut self, action: Value) -> VmResult<HostStreamAction> {
+        if Instant::now() >= self.deadline {
+            return Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()));
+        }
+        match action {
+            Value::Bool(true) => Ok(HostStreamAction::Continue),
+            Value::Bool(false) => Ok(HostStreamAction::CancelWithVm(
+                self.summary("stopped"),
+                OperationCancelReason::Requested,
+            )),
+            _ => Err(VmError::TypeMismatch("SSE callback bool")),
+        }
+    }
+}
+
+async fn open_sse_response(
+    context: &SseRequestContext,
+    request: &HttpRequest,
+    bytes_sent: &mut usize,
+) -> VmResult<(OwnedResponse, url::Url)> {
+    let opening_idle_deadline =
+        policy::phase_deadline(context.deadline, context.http.config.stream_idle_timeout);
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(opening_idle_deadline)) => {
+            if context.deadline <= opening_idle_deadline {
+                Err(VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string()))
+            } else {
+                Err(VmError::HostError(
+                    "SSE stream idle timeout while opening response".to_string(),
+                ))
+            }
+        }
+        opened = open_stream_response(
+            &context.http.client,
+            &context.http.config,
+            request,
+            context.deadline,
+            bytes_sent,
+        ) => opened.map_err(|error| {
+            if error.to_string().contains("HTTP request deadline exceeded") {
+                let now = Instant::now();
+                if now >= context.deadline {
+                    VmError::HostError(SSE_TOTAL_DEADLINE_ERROR.to_string())
+                } else if now >= opening_idle_deadline {
+                    VmError::HostError(
+                        "SSE stream idle timeout while opening response".to_string(),
+                    )
+                } else {
+                    error
+                }
+            } else {
+                error
+            }
+        })
+    }
+}
+
+async fn stream_sse(
+    context: SseRequestContext,
+    request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
+    callback: Value,
+    on_open: Option<Value>,
+) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
+    let mut request = super::request::into_request(request.into_inner());
+    add_accept_header(&mut request.headers);
+    let mut bytes_sent = 0;
+    let (response, url) = open_sse_response(&context, &request, &mut bytes_sent).await?;
+    let SseRequestContext { http, deadline } = context;
+    let driver = SseStreamDriver::new(
+        response,
+        url,
+        &http.config,
+        deadline,
+        http.permit,
+        bytes_sent,
+        on_open.is_some(),
+    )?;
+    Ok(HostFutureOutput::continue_with(move |vm| {
+        match vm.submit_callable_stream_callbacks(
+            callback,
+            on_open,
+            &event_params(),
+            &open_params(),
+            driver,
+        ) {
+            Ok(CallOutcome::Pending(id)) => Ok(CallOutcome::Pending(id)),
+            Ok(_) => Err(VmError::InvalidFrameState(
+                "callable stream admission returned a non-pending outcome",
+            )),
+            Err(rejection) => Err(vm.rollback_rejected_callable_stream(rejection)),
+        }
+    }))
 }
 
 /// Stream SSE events with an optional open callback and deadline.
 #[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
-#[pd_host_function(name = "http::client::sse", contract = super::http_sse_contract, runtime_owned_pending)]
-pub(super) fn builtin_http_client_sse(
-    vm: &mut Vm,
+#[pd_host_function(name = "http::client::sse", contract = super::http_sse_contract)]
+pub(super) async fn builtin_http_client_sse(
+    #[pd_host_context] context: SseRequestContext,
     request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
     on_event: VmCallable<fn(String, String, String, String) -> bool>,
-) -> VmResult<HostCallResult<Resource<SseSummary>>> {
-    builtin_sse_start(vm, request, on_event.into_value(), None, None)
+) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
+    stream_sse(context, request, on_event.into_value(), None).await
 }
 
 /// Stream events with an open callback.
 #[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
-#[pd_host_function(name = "http::client::sse", contract = super::http_sse_open_contract, runtime_owned_pending)]
-pub(super) fn builtin_http_client_sse_open(
-    vm: &mut Vm,
+#[pd_host_function(name = "http::client::sse", contract = super::http_sse_open_contract)]
+pub(super) async fn builtin_http_client_sse_open(
+    #[pd_host_context] context: SseRequestContext,
     request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
     on_event: VmCallable<fn(String, String, String, String) -> bool>,
     on_open: VmCallable<fn(i64, i64, String) -> bool>,
-) -> VmResult<HostCallResult<Resource<SseSummary>>> {
-    builtin_sse_start(
-        vm,
+) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
+    stream_sse(
+        context,
         request,
         on_event.into_value(),
         Some(on_open.into_value()),
-        None,
     )
+    .await
 }
 
 /// Stream events with a deadline and no open callback.
 #[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
-#[pd_host_function(name = "http::client::sse", contract = super::http_sse_only_timeout_contract, runtime_owned_pending)]
-pub(super) fn builtin_http_client_sse_only_timeout(
-    vm: &mut Vm,
+#[pd_host_function(name = "http::client::sse", contract = super::http_sse_only_timeout_contract)]
+pub(super) async fn builtin_http_client_sse_only_timeout(
+    #[pd_host_context] context: SseRequestContext,
     request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
     on_event: VmCallable<fn(String, String, String, String) -> bool>,
-    timeout_ms: i64,
-) -> VmResult<HostCallResult<Resource<SseSummary>>> {
-    builtin_sse_start(vm, request, on_event.into_value(), None, Some(timeout_ms))
+    _timeout_ms: i64,
+) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
+    stream_sse(context, request, on_event.into_value(), None).await
 }
 
 /// Stream events with an optional open callback and timeout.
 #[allow(clippy::type_complexity)] // The host scanner needs the explicit callable signature.
-#[pd_host_function(name = "http::client::sse", contract = super::http_sse_timeout_contract, runtime_owned_pending)]
-pub(super) fn builtin_http_client_sse_timeout(
-    vm: &mut Vm,
+#[pd_host_function(name = "http::client::sse", contract = super::http_sse_timeout_contract)]
+pub(super) async fn builtin_http_client_sse_timeout(
+    #[pd_host_context] context: SseRequestContext,
     request: crate::vm::resource::ResourceOwned<super::resources::HttpRequest>,
     on_event: VmCallable<fn(String, String, String, String) -> bool>,
     on_open: VmCallable<fn(i64, i64, String) -> bool>,
-    timeout_ms: i64,
-) -> VmResult<HostCallResult<Resource<SseSummary>>> {
-    builtin_sse_start(
-        vm,
+    _timeout_ms: i64,
+) -> VmResult<HostFutureOutput<crate::vm::resource::Resource<SseSummary>>> {
+    stream_sse(
+        context,
         request,
         on_event.into_value(),
         Some(on_open.into_value()),
-        Some(timeout_ms),
     )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use super::{
-        FAIL_NEXT_WORKER_SPAWN, REJECT_NEXT_OPERATION_ADMISSION, SseEvent, SseParser,
-        SseScopeOperation, SseShared, SseStreamResource, SseWorkerLifecycle,
-        rollback_sse_admission, spawn_worker, start_operation,
-    };
-    use crate::vm::VmError;
+    use super::{SseEvent, SseParser};
 
     fn event(data: &str, event: Option<&str>, id: Option<&str>, retry_ms: Option<i64>) -> SseEvent {
         SseEvent {
@@ -1847,90 +1041,6 @@ mod tests {
                 event("first", None, None, None),
                 event("\u{feff}second", None, None, None),
             ]
-        );
-    }
-
-    #[test]
-    fn admission_rollback_reclaims_workerless_sse_resource() {
-        let mut vm = crate::vm::Vm::new(crate::vm::Program::new(
-            Vec::new(),
-            vec![crate::vm::OpCode::Ret as u8],
-        ));
-        let permit = crate::builtins::runtime::http::policy::ConnectionAdmission::new(1)
-            .acquire()
-            .expect("test permit");
-        let (items, _receiver) = tokio::sync::mpsc::channel(1);
-        let shared = std::sync::Arc::new(SseShared {
-            stopping: AtomicBool::new(false),
-            cancel: tokio::sync::Notify::new(),
-            cancellation_reason: std::sync::Mutex::new(None),
-            item_ack: tokio::sync::Notify::new(),
-            waker: futures_util::task::AtomicWaker::new(),
-            items,
-            done: AtomicBool::new(false),
-            thread_finished: AtomicBool::new(false),
-            worker_lifecycle: std::sync::atomic::AtomicU8::new(
-                SseWorkerLifecycle::NotStarted as u8,
-            ),
-            result: std::sync::Mutex::new(None),
-            join_handle: std::sync::Mutex::new(None),
-            close_waker: futures_util::task::AtomicWaker::new(),
-            quiescence_waker: futures_util::task::AtomicWaker::new(),
-            _permit: permit,
-            rollback_finished: AtomicBool::new(false),
-        });
-        let token = vm
-            .execution_scope()
-            .push_resource(SseStreamResource {
-                shared: std::sync::Arc::clone(&shared),
-            })
-            .expect("SSE resource");
-        let primary = crate::vm::VmError::HostError("operation admission rejected".to_string());
-        REJECT_NEXT_OPERATION_ADMISSION.store(true, Ordering::Release);
-        let admission = start_operation(
-            &mut vm,
-            SseScopeOperation {
-                shared: std::sync::Arc::clone(&shared),
-            },
-        );
-        assert!(admission.is_err());
-
-        let error = rollback_sse_admission(&mut vm, &shared, token.handle(), None, primary);
-
-        assert!(error.to_string().contains("operation admission rejected"));
-        assert_eq!(vm.execution_scope().resources().len(), 0);
-        assert_eq!(
-            shared.worker_lifecycle.load(Ordering::Acquire),
-            SseWorkerLifecycle::Finished as u8
-        );
-        assert!(shared.done.load(Ordering::Acquire));
-        assert!(shared.thread_finished.load(Ordering::Acquire));
-
-        let repeated = rollback_sse_admission(
-            &mut vm,
-            &shared,
-            token.handle(),
-            None,
-            VmError::HostError("repeated rollback".to_string()),
-        );
-        assert!(repeated.to_string().contains("repeated rollback"));
-    }
-
-    #[test]
-    fn worker_spawn_abstraction_can_inject_a_builder_failure() {
-        FAIL_NEXT_WORKER_SPAWN.store(true, Ordering::Release);
-        let result = spawn_worker("injected-sse-worker", || {});
-        let error = match result {
-            Ok(handle) => {
-                handle.join().expect("unexpected worker");
-                panic!("spawn should have been rejected")
-            }
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("injected SSE worker spawn failure")
         );
     }
 }
