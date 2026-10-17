@@ -248,6 +248,9 @@ pub(crate) enum AotSsaInstKind {
     TaggedToInt {
         input: AotSsaValueId,
     },
+    TaggedToBool {
+        input: AotSsaValueId,
+    },
     TaggedNumberToFloat {
         input: AotSsaValueId,
     },
@@ -380,6 +383,7 @@ impl AotSsaInstKind {
             | Self::FloatCmpGt { lhs, rhs } => vec![*lhs, *rhs],
             Self::BoolNot { input }
             | Self::TaggedToInt { input }
+            | Self::TaggedToBool { input }
             | Self::TaggedNumberToFloat { input }
             | Self::IntToFloat { input }
             | Self::IntNeg { input }
@@ -1533,10 +1537,22 @@ impl<'a> Builder<'a> {
                 target_ip,
                 fallthrough_ip,
             } => {
-                let condition = frame.pop(block.terminal_ip.unwrap_or(block.end_ip), "brfalse")?;
+                let ip = block.terminal_ip.unwrap_or(block.end_ip);
+                let mut condition = frame.pop(ip, "brfalse")?;
+                if condition.value.repr == AotSsaValueRepr::Tagged
+                    && operand_types_at(self.program, ip).0 == ValueType::Bool
+                {
+                    condition.value = emitter.emit(
+                        ip,
+                        AotSsaInstKind::TaggedToBool {
+                            input: condition.value.id,
+                        },
+                        AotSsaValueRepr::Bool,
+                    );
+                }
                 if condition.value.repr != AotSsaValueRepr::Bool {
                     return Err(AotSsaBuildError::NonBoolBranchCondition {
-                        ip: block.terminal_ip.unwrap_or(block.end_ip),
+                        ip,
                         repr: condition.value.repr,
                     });
                 }

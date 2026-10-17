@@ -86,6 +86,33 @@ fn call_script_executes_direct_call() {
 }
 
 #[test]
+fn nostd_executes_std_encoded_result_ok_and_err_without_source() {
+    let cases = [
+        (
+            "let value: Result<int, int> = Result::Ok(7); match value { Result::Ok(v) => v, Result::Err(e) => e };",
+            EmbeddedValue::Int(7),
+        ),
+        (
+            "let value: Result<int, int> = Result::Err(4); match value { Result::Ok(v) => v, Result::Err(e) => e };",
+            EmbeddedValue::Int(4),
+        ),
+    ];
+    for (source, expected) in cases {
+        let compiled = compile_source(source).expect("Result source should compile");
+        let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
+            .expect("Result program should encode");
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
+        let program = decode_program(&bytes).expect("no-std should decode v13 Result program");
+        let mut vm = EmbeddedVm::new(program);
+        assert_eq!(
+            vm.run().expect("decoded Result program should halt"),
+            EmbeddedVmStatus::Halted
+        );
+        assert_eq!(vm.stack().last().cloned(), Some(expected));
+    }
+}
+
+#[test]
 fn call_script_executes_nested_direct_calls() {
     let compiled = compile_source(
         "fn add2(value: int) -> int { value + 2 } fn add5(value: int) -> int { add2(value) + 3 } add5(0);",

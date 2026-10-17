@@ -600,8 +600,42 @@ fn substitute_named_struct_schema(
                 .collect(),
             result: Box::new(substitute_named_struct_schema(result, bindings)),
         },
+        TypeSchema::Result { ok, err } => TypeSchema::Result {
+            ok: Box::new(substitute_named_struct_schema(ok, bindings)),
+            err: Box::new(substitute_named_struct_schema(err, bindings)),
+        },
         _ => schema.clone(),
     }
+}
+
+pub(crate) fn split_result_carrier(value: &Value) -> VmResult<(bool, Option<&Value>)> {
+    let Value::Map(entries) = value else {
+        return Err(VmError::TypeMismatch("result"));
+    };
+    if entries.len() > 2 {
+        return Err(VmError::TypeMismatch("result"));
+    }
+    for (key, _) in entries.iter() {
+        let Value::String(name) = key else {
+            return Err(VmError::TypeMismatch("result"));
+        };
+        if name.as_str() != "tag" && name.as_str() != "payload" {
+            return Err(VmError::TypeMismatch("result"));
+        }
+    }
+    let Some(Value::Bool(ok)) = entries.get(&Value::string("tag")) else {
+        return Err(VmError::TypeMismatch("result"));
+    };
+    Ok((*ok, entries.get(&Value::string("payload"))))
+}
+
+fn result_schema_accepts_missing_payload(schema: &crate::compiler::TypeSchema) -> bool {
+    matches!(
+        schema,
+        crate::compiler::TypeSchema::Null
+            | crate::compiler::TypeSchema::Optional(_)
+            | crate::compiler::TypeSchema::Unknown
+    )
 }
 
 fn validate_value_against_type_schema(
@@ -888,6 +922,33 @@ fn validate_value_against_type_schema_walk(
                 .validate_resource_type_key(handle, key)
                 .map_err(|error| VmError::HostError(error.to_string()))
         }
+        TypeSchema::Result { ok, err } => {
+            let (is_ok, payload) = split_result_carrier(value)?;
+            let active = if is_ok { ok.as_ref() } else { err.as_ref() };
+            match payload {
+                Some(payload) => validate_value_against_type_schema_walk(
+                    payload,
+                    active,
+                    resources,
+                    validate_scalars,
+                    named_struct_schemas,
+                    depth,
+                    nodes,
+                ),
+                None if result_schema_accepts_missing_payload(active) => {
+                    validate_value_against_type_schema_walk(
+                        &Value::Null,
+                        active,
+                        resources,
+                        validate_scalars,
+                        named_struct_schemas,
+                        depth,
+                        nodes,
+                    )
+                }
+                None => Err(VmError::TypeMismatch("result")),
+            }
+        }
     }
 }
 
@@ -950,6 +1011,16 @@ fn schema_contains_resource_walk(
 
     match schema {
         TypeSchema::Resource(_) => true,
+        TypeSchema::Result { ok, err } => {
+            schema_contains_resource_walk(ok, named_struct_schemas, depth + 1, active, nodes)
+                || schema_contains_resource_walk(
+                    err,
+                    named_struct_schemas,
+                    depth + 1,
+                    active,
+                    nodes,
+                )
+        }
         TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
             schema_contains_resource_walk(inner, named_struct_schemas, depth + 1, active, nodes)
         }
@@ -1079,6 +1150,11 @@ fn hash_type_schema(schema: &crate::compiler::TypeSchema, state: &mut impl Hashe
                 hash_type_schema(param, state);
             }
             hash_type_schema(result, state);
+        }
+        TypeSchema::Result { ok, err } => {
+            18u8.hash(state);
+            hash_type_schema(ok, state);
+            hash_type_schema(err, state);
         }
         TypeSchema::Resource(key) => {
             17u8.hash(state);

@@ -9,6 +9,7 @@ use vm::{
     compile_source, decode_program, disassemble_vmbc, disassemble_vmbc_with_options,
     encode_program, infer_local_count, validate_program,
 };
+use vm::compiler::TypeSchema;
 
 #[test]
 fn wire_roundtrip_preserves_constants_and_code() {
@@ -66,6 +67,59 @@ fn wire_roundtrip_preserves_constants_and_code() {
     assert_eq!(decoded.imports, program.imports);
     assert_eq!(decoded.debug, program.debug);
     assert_eq!(decoded.type_map, program.type_map);
+}
+
+#[test]
+fn wire_v11_legacy_imports_decode_without_schema_metadata() {
+    let import = HostImport {
+        name: "legacy::import".to_string(),
+        arity: 0,
+        return_type: ValueType::Unknown,
+    };
+    let program = Program::with_imports_and_debug(
+        Vec::new(),
+        vec![vm::OpCode::Ret as u8],
+        vec![import.clone()],
+        None,
+    );
+    let encoded = encode_program(&program).expect("v13 encoding should succeed");
+    let marker_offset = 8 + 4 + 4 + program.code.len() + 4 + 4 + import.name.len() + 2;
+    assert_eq!(encoded[marker_offset], 0);
+    let mut legacy = encoded;
+    legacy.drain(marker_offset..marker_offset + 1);
+    strip_empty_named_struct_section(&mut legacy);
+    legacy[4..6].copy_from_slice(&11u16.to_le_bytes());
+
+    assert!(
+        matches!(decode_program(&legacy), Err(WireError::UnsupportedVersion(11))),
+        "v11 payloads are not a supported reader"
+    );
+}
+
+#[test]
+fn wire_v11_zero_import_program_decodes_by_version() {
+    let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
+    let mut encoded = encode_program(&program).expect("v13 encoding should succeed");
+    strip_empty_named_struct_section(&mut encoded);
+    encoded[4..6].copy_from_slice(&11u16.to_le_bytes());
+
+    assert!(matches!(
+        decode_program(&encoded),
+        Err(WireError::UnsupportedVersion(11))
+    ));
+}
+
+fn strip_empty_named_struct_section(encoded: &mut Vec<u8>) {
+    assert!(
+        encoded.len() >= 4,
+        "encoded VMBC is too short to contain a named-struct section"
+    );
+    assert_eq!(
+        &encoded[encoded.len() - 4..],
+        &[0, 0, 0, 0],
+        "expected an empty named-struct count trailer on current encode"
+    );
+    encoded.truncate(encoded.len() - 4);
 }
 
 fn minimal_vmbc_prefix(constant_count: u32, code: &[u8], import_count: u32) -> Vec<u8> {
@@ -1007,6 +1061,14 @@ fn call_script_wire_version_is_v13() {
     let program = Program::new(vec![], vec![vm::OpCode::Ret as u8]);
     let encoded = encode_program(&program).expect("encode should succeed");
     assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
+
+    let mut old = encoded;
+    strip_empty_named_struct_section(&mut old);
+    old[4..6].copy_from_slice(&11u16.to_le_bytes());
+    assert!(matches!(
+        decode_program(&old),
+        Err(WireError::UnsupportedVersion(11))
+    ));
 }
 
 #[test]
@@ -1022,6 +1084,25 @@ fn current_vmbc_preserves_code_bytes_without_script_calls() {
     let decoded = decode_program(&encoded).expect("decode should succeed");
     assert_eq!(decoded.code, program.code);
     assert_eq!(decoded.constants, program.constants);
+}
+
+#[test]
+fn v12_trailing_zero_count_is_not_a_named_struct_table() {
+    let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
+    let mut encoded = encode_program(&program).expect("v13 encoding should succeed");
+    strip_empty_named_struct_section(&mut encoded);
+    encoded[4..6].copy_from_slice(&12u16.to_le_bytes());
+    assert!(matches!(
+        decode_program(&encoded),
+        Err(WireError::UnsupportedVersion(12))
+    ));
+
+    let mut garbage = encoded;
+    garbage.extend_from_slice(&0u32.to_le_bytes());
+    assert!(
+        matches!(decode_program(&garbage), Err(WireError::UnsupportedVersion(12))),
+        "v12 is rejected before trailing bytes are interpreted"
+    );
 }
 
 #[test]
@@ -1046,4 +1127,63 @@ fn v13_roundtrip_preserves_guest_named_struct_payload() {
         decoded.named_struct_decls().contains_key("Point"),
         "VMBC v13 should preserve guest struct decls"
     );
+}
+
+#[test]
+fn result_schema_roundtrip_rejects_non_v13_unknown_tags_and_excess_depth() {
+    let compiled = compile_source(
+        "let value: Result<int, string> = Result::Ok(7); match value { Result::Ok(v) => v, Result::Err(e) => -1 };",
+    )
+    .expect("Result source should compile");
+    let encoded = encode_program(&compiled.program.with_local_count(compiled.locals))
+        .expect("Result program should encode");
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
+    let decoded = decode_program(&encoded).expect("v13 Result program should decode");
+    let has_result = decoded.type_map.as_ref().is_some_and(|map| {
+        map.local_schemas
+            .iter()
+            .flatten()
+            .any(|schema| matches!(schema, TypeSchema::Result { .. }))
+    });
+    assert!(has_result, "decoded type map should keep the Result schema");
+
+    let mut old = encoded.clone();
+    old[4..6].copy_from_slice(&11u16.to_le_bytes());
+    assert!(matches!(
+        decode_program(&old),
+        Err(WireError::UnsupportedVersion(11))
+    ));
+
+    let mut unknown = encoded.clone();
+    let tag = unknown
+        .windows(2)
+        .position(|window| window == [18, 2])
+        .expect("encoded Result<int> schema should contain tag 18 then Int");
+    unknown[tag + 1] = 99;
+    assert!(matches!(
+        decode_program(&unknown),
+        Err(WireError::InvalidValueType(99))
+    ));
+
+    let mut schema = TypeSchema::Int;
+    for _ in 0..70 {
+        schema = TypeSchema::Result {
+            ok: Box::new(schema),
+            err: Box::new(TypeSchema::Int),
+        };
+    }
+    let mut deep = Program::new(vec![Value::Int(1)], vec![0x01]);
+    deep.type_map = Some(TypeMap {
+        strict_types: true,
+        local_types: vec![ValueType::Map],
+        local_schemas: vec![Some(schema)],
+        callable_slots: vec![false],
+        optional_slots: vec![false],
+        operand_types: HashMap::new(),
+    });
+    let deep_bytes = encode_program(&deep).expect("deep Result schema should encode");
+    assert!(matches!(
+        decode_program(&deep_bytes),
+        Err(WireError::LengthTooLarge("schema nesting depth", _))
+    ));
 }

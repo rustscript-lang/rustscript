@@ -249,6 +249,13 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
                     .any(|(_, arm_expr)| expr_uses_slot(arm_expr, slot))
                 || expr_uses_slot(default, slot)
         }
+        other @ (Expr::ResultConstruct { .. }
+        | Expr::ResultQuery { .. }
+        | Expr::ResultMatch { .. }) => {
+            let mut used = false;
+            other.visit_result_children(|child| used |= expr_uses_slot(child, slot));
+            used
+        }
         Expr::Block { stmts, expr } => {
             stmts.iter().any(|stmt| stmt_uses_slot(stmt, slot)) || expr_uses_slot(expr, slot)
         }
@@ -580,6 +587,18 @@ pub(super) fn collect_consumed_positions_from_expr(
                 known_consumed_positions,
                 out,
             );
+        }
+        other @ (Expr::ResultConstruct { .. }
+        | Expr::ResultQuery { .. }
+        | Expr::ResultMatch { .. }) => {
+            other.visit_result_children(|child| {
+                collect_consumed_positions_from_expr(
+                    child,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
+            });
         }
         Expr::Block { stmts, expr } => {
             for nested in stmts {

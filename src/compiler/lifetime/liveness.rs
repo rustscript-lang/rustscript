@@ -241,7 +241,11 @@ impl LivenessRewriter {
                     }],
                 )
             }
-            Stmt::ClosureLet { line, closure } => {
+            Stmt::ClosureLet {
+                line,
+                closure,
+                expected_schema,
+            } => {
                 let mut live_before = live_after.clone();
                 let mut defs = Vec::with_capacity(closure.capture_copies.len());
                 for (source_slot, captured_slot) in &closure.capture_copies {
@@ -256,6 +260,7 @@ impl LivenessRewriter {
                     Stmt::ClosureLet {
                         line: *line,
                         closure: closure.clone(),
+                        expected_schema: expected_schema.clone(),
                     },
                     live_before,
                     defs,
@@ -670,6 +675,13 @@ impl LivenessRewriter {
                 }
                 self.add_expr_uses_impl(default, live, conservative);
             }
+            other @ (Expr::ResultConstruct { .. }
+            | Expr::ResultQuery { .. }
+            | Expr::ResultMatch { .. }) => {
+                other.visit_result_children(|child| {
+                    self.add_expr_uses_impl(child, live, conservative)
+                });
+            }
             Expr::Block { stmts, expr } => {
                 let live_out = if conservative {
                     self.uses_expr(expr)
@@ -998,7 +1010,21 @@ impl LocalSlotAllocator {
                     }
                 }
             }
-            Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+            Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
+                // A closure binding that passes Some(binding) into prototype
+                // creation must not share a physical slot with a logically
+                // distinct capture source. Same-binding recursion stays
+                // allowed because add_edge ignores a self edge.
+                if let Expr::Closure(closure) = expr {
+                    for (source_slot, _) in &closure.capture_copies {
+                        if *source_slot != *index {
+                            self.add_edge(*index as usize, *source_slot as usize);
+                        }
+                    }
+                }
+                self.collect_expr_constraints(expr, live_before, protected_slots)?;
+            }
+            Stmt::Expr { expr, .. } => {
                 self.collect_expr_constraints(expr, live_before, protected_slots)?;
             }
             Stmt::ClosureLet { closure, .. } => {
@@ -1227,6 +1253,32 @@ impl LocalSlotAllocator {
                     self.collect_expr_constraints(arm_expr, &live_during, protected_slots)?;
                 }
                 self.collect_expr_constraints(default, &live_during, protected_slots)?;
+            }
+            Expr::ResultConstruct { payload, .. } => {
+                self.collect_expr_constraints(payload, &live_during, protected_slots)?;
+            }
+            Expr::ResultQuery { value, .. } => {
+                self.collect_expr_constraints(value, &live_during, protected_slots)?;
+            }
+            Expr::ResultMatch {
+                value,
+                value_slot,
+                ok_binding,
+                ok_expr,
+                err_binding,
+                err_expr,
+                ..
+            } => {
+                self.add_slot_live_edges(*value_slot, &live_during);
+                if let Some(slot) = *ok_binding {
+                    self.add_slot_live_edges(slot, &live_during);
+                }
+                if let Some(slot) = *err_binding {
+                    self.add_slot_live_edges(slot, &live_during);
+                }
+                self.collect_expr_constraints(value, &live_during, protected_slots)?;
+                self.collect_expr_constraints(ok_expr, &live_during, protected_slots)?;
+                self.collect_expr_constraints(err_expr, &live_during, protected_slots)?;
             }
             Expr::Block { stmts, expr } => {
                 self.collect_expr_constraints(expr, &live_during, protected_slots)?;
@@ -1482,6 +1534,30 @@ impl LocalSlotAllocator {
                     self.collect_expr_footprint(arm_expr, set, stack);
                 }
                 self.collect_expr_footprint(default, set, stack);
+            }
+            Expr::ResultConstruct { payload, .. } => {
+                self.collect_expr_footprint(payload, set, stack)
+            }
+            Expr::ResultQuery { value, .. } => self.collect_expr_footprint(value, set, stack),
+            Expr::ResultMatch {
+                value,
+                value_slot,
+                ok_binding,
+                ok_expr,
+                err_binding,
+                err_expr,
+                ..
+            } => {
+                self.mark_set_slot(set, *value_slot);
+                if let Some(slot) = *ok_binding {
+                    self.mark_set_slot(set, slot);
+                }
+                if let Some(slot) = *err_binding {
+                    self.mark_set_slot(set, slot);
+                }
+                self.collect_expr_footprint(value, set, stack);
+                self.collect_expr_footprint(ok_expr, set, stack);
+                self.collect_expr_footprint(err_expr, set, stack);
             }
             Expr::Block { stmts, expr } => {
                 for nested in stmts {
@@ -1837,6 +1913,13 @@ fn collect_persistent_closure_sources_from_expr(expr: &Expr, slots: &mut BTreeSe
             }
             collect_persistent_closure_sources_from_expr(default, slots);
         }
+        other @ (Expr::ResultConstruct { .. }
+        | Expr::ResultQuery { .. }
+        | Expr::ResultMatch { .. }) => {
+            other.visit_result_children(|child| {
+                collect_persistent_closure_sources_from_expr(child, slots)
+            });
+        }
         Expr::Block { stmts, expr } => {
             collect_persistent_closure_sources_from_stmts(stmts, slots);
             collect_persistent_closure_sources_from_expr(expr, slots);
@@ -2027,6 +2110,28 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
             }
             remap_expr_slots(default, mapping)?;
         }
+        Expr::ResultConstruct { payload, .. } => remap_expr_slots(payload, mapping)?,
+        Expr::ResultQuery { value, .. } => remap_expr_slots(value, mapping)?,
+        Expr::ResultMatch {
+            value,
+            value_slot,
+            ok_binding,
+            ok_expr,
+            err_binding,
+            err_expr,
+            ..
+        } => {
+            *value_slot = remap_slot(*value_slot, mapping)?;
+            if let Some(slot) = ok_binding {
+                *slot = remap_slot(*slot, mapping)?;
+            }
+            if let Some(slot) = err_binding {
+                *slot = remap_slot(*slot, mapping)?;
+            }
+            remap_expr_slots(value, mapping)?;
+            remap_expr_slots(ok_expr, mapping)?;
+            remap_expr_slots(err_expr, mapping)?;
+        }
         Expr::Block { stmts, expr } => {
             for nested in stmts {
                 remap_stmt_slots(nested, mapping)?;
@@ -2213,6 +2318,113 @@ mod loop_owned_drop_tests {
         assert!(
             body.iter().all(|stmt| !matches!(stmt, Stmt::Drop { .. })),
             "non-owned loop body must not gain drops: {body:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod closure_binding_interference_tests {
+    use super::LocalSlotAllocator;
+    use crate::compiler::ir::{AssignmentKind, ClosureExpr, Expr, FrontendIr, Stmt};
+    use std::collections::HashMap;
+
+    fn ir(stmts: Vec<Stmt>, locals: usize) -> FrontendIr {
+        FrontendIr {
+            stmts,
+            locals,
+            local_bindings: Vec::new(),
+            struct_schemas: HashMap::new(),
+            unknown_type_spans: Vec::new(),
+            functions: Vec::new(),
+            function_impls: HashMap::new(),
+            stmt_sources: Vec::new(),
+            function_sources: HashMap::new(),
+            use_declarations: Vec::new(),
+            implicit_extern_names: Vec::new(),
+            host_api_metadata: None,
+            semantic_index: None,
+            parsed_semantic_index: None,
+            catalog_visibility: None,
+            lexer_tokens: Vec::new(),
+        }
+    }
+
+    fn closure_capturing(source: u16, target: u16) -> Expr {
+        Expr::Closure(ClosureExpr {
+            param_slots: Vec::new(),
+            capture_copies: vec![(source, target)],
+            body: Box::new(Expr::Var(target)),
+        })
+    }
+
+    #[test]
+    fn distinct_let_and_assign_bindings_do_not_reuse_capture_sources() {
+        let source = 0u16;
+        let binding = 1u16;
+        let target = 2u16;
+        let assigned = 3u16;
+        let assigned_target = 4u16;
+        let stmts = vec![
+            Stmt::Let {
+                index: source,
+                declared_schema: None,
+                expr: Expr::Int(3),
+                line: 1,
+            },
+            Stmt::Let {
+                index: binding,
+                declared_schema: None,
+                expr: closure_capturing(source, target),
+                line: 2,
+            },
+            Stmt::Assign {
+                kind: AssignmentKind::Set,
+                index: assigned,
+                expr: closure_capturing(source, assigned_target),
+                line: 3,
+            },
+            Stmt::Expr {
+                expr: Expr::LocalCall(binding, Vec::new(), Vec::new(), None),
+                line: 4,
+            },
+        ];
+        let allocation = LocalSlotAllocator::new(5, &[], &HashMap::new())
+            .allocate(ir(stmts, 5), &[])
+            .expect("distinct capture binding should allocate");
+        assert_ne!(
+            allocation.mapping[source as usize], allocation.mapping[binding as usize],
+            "let binding must not reuse a distinct capture source: {:?}",
+            allocation.mapping
+        );
+        assert_ne!(
+            allocation.mapping[source as usize], allocation.mapping[assigned as usize],
+            "assign binding must not reuse a distinct capture source: {:?}",
+            allocation.mapping
+        );
+    }
+
+    #[test]
+    fn same_binding_recursive_capture_stays_allowed() {
+        let binding = 0u16;
+        let target = 1u16;
+        let stmts = vec![Stmt::Let {
+            index: binding,
+            declared_schema: None,
+            expr: closure_capturing(binding, target),
+            line: 1,
+        }];
+        let allocation = LocalSlotAllocator::new(2, &[], &HashMap::new())
+            .allocate(ir(stmts, 2), &[])
+            .expect("genuine self capture must remain allocatable");
+        assert_eq!(
+            allocation.mapping[binding as usize], allocation.mapping[binding as usize],
+            "same logical self binding maps to one physical slot"
+        );
+        assert!(
+            (allocation.mapping[binding as usize] as usize) < allocation.ir.locals
+                || allocation.mapping[binding as usize] == binding,
+            "self binding keeps a real slot: {:?}",
+            allocation.mapping
         );
     }
 }

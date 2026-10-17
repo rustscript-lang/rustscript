@@ -1104,6 +1104,96 @@ impl Compiler {
                 self.compile_stmts(stmts)?;
                 self.compile_expr(expr)?;
             }
+            Expr::ResultConstruct { ok, payload, .. } => {
+                self.assembler.call(BuiltinFunction::MapNew.call_index(), 0);
+                self.assembler
+                    .push_const(Value::string(super::result::RESULT_TAG_KEY));
+                self.assembler.push_const(Value::Bool(*ok));
+                self.assembler.call(BuiltinFunction::Set.call_index(), 3);
+                self.assembler
+                    .push_const(Value::string(super::result::RESULT_PAYLOAD_KEY));
+                self.compile_expr(payload)?;
+                self.assembler.call(BuiltinFunction::Set.call_index(), 3);
+            }
+            Expr::ResultQuery { value, ok, .. } => {
+                self.compile_expr(value)?;
+                self.assembler
+                    .push_const(Value::string(super::result::RESULT_TAG_KEY));
+                self.assembler.call(BuiltinFunction::Get.call_index(), 2);
+                if !*ok {
+                    self.assembler.not();
+                }
+            }
+            Expr::ResultMatch {
+                value,
+                value_slot,
+                ok_binding,
+                ok_expr,
+                err_binding,
+                err_expr,
+                ..
+            } => {
+                self.compile_expr(value)?;
+                self.emit_stloc(*value_slot)?;
+                self.emit_copy_ldloc(*value_slot)?;
+                self.assembler
+                    .push_const(Value::string(super::result::RESULT_TAG_KEY));
+                self.assembler.call(BuiltinFunction::Get.call_index(), 2);
+                let err_label = self.fresh_label("result_err");
+                let end_label = self.fresh_label("result_end");
+                self.record_unary_operand_type(ValueType::Bool);
+                self.assembler.brfalse_label(&err_label);
+                self.compile_result_binding(*value_slot, *ok_binding)?;
+                self.compile_expr(ok_expr)?;
+                self.assembler.br_label(&end_label);
+                self.assembler
+                    .label(&err_label)
+                    .map_err(CompileError::Assembler)?;
+                self.compile_result_binding(*value_slot, *err_binding)?;
+                self.compile_expr(err_expr)?;
+                self.assembler
+                    .label(&end_label)
+                    .map_err(CompileError::Assembler)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_result_binding(
+        &mut self,
+        root: LocalSlot,
+        binding: Option<LocalSlot>,
+    ) -> Result<(), CompileError> {
+        self.emit_copy_ldloc(root)?;
+        self.assembler
+            .push_const(Value::string(super::result::RESULT_PAYLOAD_KEY));
+        self.assembler.call(BuiltinFunction::Has.call_index(), 2);
+        let missing = self.fresh_label("result_payload_missing");
+        let done = self.fresh_label("result_payload_done");
+        self.record_unary_operand_type(ValueType::Bool);
+        self.assembler.brfalse_label(&missing);
+        self.emit_copy_ldloc(root)?;
+        self.assembler
+            .push_const(Value::string(super::result::RESULT_PAYLOAD_KEY));
+        self.assembler.call(BuiltinFunction::Get.call_index(), 2);
+        self.emit_copy_ldloc(root)?;
+        self.assembler
+            .push_const(Value::string(super::result::RESULT_PAYLOAD_KEY));
+        self.assembler.push_const(Value::Null);
+        self.assembler.call(BuiltinFunction::Set.call_index(), 3);
+        self.emit_stloc(root)?;
+        self.assembler.br_label(&done);
+        self.assembler
+            .label(&missing)
+            .map_err(CompileError::Assembler)?;
+        self.assembler.push_const(Value::Null);
+        self.assembler
+            .label(&done)
+            .map_err(CompileError::Assembler)?;
+        if let Some(slot) = binding {
+            self.emit_stloc(slot)?;
+        } else {
+            self.assembler.pop();
         }
         Ok(())
     }
@@ -2339,6 +2429,10 @@ fn substitute_type_schema(
                 .map(|schema| substitute_type_schema(schema, bindings))
                 .collect(),
             result: Box::new(substitute_type_schema(result, bindings)),
+        },
+        TypeSchema::Result { ok, err } => TypeSchema::Result {
+            ok: Box::new(substitute_type_schema(ok, bindings)),
+            err: Box::new(substitute_type_schema(err, bindings)),
         },
         _ => schema.clone(),
     }
