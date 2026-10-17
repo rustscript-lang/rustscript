@@ -1075,6 +1075,24 @@ pub(super) fn validate_expr(
             )?;
             BoundType::Bool
         }
+        Expr::ResultTry {
+            value,
+            operand_schema,
+            ..
+        } => {
+            let _ = validate_expr(
+                value,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            match operand_schema {
+                TypeSchema::Result { ok, .. } => context.bound_type_for_schema(ok),
+                _ => BoundType::Unknown,
+            }
+        }
         Expr::ResultMatch {
             value,
             ok_binding,

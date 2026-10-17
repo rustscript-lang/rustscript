@@ -1410,7 +1410,13 @@ fn function_region_entry_shape(
     };
     for (slot, schema) in prototype.parameter_slots.iter().zip(params.iter()) {
         if let Some(repr) = shape.locals.get_mut(*slot as usize) {
-            *repr = value_type_repr(schema.coarse_value_type());
+            // Optional's coarse payload type cannot describe a nullable
+            // native entry value. Keep the tag across the frame boundary.
+            *repr = if matches!(schema, crate::compiler::TypeSchema::Optional(_)) {
+                AotSsaValueRepr::Tagged
+            } else {
+                value_type_repr(schema.coarse_value_type())
+            };
         }
     }
     shape
@@ -2862,11 +2868,24 @@ fn call_result_reprs(
                     .map(value_type_repr)
             })
             .unwrap_or(AotSsaValueRepr::Tagged),
-        AotCallDispatch::HostImport => program
-            .imports
-            .get(call.index as usize)
-            .map(|import| value_type_repr(import.return_type))
-            .unwrap_or(AotSsaValueRepr::Tagged),
+        AotCallDispatch::HostImport => {
+            let nullable = program
+                .host_import_schemas()
+                .get(call.index as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|schema| {
+                    matches!(schema.return_type, crate::HostTypeSchema::Optional(_))
+                });
+            if nullable {
+                AotSsaValueRepr::Tagged
+            } else {
+                program
+                    .imports
+                    .get(call.index as usize)
+                    .map(|import| value_type_repr(import.return_type))
+                    .unwrap_or(AotSsaValueRepr::Tagged)
+            }
+        }
     };
     vec![repr; result_count]
 }
@@ -2939,6 +2958,203 @@ fn promoted_numeric_result_repr(arg_reprs: &[AotSsaValueRepr]) -> Option<AotSsaV
 mod tests {
     use super::*;
     use crate::{BytecodeBuilder, HostImport, Value};
+
+    #[test]
+    fn aotnull_exact_err_fallback_has_tagged_resume_and_native_execution() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Fallback(Arc<AtomicUsize>);
+        impl crate::HostFunction for Fallback {
+            fn call(
+                &mut self,
+                _vm: &mut crate::Vm,
+                _args: &[Value],
+            ) -> crate::VmResult<crate::CallOutcome> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::CallOutcome::Return(crate::CallReturn::one(
+                    Value::map(vec![
+                        (Value::string("tag"), Value::Bool(false)),
+                        (Value::string("payload"), Value::Int(9)),
+                    ]),
+                )))
+            }
+        }
+
+        let mut catalog = crate::HostApiBuilder::new();
+        catalog.function(crate::HostFunctionSchema::with_return(
+            "test::make_err_int",
+            Vec::new(),
+            crate::HostTypeSchema::Result {
+                ok: Box::new(crate::HostTypeSchema::Int),
+                err: Box::new(crate::HostTypeSchema::Int),
+            },
+        ));
+        let compiled = crate::compile_source_with_flavor_and_options(
+            "fn absent() -> int? { null } fn relay() -> Result<int,int> { let x = absent().unwrap_or(test::make_err_int()?); Result::Ok(0) } let carried = relay(); carried;",
+            crate::SourceFlavor::RustScript,
+            crate::CompileSourceFileOptions::new()
+                .with_host_api_catalog(Arc::new(catalog.build().unwrap())),
+        )
+        .unwrap();
+        let program = compiled.program.with_local_count(compiled.locals);
+        let ssa = build_aot_ssa(&program).unwrap();
+        // The exact relay's CallScript at ip24 resumes with a nullable value.
+        assert_eq!(
+            ssa.checkpoint_for_ip(30).unwrap().stack,
+            vec![AotSsaValueRepr::Tagged]
+        );
+        assert!(!ssa.text().contains("InterpreterBoundary"));
+        println!("AOTNULL exact Err9 SSA\n{}", ssa.text());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut vm = crate::Vm::new(program);
+        vm.set_fuel(100_000);
+        vm.bind_function("test::make_err_int", Box::new(Fallback(calls.clone())));
+        vm.compile_aot().unwrap();
+        assert_eq!(vm.run().unwrap(), crate::VmStatus::Halted);
+        assert_eq!(
+            vm.stack().last(),
+            Some(&Value::map(vec![
+                (Value::string("tag"), Value::Bool(false)),
+                (Value::string("payload"), Value::Int(9)),
+            ]))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(vm.aot_exec_count() > 0);
+        assert!(vm.execution_scope().is_active());
+        println!(
+            "AOTNULL exact Err9 fallback_calls={}\n{}",
+            calls.load(Ordering::SeqCst),
+            vm.dump_aot_info()
+        );
+    }
+
+    #[test]
+    fn aotnull_optional_call_representation_control() {
+        let mut failures = Vec::new();
+        for expression in ["0", "7", "null"] {
+            let source = format!(
+                "fn absent() -> int? {{ {expression} }} let carried = absent().unwrap_or(41); carried;"
+            );
+            let compiled = crate::compile_source(&source).unwrap();
+            let program = compiled.program.with_local_count(compiled.locals);
+            println!(
+                "AOTNULL source={source}\n{}\nTYPEMAP={:#?}",
+                crate::disassemble_program(&program),
+                program.type_map
+            );
+            let ssa = build_aot_ssa(&program).unwrap();
+            assert_eq!(
+                ssa.checkpoint_for_ip(6).unwrap().stack,
+                vec![AotSsaValueRepr::Tagged]
+            );
+            assert!(!ssa.text().contains("InterpreterBoundary"));
+            println!(
+                "SSA={}\nIR={:#?}",
+                ssa.text(),
+                super::super::ir::lower_program(&program).unwrap()
+            );
+            for backend in 0..3 {
+                let program = if backend == 1 {
+                    crate::decode_program(&crate::encode_program(&program).unwrap()).unwrap()
+                } else {
+                    program.clone()
+                };
+                let mut vm = crate::Vm::new(program);
+                vm.set_fuel(100_000);
+                if backend == 2 {
+                    vm.compile_aot().unwrap();
+                }
+                assert_eq!(vm.run().unwrap(), crate::VmStatus::Halted);
+                println!(
+                    "AOTNULL expression={expression} backend={backend} stack={:?}\n{}",
+                    vm.stack(),
+                    vm.dump_aot_info()
+                );
+                let expected = Value::Int(if expression == "null" {
+                    41
+                } else {
+                    expression.parse().unwrap()
+                });
+                if vm.stack().last() != Some(&expected) {
+                    failures.push(format!("{expression} backend={backend}: {:?}", vm.stack()));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn aotnull_nullable_parameter_alias_and_local_controls() {
+        for expression in ["0", "7", "null"] {
+            for source in [
+                format!("fn relay(x:int?) -> int {{ x.unwrap_or(41) }} relay({expression});"),
+                format!(
+                    "fn absent() -> int? {{ {expression} }} let f = absent; f().unwrap_or(41);"
+                ),
+                format!("let x:int? = {expression}; x.unwrap_or(41);"),
+            ] {
+                let compiled = crate::compile_source(&source).unwrap();
+                let program = compiled.program.with_local_count(compiled.locals);
+                println!(
+                    "AOTNULL source={source}\n{}\n{}",
+                    crate::disassemble_program(&program),
+                    build_aot_ssa(&program).unwrap().text()
+                );
+                let mut vm = crate::Vm::new(program);
+                vm.set_fuel(100_000);
+                vm.compile_aot().unwrap();
+                assert_eq!(vm.run().unwrap(), crate::VmStatus::Halted);
+                println!("stack={:?}\n{}", vm.stack(), vm.dump_aot_info());
+                assert_eq!(
+                    vm.stack().last(),
+                    Some(&Value::Int(if expression == "null" {
+                        41
+                    } else {
+                        expression.parse().unwrap()
+                    }))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aotnull_imported_nested_optional_returns() {
+        let root = std::env::temp_dir().join(format!("aotnull-import-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("nullable.rss"), "fn pick(flag:bool) -> int? { if flag => { null } else => { 0 } } pub fn relay(flag:bool) -> int? { pick(flag) }").unwrap();
+        for (flag, expected) in [(true, 41), (false, 0)] {
+            let main = root.join("main.rss");
+            std::fs::write(
+                &main,
+                format!("use self::nullable as imported; imported::relay({flag}).unwrap_or(41);"),
+            )
+            .unwrap();
+            let compiled = crate::compile_source_file(&main).unwrap();
+            let program = compiled.program.with_local_count(compiled.locals);
+            let ssa = build_aot_ssa(&program).unwrap();
+            assert!(!ssa.text().contains("InterpreterBoundary"));
+            println!("AOTNULL imported flag={flag}\n{}", ssa.text());
+            for backend in 0..3 {
+                let program = if backend == 1 {
+                    crate::decode_program(&crate::encode_program(&program).unwrap()).unwrap()
+                } else {
+                    program.clone()
+                };
+                let mut vm = crate::Vm::new(program);
+                vm.set_fuel(100_000);
+                if backend == 2 {
+                    vm.compile_aot().unwrap();
+                }
+                assert_eq!(vm.run().unwrap(), crate::VmStatus::Halted);
+                assert_eq!(vm.stack().last(), Some(&Value::Int(expected)));
+                if backend == 2 {
+                    assert!(vm.aot_exec_count() > 0);
+                }
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn aot_ssa_number_relations_retain_dynamic_operands_without_hints() {

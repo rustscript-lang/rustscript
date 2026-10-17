@@ -5,7 +5,8 @@ use std::hash::Hash;
 use crate::builtins::BuiltinFunction;
 use crate::bytecode::{
     CallableKind, CallablePrototype, CallableTarget, CaptureBindingMode, ExportedCallable,
-    FunctionRegion, MAX_FRAME_LOCAL_COUNT, RootCallableBinding, ScriptFunction, TypeMap, ValueType,
+    FunctionRegion, MAX_FRAME_LOCAL_COUNT, RetCleanupLocal, RetCleanupPlan, RootCallableBinding,
+    ScriptFunction, TypeMap, ValueType,
 };
 use crate::compiler::ir::{StructDecl, StructDeclOrigin, TypeSchema};
 use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
@@ -49,6 +50,7 @@ pub enum WireError {
     CodeTooLong(usize),
     UnsupportedConstantType(&'static str),
     LengthTooLarge(&'static str, usize),
+    InvalidRetCleanup(&'static str),
     TrailingBytes,
 }
 
@@ -93,6 +95,9 @@ impl std::fmt::Display for WireError {
             }
             WireError::LengthTooLarge(field, len) => {
                 write!(f, "{field} length too large: {len}")
+            }
+            WireError::InvalidRetCleanup(reason) => {
+                write!(f, "invalid ret cleanup: {reason}")
             }
             WireError::TrailingBytes => write!(f, "trailing bytes after program payload"),
         }
@@ -301,6 +306,354 @@ fn read_constant(cursor: &mut Cursor<'_>, depth: usize) -> Result<Value, WireErr
     }
 }
 
+fn write_ret_cleanups(out: &mut Vec<u8>, program: &Program) -> Result<(), WireError> {
+    validate_ret_cleanups(program)?;
+    let mut plans = program.ret_cleanups.clone();
+    for plan in &mut plans {
+        plan.locals.sort_by_key(|local| local.slot);
+    }
+    plans.sort_by_key(|plan| plan.site);
+    write_u32_count("ret cleanup plans", plans.len(), out)?;
+    for plan in &plans {
+        out.extend_from_slice(&plan.site.to_le_bytes());
+        write_u32_count("ret cleanup locals", plan.locals.len(), out)?;
+        for local in &plan.locals {
+            out.extend_from_slice(&local.slot.to_le_bytes());
+            write_schema(&local.schema, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_ret_cleanups(
+    cursor: &mut Cursor<'_>,
+    code: &[u8],
+    prototypes: &[CallablePrototype],
+    regions: &[FunctionRegion],
+    decls: &HashMap<String, StructDecl>,
+) -> Result<Vec<RetCleanupPlan>, WireError> {
+    let plan_count = cursor.read_count_with_overhead("ret cleanup plans", 8, 0)?;
+    if plan_count > code.len() {
+        return Err(WireError::LengthTooLarge("ret cleanup plans", plan_count));
+    }
+    let ret_sites = if plan_count == 0 {
+        HashSet::new()
+    } else {
+        ret_instruction_sites(code)?
+    };
+    let mut plans = Vec::new();
+    reserve_vec(&mut plans, "ret cleanup plans", plan_count)?;
+    let mut previous_site = None;
+    for _ in 0..plan_count {
+        let site = cursor.read_u32()?;
+        if previous_site.is_some_and(|previous| site <= previous) {
+            return Err(WireError::InvalidRetCleanup(
+                "cleanup sites are not canonical",
+            ));
+        }
+        previous_site = Some(site);
+        let frame_locals = cleanup_frame_local_count(prototypes, regions, &ret_sites, site)?;
+        let local_count = cursor.read_u32()? as usize;
+        if local_count > frame_locals || local_count > MAX_FRAME_LOCAL_COUNT {
+            return Err(WireError::LengthTooLarge("ret cleanup locals", local_count));
+        }
+        cursor.validate_count("ret cleanup locals", local_count, 3)?;
+        cursor.debit_count("ret cleanup locals", local_count)?;
+        let mut locals = Vec::new();
+        reserve_vec(&mut locals, "ret cleanup locals", local_count)?;
+        let mut previous_slot = None;
+        for _ in 0..local_count {
+            let slot = cursor.read_u16()?;
+            if previous_slot.is_some_and(|previous| slot <= previous) {
+                return Err(WireError::InvalidRetCleanup(
+                    "cleanup locals are not canonical",
+                ));
+            }
+            if slot as usize >= frame_locals {
+                return Err(WireError::InvalidRetCleanup(
+                    "cleanup local is outside the frame",
+                ));
+            }
+            previous_slot = Some(slot);
+            let schema = read_schema(cursor, 0)?;
+            require_owned_cleanup_schema(&schema, decls)?;
+            locals.push(RetCleanupLocal { slot, schema });
+        }
+        plans.push(RetCleanupPlan { site, locals });
+    }
+    Ok(plans)
+}
+
+fn validate_ret_cleanups(program: &Program) -> Result<(), WireError> {
+    if program.ret_cleanups.is_empty() {
+        return Ok(());
+    }
+    let ret_sites = ret_instruction_sites(&program.code)?;
+    let mut seen_sites = HashSet::new();
+    for plan in &program.ret_cleanups {
+        if !seen_sites.insert(plan.site) {
+            return Err(WireError::InvalidRetCleanup("duplicate cleanup site"));
+        }
+        let frame_locals = cleanup_frame_local_count(
+            &program.callable_prototypes,
+            &program.function_regions,
+            &ret_sites,
+            plan.site,
+        )?;
+        let mut seen_slots = HashSet::new();
+        for local in &plan.locals {
+            if !seen_slots.insert(local.slot) {
+                return Err(WireError::InvalidRetCleanup("duplicate cleanup local"));
+            }
+            if local.slot as usize >= frame_locals {
+                return Err(WireError::InvalidRetCleanup(
+                    "cleanup local is outside the frame",
+                ));
+            }
+            require_owned_cleanup_schema(&local.schema, &program.named_struct_decls)?;
+        }
+    }
+    Ok(())
+}
+
+fn ret_instruction_sites(code: &[u8]) -> Result<HashSet<u32>, WireError> {
+    let mut ip = 0usize;
+    let mut sites = HashSet::new();
+    while ip < code.len() {
+        let opcode = OpCode::try_from(code[ip])
+            .map_err(|_| WireError::InvalidRetCleanup("cleanup bytecode has an invalid opcode"))?;
+        if opcode == OpCode::Ret {
+            let site = u32::try_from(ip).map_err(|_| WireError::LengthTooLarge("code", ip))?;
+            sites.insert(site);
+        }
+        let next = ip
+            .checked_add(1)
+            .and_then(|value| value.checked_add(opcode.operand_len()))
+            .ok_or(WireError::LengthTooLarge("code", ip))?;
+        if next > code.len() {
+            return Err(WireError::InvalidRetCleanup("truncated instruction"));
+        }
+        ip = next;
+    }
+    Ok(sites)
+}
+
+fn cleanup_frame_local_count(
+    prototypes: &[CallablePrototype],
+    regions: &[FunctionRegion],
+    ret_sites: &HashSet<u32>,
+    site: u32,
+) -> Result<usize, WireError> {
+    if !ret_sites.contains(&site) {
+        return Err(WireError::InvalidRetCleanup(
+            "cleanup site is not a Ret instruction",
+        ));
+    }
+    let mut frame_locals = None;
+    for region in regions {
+        if site < region.start_ip || site >= region.end_ip {
+            continue;
+        }
+        let Some(prototype_id) = region.prototype_id else {
+            continue;
+        };
+        let Some(prototype) = prototypes.get(prototype_id as usize) else {
+            return Err(WireError::InvalidRetCleanup(
+                "cleanup frame prototype is missing",
+            ));
+        };
+        if !matches!(prototype.target, CallableTarget::ScriptFunction(_)) {
+            return Err(WireError::InvalidRetCleanup(
+                "cleanup frame is not a script function",
+            ));
+        }
+        if frame_locals.replace(prototype.frame_local_count).is_some() {
+            return Err(WireError::InvalidRetCleanup(
+                "cleanup site matches multiple frames",
+            ));
+        }
+    }
+    frame_locals.ok_or(WireError::InvalidRetCleanup(
+        "cleanup site is not in a callable frame",
+    ))
+}
+
+fn require_owned_cleanup_schema(
+    schema: &TypeSchema,
+    decls: &HashMap<String, StructDecl>,
+) -> Result<(), WireError> {
+    let mut nodes = 0usize;
+    if cleanup_schema_owns_resource(schema, decls, 0, &mut nodes, &mut HashSet::new())? {
+        Ok(())
+    } else {
+        Err(WireError::InvalidRetCleanup(
+            "cleanup schema has no owned resource",
+        ))
+    }
+}
+
+fn cleanup_schema_owns_resource(
+    schema: &TypeSchema,
+    decls: &HashMap<String, StructDecl>,
+    depth: usize,
+    nodes: &mut usize,
+    active: &mut HashSet<String>,
+) -> Result<bool, WireError> {
+    if depth >= MAX_SCHEMA_DEPTH {
+        return Err(WireError::LengthTooLarge("schema nesting depth", depth));
+    }
+    *nodes = nodes
+        .checked_add(1)
+        .ok_or(WireError::LengthTooLarge("schema nodes", *nodes))?;
+    if *nodes > MAX_HOST_SCHEMA_NODES {
+        return Err(WireError::LengthTooLarge("schema nodes", *nodes));
+    }
+    let next = depth + 1;
+    match schema {
+        TypeSchema::Resource(_) => Ok(true),
+        TypeSchema::Optional(inner) | TypeSchema::Array(inner) => {
+            cleanup_schema_owns_resource(inner, decls, next, nodes, active)
+        }
+        TypeSchema::ArrayTuple(items) => {
+            let mut owned = false;
+            for item in items {
+                owned |= cleanup_schema_owns_resource(item, decls, next, nodes, active)?;
+            }
+            Ok(owned)
+        }
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            let mut owned = cleanup_schema_owns_resource(rest, decls, next, nodes, active)?;
+            for item in prefix {
+                owned |= cleanup_schema_owns_resource(item, decls, next, nodes, active)?;
+            }
+            Ok(owned)
+        }
+        TypeSchema::Result { ok, err } => {
+            let ok_owned = cleanup_schema_owns_resource(ok, decls, next, nodes, active)?;
+            let err_owned = cleanup_schema_owns_resource(err, decls, next, nodes, active)?;
+            Ok(ok_owned || err_owned)
+        }
+        TypeSchema::Map(value) => cleanup_schema_owns_resource(value, decls, next, nodes, active),
+        TypeSchema::Object(fields) => {
+            let mut owned = false;
+            let mut fields = fields.iter().collect::<Vec<_>>();
+            fields.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+            for (_, field) in fields {
+                owned |= cleanup_schema_owns_resource(field, decls, next, nodes, active)?;
+            }
+            Ok(owned)
+        }
+        TypeSchema::Callable { params, result } => {
+            for param in params {
+                cleanup_schema_owns_resource(param, decls, next, nodes, active)?;
+            }
+            cleanup_schema_owns_resource(result, decls, next, nodes, active)?;
+            Ok(false)
+        }
+        TypeSchema::Named(name, args) => {
+            let Some(decl) = decls.get(name) else {
+                return Err(WireError::InvalidRetCleanup(
+                    "unresolved named cleanup schema",
+                ));
+            };
+            if decl.type_params.len() != args.len() {
+                return Err(WireError::InvalidRetCleanup("named cleanup schema arity"));
+            }
+            if !active.insert(name.clone()) {
+                return Err(WireError::InvalidRetCleanup("named cleanup schema cycle"));
+            }
+            let substituted = substitute_cleanup_schema(&decl.body_schema, &decl.type_params, args);
+            let mut owned = cleanup_schema_owns_resource(&substituted, decls, next, nodes, active)?;
+            for arg in args {
+                owned |= cleanup_schema_owns_resource(arg, decls, next, nodes, active)?;
+            }
+            active.remove(name);
+            Ok(owned)
+        }
+        TypeSchema::Unknown
+        | TypeSchema::Null
+        | TypeSchema::Int
+        | TypeSchema::Float
+        | TypeSchema::Number
+        | TypeSchema::Bool
+        | TypeSchema::String
+        | TypeSchema::Bytes
+        | TypeSchema::GenericParam(_) => Ok(false),
+    }
+}
+
+fn substitute_cleanup_schema(
+    schema: &TypeSchema,
+    params: &[String],
+    args: &[TypeSchema],
+) -> TypeSchema {
+    match schema {
+        TypeSchema::GenericParam(name) => params
+            .iter()
+            .position(|param| param == name)
+            .and_then(|index| args.get(index).cloned())
+            .unwrap_or_else(|| schema.clone()),
+        TypeSchema::Optional(inner) => {
+            TypeSchema::Optional(Box::new(substitute_cleanup_schema(inner, params, args)))
+        }
+        TypeSchema::Array(inner) => {
+            TypeSchema::Array(Box::new(substitute_cleanup_schema(inner, params, args)))
+        }
+        TypeSchema::Map(inner) => {
+            TypeSchema::Map(Box::new(substitute_cleanup_schema(inner, params, args)))
+        }
+        TypeSchema::ArrayTuple(items) => TypeSchema::ArrayTuple(
+            items
+                .iter()
+                .map(|item| substitute_cleanup_schema(item, params, args))
+                .collect(),
+        ),
+        TypeSchema::ArrayTupleRest { prefix, rest } => TypeSchema::ArrayTupleRest {
+            prefix: prefix
+                .iter()
+                .map(|item| substitute_cleanup_schema(item, params, args))
+                .collect(),
+            rest: Box::new(substitute_cleanup_schema(rest, params, args)),
+        },
+        TypeSchema::Object(fields) => TypeSchema::Object(
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), substitute_cleanup_schema(value, params, args)))
+                .collect(),
+        ),
+        TypeSchema::Callable {
+            params: callable_params,
+            result,
+        } => TypeSchema::Callable {
+            params: callable_params
+                .iter()
+                .map(|param| substitute_cleanup_schema(param, params, args))
+                .collect(),
+            result: Box::new(substitute_cleanup_schema(result, params, args)),
+        },
+        TypeSchema::Named(name, type_args) => TypeSchema::Named(
+            name.clone(),
+            type_args
+                .iter()
+                .map(|arg| substitute_cleanup_schema(arg, params, args))
+                .collect(),
+        ),
+        TypeSchema::Result { ok, err } => TypeSchema::Result {
+            ok: Box::new(substitute_cleanup_schema(ok, params, args)),
+            err: Box::new(substitute_cleanup_schema(err, params, args)),
+        },
+        TypeSchema::Unknown
+        | TypeSchema::Null
+        | TypeSchema::Int
+        | TypeSchema::Float
+        | TypeSchema::Number
+        | TypeSchema::Bool
+        | TypeSchema::String
+        | TypeSchema::Bytes
+        | TypeSchema::Resource(_) => schema.clone(),
+    }
+}
+
 pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
@@ -342,6 +695,7 @@ pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     write_debug_info(&mut out, program.debug.as_ref())?;
     write_callable_metadata(&mut out, program)?;
     write_named_struct_decls(&mut out, program)?;
+    write_ret_cleanups(&mut out, program)?;
 
     Ok(out)
 }
@@ -412,6 +766,13 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
         exported_callables,
     ) = read_callable_metadata(&mut cursor)?;
     let named_struct_decls = read_named_struct_decls(&mut cursor)?;
+    let ret_cleanups = read_ret_cleanups(
+        &mut cursor,
+        &code,
+        &callable_prototypes,
+        &function_regions,
+        &named_struct_decls,
+    )?;
 
     if !cursor.is_eof() {
         return Err(WireError::TrailingBytes);
@@ -426,6 +787,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     program.root_callable_bindings = root_callable_bindings;
     program.exported_callables = exported_callables;
     program.named_struct_decls = named_struct_decls;
+    program.ret_cleanups = ret_cleanups;
     let type_map_local_count = program
         .type_map
         .as_ref()
@@ -2276,6 +2638,357 @@ mod budget_tests {
         assert_eq!(
             cursor.validate_count_with_overhead("overflow", 2, usize::MAX, 0),
             Err(WireError::LengthTooLarge("overflow", 2))
+        );
+    }
+}
+
+#[cfg(test)]
+mod ret_cleanup_wire_tests {
+    use super::*;
+    use crate::compiler::ir::StructDeclOrigin;
+
+    fn resource_schema() -> TypeSchema {
+        TypeSchema::Resource(ResourceTypeKey::new("pr24.closure").expect("resource key"))
+    }
+
+    fn prototype(frame_local_count: usize) -> CallablePrototype {
+        CallablePrototype {
+            kind: CallableKind::FunctionItem,
+            target: CallableTarget::ScriptFunction(0),
+            arity: 0,
+            frame_local_count,
+            parameter_slots: Vec::new(),
+            capture_source_slots: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_modes: Vec::new(),
+            self_slot: None,
+            schema: None,
+        }
+    }
+
+    fn program_with_ret_at(code: Vec<u8>, frame_local_count: usize) -> Program {
+        let end = code.len() as u32;
+        Program::new(Vec::new(), code).with_callable_metadata(
+            vec![ScriptFunction {
+                entry_ip: 0,
+                end_ip: end,
+            }],
+            vec![prototype(frame_local_count)],
+            vec![FunctionRegion {
+                start_ip: 0,
+                end_ip: end,
+                prototype_id: Some(0),
+            }],
+            Vec::new(),
+        )
+    }
+
+    fn ldc_ret_program() -> Program {
+        program_with_ret_at(
+            vec![
+                OpCode::Ldc as u8,
+                OpCode::Ret as u8,
+                0,
+                0,
+                0,
+                OpCode::Ret as u8,
+            ],
+            2,
+        )
+    }
+
+    #[test]
+    fn private_cleanup_plan_roundtrips_in_canonical_order() {
+        let mut program = ldc_ret_program();
+        program.ret_cleanups = vec![RetCleanupPlan {
+            site: 5,
+            locals: vec![
+                RetCleanupLocal {
+                    slot: 1,
+                    schema: resource_schema(),
+                },
+                RetCleanupLocal {
+                    slot: 0,
+                    schema: TypeSchema::Optional(Box::new(resource_schema())),
+                },
+            ],
+        }];
+        let bytes = encode_program(&program).expect("canonical cleanup should encode");
+        let decoded = decode_program(&bytes).expect("canonical cleanup should decode");
+        assert_eq!(
+            decoded.ret_cleanups,
+            vec![RetCleanupPlan {
+                site: 5,
+                locals: vec![
+                    RetCleanupLocal {
+                        slot: 0,
+                        schema: TypeSchema::Optional(Box::new(resource_schema())),
+                    },
+                    RetCleanupLocal {
+                        slot: 1,
+                        schema: resource_schema(),
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn named_cleanup_schema_roundtrips_without_renaming() {
+        let mut program = ldc_ret_program();
+        program.named_struct_decls.insert(
+            "Holder".to_string(),
+            StructDecl {
+                name: "Holder".to_string(),
+                type_params: vec!["T".to_string()],
+                body_schema: TypeSchema::GenericParam("T".to_string()),
+                origin: StructDeclOrigin::Guest,
+            },
+        );
+        program.ret_cleanups = vec![RetCleanupPlan {
+            site: 5,
+            locals: vec![RetCleanupLocal {
+                slot: 0,
+                schema: TypeSchema::Named("Holder".to_string(), vec![resource_schema()]),
+            }],
+        }];
+        let decoded =
+            decode_program(&encode_program(&program).expect("named cleanup should encode"))
+                .expect("named cleanup should decode");
+        assert_eq!(decoded.ret_cleanups, program.ret_cleanups);
+    }
+
+    #[test]
+    fn operand_byte_equal_to_ret_is_not_a_cleanup_site() {
+        let mut program = ldc_ret_program();
+        program.ret_cleanups = vec![RetCleanupPlan {
+            site: 5,
+            locals: vec![RetCleanupLocal {
+                slot: 0,
+                schema: resource_schema(),
+            }],
+        }];
+        let mut bytes = encode_program(&program).expect("valid site should encode");
+        let key = b"pr24.closure";
+        let schema_len = 1 + 4 + key.len();
+        let site_offset = bytes.len() - schema_len - 2 - 4 - 4;
+        bytes[site_offset..site_offset + 4].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            decode_program(&bytes),
+            Err(WireError::InvalidRetCleanup(
+                "cleanup site is not a Ret instruction"
+            ))
+        ));
+    }
+
+    #[test]
+    fn malformed_cleanup_metadata_is_rejected_before_any_program_exists() {
+        let mut program = ldc_ret_program();
+        program.ret_cleanups = vec![
+            RetCleanupPlan {
+                site: 5,
+                locals: vec![RetCleanupLocal {
+                    slot: 0,
+                    schema: resource_schema(),
+                }],
+            },
+            RetCleanupPlan {
+                site: 5,
+                locals: vec![RetCleanupLocal {
+                    slot: 1,
+                    schema: resource_schema(),
+                }],
+            },
+        ];
+        assert!(matches!(
+            encode_program(&program),
+            Err(WireError::InvalidRetCleanup("duplicate cleanup site"))
+        ));
+
+        program.ret_cleanups.truncate(1);
+        program.ret_cleanups[0].locals[0].slot = 9;
+        assert!(matches!(
+            encode_program(&program),
+            Err(WireError::InvalidRetCleanup(
+                "cleanup local is outside the frame"
+            ))
+        ));
+
+        let mut missing = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+            .expect("zero-plan program should encode");
+        missing.truncate(missing.len() - 4);
+        assert!(matches!(
+            decode_program(&missing),
+            Err(WireError::UnexpectedEof)
+        ));
+
+        let mut truncated = encode_program(&{
+            let mut valid = ldc_ret_program();
+            valid.ret_cleanups = vec![RetCleanupPlan {
+                site: 5,
+                locals: vec![RetCleanupLocal {
+                    slot: 0,
+                    schema: resource_schema(),
+                }],
+            }];
+            valid
+        })
+        .expect("plan should encode");
+        truncated.pop();
+        assert!(matches!(
+            decode_program(&truncated),
+            Err(WireError::UnexpectedEof)
+        ));
+
+        let mut overflow = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+            .expect("zero-plan program should encode");
+        let count_at = overflow.len() - 4;
+        overflow[count_at..].copy_from_slice(&1_000_001u32.to_le_bytes());
+        assert!(matches!(
+            decode_program(&overflow),
+            Err(WireError::LengthTooLarge("ret cleanup plans", _))
+        ));
+
+        let mut deep = encode_program(&{
+            let mut valid = ldc_ret_program();
+            valid.ret_cleanups = vec![RetCleanupPlan {
+                site: 5,
+                locals: vec![RetCleanupLocal {
+                    slot: 0,
+                    schema: resource_schema(),
+                }],
+            }];
+            valid
+        })
+        .expect("plan should encode");
+        let key = b"pr24.closure";
+        let schema_len = 1 + 4 + key.len();
+        deep.truncate(deep.len() - schema_len);
+        for _ in 0..64 {
+            deep.push(16);
+        }
+        deep.push(17);
+        deep.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        deep.extend_from_slice(key);
+        assert!(matches!(
+            decode_program(&deep),
+            Err(WireError::LengthTooLarge("schema nesting depth", _))
+        ));
+
+        let mut bad_key = encode_program(&{
+            let mut valid = ldc_ret_program();
+            valid.ret_cleanups = vec![RetCleanupPlan {
+                site: 5,
+                locals: vec![RetCleanupLocal {
+                    slot: 0,
+                    schema: resource_schema(),
+                }],
+            }];
+            valid
+        })
+        .expect("plan should encode");
+        let key_at = bad_key.len() - key.len();
+        bad_key[key_at] = b'P';
+        assert!(matches!(
+            decode_program(&bad_key),
+            Err(WireError::InvalidResourceKey(_))
+        ));
+
+        let mut version = encode_program(&Program::new(Vec::new(), vec![OpCode::Ret as u8]))
+            .expect("zero-plan program should encode");
+        version[4..6].copy_from_slice(&12u16.to_le_bytes());
+        assert!(matches!(
+            decode_program(&version),
+            Err(WireError::UnsupportedVersion(12))
+        ));
+    }
+
+    fn cleanup_program(schema: TypeSchema) -> Program {
+        let mut program = ldc_ret_program();
+        program.ret_cleanups = vec![RetCleanupPlan {
+            site: 5,
+            locals: vec![RetCleanupLocal { slot: 0, schema }],
+        }];
+        program
+    }
+
+    #[test]
+    fn named_cleanup_validity_precedes_capability_in_both_result_branches() {
+        let mut owned_body = cleanup_program(TypeSchema::Named("Holder".to_string(), Vec::new()));
+        owned_body.named_struct_decls.insert(
+            "Holder".to_string(),
+            StructDecl {
+                name: "Holder".to_string(),
+                type_params: Vec::new(),
+                body_schema: resource_schema(),
+                origin: StructDeclOrigin::Guest,
+            },
+        );
+        let decoded =
+            decode_program(&encode_program(&owned_body).expect("named body should encode"))
+                .expect("named body should decode");
+        assert_eq!(
+            decoded.ret_cleanups[0].locals[0].schema,
+            TypeSchema::Named("Holder".to_string(), Vec::new())
+        );
+
+        for (label, schema) in [
+            (
+                "err",
+                TypeSchema::Result {
+                    ok: Box::new(resource_schema()),
+                    err: Box::new(TypeSchema::Named("Missing".to_string(), Vec::new())),
+                },
+            ),
+            (
+                "ok",
+                TypeSchema::Result {
+                    ok: Box::new(TypeSchema::Named("Missing".to_string(), Vec::new())),
+                    err: Box::new(resource_schema()),
+                },
+            ),
+        ] {
+            let program = cleanup_program(schema);
+            assert_eq!(
+                encode_program(&program),
+                Err(WireError::InvalidRetCleanup(
+                    "unresolved named cleanup schema"
+                )),
+                "{label} branch must be validated before a resource plan is accepted"
+            );
+        }
+
+        let mut arity = cleanup_program(TypeSchema::Named(
+            "Holder".to_string(),
+            vec![TypeSchema::Int],
+        ));
+        arity.named_struct_decls.insert(
+            "Holder".to_string(),
+            StructDecl {
+                name: "Holder".to_string(),
+                type_params: Vec::new(),
+                body_schema: resource_schema(),
+                origin: StructDeclOrigin::Guest,
+            },
+        );
+        assert_eq!(
+            encode_program(&arity),
+            Err(WireError::InvalidRetCleanup("named cleanup schema arity"))
+        );
+
+        let mut cycle = cleanup_program(TypeSchema::Named("Holder".to_string(), Vec::new()));
+        cycle.named_struct_decls.insert(
+            "Holder".to_string(),
+            StructDecl {
+                name: "Holder".to_string(),
+                type_params: Vec::new(),
+                body_schema: TypeSchema::Named("Holder".to_string(), Vec::new()),
+                origin: StructDeclOrigin::Guest,
+            },
+        );
+        assert_eq!(
+            encode_program(&cycle),
+            Err(WireError::InvalidRetCleanup("named cleanup schema cycle"))
         );
     }
 }

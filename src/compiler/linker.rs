@@ -356,6 +356,16 @@ fn remap_expression_type_names(expression: &mut Expr, names: &HashMap<String, St
             remap_expression_type_names(payload, names);
         }
         Expr::ResultQuery { value, .. } => remap_expression_type_names(value, names),
+        Expr::ResultTry {
+            value,
+            operand_schema,
+            return_schema,
+            ..
+        } => {
+            remap_type_schema_names(operand_schema, names);
+            remap_type_schema_names(return_schema, names);
+            remap_expression_type_names(value, names);
+        }
         Expr::ResultMatch {
             value,
             ok_expr,
@@ -1528,6 +1538,24 @@ fn remap_expr_indices(
         Expr::ResultQuery {
             value, semantic_id, ..
         } => {
+            rebase_semantic_id(semantic_id, node_offset);
+            remap_expr_indices(
+                value,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+        }
+        Expr::ResultTry {
+            value,
+            value_slot,
+            payload_slot,
+            semantic_id,
+            ..
+        } => {
+            *value_slot = remap_local_index(*value_slot, local_base)?;
+            *payload_slot = remap_local_index(*payload_slot, local_base)?;
             rebase_semantic_id(semantic_id, node_offset);
             remap_expr_indices(
                 value,

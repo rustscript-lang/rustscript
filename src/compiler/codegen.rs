@@ -65,6 +65,11 @@ pub struct Compiler {
     pending_closures: Vec<(u32, ClosureExpr)>,
     callable_prototype_bindings: HashMap<LocalSlot, u32>,
     closure_param_hints: HashMap<u32, Vec<(typing::BoundType, Option<TypeSchema>)>>,
+    /// True while emitting a named-function or closure body. `?` may `Ret`
+    /// only from that lexical frame, never from root code.
+    in_callable: bool,
+    /// Err-path `Ret` sites and the owned locals to close before the frame drain.
+    ret_cleanups: Vec<crate::RetCleanupPlan>,
 }
 
 struct LoopContext {
@@ -123,6 +128,8 @@ impl Compiler {
             pending_closures: Vec::new(),
             callable_prototype_bindings: HashMap::new(),
             closure_param_hints: HashMap::new(),
+            in_callable: false,
+            ret_cleanups: Vec::new(),
         }
     }
 
@@ -320,6 +327,7 @@ impl Compiler {
         program.root_callable_bindings = self.root_callable_bindings;
         program.exported_callables = exported_callables;
         program.imports = self.host_imports;
+        program.ret_cleanups = std::mem::take(&mut self.ret_cleanups);
         program = program.with_optional_host_import_schemas(self.host_import_schemas);
         let guest_struct_decls = self
             .struct_schemas
@@ -488,6 +496,8 @@ impl Compiler {
         let callable_snapshot = self.callable_bindings.clone();
         let type_snapshot = self.type_state.clone();
         let loop_snapshot = std::mem::take(&mut self.loop_stack);
+        let callable_flag = self.in_callable;
+        self.in_callable = true;
         self.seed_frame_type_state_from_type_map();
         if let Some(decl) = self.function_decls.get(&function_index) {
             for (slot, schema) in function_impl.param_slots.iter().zip(&decl.arg_schemas) {
@@ -510,6 +520,7 @@ impl Compiler {
         self.compile_stmts(&function_impl.body_stmts)?;
         self.compile_expr(&function_impl.body_expr)?;
         self.assembler.ret();
+        self.in_callable = callable_flag;
         self.loop_stack = loop_snapshot;
         self.callable_bindings = callable_snapshot;
         self.type_state = type_snapshot;
@@ -540,6 +551,8 @@ impl Compiler {
         let callable_snapshot = self.callable_bindings.clone();
         let type_snapshot = self.type_state.clone();
         let loop_snapshot = std::mem::take(&mut self.loop_stack);
+        let callable_flag = self.in_callable;
+        self.in_callable = true;
         self.seed_frame_type_state_from_type_map();
         if let Some(hints) = self.closure_param_hints.get(&prototype_id).cloned() {
             for (slot, (ty, schema)) in closure.param_slots.iter().zip(hints) {
@@ -549,6 +562,7 @@ impl Compiler {
         }
         self.compile_expr(&closure.body)?;
         self.assembler.ret();
+        self.in_callable = callable_flag;
         self.loop_stack = loop_snapshot;
         self.callable_bindings = callable_snapshot;
         self.type_state = type_snapshot;
@@ -1155,6 +1169,14 @@ impl Compiler {
                     .label(&end_label)
                     .map_err(CompileError::Assembler)?;
             }
+            Expr::ResultTry {
+                value,
+                value_slot,
+                payload_slot,
+                exit_cleanup,
+                span,
+                ..
+            } => self.compile_result_try(value, *value_slot, *payload_slot, exit_cleanup, *span)?,
         }
         Ok(())
     }
@@ -1195,6 +1217,83 @@ impl Compiler {
         } else {
             self.assembler.pop();
         }
+        Ok(())
+    }
+
+    fn emit_err_ret(
+        &mut self,
+        slots: &[(LocalSlot, crate::compiler::TypeSchema)],
+    ) -> Result<(), CompileError> {
+        let site = self.assembler.position();
+        let mut locals = Vec::new();
+        for (slot, stored) in slots {
+            let schema = if stored.contains_resource_with_named_types(&self.struct_schemas) {
+                stored.clone()
+            } else {
+                self.type_map
+                    .local_schemas
+                    .get(*slot as usize)
+                    .and_then(|schema| schema.clone())
+                    .filter(|schema| {
+                        schema.contains_resource_with_named_types(&self.struct_schemas)
+                    })
+                    .ok_or_else(|| CompileError::StrictTypingRequired {
+                        line: None,
+                        source_name: None,
+                        detail: format!("owned local {slot} has no schema for Err cleanup"),
+                        span: None,
+                    })?
+            };
+            locals.push(crate::RetCleanupLocal {
+                slot: *slot,
+                schema,
+            });
+        }
+        if !locals.is_empty() {
+            self.ret_cleanups
+                .push(crate::RetCleanupPlan { site, locals });
+        }
+        self.assembler.ret();
+        Ok(())
+    }
+
+    fn compile_result_try(
+        &mut self,
+        value: &Expr,
+        value_slot: LocalSlot,
+        payload_slot: LocalSlot,
+        exit_cleanup: &[(LocalSlot, crate::compiler::TypeSchema)],
+        span: crate::compiler::source_map::Span,
+    ) -> Result<(), CompileError> {
+        if !self.in_callable {
+            return Err(CompileError::StrictTypingRequired {
+                line: None,
+                source_name: None,
+                detail: "? requires the enclosing function to return Result<U, E>".to_string(),
+                span: Some(span),
+            });
+        }
+        self.compile_expr(value)?;
+        self.emit_stloc(value_slot)?;
+        self.emit_copy_ldloc(value_slot)?;
+        self.assembler
+            .push_const(Value::string(super::result::RESULT_TAG_KEY));
+        self.assembler.call(BuiltinFunction::Get.call_index(), 2);
+        let err_label = self.fresh_label("result_try_err");
+        let ok_label = self.fresh_label("result_try_ok");
+        self.record_unary_operand_type(ValueType::Bool);
+        self.assembler.brfalse_label(&err_label);
+        self.compile_result_binding(value_slot, Some(payload_slot))?;
+        self.emit_move_ldloc(payload_slot)?;
+        self.assembler.br_label(&ok_label);
+        self.assembler
+            .label(&err_label)
+            .map_err(CompileError::Assembler)?;
+        self.emit_move_ldloc(value_slot)?;
+        self.emit_err_ret(exit_cleanup)?;
+        self.assembler
+            .label(&ok_label)
+            .map_err(CompileError::Assembler)?;
         Ok(())
     }
 
@@ -1849,7 +1948,15 @@ impl Compiler {
                 let return_type = self
                     .function_decls
                     .get(&index)
-                    .map(|decl| decl.return_type)
+                    .map(|decl| {
+                        // A coarse Optional payload type is not a definite
+                        // physical return type: native resume must retain Null.
+                        if matches!(decl.return_schema, Some(TypeSchema::Optional(_))) {
+                            ValueType::Unknown
+                        } else {
+                            decl.return_type
+                        }
+                    })
                     .unwrap_or(ValueType::Unknown);
                 for arg in args {
                     self.compile_scalar_expr(arg)?;
@@ -1868,7 +1975,15 @@ impl Compiler {
             let return_type = self
                 .function_decls
                 .get(&index)
-                .map(|decl| decl.return_type)
+                .map(|decl| {
+                    // A coarse Optional payload type is not a definite
+                    // physical return type: native resume must retain Null.
+                    if matches!(decl.return_schema, Some(TypeSchema::Optional(_))) {
+                        ValueType::Unknown
+                    } else {
+                        decl.return_type
+                    }
+                })
                 .unwrap_or(ValueType::Unknown);
             self.emit_copy_ldloc(slot)?;
             return self.compile_callvalue_args(args, return_type);
@@ -2268,7 +2383,13 @@ impl Compiler {
             .get(slot as usize)
             .and_then(|schema| schema.as_ref())
         {
-            Some(TypeSchema::Callable { result, .. }) => result.coarse_value_type(),
+            Some(TypeSchema::Callable { result, .. }) => {
+                if matches!(result.as_ref(), TypeSchema::Optional(_)) {
+                    ValueType::Unknown
+                } else {
+                    result.coarse_value_type()
+                }
+            }
             _ => ValueType::Unknown,
         }
     }

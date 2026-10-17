@@ -325,12 +325,7 @@ impl TypeSchema {
                 TypeSchema::Object(fields) => fields
                     .values()
                     .any(|value| visit(value, structs, active, reentries)),
-                TypeSchema::Callable { params, result } => {
-                    params
-                        .iter()
-                        .any(|param| visit(param, structs, active, reentries))
-                        || visit(result, structs, active, reentries)
-                }
+                TypeSchema::Callable { .. } => false,
                 TypeSchema::Result { ok, err } => {
                     visit(ok, structs, active, reentries) || visit(err, structs, active, reentries)
                 }
@@ -714,6 +709,21 @@ pub enum Expr {
         span: Span,
         semantic_id: Option<SemanticNodeId>,
     },
+    /// Postfix `?`. Evaluates `value` once. Ok continues as `T`; Err returns
+    /// the active carrier from the lexical function through the existing `Ret`.
+    ResultTry {
+        value: Box<Expr>,
+        value_slot: LocalSlot,
+        payload_slot: LocalSlot,
+        operand_schema: TypeSchema,
+        return_schema: TypeSchema,
+        /// Owned locals that are available when this `?` takes the Err path.
+        /// The schema is the pre-compaction type, so cleanup does not depend on
+        /// the post-compaction type map having the same index.
+        exit_cleanup: Vec<(LocalSlot, TypeSchema)>,
+        span: Span,
+        semantic_id: Option<SemanticNodeId>,
+    },
 }
 
 impl Expr {
@@ -731,6 +741,7 @@ impl Expr {
                 visit(ok_expr);
                 visit(err_expr);
             }
+            Expr::ResultTry { value, .. } => visit(value),
             _ => {}
         }
     }
@@ -1462,7 +1473,8 @@ fn collect_resolved_calls_in_expr(
         }
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
-        | Expr::ResultMatch { .. }) => {
+        | Expr::ResultMatch { .. }
+        | Expr::ResultTry { .. }) => {
             other.visit_result_children(|child| {
                 collect_resolved_calls_in_expr(child, by_id, typed, slot_schemas);
             });

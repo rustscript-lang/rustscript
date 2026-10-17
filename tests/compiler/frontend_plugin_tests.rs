@@ -419,6 +419,350 @@ fn synthetic_frontend_ir_result_match_returns_ok_payload() {
     assert_eq!(vm.stack(), &[Value::Int(7)]);
 }
 
+// This producer deliberately does not invoke the RustScript parser or analyzer.
+struct IndependentTryIrPlugin;
+static INDEPENDENT_TRY_IR: IndependentTryIrPlugin = IndependentTryIrPlugin;
+
+impl SourcePlugin for IndependentTryIrPlugin {
+    fn descriptor(&self) -> SourceFrontendDescriptor {
+        SourceFrontendDescriptor {
+            id: FrontendId::new("independent-try-ir"),
+            extensions: &["try-ir"],
+            typing_policy: FrontendTypingPolicy::Strict,
+            supports_ownership_checking: false,
+        }
+    }
+
+    fn parse_source(
+        &self,
+        source: &str,
+        context: &SourceFrontendContext<'_>,
+    ) -> Result<FrontendIr, ParseError> {
+        use vm::compiler::ir::{FunctionDecl, FunctionImpl};
+        let span = vm::Span::new(0, 0, 1);
+        let result = vm::TypeSchema::Result {
+            ok: Box::new(vm::TypeSchema::Int),
+            err: Box::new(vm::TypeSchema::String),
+        };
+        let leaf_callable = vm::TypeSchema::Callable {
+            params: Vec::new(),
+            result: Box::new(vm::TypeSchema::Int),
+        };
+        let optional_callable = vm::TypeSchema::Optional(Box::new(leaf_callable.clone()));
+        let is_callable = source.starts_with("callable-");
+        let operand = if is_callable {
+            vm::TypeSchema::Result {
+                ok: Box::new(optional_callable.clone()),
+                err: Box::new(vm::TypeSchema::String),
+            }
+        } else if source == "wrong-error" {
+            vm::TypeSchema::Result {
+                ok: Box::new(vm::TypeSchema::Int),
+                err: Box::new(vm::TypeSchema::Int),
+            }
+        } else {
+            result.clone()
+        };
+        let make_result = |ok, payload, schema| Expr::ResultConstruct {
+            ok,
+            payload: Box::new(payload),
+            result_schema: schema,
+            span,
+            semantic_id: None,
+        };
+        let callable = vm::TypeSchema::Callable {
+            params: Vec::new(),
+            result: Box::new(result.clone()),
+        };
+        let mut ir = PLUG_A.ir();
+        ir.locals = 10;
+        ir.stmts = vec![
+            Stmt::FuncDecl {
+                name: "relay".into(),
+                index: 0,
+                arity: 0,
+                args: Vec::new(),
+                exported: false,
+                has_impl: true,
+                line: 1,
+            },
+            Stmt::Let {
+                index: 1,
+                declared_schema: Some(callable),
+                expr: Expr::FunctionRef(0, Vec::new()),
+                line: 1,
+            },
+            Stmt::Expr {
+                expr: Expr::ResultMatch {
+                    value: Box::new(Expr::LocalCall(1, Vec::new(), Vec::new(), None)),
+                    value_slot: 2,
+                    ok_binding: Some(3),
+                    ok_expr: Box::new(Expr::Var(3)),
+                    err_binding: Some(4),
+                    err_expr: Box::new(Expr::Var(4)),
+                    scrutinee_schema: result.clone(),
+                    span,
+                    semantic_id: None,
+                },
+                line: 1,
+            },
+        ];
+        ir.functions = vec![FunctionDecl {
+            name: "relay".into(),
+            arity: 0,
+            index: 0,
+            args: Vec::new(),
+            arg_schemas: Vec::new(),
+            return_schema: Some(result.clone()),
+            type_params: Vec::new(),
+            exported: false,
+            return_type: vm::ValueType::Map,
+            symbol: None,
+        }];
+        if is_callable {
+            ir.functions.push(FunctionDecl {
+                name: "one".into(),
+                arity: 0,
+                index: 1,
+                args: Vec::new(),
+                arg_schemas: Vec::new(),
+                return_schema: Some(vm::TypeSchema::Int),
+                type_params: Vec::new(),
+                exported: false,
+                return_type: vm::ValueType::Int,
+                symbol: None,
+            });
+            ir.function_impls.insert(
+                1,
+                FunctionImpl {
+                    param_slots: Vec::new(),
+                    capture_copies: Vec::new(),
+                    body_stmts: Vec::new(),
+                    body_expr: Expr::Int(1),
+                    body_expr_line: 1,
+                },
+            );
+        }
+        let mark = context.install_host_function(&mut ir, "test::mark", 1)?;
+        let set_log = |n| Expr::Call(mark, Vec::new(), vec![Expr::Int(n)], None, None);
+        let ok = source == "ok" || is_callable;
+        let payload = if is_callable {
+            if source.ends_with("-null") {
+                Expr::Null
+            } else {
+                Expr::FunctionRef(1, Vec::new())
+            }
+        } else if ok {
+            Expr::Int(7)
+        } else if source == "wrong-error" {
+            Expr::Int(9)
+        } else {
+            Expr::String("bad".into())
+        };
+        ir.function_impls.insert(
+            0,
+            FunctionImpl {
+                param_slots: Vec::new(),
+                capture_copies: Vec::new(),
+                body_stmts: vec![
+                    Stmt::Expr {
+                        expr: set_log(1),
+                        line: 1,
+                    },
+                    Stmt::Let {
+                        index: 6,
+                        declared_schema: Some(if is_callable {
+                            optional_callable
+                        } else {
+                            vm::TypeSchema::Int
+                        }),
+                        expr: Expr::ResultTry {
+                            value: Box::new(make_result(ok, payload, operand.clone())),
+                            value_slot: 7,
+                            payload_slot: 8,
+                            operand_schema: operand,
+                            return_schema: result.clone(),
+                            exit_cleanup: Vec::new(),
+                            span,
+                            semantic_id: None,
+                        },
+                        line: 1,
+                    },
+                    Stmt::Expr {
+                        expr: set_log(2),
+                        line: 1,
+                    },
+                ],
+                body_expr: make_result(
+                    true,
+                    if is_callable {
+                        Expr::LocalCall(
+                            if source == "callable-direct" { 6 } else { 9 },
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                        )
+                    } else {
+                        Expr::Var(6)
+                    },
+                    result,
+                ),
+                body_expr_line: 1,
+            },
+        );
+        if source == "callable-direct" {
+            let body = ir.function_impls.get_mut(&0).unwrap();
+            body.body_stmts.push(Stmt::Expr {
+                expr: Expr::LocalCall(6, Vec::new(), Vec::new(), None),
+                line: 1,
+            });
+            body.body_expr = make_result(
+                true,
+                Expr::Int(1),
+                vm::TypeSchema::Result {
+                    ok: Box::new(vm::TypeSchema::Int),
+                    err: Box::new(vm::TypeSchema::String),
+                },
+            );
+        }
+        if is_callable && source != "callable-direct" {
+            ir.function_impls
+                .get_mut(&0)
+                .unwrap()
+                .body_stmts
+                .push(Stmt::Let {
+                    index: 9,
+                    declared_schema: Some(leaf_callable),
+                    expr: Expr::OptionUnwrapOr {
+                        value: Box::new(Expr::Var(6)),
+                        value_slot: 5,
+                        fallback: Box::new(Expr::Closure(vm::ClosureExpr {
+                            param_slots: Vec::new(),
+                            capture_copies: Vec::new(),
+                            body: Box::new(Expr::Int(9)),
+                        })),
+                        semantic_id: None,
+                    },
+                    line: 1,
+                });
+        }
+        Ok(ir)
+    }
+
+    fn parse_module_imports(
+        &self,
+        _source: &str,
+        _path: &Path,
+        _context: &SourceFrontendContext<'_>,
+    ) -> Result<Vec<vm::ModuleImport>, vm::SourcePathError> {
+        Ok(Vec::new())
+    }
+}
+
+fn independent_try_options() -> CompileSourceFileOptions {
+    let mut catalog = vm::HostApiBuilder::new();
+    catalog.function(vm::HostFunctionSchema::with_return(
+        "test::mark",
+        vec![vm::HostParamSchema::value("n", vm::HostTypeSchema::Int)],
+        vm::HostTypeSchema::Int,
+    ));
+    CompileSourceFileOptions::new()
+        .with_source_plugin(&INDEPENDENT_TRY_IR)
+        .with_host_api_catalog(std::sync::Arc::new(catalog.build().unwrap()))
+}
+
+#[test]
+fn independent_typed_try_ir_public_compile_runs_ok_err_and_effects() {
+    struct Mark(std::sync::Arc<Mutex<Vec<Value>>>);
+    impl vm::HostFunction for Mark {
+        fn call(&mut self, _: &mut Vm, args: &[Value]) -> vm::VmResult<vm::CallOutcome> {
+            self.0.lock().unwrap().push(args[0].clone());
+            Ok(vm::CallOutcome::Return(vm::CallReturn::one(
+                args[0].clone(),
+            )))
+        }
+    }
+    for (source, payload, effects) in [
+        ("ok", Value::Int(7), vec![Value::Int(1), Value::Int(2)]),
+        ("err", Value::string("bad"), vec![Value::Int(1)]),
+    ] {
+        let compiled = compile_source_with_flavor_and_options(
+            source,
+            SourceFlavor::Plugin(FrontendId::new("independent-try-ir")),
+            independent_try_options(),
+        )
+        .unwrap_or_else(|error| panic!("independent {source} IR admission: {error:?}"));
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut machine = Vm::new(compiled.program.with_local_count(compiled.locals));
+        machine.bind_function("test::mark", Box::new(Mark(log.clone())));
+        machine.set_fuel(100_000);
+        assert_eq!(
+            machine.run().expect("independent IR runtime"),
+            VmStatus::Halted
+        );
+        assert_eq!(machine.stack(), &[payload]);
+        assert_eq!(*log.lock().unwrap(), effects);
+    }
+}
+
+#[test]
+fn independent_typed_try_ir_rejects_wrong_error_schema() {
+    let error = compile_source_with_flavor_and_options(
+        "wrong-error",
+        SourceFlavor::Plugin(FrontendId::new("independent-try-ir")),
+        independent_try_options(),
+    )
+    .err()
+    .expect("wrong E must reject through public strict admission");
+    assert!(error.to_string().contains("error type"), "{error:?}");
+}
+
+#[test]
+fn independent_optional_callable_try_rejects_unrefined_invocation() {
+    let error = compile_source_with_flavor_and_options(
+        "callable-direct",
+        SourceFlavor::Plugin(FrontendId::new("independent-try-ir")),
+        independent_try_options(),
+    )
+    .err()
+    .expect("OptionalCallable must not be directly invoked");
+    assert!(
+        error.to_string().contains("optional") || error.to_string().contains("null"),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn independent_optional_callable_try_unwrap_executes_null_and_nonnull() {
+    struct Mark;
+    impl vm::HostFunction for Mark {
+        fn call(&mut self, _: &mut Vm, args: &[Value]) -> vm::VmResult<vm::CallOutcome> {
+            Ok(vm::CallOutcome::Return(vm::CallReturn::one(
+                args[0].clone(),
+            )))
+        }
+    }
+    for source in ["callable-unwrap-null", "callable-unwrap-nonnull"] {
+        let compiled = compile_source_with_flavor_and_options(
+            source,
+            SourceFlavor::Plugin(FrontendId::new("independent-try-ir")),
+            independent_try_options(),
+        )
+        .unwrap_or_else(|error| panic!("{source} admission: {error:?}"));
+        let mut machine = Vm::new(compiled.program.with_local_count(compiled.locals));
+        machine.set_fuel(100_000);
+        machine.bind_function("test::mark", Box::new(Mark));
+        assert_eq!(
+            machine.run().expect("unwrapped callable runtime"),
+            VmStatus::Halted
+        );
+        assert_eq!(
+            machine.stack(),
+            &[Value::Int(if source.ends_with("-null") { 9 } else { 1 })]
+        );
+    }
+}
+
 struct ContextualResultIrPlugin;
 
 static CONTEXTUAL_RESULT_IR: ContextualResultIrPlugin = ContextualResultIrPlugin;
