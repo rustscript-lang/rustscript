@@ -365,6 +365,124 @@ where
     }
 }
 
+macro_rules! take_scalar {
+    ($($ty:ty),* $(,)?) => {$ (
+        impl TakeVmValue for $ty {
+            fn take_vm_value(slot: &mut Value, label: &str) -> VmResult<Self> {
+                let result = Self::from_vm_value(slot, label)?;
+                *slot = Value::Null;
+                Ok(result)
+            }
+        }
+    )*};
+}
+take_scalar!(i64, bool, f64, String, u32, usize);
+
+impl FromVmValue<'_> for () {
+    fn from_vm_value(value: &Value, _label: &str) -> VmResult<Self> {
+        if matches!(value, Value::Null) {
+            Ok(())
+        } else {
+            Err(VmError::TypeMismatch("null"))
+        }
+    }
+}
+take_scalar!(());
+
+impl FromVmValue<'_> for Vec<u8> {
+    fn from_vm_value(value: &Value, _label: &str) -> VmResult<Self> {
+        match value {
+            Value::Bytes(bytes) => Ok(bytes.as_ref().clone()),
+            _ => Err(VmError::TypeMismatch("bytes")),
+        }
+    }
+}
+
+impl TakeVmValue for Vec<u8> {
+    fn take_vm_value(slot: &mut Value, _label: &str) -> VmResult<Self> {
+        if !matches!(slot, Value::Bytes(_)) {
+            return Err(VmError::TypeMismatch("bytes"));
+        }
+        let Value::Bytes(bytes) = std::mem::replace(slot, Value::Null) else {
+            unreachable!()
+        };
+        Ok(std::sync::Arc::unwrap_or_clone(bytes))
+    }
+}
+
+impl<'a, T: FromVmValue<'a>> FromVmValue<'a> for Vec<T> {
+    fn from_vm_value(value: &'a Value, label: &str) -> VmResult<Self> {
+        let Value::Array(values) = value else {
+            return Err(VmError::TypeMismatch("array"));
+        };
+        values
+            .iter()
+            .map(|value| T::from_vm_value(value, label))
+            .collect()
+    }
+}
+
+impl<T: TakeVmValue> TakeVmValue for Vec<T> {
+    fn take_vm_value(slot: &mut Value, label: &str) -> VmResult<Self> {
+        if !matches!(slot, Value::Array(_)) {
+            return Err(VmError::TypeMismatch("array"));
+        }
+        let Value::Array(values) = std::mem::replace(slot, Value::Null) else {
+            unreachable!()
+        };
+        let mut values = std::sync::Arc::unwrap_or_clone(values);
+        values
+            .iter_mut()
+            .map(|value| T::take_vm_value(value, label))
+            .collect()
+    }
+}
+
+impl<'a, T, E> FromVmValue<'a> for crate::GuestResult<T, E>
+where
+    T: FromVmValue<'a>,
+    E: FromVmValue<'a>,
+{
+    fn from_vm_value(value: &'a Value, label: &str) -> VmResult<Self> {
+        let (tag, payload) = crate::result::payload(value)?;
+        if tag {
+            T::from_vm_value(payload, label).map(Self::Ok)
+        } else {
+            E::from_vm_value(payload, label).map(Self::Err)
+        }
+    }
+}
+
+impl<T, E> TakeVmValue for crate::GuestResult<T, E>
+where
+    T: TakeVmValue,
+    E: TakeVmValue,
+{
+    fn take_vm_value(slot: &mut Value, label: &str) -> VmResult<Self> {
+        let (tag, _) = crate::result::payload(slot)?;
+        let Value::Map(mut entries) = std::mem::replace(slot, Value::Null) else {
+            unreachable!()
+        };
+        let mut payload = std::sync::Arc::make_mut(&mut entries)
+            .remove(&Value::string("payload"))
+            .unwrap_or(Value::Null);
+        if tag {
+            T::take_vm_value(&mut payload, label).map(Self::Ok)
+        } else {
+            E::take_vm_value(&mut payload, label).map(Self::Err)
+        }
+    }
+}
+
+impl<T: IntoVmValue, E: IntoVmValue> IntoVmValue for crate::GuestResult<T, E> {
+    fn into_vm_value(self) -> Value {
+        match self {
+            Self::Ok(value) => crate::result::carrier(true, value.into_vm_value()),
+            Self::Err(error) => crate::result::carrier(false, error.into_vm_value()),
+        }
+    }
+}
+
 pub trait IntoVmValue {
     fn into_vm_value(self) -> Value;
 }
@@ -452,9 +570,9 @@ where
     }
 }
 
-impl IntoVmValue for Vec<Value> {
+impl<T: IntoVmValue> IntoVmValue for Vec<T> {
     fn into_vm_value(self) -> Value {
-        Value::array(self)
+        Value::array(self.into_iter().map(IntoVmValue::into_vm_value).collect())
     }
 }
 

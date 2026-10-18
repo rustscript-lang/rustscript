@@ -1422,6 +1422,9 @@ impl Vm {
             callable_maintenance::after_registration(entries, &mut self.host.module_state_store);
         });
         self.engine.reset_runtime_state(&self.program);
+        if !self.host.scope_reset_pending {
+            self.instance.callback_publication_unresolved = false;
+        }
         Ok(())
     }
 
@@ -1451,11 +1454,26 @@ impl Vm {
     /// Callers that maintain a VM pool can use this method with their own
     /// waker instead of releasing the VM while its old scope is Closing.
     pub fn poll_reset_for_reuse(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<()>> {
+        let was_pending = self.host.scope_reset_pending;
         match self.host.poll_reset_execution_scope(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(())) => {
+                if was_pending && !self.host.scope_reset_pending {
+                    self.instance.callback_publication_unresolved = false;
+                }
+                Poll::Ready(Ok(()))
+            }
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
         }
+    }
+
+    fn ensure_callback_publication_resolved(&self) -> VmResult<()> {
+        if self.instance.callback_publication_unresolved {
+            return Err(VmError::InvalidFrameState(
+                "callback publication ownership unresolved; explicit shutdown/reset required",
+            ));
+        }
+        Ok(())
     }
 
     fn ensure_scope_ready(&mut self) -> VmResult<()> {
@@ -1463,6 +1481,7 @@ impl Vm {
         if self.instance.shutdown {
             return Err(VmError::InvalidFrameState("vm is shut down"));
         }
+        self.ensure_callback_publication_resolved()?;
         if let Some(error) = self.host.scope_reset_error().cloned() {
             return Err(VmError::ExecutionScope(error));
         }
@@ -3089,9 +3108,11 @@ impl Vm {
                 .execution_frames
                 .last()
                 .and_then(|frame| frame.prototype_id);
-            let target_is_valid = if let Some(prototype_id) = active_prototype
-                && !self.has_aot_program()
-            {
+            // Specialized callable prototypes may share a script function's
+            // code region. Branch authority is that active function range in
+            // both backends, not equality with the region's representative
+            // prototype (which need not be the admitted specialization).
+            let target_is_valid = if let Some(prototype_id) = active_prototype {
                 self.program
                     .callable_prototypes
                     .get(prototype_id as usize)
@@ -3945,6 +3966,7 @@ impl Vm {
     }
 
     pub fn drain_callable_queue(&mut self) -> VmResult<Vec<Value>> {
+        self.ensure_callback_publication_resolved()?;
         if self.instance.draining_queued_callables {
             return Err(VmError::InvalidFrameState(
                 "callable queue is already being drained",
@@ -4114,7 +4136,10 @@ impl Vm {
         if let Some(frame) = self.instance.execution_frames.last_mut() {
             frame.continuation = FrameContinuation::ReturnToHost;
         }
-        match self.run_internal(None, false) {
+        // Host-root frames use the same typed return continuation and native
+        // frame ABI as guest calls. Preserve configured backend execution here;
+        // disabling it silently made standalone callbacks interpreter-only.
+        match self.run_internal(None, true) {
             Ok(status) => Ok(status),
             Err(error) => {
                 self.abort_host_invocation(stack_base, frame_count);
@@ -4204,8 +4229,12 @@ impl Vm {
 
     /// Takes the next result from the callback completion queue. If no queued
     /// callback result exists, this also retains the legacy fallback to the
-    /// current host return slot.
+    /// current host return slot. Unresolved callback ownership retains both
+    /// queues until explicit scope cleanup; no result can be taken then.
     pub fn take_callable_result(&mut self) -> Option<Value> {
+        if self.instance.callback_publication_unresolved {
+            return None;
+        }
         self.instance
             .completed_callable_results
             .pop_front()

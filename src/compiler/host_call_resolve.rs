@@ -367,6 +367,36 @@ pub(crate) fn resolve_candidate_slice_with_passing(
     resolve_candidate_refs(requested_name, &named, args, fingerprint)
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ArgumentRejection {
+    Schema {
+        argument: usize,
+    },
+    Passing {
+        argument: usize,
+        expected: HostParamPassing,
+        actual: HostParamPassing,
+    },
+}
+
+pub(crate) fn resolve_candidate_slice_for_admission(
+    name: &str,
+    candidates: &[HostFunctionSchema],
+    args: &[ActualCallArg<'_>],
+    fingerprint: HostApiFingerprint,
+) -> (
+    Result<ResolvedHostCall, HostCallResolveError>,
+    Option<ArgumentRejection>,
+) {
+    let named = candidates
+        .iter()
+        .filter(|candidate| candidate.name == name)
+        .collect::<Vec<_>>();
+    let mut reason = None;
+    let result = resolve_candidate_refs_for_admission(name, &named, args, fingerprint, &mut reason);
+    (result, reason)
+}
+
 /// Shared selection core over an already requested-name-filtered slice.
 ///
 /// `named` holds only candidates whose name equals `name`, in slice order. An
@@ -384,11 +414,21 @@ pub(crate) fn resolve_candidate_slice_with_passing(
 /// [`HostCallResolveError::NoMatch`]. Passing intent is a pure viability gate:
 /// an exact [`Some`] intent that differs from the candidate parameter's mode
 /// rules that candidate non-viable, while anything else leaves it viable.
-fn resolve_candidate_refs<'a, A: ActualCallArgView>(
+fn resolve_candidate_refs<A: ActualCallArgView>(
+    name: &str,
+    named: &[&HostFunctionSchema],
+    args: &[A],
+    fingerprint: HostApiFingerprint,
+) -> Result<ResolvedHostCall, HostCallResolveError> {
+    resolve_candidate_refs_for_admission(name, named, args, fingerprint, &mut None)
+}
+
+fn resolve_candidate_refs_for_admission<'a, A: ActualCallArgView>(
     name: &str,
     named: &[&'a HostFunctionSchema],
     args: &[A],
     fingerprint: HostApiFingerprint,
+    reason: &mut Option<ArgumentRejection>,
 ) -> Result<ResolvedHostCall, HostCallResolveError> {
     if named.is_empty() {
         return Err(HostCallResolveError::UnknownFunction(name.to_string()));
@@ -475,6 +515,20 @@ fn resolve_candidate_refs<'a, A: ActualCallArgView>(
 
     // No viable candidate: report the best concrete mismatch.
     let (best_candidate, mismatch) = best_concrete_mismatch(&non_viable, args);
+    // Retain the canonical argument/reason before rendering any diagnostic.
+    *reason = mismatch.as_ref().and_then(|mismatch| {
+        if mismatch.passing {
+            Some(ArgumentRejection::Passing {
+                argument: mismatch.index,
+                expected: best_candidate?.params[mismatch.index].passing,
+                actual: args[mismatch.index].passing()?,
+            })
+        } else {
+            Some(ArgumentRejection::Schema {
+                argument: mismatch.index,
+            })
+        }
+    });
     let suffix = best_candidate
         .map(|function| format!("; best candidate is `{}`", signature_label(function)))
         .unwrap_or_default();
@@ -612,6 +666,19 @@ fn score_pair(expected: &TypeSchema, actual: &TypeSchema) -> MatchScore {
     }
 
     match (expected, actual) {
+        (
+            Result {
+                ok: e_ok,
+                err: e_err,
+            },
+            Result {
+                ok: a_ok,
+                err: a_err,
+            },
+        ) => MatchScore::default()
+            .plus_exact()
+            .combined(score_pair(e_ok, a_ok))
+            .combined(score_pair(e_err, a_err)),
         (Optional(e), Optional(a)) => MatchScore::default()
             .plus_exact()
             .combined(score_pair(e, a)),
@@ -1129,6 +1196,64 @@ mod tests {
             HostTypeSchema::Int,
         ));
         b.build().expect("valid catalog")
+    }
+
+    #[test]
+    fn result_pair_scores_both_branches_with_existing_rules() {
+        fn result(ok: Ts, err: Ts) -> Ts {
+            Ts::Result {
+                ok: Box::new(ok),
+                err: Box::new(err),
+            }
+        }
+        let expected = result(Ts::Array(Box::new(Ts::Int)), Ts::Resource(io_file()));
+        let exact = score_pair(&expected, &expected);
+        assert_eq!(
+            exact,
+            MatchScore {
+                exact_structural: 4,
+                ..MatchScore::default()
+            }
+        );
+        let deferred = score_pair(
+            &expected,
+            &result(Ts::Array(Box::new(Ts::Unknown)), Ts::Resource(io_file())),
+        );
+        assert_eq!(deferred.deferred, 1);
+        assert_eq!(deferred.mismatches, 0);
+        assert_eq!(
+            score_pair(
+                &expected,
+                &result(Ts::Array(Box::new(Ts::Number)), Ts::Resource(io_file()))
+            )
+            .numeric_compat,
+            1
+        );
+        assert_eq!(
+            score_pair(
+                &expected,
+                &result(Ts::Array(Box::new(Ts::Int)), Ts::Resource(sqlite_conn()))
+            )
+            .mismatches,
+            1
+        );
+        assert_eq!(
+            score_pair(
+                &expected,
+                &result(Ts::Resource(io_file()), Ts::Array(Box::new(Ts::Int)))
+            )
+            .mismatches,
+            2
+        );
+        assert_eq!(
+            score_pair(
+                &result(Ts::GenericParam("T".into()), Ts::String),
+                &result(Ts::GenericParam("E".into()), Ts::String)
+            )
+            .mismatches,
+            1
+        );
+        assert_eq!(score_pair(&expected, &Ts::Int).mismatches, 1);
     }
 
     #[test]

@@ -1,0 +1,5 @@
+error: ResourceMut cannot appear in a host function return nested inside `VmResult` -> `GuestResult` -> `Option` -> `Vec`; resource borrows cannot cross the host boundary
+ --> tests/ui/fail/guest_result_borrowed_err.rs:7:17
+  |
+7 | fn invalid() -> VmResult<GuestResult<i64, Option<Vec<ResourceMut<'static, Counter>>>>> {
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
