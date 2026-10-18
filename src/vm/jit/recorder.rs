@@ -2789,7 +2789,13 @@ fn select_numeric_compare(
     lhs: ValueInfo,
     rhs: ValueInfo,
 ) -> Result<NumericCompareKind, TraceRecordError> {
-    if lhs.force_value_eq || rhs.force_value_eq {
+    if lhs.force_value_eq
+        || rhs.force_value_eq
+        || [lhs.known_type, rhs.known_type]
+            .into_iter()
+            .flatten()
+            .any(|ty| !matches!(ty, ValueType::Int | ValueType::Float | ValueType::Unknown))
+    {
         return Err(TraceRecordError::UnsupportedTrace(
             "SSA recorder requires value equality for known non-numeric operands".to_string(),
         ));

@@ -1924,6 +1924,18 @@ fn rebase_parsed_semantic_index(
 
     Ok(ParsedSemanticIndex {
         type_provenance: unit.type_provenance.clone(),
+        call_arguments: unit
+            .call_arguments
+            .iter()
+            .map(|site| {
+                let mut site = site.clone();
+                site.call_id = remap_node(site.call_id);
+                for arg in &mut site.arguments {
+                    arg.local = arg.local.map(&remap_slot).transpose()?;
+                }
+                Ok(site)
+            })
+            .collect::<Result<Vec<_>, SourcePathError>>()?,
         call_sites,
         local_decls,
         local_refs,
@@ -1970,6 +1982,7 @@ fn merge_parsed_semantic_index(merged: &mut ParsedSemanticIndex, unit: ParsedSem
     debug_assert!(merged.next_node_id <= unit.next_node_id);
     debug_assert!(merged.next_scope_id <= unit.next_scope_id);
     merged.call_sites.extend(unit.call_sites);
+    merged.call_arguments.extend(unit.call_arguments);
     merged.local_decls.extend(unit.local_decls);
     merged.local_refs.extend(unit.local_refs);
     merged.func_decls.extend(unit.func_decls);
@@ -2756,6 +2769,7 @@ mod linker_provenance_merge_tests {
             stmt_spans: Vec::new(),
             struct_decls: Vec::new(),
             type_provenance: Vec::new(),
+            call_arguments: Vec::new(),
             next_node_id,
             next_scope_id,
         }
@@ -2910,6 +2924,7 @@ mod linker_provenance_merge_tests {
             stmt_spans: Vec::new(),
             struct_decls: Vec::new(),
             type_provenance: Vec::new(),
+            call_arguments: Vec::new(),
             next_node_id: 3,
             next_scope_id: 1,
         };
@@ -2936,6 +2951,7 @@ mod linker_provenance_merge_tests {
             stmt_spans: Vec::new(),
             struct_decls: Vec::new(),
             type_provenance: Vec::new(),
+            call_arguments: Vec::new(),
             next_node_id: 1,
             next_scope_id: 1,
         };
@@ -3053,6 +3069,7 @@ mod linker_provenance_merge_tests {
             func_decls: Vec::new(),
             struct_decls: Vec::new(),
             type_provenance: Vec::new(),
+            call_arguments: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
             stmt_spans: Vec::new(),
@@ -3074,6 +3091,7 @@ mod linker_provenance_merge_tests {
             func_decls: Vec::new(),
             struct_decls: Vec::new(),
             type_provenance: Vec::new(),
+            call_arguments: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
             stmt_spans: Vec::new(),
@@ -3145,6 +3163,7 @@ mod linker_provenance_merge_tests {
             func_decls: Vec::new(),
             struct_decls: Vec::new(),
             type_provenance: Vec::new(),
+            call_arguments: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
             stmt_spans: Vec::new(),

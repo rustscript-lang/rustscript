@@ -191,11 +191,15 @@ fn jit_blocks_depth_zero_zero_benefit_call_boundary_trace() {
             "blocked root should have no recorded trace, dump:\n{}",
             vm.dump_jit_info()
         );
-        assert_eq!(
-            vm.jit_native_trace_count(),
-            0,
-            "dump:\n{}",
-            vm.dump_jit_info()
+        // The rejected pre-call root remains absent. Useful arithmetic after
+        // the interpreter call is independently eligible inside the loop.
+        assert!(vm.jit_native_trace_count() > 0, "{}", vm.dump_jit_info());
+        assert!(vm.jit_native_exec_count() > 0);
+        assert!(
+            snapshot
+                .traces
+                .iter()
+                .any(|trace| trace.executions > 0 && trace.ssa_text().contains("iadd"))
         );
     }
 }
@@ -271,11 +275,15 @@ fn jit_blocks_depth_one_zero_benefit_call_boundary_trace() {
             "blocked root should have no recorded trace, dump:\n{}",
             vm.dump_jit_info()
         );
-        assert_eq!(
-            vm.jit_native_trace_count(),
-            0,
-            "dump:\n{}",
-            vm.dump_jit_info()
+        // The rejected pre-call root remains absent. Useful arithmetic after
+        // the interpreter call is independently eligible inside the loop.
+        assert!(vm.jit_native_trace_count() > 0, "{}", vm.dump_jit_info());
+        assert!(vm.jit_native_exec_count() > 0);
+        assert!(
+            snapshot
+                .traces
+                .iter()
+                .any(|trace| trace.executions > 0 && trace.ssa_text().contains("iadd"))
         );
     }
 }

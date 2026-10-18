@@ -840,6 +840,23 @@ fn remap_lowered_spans(
             map(&mut site.callee_span);
             map(&mut site.expr_span);
         }
+        index.call_arguments.retain_mut(|site| {
+            let remap = |span: &mut Span| {
+                if let Some(mapped) =
+                    lowered
+                        .byte_mapping
+                        .map_span(original_source_id, *span, lowered_source_id)
+                {
+                    *span = mapped;
+                    true
+                } else {
+                    false
+                }
+            };
+            remap(&mut site.callee_span)
+                && remap(&mut site.expr_span)
+                && site.arguments.iter_mut().all(|arg| remap(&mut arg.span))
+        });
         for decl in &mut index.local_decls {
             map(&mut decl.ident_span);
             map(&mut decl.stmt_span);
@@ -2052,8 +2069,8 @@ mod lowered_provenance_remap_tests {
                 };
                 let mut spans = Vec::new();
                 for stmt in &ir.stmts {
-                    if let Stmt::Let { expr, .. } = stmt {
-                        match expr {
+                    if let Stmt::Let {
+                        expr:
                             Expr::ResultConstruct {
                                 span, semantic_id, ..
                             }
@@ -2062,15 +2079,12 @@ mod lowered_provenance_remap_tests {
                             }
                             | Expr::ResultMatch {
                                 span, semantic_id, ..
-                            } => {
-                                spans.push(*span);
-                                assert!(
-                                    semantic_id.is_none(),
-                                    "parser Result identity is unchanged"
-                                );
-                            }
-                            _ => {}
-                        }
+                            },
+                        ..
+                    } = stmt
+                    {
+                        spans.push(*span);
+                        assert!(semantic_id.is_none(), "parser Result identity is unchanged");
                     }
                 }
                 let function = ir.function_impls.values().next().unwrap();

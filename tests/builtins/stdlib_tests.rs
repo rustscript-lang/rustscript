@@ -17,7 +17,20 @@ fn run_rustscript_spec(path: &Path) -> Vec<Value> {
     #[cfg(feature = "async")]
     super::async_test_bridge::install(&mut vm);
     loop {
-        let status = vm.run().expect("spec vm should run");
+        let status = vm.run().unwrap_or_else(|error| {
+            let dump = vm
+                .dump_jit_info()
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("code:"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "spec vm should run: {error:?}, ip={}, stack={:?}\n{}\n{dump}",
+                vm.ip(),
+                vm.stack(),
+                vm::disassemble_program(vm.program())
+            );
+        });
         match status {
             VmStatus::Halted => break,
             VmStatus::Yielded => continue,

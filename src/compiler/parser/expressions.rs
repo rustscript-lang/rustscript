@@ -3054,9 +3054,31 @@ impl Parser {
 
     pub(super) fn parse_call_args(&mut self) -> Result<Vec<Expr>, ParseError> {
         let mut args = Vec::new();
+        let mut arguments = Vec::new();
         if !self.check(&TokenKind::RParen) {
             loop {
-                args.push(self.parse_expr()?);
+                let start = self.tokens[self.pos].span;
+                let arg = self.parse_expr()?;
+                let end = self.tokens[self.pos - 1].span;
+                use super::super::ir::{ParsedArgumentShape, ParsedCallArgument};
+                let (shape, inner) = match &arg {
+                    Expr::Borrow(inner) => (ParsedArgumentShape::Borrow, Some(inner.as_ref())),
+                    Expr::BorrowMut(inner) => {
+                        (ParsedArgumentShape::BorrowMut, Some(inner.as_ref()))
+                    }
+                    Expr::ToOwned(inner) => (ParsedArgumentShape::Copy, Some(inner.as_ref())),
+                    _ => (ParsedArgumentShape::Other, None),
+                };
+                let local = match inner {
+                    Some(Expr::Var(slot)) => Some(*slot),
+                    _ => None,
+                };
+                arguments.push(ParsedCallArgument {
+                    span: Span::new(start.source_id, start.lo, end.hi),
+                    shape,
+                    local,
+                });
+                args.push(arg);
                 if self.match_kind(&TokenKind::Comma) {
                     continue;
                 }
@@ -3064,6 +3086,8 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RParen, "expected ')' after arguments")?;
+        self.call_args_by_end
+            .insert(self.tokens[self.pos - 1].span.hi, arguments);
         Ok(args)
     }
 }
