@@ -617,6 +617,20 @@ impl DecodedInstructionData {
     }
 }
 
+/// One owned local closed when a specific Err `Ret` runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetCleanupLocal {
+    pub slot: u16,
+    pub schema: crate::compiler::TypeSchema,
+}
+
+/// Cleanup metadata for one Err-path `Ret` opcode site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetCleanupPlan {
+    pub site: u32,
+    pub locals: Vec<RetCleanupLocal>,
+}
+
 /// Hard upper bound for a single interpreter frame's local slots.
 ///
 /// This is deliberately below the wire-format count ceiling: metadata may be
@@ -651,6 +665,9 @@ pub struct Program {
     pub function_regions: Vec<FunctionRegion>,
     pub root_callable_bindings: Vec<RootCallableBinding>,
     pub exported_callables: Vec<ExportedCallable>,
+    /// Err-path `Ret` sites and the owned locals to close before frame drain.
+    /// Empty for programs that do not use `?`.
+    pub(crate) ret_cleanups: Vec<RetCleanupPlan>,
     #[allow(dead_code)]
     decoded_instruction_data_cache: Arc<OnceLock<Arc<DecodedInstructionData>>>,
     operand_type_hints_cache: Arc<OnceLock<Option<Arc<[u8]>>>>,
@@ -673,6 +690,7 @@ impl Program {
             function_regions: Vec::new(),
             root_callable_bindings: Vec::new(),
             exported_callables: Vec::new(),
+            ret_cleanups: Vec::new(),
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
             operand_type_hints_cache: Arc::new(OnceLock::new()),
         }
@@ -698,6 +716,7 @@ impl Program {
             function_regions: Vec::new(),
             root_callable_bindings: Vec::new(),
             exported_callables: Vec::new(),
+            ret_cleanups: Vec::new(),
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
             operand_type_hints_cache: Arc::new(OnceLock::new()),
         }
@@ -724,6 +743,7 @@ impl Program {
             function_regions: Vec::new(),
             root_callable_bindings: Vec::new(),
             exported_callables: Vec::new(),
+            ret_cleanups: Vec::new(),
             decoded_instruction_data_cache: Arc::new(OnceLock::new()),
             operand_type_hints_cache: Arc::new(OnceLock::new()),
         }

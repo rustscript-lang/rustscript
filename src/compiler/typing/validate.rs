@@ -453,6 +453,10 @@ fn validate_json_schema_with_seen(
         TypeSchema::Bytes => Err(format!(
             "{path} uses bytes, which json::encode does not support"
         )),
+        TypeSchema::Result { ok, err } => {
+            validate_json_schema_with_seen(ok, context, path, seen, reentries)?;
+            validate_json_schema_with_seen(err, context, path, seen, reentries)
+        }
         TypeSchema::Resource(key) => Err(format!(
             "{path} is resource '{key}', which json::encode does not support"
         )),
@@ -751,6 +755,16 @@ pub(super) fn validate_expr(
         | Expr::ModuleCall(..)
         | Expr::LocalCall(..)
         | Expr::Closure(_) => {
+            if let Expr::LocalCall(slot, _, _, _) = expr {
+                ensure_expr_not_optional(
+                    &Expr::Var(*slot),
+                    state,
+                    line_context,
+                    source_name,
+                    context,
+                    "callable call",
+                )?;
+            }
             validate_expr_children(
                 expr,
                 state,
@@ -1038,6 +1052,105 @@ pub(super) fn validate_expr(
                 )?;
                 merge_bound_types(arm_type, default_ty)
             }
+        }
+        Expr::ResultConstruct { payload, .. } => {
+            let _ = validate_expr(
+                payload,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            BoundType::Map
+        }
+        Expr::ResultQuery { value, .. } => {
+            let _ = validate_expr(
+                value,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            BoundType::Bool
+        }
+        Expr::ResultTry {
+            value,
+            operand_schema,
+            ..
+        } => {
+            let _ = validate_expr(
+                value,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            match operand_schema {
+                TypeSchema::Result { ok, .. } => context.bound_type_for_schema(ok),
+                _ => BoundType::Unknown,
+            }
+        }
+        Expr::ResultMatch {
+            value,
+            ok_binding,
+            ok_expr,
+            err_binding,
+            err_expr,
+            scrutinee_schema,
+            ..
+        } => {
+            let _ = validate_expr(
+                value,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            let (ok_schema, err_schema) = match scrutinee_schema {
+                TypeSchema::Result { ok, err } => ((**ok).clone(), (**err).clone()),
+                _ => (TypeSchema::Unknown, TypeSchema::Unknown),
+            };
+            let mut ok_state = state.clone();
+            if let Some(slot) = ok_binding {
+                ok_state.set_with_optional_schema_origin(
+                    *slot,
+                    context.bound_type_for_schema(&ok_schema),
+                    Some(ok_schema.clone()),
+                    true,
+                    matches!(ok_schema, TypeSchema::Optional(_)),
+                );
+            }
+            let mut err_state = state.clone();
+            if let Some(slot) = err_binding {
+                err_state.set_with_optional_schema_origin(
+                    *slot,
+                    context.bound_type_for_schema(&err_schema),
+                    Some(err_schema.clone()),
+                    true,
+                    matches!(err_schema, TypeSchema::Optional(_)),
+                );
+            }
+            let ok_ty = validate_expr(
+                ok_expr,
+                &ok_state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            let err_ty = validate_expr(
+                err_expr,
+                &err_state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            merge_bound_types(ok_ty, err_ty)
         }
         Expr::Block { stmts, expr } => {
             let mut nested = state.clone();

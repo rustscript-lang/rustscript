@@ -1,4 +1,5 @@
 use super::*;
+use crate::host_api::HostParamPassing;
 
 pub(super) fn extract_passthrough_return_slot(function_impl: &FunctionImpl) -> Option<LocalSlot> {
     if !function_impl.body_stmts.is_empty() {
@@ -60,6 +61,30 @@ pub(super) fn collect_consumed_positions_from_function(
         out,
     );
     collect_return_rebind_consumed_positions(function_impl, out);
+    collect_direct_return_consumed_positions(function_impl, out);
+}
+
+pub(super) fn collect_direct_return_consumed_positions(
+    function_impl: &FunctionImpl,
+    out: &mut HashSet<usize>,
+) {
+    let slots = match &function_impl.body_expr {
+        Expr::Var(slot) | Expr::MoveVar(slot) => vec![*slot],
+        Expr::ResultConstruct { payload, .. } => match payload.as_ref() {
+            Expr::Var(slot) | Expr::MoveVar(slot) => vec![*slot],
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    for slot in slots {
+        if let Some(position) = function_impl
+            .param_slots
+            .iter()
+            .position(|param| *param == slot)
+        {
+            out.insert(position);
+        }
+    }
 }
 
 pub(super) fn collect_return_rebind_consumed_positions(
@@ -249,6 +274,19 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
                     .any(|(_, arm_expr)| expr_uses_slot(arm_expr, slot))
                 || expr_uses_slot(default, slot)
         }
+        other @ (Expr::ResultConstruct { .. }
+        | Expr::ResultQuery { .. }
+        | Expr::ResultMatch { .. }
+        | Expr::ResultTry { .. }) => {
+            let mut used = false;
+            other.visit_result_children(|child| used |= expr_uses_slot(child, slot));
+            if let Expr::ResultTry { exit_cleanup, .. } = other {
+                used |= exit_cleanup
+                    .iter()
+                    .any(|(cleanup_slot, _)| *cleanup_slot == slot);
+            }
+            used
+        }
         Expr::Block { stmts, expr } => {
             stmts.iter().any(|stmt| stmt_uses_slot(stmt, slot)) || expr_uses_slot(expr, slot)
         }
@@ -427,7 +465,7 @@ pub(super) fn collect_consumed_positions_from_expr(
                 out,
             );
         }
-        Expr::Call(index, _, args, _, _) => {
+        Expr::Call(index, _, args, resolution, _) => {
             for arg in args {
                 collect_consumed_positions_from_expr(
                     arg,
@@ -435,6 +473,24 @@ pub(super) fn collect_consumed_positions_from_expr(
                     known_consumed_positions,
                     out,
                 );
+            }
+            if let Some(resolution) = resolution {
+                for (position, passing) in resolution.passing.iter().enumerate() {
+                    if *passing != HostParamPassing::TakeOwned {
+                        continue;
+                    }
+                    let Some(arg_expr) = args.get(position) else {
+                        continue;
+                    };
+                    if let Expr::Var(slot) | Expr::MoveVar(slot) = arg_expr
+                        && let Some(param_position) = function_impl
+                            .param_slots
+                            .iter()
+                            .position(|param| param == slot)
+                    {
+                        out.insert(param_position);
+                    }
+                }
             }
             let Some(consumed_arg_positions) = known_consumed_positions.get(index) else {
                 return;
@@ -580,6 +636,19 @@ pub(super) fn collect_consumed_positions_from_expr(
                 known_consumed_positions,
                 out,
             );
+        }
+        other @ (Expr::ResultConstruct { .. }
+        | Expr::ResultQuery { .. }
+        | Expr::ResultMatch { .. }
+        | Expr::ResultTry { .. }) => {
+            other.visit_result_children(|child| {
+                collect_consumed_positions_from_expr(
+                    child,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
+            });
         }
         Expr::Block { stmts, expr } => {
             for nested in stmts {

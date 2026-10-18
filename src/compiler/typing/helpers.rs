@@ -7,7 +7,7 @@ use crate::host_api::{HostFunctionSchema, HostParamPassing};
 
 use super::super::CompileError;
 use super::super::TypingMode;
-use super::super::host_call_resolve::{ActualCallArg, resolve_candidate_slice_with_passing};
+use super::super::host_call_resolve::{ActualCallArg, resolve_candidate_slice_for_admission};
 use super::super::ir::{
     AssignmentKind, Expr, FunctionDecl, FunctionImpl, HostApiIrMetadata, LocalSlot, MatchPattern,
     ResolvedHostCall, SemanticNodeId, Stmt, StructDecl, TypeSchema,
@@ -42,6 +42,8 @@ pub(super) struct HostCallResolutionPass<'a> {
     changed: usize,
     unresolved: usize,
     first_error: Option<CompileError>,
+    pub(super) rejections: Vec<super::CanonicalHostRejection>,
+    argument_sites: &'a [super::super::ir::ParsedCallArguments],
     /// Exact callee span of the failing call site, recorded when the call
     /// carried parser provenance ([`SemanticNodeId`] -> callee span).
     call_site_spans: Option<&'a std::collections::HashMap<SemanticNodeId, Span>>,
@@ -59,6 +61,8 @@ impl<'a> HostCallResolutionPass<'a> {
             changed: 0,
             unresolved: 0,
             first_error: None,
+            rejections: Vec::new(),
+            argument_sites: &[],
             call_site_spans: None,
         }
     }
@@ -71,6 +75,14 @@ impl<'a> HostCallResolutionPass<'a> {
         spans: &'a std::collections::HashMap<SemanticNodeId, Span>,
     ) -> Self {
         self.call_site_spans = Some(spans);
+        self
+    }
+
+    pub(super) fn with_argument_sites(
+        mut self,
+        sites: &'a [super::super::ir::ParsedCallArguments],
+    ) -> Self {
+        self.argument_sites = sites;
         self
     }
 
@@ -103,7 +115,7 @@ impl<'a> HostCallResolutionPass<'a> {
         let Some(metadata) = self.metadata else {
             return;
         };
-        let Expr::Call(index, _, args, resolution, _) = expr else {
+        let Expr::Call(index, _, args, resolution, semantic_id) = expr else {
             return;
         };
         if resolution.is_some() {
@@ -153,8 +165,12 @@ impl<'a> HostCallResolutionPass<'a> {
             .zip(&schemas)
             .map(|(arg, schema)| ActualCallArg::new(schema, actual_passing(arg, schema)))
             .collect::<Vec<_>>();
-        let result =
-            resolve_candidate_slice_with_passing(&name, resolver_candidates, &actuals, fingerprint);
+        let (result, reason) = resolve_candidate_slice_for_admission(
+            &name,
+            resolver_candidates,
+            &actuals,
+            fingerprint,
+        );
         match result {
             Ok(resolved) => {
                 if let Err(error) =
@@ -168,6 +184,25 @@ impl<'a> HostCallResolutionPass<'a> {
             }
             Err(error) => {
                 self.unresolved += 1;
+                if self.phase == HostCallResolutionPhase::Final {
+                    let matching = self
+                        .argument_sites
+                        .iter()
+                        .filter(|site| Some(site.call_id) == *semantic_id)
+                        .collect::<Vec<_>>();
+                    if let [provenance] = matching.as_slice()
+                        && provenance.arguments.len() == args.len()
+                        && self
+                            .call_site_spans
+                            .and_then(|spans| spans.get(&provenance.call_id))
+                            == Some(&provenance.callee_span)
+                    {
+                        self.rejections.push(super::CanonicalHostRejection {
+                            provenance: (*provenance).clone(),
+                            reason,
+                        });
+                    }
+                }
                 if self.phase == HostCallResolutionPhase::Final && self.first_error.is_none() {
                     // Record the exact callee span of the failing call site
                     // when the call carried parser provenance; the semantic
@@ -285,6 +320,9 @@ fn schema_contains_unresolved(schema: &TypeSchema) -> bool {
         TypeSchema::Object(fields) => fields.values().any(schema_contains_unresolved),
         TypeSchema::Callable { params, result } => {
             params.iter().any(schema_contains_unresolved) || schema_contains_unresolved(result)
+        }
+        TypeSchema::Result { ok, err } => {
+            schema_contains_unresolved(ok) || schema_contains_unresolved(err)
         }
         TypeSchema::Null
         | TypeSchema::Int
@@ -1263,6 +1301,17 @@ fn find_declared_schema_mismatch_with_recursion(
     };
 
     match (&expected, &actual) {
+        (_, TypeSchema::Unknown) | (TypeSchema::Unknown, _) if context.result_payload_strict => {
+            Some("cannot check Result payload against an unknown schema".to_string())
+        }
+        (_, TypeSchema::Null)
+            if context.result_payload_strict && !matches!(expected, TypeSchema::Null) =>
+        {
+            Some(format!(
+                "Result payload null is not compatible with {}",
+                schema_type_label(&expected)
+            ))
+        }
         (_, TypeSchema::Unknown | TypeSchema::Null) | (TypeSchema::Unknown, _) => None,
         (TypeSchema::Int, TypeSchema::Int)
         | (TypeSchema::Number, TypeSchema::Int)
@@ -1293,7 +1342,18 @@ fn find_declared_schema_mismatch_with_recursion(
                 allow_partial_object,
             )
         }
-        (TypeSchema::GenericParam(_), _) | (_, TypeSchema::GenericParam(_)) => None,
+        (TypeSchema::GenericParam(_), _) | (_, TypeSchema::GenericParam(_)) => {
+            if context.result_payload_strict && expected != actual {
+                Some(format!(
+                    "{} is declared as schema type '{}' but was assigned {}",
+                    schema_path_label(&path),
+                    schema_type_label(&expected),
+                    schema_type_label(&actual)
+                ))
+            } else {
+                None
+            }
+        }
         (
             TypeSchema::Callable {
                 params: expected_params,
@@ -1414,6 +1474,31 @@ fn find_declared_schema_mismatch_with_recursion(
                 }
             }
             None
+        }
+        (
+            TypeSchema::Result {
+                ok: expected_ok,
+                err: expected_err,
+            },
+            TypeSchema::Result {
+                ok: actual_ok,
+                err: actual_err,
+            },
+        ) => {
+            let expected_ok = context.substitute_schema_generics(expected_ok);
+            let actual_ok = context.substitute_schema_generics(actual_ok);
+            let expected_err = context.substitute_schema_generics(expected_err);
+            let actual_err = context.substitute_schema_generics(actual_err);
+            if expected_ok == actual_ok && expected_err == actual_err {
+                None
+            } else {
+                Some(format!(
+                    "{} is declared as schema type '{}' but was assigned {}",
+                    schema_path_label(&path),
+                    schema_type_label(&expected),
+                    schema_type_label(&actual)
+                ))
+            }
         }
         _ => Some(format!(
             "{} is declared as schema type '{}' but was assigned {}",
@@ -1880,6 +1965,16 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
                     .any(|(_, arm_expr)| expr_contains_param_add(arm_expr, param_slots))
                 || expr_contains_param_add(default, param_slots)
         }
+        other @ (Expr::ResultConstruct { .. }
+        | Expr::ResultQuery { .. }
+        | Expr::ResultMatch { .. }
+        | Expr::ResultTry { .. }) => {
+            let mut found = false;
+            other.visit_result_children(|child| {
+                found |= expr_contains_param_add(child, param_slots)
+            });
+            found
+        }
         Expr::Block { stmts, expr } => function_body_contains_param_add(param_slots, stmts, expr),
     }
 }
@@ -1951,6 +2046,14 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
                     .iter()
                     .any(|(_, arm_expr)| expr_uses_param(arm_expr, param_slots))
                 || expr_uses_param(default, param_slots)
+        }
+        other @ (Expr::ResultConstruct { .. }
+        | Expr::ResultQuery { .. }
+        | Expr::ResultMatch { .. }
+        | Expr::ResultTry { .. }) => {
+            let mut found = false;
+            other.visit_result_children(|child| found |= expr_uses_param(child, param_slots));
+            found
         }
         Expr::Block { stmts, expr } => {
             stmts.iter().any(|stmt| stmt_uses_param(stmt, param_slots))
@@ -2144,6 +2247,67 @@ pub(super) fn legalize_expr(
                 default_ty
             } else if arm_type != BoundType::Unknown && arm_type == default_ty {
                 arm_type
+            } else {
+                BoundType::Unknown
+            }
+        }
+        Expr::ResultConstruct { payload, .. } => {
+            let _ = legalize_expr(payload, state, context, site, host_resolution);
+            BoundType::Map
+        }
+        Expr::ResultQuery { value, .. } => {
+            let _ = legalize_expr(value, state, context, site, host_resolution);
+            BoundType::Bool
+        }
+        Expr::ResultTry {
+            value,
+            operand_schema,
+            ..
+        } => {
+            let _ = legalize_expr(value, state, context, site, host_resolution);
+            context
+                .selected_result_success_schema(value, operand_schema, state)
+                .map(|schema| context.bound_type_for_schema(&schema))
+                .unwrap_or(BoundType::Unknown)
+        }
+        Expr::ResultMatch {
+            value,
+            ok_binding,
+            ok_expr,
+            err_binding,
+            err_expr,
+            scrutinee_schema,
+            ..
+        } => {
+            let _ = legalize_expr(value, state, context, site, host_resolution);
+            let (ok_schema, err_schema) = match scrutinee_schema {
+                TypeSchema::Result { ok, err } => ((**ok).clone(), (**err).clone()),
+                _ => (TypeSchema::Unknown, TypeSchema::Unknown),
+            };
+            let mut ok_state = state.clone();
+            if let Some(slot) = *ok_binding {
+                ok_state.set_with_optional_schema_origin(
+                    slot,
+                    context.bound_type_for_schema(&ok_schema),
+                    Some(ok_schema.clone()),
+                    true,
+                    matches!(ok_schema, TypeSchema::Optional(_)),
+                );
+            }
+            let mut err_state = state.clone();
+            if let Some(slot) = *err_binding {
+                err_state.set_with_optional_schema_origin(
+                    slot,
+                    context.bound_type_for_schema(&err_schema),
+                    Some(err_schema.clone()),
+                    true,
+                    matches!(err_schema, TypeSchema::Optional(_)),
+                );
+            }
+            let ok_ty = legalize_expr(ok_expr, &ok_state, context, site, host_resolution);
+            let err_ty = legalize_expr(err_expr, &err_state, context, site, host_resolution);
+            if ok_ty == err_ty {
+                ok_ty
             } else {
                 BoundType::Unknown
             }

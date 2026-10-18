@@ -55,6 +55,13 @@ pub enum TypeSchema {
     /// resource can never be mistaken for structural data (object/map) or a
     /// generic instantiation.
     Resource(ResourceTypeKey),
+    /// Guest `Result<T, E>`. Runtime values are maps with `tag: bool` and the
+    /// active `payload`; this variant is not a [`TypeSchema::Named`] or
+    /// [`TypeSchema::Map`].
+    Result {
+        ok: Box<TypeSchema>,
+        err: Box<TypeSchema>,
+    },
 }
 
 impl Hash for TypeSchema {
@@ -96,6 +103,10 @@ impl Hash for TypeSchema {
                 result.hash(state);
             }
             TypeSchema::Resource(key) => key.hash(state),
+            TypeSchema::Result { ok, err } => {
+                ok.hash(state);
+                err.hash(state);
+            }
         }
     }
 }
@@ -132,7 +143,10 @@ impl TypeSchema {
             TypeSchema::String => ValueType::String,
             TypeSchema::Bytes => ValueType::Bytes,
             TypeSchema::Optional(inner) => inner.coarse_value_type(),
-            TypeSchema::Named(_, _) | TypeSchema::Map(_) | TypeSchema::Object(_) => ValueType::Map,
+            TypeSchema::Named(_, _)
+            | TypeSchema::Map(_)
+            | TypeSchema::Object(_)
+            | TypeSchema::Result { .. } => ValueType::Map,
             // Semantic (nominal) lowering: a resource is opaque and is *not*
             // surfaced as an integral token here, so inferred schemas and
             // diagnostics never present a resource as `int`. The physical ABI
@@ -214,6 +228,7 @@ impl TypeSchema {
             TypeSchema::Callable { params, result } => {
                 params.iter().any(|param| param.contains_resource()) || result.contains_resource()
             }
+            TypeSchema::Result { ok, err } => ok.contains_resource() || err.contains_resource(),
             TypeSchema::Unknown
             | TypeSchema::Null
             | TypeSchema::Int
@@ -273,6 +288,10 @@ impl TypeSchema {
                         .collect(),
                     result: Box::new(substitute(result, bindings)),
                 },
+                TypeSchema::Result { ok, err } => TypeSchema::Result {
+                    ok: Box::new(substitute(ok, bindings)),
+                    err: Box::new(substitute(err, bindings)),
+                },
                 _ => schema.clone(),
             }
         }
@@ -306,11 +325,9 @@ impl TypeSchema {
                 TypeSchema::Object(fields) => fields
                     .values()
                     .any(|value| visit(value, structs, active, reentries)),
-                TypeSchema::Callable { params, result } => {
-                    params
-                        .iter()
-                        .any(|param| visit(param, structs, active, reentries))
-                        || visit(result, structs, active, reentries)
+                TypeSchema::Callable { .. } => false,
+                TypeSchema::Result { ok, err } => {
+                    visit(ok, structs, active, reentries) || visit(err, structs, active, reentries)
                 }
                 TypeSchema::Named(name, args) => {
                     if args
@@ -663,9 +680,72 @@ pub enum Expr {
         stmts: Vec<Stmt>,
         expr: Box<Expr>,
     },
+    /// `Result::Ok(payload)` or `Result::Err(payload)`. `ok` selects the active
+    /// branch. `result_schema` is filled by the Result resolver; it is never a
+    /// license to treat an unresolved constructor as `Unknown`.
+    ResultConstruct {
+        ok: bool,
+        payload: Box<Expr>,
+        result_schema: TypeSchema,
+        span: Span,
+        semantic_id: Option<SemanticNodeId>,
+    },
+    /// Exhaustive two-arm Result match. Bindings are `None` for wildcard arms.
+    ResultMatch {
+        value: Box<Expr>,
+        value_slot: LocalSlot,
+        ok_binding: Option<LocalSlot>,
+        ok_expr: Box<Expr>,
+        err_binding: Option<LocalSlot>,
+        err_expr: Box<Expr>,
+        scrutinee_schema: TypeSchema,
+        span: Span,
+        semantic_id: Option<SemanticNodeId>,
+    },
+    /// `is_ok` / `is_err`. Reads the tag only; does not consume the value.
+    ResultQuery {
+        value: Box<Expr>,
+        ok: bool,
+        span: Span,
+        semantic_id: Option<SemanticNodeId>,
+    },
+    /// Postfix `?`. Evaluates `value` once. Ok continues as `T`; Err returns
+    /// the active carrier from the lexical function through the existing `Ret`.
+    ResultTry {
+        value: Box<Expr>,
+        value_slot: LocalSlot,
+        payload_slot: LocalSlot,
+        operand_schema: TypeSchema,
+        return_schema: TypeSchema,
+        /// Owned locals that are available when this `?` takes the Err path.
+        /// The schema is the pre-compaction type, so cleanup does not depend on
+        /// the post-compaction type map having the same index.
+        exit_cleanup: Vec<(LocalSlot, TypeSchema)>,
+        span: Span,
+        semantic_id: Option<SemanticNodeId>,
+    },
 }
 
 impl Expr {
+    pub(crate) fn visit_result_children(&self, mut visit: impl FnMut(&Expr)) {
+        match self {
+            Expr::ResultConstruct { payload, .. } => visit(payload),
+            Expr::ResultQuery { value, .. } => visit(value),
+            Expr::ResultMatch {
+                value,
+                ok_expr,
+                err_expr,
+                ..
+            } => {
+                visit(value);
+                visit(ok_expr);
+                visit(err_expr);
+            }
+            Expr::ResultTry { value, .. } => visit(value),
+            _ => {}
+        }
+    }
+
     /// The exact per-call host-call catalog resolution carried by this node,
     /// if it is a catalog-resolved [`Expr::Call`].
     ///
@@ -722,6 +802,9 @@ pub enum Stmt {
     ClosureLet {
         line: u32,
         closure: ClosureExpr,
+        /// Callable schema preserved for frontends that emit this statement
+        /// directly. Parser output uses [`Expr::Closure`] under a typed let.
+        expected_schema: Option<TypeSchema>,
     },
     FuncDecl {
         name: String,
@@ -1388,6 +1471,14 @@ fn collect_resolved_calls_in_expr(
             collect_resolved_calls_in_expr(value, by_id, typed, slot_schemas);
             collect_resolved_calls_in_expr(fallback, by_id, typed, slot_schemas);
         }
+        other @ (Expr::ResultConstruct { .. }
+        | Expr::ResultQuery { .. }
+        | Expr::ResultMatch { .. }
+        | Expr::ResultTry { .. }) => {
+            other.visit_result_children(|child| {
+                collect_resolved_calls_in_expr(child, by_id, typed, slot_schemas);
+            });
+        }
         _ => {}
     }
 }
@@ -1434,6 +1525,31 @@ pub struct ParsedCallSite {
     pub scope_id: ScopeId,
     /// Whether this is a namespace/dotted/multiline call.
     pub is_namespace_call: bool,
+}
+
+/// Exact source-level shape at one direct argument boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParsedArgumentShape {
+    Other,
+    Borrow,
+    BorrowMut,
+    Copy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedCallArgument {
+    pub span: Span,
+    pub shape: ParsedArgumentShape,
+    /// Direct wrapper operand only; never inferred from nearby references.
+    pub local: Option<LocalSlot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedCallArguments {
+    pub call_id: SemanticNodeId,
+    pub callee_span: Span,
+    pub expr_span: Span,
+    pub arguments: Vec<ParsedCallArgument>,
 }
 
 /// A parsed local variable declaration site.
@@ -1612,6 +1728,8 @@ pub struct ParsedSemanticIndex {
     pub type_provenance: Vec<GuestTypeProvenance>,
     /// All parsed call sites, in allocation order.
     pub call_sites: Vec<ParsedCallSite>,
+    /// Source-only ordered argument provenance; absent for synthetic calls.
+    pub call_arguments: Vec<ParsedCallArguments>,
     /// All parsed local declarations, in allocation order.
     pub local_decls: Vec<LocalDeclSite>,
     /// All parsed local variable references, in allocation order.

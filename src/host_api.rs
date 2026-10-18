@@ -935,6 +935,11 @@ pub enum HostTypeSchema {
         name: String,
         fields: Vec<HostStructField>,
     },
+    /// Guest `Result<T, E>`. Distinct from [`Self::Named`] and [`Self::Map`].
+    Result {
+        ok: Box<HostTypeSchema>,
+        err: Box<HostTypeSchema>,
+    },
 }
 
 impl HostTypeSchema {
@@ -1026,6 +1031,13 @@ impl Serialize for HostTypeSchema {
                 state.serialize_field("fields", fields)?;
                 state.end()
             }
+            Self::Result { ok, err } => {
+                let mut state =
+                    serializer.serialize_struct_variant("HostTypeSchema", 14, "Result", 2)?;
+                state.serialize_field("ok", ok)?;
+                state.serialize_field("err", err)?;
+                state.end()
+            }
         }
     }
 }
@@ -1046,6 +1058,7 @@ enum HostTypeSchemaVariant {
     Callable,
     Resource,
     Named,
+    Result,
 }
 
 struct HostTypeSchemaSeed<'a> {
@@ -1078,7 +1091,7 @@ impl<'de> DeserializeSeed<'de> for HostTypeSchemaSeed<'_> {
             "HostTypeSchema",
             &[
                 "Unknown", "Null", "Int", "Float", "Number", "Bool", "String", "Bytes", "Array",
-                "Map", "Optional", "Callable", "Resource", "Named",
+                "Map", "Optional", "Callable", "Resource", "Named", "Result",
             ],
             HostTypeSchemaVisitor {
                 budget: self.budget,
@@ -1161,6 +1174,12 @@ impl<'de> Visitor<'de> for HostTypeSchemaVisitor<'_> {
                     depth: self.depth,
                 })
                 .map(|(name, fields)| HostTypeSchema::Named { name, fields }),
+            HostTypeSchemaVariant::Result => access
+                .newtype_variant_seed(ResultSchemaSeed {
+                    budget: self.budget,
+                    depth: self.depth,
+                })
+                .map(|(ok, err)| HostTypeSchema::Result { ok, err }),
         }
     }
 }
@@ -1188,6 +1207,91 @@ impl<'de> Deserialize<'de> for HostTypeSchema {
             property: false,
         }
         .deserialize(deserializer)
+    }
+}
+
+struct ResultSchemaSeed<'a> {
+    budget: &'a mut ComplexityBudget,
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for ResultSchemaSeed<'_> {
+    type Value = (Box<HostTypeSchema>, Box<HostTypeSchema>);
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let child_depth = next_schema_depth::<D::Error>(self.depth)?;
+        deserializer.deserialize_struct(
+            "HostTypeSchema::Result",
+            &["ok", "err"],
+            ResultSchemaVisitor {
+                budget: self.budget,
+                child_depth,
+            },
+        )
+    }
+}
+
+struct ResultSchemaVisitor<'a> {
+    budget: &'a mut ComplexityBudget,
+    child_depth: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum ResultSchemaField {
+    Ok,
+    Err,
+}
+
+impl<'de> Visitor<'de> for ResultSchemaVisitor<'_> {
+    type Value = (Box<HostTypeSchema>, Box<HostTypeSchema>);
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a Result schema object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        bounded_map_size_hint(map.size_hint(), "result schema", 2)?;
+        let mut entries = 0;
+        let mut ok = None;
+        let mut err = None;
+        loop {
+            let Some(field) = map.next_key::<ResultSchemaField>()? else {
+                break;
+            };
+            bounded_map_entry(&mut entries, "result schema", 2)?;
+            match field {
+                ResultSchemaField::Ok => {
+                    if ok.is_some() {
+                        return Err(de::Error::duplicate_field("ok"));
+                    }
+                    ok = Some(Box::new(map.next_value_seed(HostTypeSchemaSeed {
+                        budget: self.budget,
+                        depth: self.child_depth,
+                        property: false,
+                    })?));
+                }
+                ResultSchemaField::Err => {
+                    if err.is_some() {
+                        return Err(de::Error::duplicate_field("err"));
+                    }
+                    err = Some(Box::new(map.next_value_seed(HostTypeSchemaSeed {
+                        budget: self.budget,
+                        depth: self.child_depth,
+                        property: false,
+                    })?));
+                }
+            }
+        }
+        let ok = ok.ok_or_else(|| de::Error::missing_field("ok"))?;
+        let err = err.ok_or_else(|| de::Error::missing_field("err"))?;
+        Ok((ok, err))
     }
 }
 
@@ -1602,6 +1706,7 @@ impl fmt::Display for HostTypeSchema {
             }
             Self::Resource(key) => write!(f, "resource<{key}>"),
             Self::Named { name, .. } => write!(f, "{name}"),
+            Self::Result { ok, err } => write!(f, "Result<{ok}, {err}>"),
         }
     }
 }
@@ -2947,6 +3052,21 @@ where
                     pending.push((&field.ty, child_depth));
                 }
             }
+            HostTypeSchema::Result { ok, err } => {
+                let child_depth =
+                    depth
+                        .checked_add(1)
+                        .ok_or(HostSchemaValidationError::IntegerOverflow {
+                            field: "schema depth",
+                        })?;
+                pending.try_reserve(2).map_err(|_| {
+                    HostSchemaValidationError::AllocationFailed {
+                        field: "schema traversal",
+                    }
+                })?;
+                pending.push((err, child_depth));
+                pending.push((ok, child_depth));
+            }
             HostTypeSchema::Unknown
             | HostTypeSchema::Null
             | HostTypeSchema::Int
@@ -4136,6 +4256,16 @@ fn try_push_type(
                 push_len_str(bytes, name)?;
                 push_named_fields(bytes, fields)?;
             }
+            HostTypeSchema::Result { ok, err } => {
+                push_tag(bytes, b'R');
+                pending.try_reserve(2).map_err(|_| {
+                    HostSchemaValidationError::AllocationFailed {
+                        field: "schema encoding",
+                    }
+                })?;
+                pending.push(err);
+                pending.push(ok);
+            }
         }
     }
     Ok(())
@@ -4276,6 +4406,10 @@ fn validate_named_struct_refs(
                 validate_named_struct_refs(function, param, structs)?;
             }
             validate_named_struct_refs(function, result, structs)
+        }
+        HostTypeSchema::Result { ok, err } => {
+            validate_named_struct_refs(function, ok, structs)?;
+            validate_named_struct_refs(function, err, structs)
         }
         _ => Ok(()),
     }

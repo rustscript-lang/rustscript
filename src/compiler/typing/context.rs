@@ -84,6 +84,9 @@ fn schema_mentions_generic_param(schema: &TypeSchema, name: &str) -> bool {
         }
         TypeSchema::Map(value) => schema_mentions_generic_param(value, name),
         TypeSchema::Optional(inner) => schema_mentions_generic_param(inner, name),
+        TypeSchema::Result { ok, err } => {
+            schema_mentions_generic_param(ok, name) || schema_mentions_generic_param(err, name)
+        }
         TypeSchema::Object(fields) => fields
             .values()
             .any(|value| schema_mentions_generic_param(value, name)),
@@ -124,6 +127,12 @@ pub(super) struct TypeContext<'a> {
     /// diagnostics. `None` for hand-built test IRs and plugin frontends that
     /// carry no parser index.
     parsed: Option<&'a crate::compiler::ir::ParsedSemanticIndex>,
+    /// Result payload checks reuse this context but must not treat
+    /// `GenericParam` or `Unknown` as compatible with every concrete schema.
+    pub(super) result_payload_strict: bool,
+    /// A catalog rejection already owns this exact parser-proven call site.
+    /// Skip only its flat legacy signature check, never child/body validation.
+    rejected_host_calls: Vec<(Span, Span)>,
 }
 
 struct CallableBody<'a> {
@@ -170,6 +179,60 @@ impl<'a> TypeContext<'a> {
             active_observed_returns: Vec::new(),
             active_optional_returns: Vec::new(),
             parsed,
+            result_payload_strict: false,
+            rejected_host_calls: Vec::new(),
+        }
+    }
+
+    pub(super) fn retain_catalog_rejection(&mut self, error: Option<&CompileError>) {
+        let Some(CompileError::HostCallResolve {
+            span: Some(callee), ..
+        }) = error
+        else {
+            return;
+        };
+        if let Some(site) = self.parsed.and_then(|index| {
+            index
+                .call_sites
+                .iter()
+                .find(|site| site.callee_span == *callee)
+                .map(|site| (site.callee_span, site.expr_span))
+        }) {
+            self.rejected_host_calls.push(site);
+        }
+    }
+
+    pub(super) fn retain_catalog_rejection_contexts(
+        &mut self,
+        rejections: &[super::CanonicalHostRejection],
+    ) {
+        let Some(parsed) = self.parsed else {
+            return;
+        };
+        for rejection in rejections {
+            let site = &rejection.provenance;
+            // Same span-exact flat-signature deferral, restricted to actual
+            // parser-proven resolver failures. No child/body check is skipped.
+            if parsed
+                .call_arguments
+                .iter()
+                .filter(|args| *args == site)
+                .count()
+                == 1
+                && parsed
+                    .call_sites
+                    .iter()
+                    .filter(|call| {
+                        call.id == site.call_id
+                            && call.callee_span == site.callee_span
+                            && call.expr_span == site.expr_span
+                    })
+                    .count()
+                    == 1
+            {
+                self.rejected_host_calls
+                    .push((site.callee_span, site.expr_span));
+            }
         }
     }
 
@@ -293,6 +356,10 @@ impl<'a> TypeContext<'a> {
                     .map(|param| self.substitute_schema_generics(param))
                     .collect(),
                 result: Box::new(self.substitute_schema_generics(result)),
+            },
+            TypeSchema::Result { ok, err } => TypeSchema::Result {
+                ok: Box::new(self.substitute_schema_generics(ok)),
+                err: Box::new(self.substitute_schema_generics(err)),
             },
             _ => schema.clone(),
         }
@@ -467,6 +534,19 @@ impl<'a> TypeContext<'a> {
                     self.resolve_schema_with_seen_tripped(inner, seen, reentries);
                 (TypeSchema::Optional(Box::new(resolved)), trip)
             }
+            TypeSchema::Result { ok, err } => {
+                let (resolved_ok, ok_trip) =
+                    self.resolve_schema_with_seen_tripped(ok, seen, reentries);
+                let (resolved_err, err_trip) =
+                    self.resolve_schema_with_seen_tripped(err, seen, reentries);
+                (
+                    TypeSchema::Result {
+                        ok: Box::new(resolved_ok),
+                        err: Box::new(resolved_err),
+                    },
+                    ok_trip.or(err_trip),
+                )
+            }
             TypeSchema::Object(fields) => {
                 let mut resolved_fields = HashMap::with_capacity(fields.len());
                 let mut innermost_trip = None;
@@ -540,6 +620,27 @@ impl<'a> TypeContext<'a> {
                 schema_instance_key(name, &resolved_args, &arg_trips)
             }
             _ => render_schema_label(schema),
+        }
+    }
+
+    pub(super) fn selected_result_success_schema(
+        &mut self,
+        operand: &Expr,
+        operand_schema: &TypeSchema,
+        state: &LocalTypeState,
+    ) -> Option<TypeSchema> {
+        let schema = if matches!(operand_schema, TypeSchema::Result { .. }) {
+            operand_schema.clone()
+        } else {
+            self.infer_expr_schema(operand, state)?
+        };
+        // Optional<Result> is not a try operand. Unknown has no success authority.
+        if schema.is_optional() || matches!(schema, TypeSchema::Unknown) {
+            return None;
+        }
+        match schema {
+            TypeSchema::Result { ok, .. } => Some(*ok),
+            _ => None,
         }
     }
 
@@ -758,6 +859,13 @@ impl<'a> TypeContext<'a> {
                 self.apply_stmts(stmts, &mut nested);
                 self.expr_is_optional(expr, &nested)
             }
+            Expr::ResultTry {
+                value,
+                operand_schema,
+                ..
+            } => self
+                .selected_result_success_schema(value, operand_schema, state)
+                .is_some_and(|schema| schema.is_optional()),
             _ => false,
         }
     }
@@ -829,6 +937,7 @@ impl<'a> TypeContext<'a> {
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.infer_optional_expr_inner_type(inner, state)
             }
+            Expr::ResultTry { .. } => self.infer_expr_type(expr, state),
             _ => self.infer_expr_type(expr, state),
         }
     }
@@ -860,6 +969,13 @@ impl<'a> TypeContext<'a> {
             Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
                 self.infer_optional_expr_inner_schema(inner, state)
             }
+            Expr::ResultTry {
+                value,
+                operand_schema,
+                ..
+            } => self
+                .selected_result_success_schema(value, operand_schema, state)
+                .map(|schema| schema.clone_inner_if_optional()),
             _ => self.infer_expr_schema(expr, state),
         }
     }
@@ -1307,6 +1423,52 @@ impl<'a> TypeContext<'a> {
                 self.apply_stmts(stmts, &mut nested);
                 self.infer_expr_schema(expr, &nested)
             }
+            Expr::ResultQuery { .. } => Some(TypeSchema::Bool),
+            Expr::ResultTry {
+                value,
+                operand_schema,
+                ..
+            } => self.selected_result_success_schema(value, operand_schema, state),
+            Expr::ResultConstruct { result_schema, .. } => match result_schema {
+                TypeSchema::Unknown => None,
+                other => Some(self.substitute_schema_generics(other)),
+            },
+            Expr::ResultMatch {
+                ok_binding,
+                ok_expr,
+                err_binding,
+                err_expr,
+                scrutinee_schema,
+                ..
+            } => {
+                let TypeSchema::Result { ok, err } = scrutinee_schema else {
+                    return None;
+                };
+                let mut ok_state = state.clone();
+                if let Some(slot) = *ok_binding {
+                    ok_state.set_with_schema_origin(
+                        slot,
+                        self.bound_type_for_schema(ok),
+                        Some(ok.as_ref().clone()),
+                        true,
+                    );
+                }
+                let mut err_state = state.clone();
+                if let Some(slot) = *err_binding {
+                    err_state.set_with_schema_origin(
+                        slot,
+                        self.bound_type_for_schema(err),
+                        Some(err.as_ref().clone()),
+                        true,
+                    );
+                }
+                let ok_schema = self.infer_expr_schema(ok_expr, &ok_state);
+                let err_schema = self.infer_expr_schema(err_expr, &err_state);
+                match (ok_schema, err_schema) {
+                    (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -1430,6 +1592,66 @@ impl<'a> TypeContext<'a> {
                     default_ty
                 } else if arm_type != BoundType::Unknown && arm_type == default_ty {
                     arm_type
+                } else {
+                    BoundType::Unknown
+                }
+            }
+            Expr::ResultConstruct { payload, .. } => {
+                let _ = self.infer_expr_type(payload, state);
+                BoundType::Map
+            }
+            Expr::ResultQuery { value, .. } => {
+                let _ = self.infer_expr_type(value, state);
+                BoundType::Bool
+            }
+            Expr::ResultTry {
+                value,
+                operand_schema,
+                ..
+            } => {
+                let _ = self.infer_expr_type(value, state);
+                self.selected_result_success_schema(value, operand_schema, state)
+                    .map(|schema| self.bound_type_for_schema(&schema))
+                    .unwrap_or(BoundType::Unknown)
+            }
+            Expr::ResultMatch {
+                value,
+                ok_binding,
+                ok_expr,
+                err_binding,
+                err_expr,
+                scrutinee_schema,
+                ..
+            } => {
+                let _ = self.infer_expr_type(value, state);
+                let (ok_schema, err_schema) = match scrutinee_schema {
+                    TypeSchema::Result { ok, err } => (ok.as_ref().clone(), err.as_ref().clone()),
+                    _ => (TypeSchema::Unknown, TypeSchema::Unknown),
+                };
+                let mut ok_state = state.clone();
+                if let Some(slot) = *ok_binding {
+                    ok_state.set_with_optional_schema_origin(
+                        slot,
+                        self.bound_type_for_schema(&ok_schema),
+                        Some(ok_schema),
+                        true,
+                        false,
+                    );
+                }
+                let mut err_state = state.clone();
+                if let Some(slot) = *err_binding {
+                    err_state.set_with_optional_schema_origin(
+                        slot,
+                        self.bound_type_for_schema(&err_schema),
+                        Some(err_schema),
+                        true,
+                        false,
+                    );
+                }
+                let ok_ty = self.infer_expr_type(ok_expr, &ok_state);
+                let err_ty = self.infer_expr_type(err_expr, &err_state);
+                if ok_ty == err_ty {
+                    ok_ty
                 } else {
                     BoundType::Unknown
                 }
@@ -2459,6 +2681,15 @@ impl<'a> TypeContext<'a> {
         source_name: Option<&str>,
         span: Option<Span>,
     ) -> Result<(), CompileError> {
+        if self
+            .rejected_host_calls
+            .iter()
+            .any(|(callee, expression)| span == Some(*callee) || span == Some(*expression))
+        {
+            // The full schema/passing resolver will return its canonical error.
+            // This does not resolve the call or permit this IR to reach codegen.
+            return Ok(());
+        }
         for (index, param) in signature.params.iter().enumerate() {
             let crate::builtins::CallableParamType::Callable(callable) = param.ty else {
                 continue;
@@ -2861,7 +3092,7 @@ pub(crate) fn bound_type_from_schema(schema: &TypeSchema) -> BoundType {
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
             BoundType::Array
         }
-        TypeSchema::Map(_) | TypeSchema::Object(_) => BoundType::Map,
+        TypeSchema::Map(_) | TypeSchema::Object(_) | TypeSchema::Result { .. } => BoundType::Map,
         // Resources are opaque (nominal) values: they are never reduced to the
         // `Map` bound or to an integral token in semantic inference.
         TypeSchema::Resource(_) => BoundType::Unknown,
@@ -3061,7 +3292,7 @@ pub(super) fn infer_access_schema(
     }
 }
 
-fn source_named_struct_field_schema(
+pub(super) fn source_named_struct_field_schema(
     struct_name: &str,
     type_args: &[TypeSchema],
     field_name: &str,
@@ -3115,7 +3346,7 @@ pub(super) fn schema_label(schema: &TypeSchema) -> &'static str {
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
             "array"
         }
-        TypeSchema::Map(_) | TypeSchema::Object(_) => "map",
+        TypeSchema::Map(_) | TypeSchema::Object(_) | TypeSchema::Result { .. } => "map",
         TypeSchema::Resource(_) => "resource",
     }
 }
@@ -3175,6 +3406,11 @@ pub(crate) fn render_schema_label(schema: &TypeSchema) -> String {
             format!("[{}]", parts.join(", "))
         }
         TypeSchema::Map(value) => format!("map<{}>", render_schema_label(value)),
+        TypeSchema::Result { ok, err } => format!(
+            "Result<{}, {}>",
+            render_schema_label(ok),
+            render_schema_label(err)
+        ),
         // Resources render as their nominal key (`resource<io.file>`), never as
         // their physical integer ABI token or a structural `map<...>` shape.
         TypeSchema::Resource(key) => format!("resource<{key}>"),

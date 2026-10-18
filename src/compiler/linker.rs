@@ -187,6 +187,10 @@ pub(super) fn remap_type_schema_names(schema: &mut TypeSchema, names: &HashMap<S
             }
             remap_type_schema_names(result, names);
         }
+        TypeSchema::Result { ok, err } => {
+            remap_type_schema_names(ok, names);
+            remap_type_schema_names(err, names);
+        }
         TypeSchema::Unknown
         | TypeSchema::Null
         | TypeSchema::Int
@@ -215,7 +219,16 @@ fn remap_statement_type_names(statement: &mut Stmt, names: &HashMap<String, Stri
         Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
             remap_expression_type_names(expr, names);
         }
-        Stmt::ClosureLet { closure, .. } => remap_expression_type_names(&mut closure.body, names),
+        Stmt::ClosureLet {
+            expected_schema,
+            closure,
+            ..
+        } => {
+            if let Some(schema) = expected_schema {
+                remap_type_schema_names(schema, names);
+            }
+            remap_expression_type_names(&mut closure.body, names);
+        }
         Stmt::IfElse {
             condition,
             then_branch,
@@ -333,6 +346,37 @@ fn remap_expression_type_names(expression: &mut Expr, names: &HashMap<String, St
                 remap_expression_type_names(arm, names);
             }
             remap_expression_type_names(default, names);
+        }
+        Expr::ResultConstruct {
+            payload,
+            result_schema,
+            ..
+        } => {
+            remap_type_schema_names(result_schema, names);
+            remap_expression_type_names(payload, names);
+        }
+        Expr::ResultQuery { value, .. } => remap_expression_type_names(value, names),
+        Expr::ResultTry {
+            value,
+            operand_schema,
+            return_schema,
+            ..
+        } => {
+            remap_type_schema_names(operand_schema, names);
+            remap_type_schema_names(return_schema, names);
+            remap_expression_type_names(value, names);
+        }
+        Expr::ResultMatch {
+            value,
+            ok_expr,
+            err_expr,
+            scrutinee_schema,
+            ..
+        } => {
+            remap_type_schema_names(scrutinee_schema, names);
+            remap_expression_type_names(value, names);
+            remap_expression_type_names(ok_expr, names);
+            remap_expression_type_names(err_expr, names);
         }
         Expr::Block { stmts, expr } => {
             for statement in stmts {
@@ -1477,6 +1521,90 @@ fn remap_expr_indices(
                 )?;
             }
         }
+        Expr::ResultConstruct {
+            payload,
+            semantic_id,
+            ..
+        } => {
+            rebase_semantic_id(semantic_id, node_offset);
+            remap_expr_indices(
+                payload,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+        }
+        Expr::ResultQuery {
+            value, semantic_id, ..
+        } => {
+            rebase_semantic_id(semantic_id, node_offset);
+            remap_expr_indices(
+                value,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+        }
+        Expr::ResultTry {
+            value,
+            value_slot,
+            payload_slot,
+            semantic_id,
+            ..
+        } => {
+            *value_slot = remap_local_index(*value_slot, local_base)?;
+            *payload_slot = remap_local_index(*payload_slot, local_base)?;
+            rebase_semantic_id(semantic_id, node_offset);
+            remap_expr_indices(
+                value,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+        }
+        Expr::ResultMatch {
+            value,
+            value_slot,
+            ok_binding,
+            ok_expr,
+            err_binding,
+            err_expr,
+            semantic_id,
+            ..
+        } => {
+            *value_slot = remap_local_index(*value_slot, local_base)?;
+            if let Some(slot) = ok_binding {
+                *slot = remap_local_index(*slot, local_base)?;
+            }
+            if let Some(slot) = err_binding {
+                *slot = remap_local_index(*slot, local_base)?;
+            }
+            rebase_semantic_id(semantic_id, node_offset);
+            remap_expr_indices(
+                value,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+            remap_expr_indices(
+                ok_expr,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+            remap_expr_indices(
+                err_expr,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+        }
         Expr::Add(lhs, rhs)
         | Expr::Sub(lhs, rhs)
         | Expr::Mul(lhs, rhs)
@@ -1796,6 +1924,18 @@ fn rebase_parsed_semantic_index(
 
     Ok(ParsedSemanticIndex {
         type_provenance: unit.type_provenance.clone(),
+        call_arguments: unit
+            .call_arguments
+            .iter()
+            .map(|site| {
+                let mut site = site.clone();
+                site.call_id = remap_node(site.call_id);
+                for arg in &mut site.arguments {
+                    arg.local = arg.local.map(&remap_slot).transpose()?;
+                }
+                Ok(site)
+            })
+            .collect::<Result<Vec<_>, SourcePathError>>()?,
         call_sites,
         local_decls,
         local_refs,
@@ -1842,6 +1982,7 @@ fn merge_parsed_semantic_index(merged: &mut ParsedSemanticIndex, unit: ParsedSem
     debug_assert!(merged.next_node_id <= unit.next_node_id);
     debug_assert!(merged.next_scope_id <= unit.next_scope_id);
     merged.call_sites.extend(unit.call_sites);
+    merged.call_arguments.extend(unit.call_arguments);
     merged.local_decls.extend(unit.local_decls);
     merged.local_refs.extend(unit.local_refs);
     merged.func_decls.extend(unit.func_decls);
@@ -2628,6 +2769,7 @@ mod linker_provenance_merge_tests {
             stmt_spans: Vec::new(),
             struct_decls: Vec::new(),
             type_provenance: Vec::new(),
+            call_arguments: Vec::new(),
             next_node_id,
             next_scope_id,
         }
@@ -2782,6 +2924,7 @@ mod linker_provenance_merge_tests {
             stmt_spans: Vec::new(),
             struct_decls: Vec::new(),
             type_provenance: Vec::new(),
+            call_arguments: Vec::new(),
             next_node_id: 3,
             next_scope_id: 1,
         };
@@ -2808,6 +2951,7 @@ mod linker_provenance_merge_tests {
             stmt_spans: Vec::new(),
             struct_decls: Vec::new(),
             type_provenance: Vec::new(),
+            call_arguments: Vec::new(),
             next_node_id: 1,
             next_scope_id: 1,
         };
@@ -2925,6 +3069,7 @@ mod linker_provenance_merge_tests {
             func_decls: Vec::new(),
             struct_decls: Vec::new(),
             type_provenance: Vec::new(),
+            call_arguments: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
             stmt_spans: Vec::new(),
@@ -2946,6 +3091,7 @@ mod linker_provenance_merge_tests {
             func_decls: Vec::new(),
             struct_decls: Vec::new(),
             type_provenance: Vec::new(),
+            call_arguments: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
             stmt_spans: Vec::new(),
@@ -3017,6 +3163,7 @@ mod linker_provenance_merge_tests {
             func_decls: Vec::new(),
             struct_decls: Vec::new(),
             type_provenance: Vec::new(),
+            call_arguments: Vec::new(),
             func_refs: Vec::new(),
             scopes: Vec::new(),
             stmt_spans: Vec::new(),
@@ -3490,5 +3637,109 @@ mod linker_provenance_merge_tests {
         let merged = merge_units(vec![a]).expect("provenance-less unit must merge");
         assert!(merged.parsed_semantic_index.is_none());
         assert!(merged.catalog_visibility.is_none());
+    }
+
+    #[test]
+    fn closure_let_expected_schema_uses_canonical_guest_name() {
+        use super::super::ir::{ClosureExpr, Expr, StructDeclOrigin};
+        let canonical_box = "__guest_type_m0_s0".to_string();
+        let canonical_inner = "__guest_type_m0_s1".to_string();
+        let names = HashMap::from([
+            ("Box".to_string(), canonical_box.clone()),
+            ("Inner".to_string(), canonical_inner.clone()),
+        ]);
+        let mut parsed = FrontendIr {
+            stmts: vec![Stmt::ClosureLet {
+                line: 1,
+                expected_schema: Some(TypeSchema::Callable {
+                    params: vec![TypeSchema::Named(
+                        "Inner".to_string(),
+                        vec![TypeSchema::GenericParam("T".to_string())],
+                    )],
+                    result: Box::new(TypeSchema::Result {
+                        ok: Box::new(TypeSchema::Named(
+                            "Box".to_string(),
+                            vec![TypeSchema::Named("Inner".to_string(), Vec::new())],
+                        )),
+                        err: Box::new(TypeSchema::String),
+                    }),
+                }),
+                closure: ClosureExpr {
+                    param_slots: Vec::new(),
+                    capture_copies: vec![(1, 2)],
+                    body: Box::new(Expr::Int(1)),
+                },
+            }],
+            locals: 0,
+            local_bindings: Vec::new(),
+            struct_schemas: HashMap::from([
+                (
+                    "Box".to_string(),
+                    StructDecl {
+                        name: "Box".to_string(),
+                        type_params: vec!["T".to_string()],
+                        body_schema: TypeSchema::Object(HashMap::from([(
+                            "value".to_string(),
+                            TypeSchema::Named("Inner".to_string(), Vec::new()),
+                        )])),
+                        origin: StructDeclOrigin::Guest,
+                    },
+                ),
+                (
+                    "Inner".to_string(),
+                    StructDecl {
+                        name: "Inner".to_string(),
+                        type_params: Vec::new(),
+                        body_schema: TypeSchema::Object(HashMap::new()),
+                        origin: StructDeclOrigin::Guest,
+                    },
+                ),
+            ]),
+            unknown_type_spans: Vec::new(),
+            functions: Vec::new(),
+            function_impls: HashMap::new(),
+            stmt_sources: Vec::new(),
+            function_sources: HashMap::new(),
+            use_declarations: Vec::new(),
+            implicit_extern_names: Vec::new(),
+            host_api_metadata: None,
+            semantic_index: None,
+            parsed_semantic_index: None,
+            catalog_visibility: None,
+            lexer_tokens: Vec::new(),
+        };
+        remap_guest_type_schemas(&mut parsed, &names);
+        assert!(parsed.struct_schemas.contains_key(&canonical_box));
+        assert!(parsed.struct_schemas.contains_key(&canonical_inner));
+        assert!(!parsed.struct_schemas.contains_key("Box"));
+        let Stmt::ClosureLet {
+            expected_schema,
+            closure,
+            ..
+        } = &parsed.stmts[0]
+        else {
+            panic!("ClosureLet should remain");
+        };
+        assert_eq!(closure.capture_copies, vec![(1, 2)]);
+        let Some(TypeSchema::Callable { params, result }) = expected_schema else {
+            panic!("expected callable schema");
+        };
+        assert_eq!(
+            params,
+            &vec![TypeSchema::Named(
+                canonical_inner.clone(),
+                vec![TypeSchema::GenericParam("T".to_string())]
+            )]
+        );
+        assert_eq!(
+            result.as_ref(),
+            &TypeSchema::Result {
+                ok: Box::new(TypeSchema::Named(
+                    canonical_box,
+                    vec![TypeSchema::Named(canonical_inner, Vec::new())],
+                )),
+                err: Box::new(TypeSchema::String),
+            }
+        );
     }
 }

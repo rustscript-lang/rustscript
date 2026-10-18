@@ -811,7 +811,8 @@ impl<C> Vm<C> {
     fn call_core_builtin(&mut self, index: u16, arity: u8) -> Option<VmResult<()>> {
         use super::generated_builtin_ids::{
             ARRAY_NEW_CALL_INDEX, ARRAY_PUSH_CALL_INDEX, BIND_CALLABLE_CALL_INDEX,
-            CONCAT_CALL_INDEX, DETACH_LOCAL_CALL_INDEX, MAP_NEW_CALL_INDEX, SET_CALL_INDEX,
+            CONCAT_CALL_INDEX, DETACH_LOCAL_CALL_INDEX, GET_CALL_INDEX, HAS_CALL_INDEX,
+            MAP_NEW_CALL_INDEX, SET_CALL_INDEX,
         };
 
         Some(match index {
@@ -879,6 +880,46 @@ impl<C> Vm<C> {
                     return Some(Err(error));
                 }
                 self.stack.push(Value::map(Vec::new()));
+                Ok(())
+            }
+            GET_CALL_INDEX => {
+                if let Err(error) = self.require_builtin_arity("get", arity, 2) {
+                    return Some(Err(error));
+                }
+                let start = match self.stack.len().checked_sub(2) {
+                    Some(start) => start,
+                    None => return Some(Err(VmError::StackUnderflow)),
+                };
+                let key = self.stack[start + 1].clone();
+                let Value::Map(entries) = self.stack[start].clone() else {
+                    return Some(Err(VmError::TypeMismatch("map")));
+                };
+                let Some(value) = entries
+                    .iter()
+                    .find(|(current, _)| current == &key)
+                    .map(|(_, value)| value.clone())
+                else {
+                    return Some(Err(VmError::HostError("map key not found")));
+                };
+                self.stack.truncate(start);
+                self.stack.push(value);
+                Ok(())
+            }
+            HAS_CALL_INDEX => {
+                if let Err(error) = self.require_builtin_arity("has", arity, 2) {
+                    return Some(Err(error));
+                }
+                let start = match self.stack.len().checked_sub(2) {
+                    Some(start) => start,
+                    None => return Some(Err(VmError::StackUnderflow)),
+                };
+                let key = self.stack[start + 1].clone();
+                let present = match &self.stack[start] {
+                    Value::Map(entries) => entries.iter().any(|(current, _)| current == &key),
+                    _ => return Some(Err(VmError::TypeMismatch("map"))),
+                };
+                self.stack.truncate(start);
+                self.stack.push(Value::Bool(present));
                 Ok(())
             }
             SET_CALL_INDEX => {

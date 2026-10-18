@@ -1,0 +1,5 @@
+error: GuestResult<T, E> requires exactly two type arguments
+ --> tests/ui/fail/guest_result_arity.rs:7:17
+  |
+7 | fn invalid() -> VmResult<GuestResult<i64>> {
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^

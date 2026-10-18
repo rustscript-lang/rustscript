@@ -61,6 +61,10 @@ impl HostTypeSchema {
             },
             HostTypeSchema::Resource(key) => TypeSchema::Resource(key.clone()),
             HostTypeSchema::Named { name, .. } => TypeSchema::Named(name.clone(), Vec::new()),
+            HostTypeSchema::Result { ok, err } => TypeSchema::Result {
+                ok: Box::new(ok.to_compiler_schema()),
+                err: Box::new(err.to_compiler_schema()),
+            },
         }
     }
 
@@ -82,6 +86,10 @@ impl HostTypeSchema {
             HostTypeSchema::Callable { params, result } => TypeSchema::Callable {
                 params: params.iter().map(Self::to_compiler_object_schema).collect(),
                 result: Box::new(result.to_compiler_object_schema()),
+            },
+            HostTypeSchema::Result { ok, err } => TypeSchema::Result {
+                ok: Box::new(ok.to_compiler_object_schema()),
+                err: Box::new(err.to_compiler_object_schema()),
             },
             other => other.to_compiler_schema(),
         }
@@ -156,6 +164,10 @@ pub(crate) fn to_host_schema(schema: &TypeSchema) -> HostTypeSchema {
             result: Box::new(to_host_schema(result)),
         },
         TypeSchema::Resource(key) => HostTypeSchema::Resource(key.clone()),
+        TypeSchema::Result { ok, err } => HostTypeSchema::Result {
+            ok: Box::new(to_host_schema(ok)),
+            err: Box::new(to_host_schema(err)),
+        },
     }
 }
 

@@ -264,6 +264,10 @@ fn collect_named_host_types(
             }
             collect_named_host_types(result, catalog, visited, pending)
         }
+        HostTypeSchema::Result { ok, err } => {
+            collect_named_host_types(ok, catalog, visited, pending)?;
+            collect_named_host_types(err, catalog, visited, pending)
+        }
         HostTypeSchema::Unknown
         | HostTypeSchema::Null
         | HostTypeSchema::Int
@@ -694,15 +698,7 @@ fn parse_lowered_with_mapping(
         host_catalog,
     ) {
         Ok(mut ir) => {
-            remap_lowered_spans(
-                ir.parsed_semantic_index.as_mut(),
-                &mut ir.unknown_type_spans,
-                &mut ir.lexer_tokens,
-                &mut ir.use_declarations,
-                &lowered,
-                lowered_source_id,
-                original_source_id,
-            );
+            remap_lowered_spans(&mut ir, &lowered, lowered_source_id, original_source_id);
             Ok(ir)
         }
         Err(mut err) => {
@@ -765,10 +761,7 @@ fn parse_lowered_repl_with_mapping(
     ) {
         Ok(mut parsed) => {
             remap_lowered_spans(
-                parsed.ir.parsed_semantic_index.as_mut(),
-                &mut parsed.ir.unknown_type_spans,
-                &mut parsed.ir.lexer_tokens,
-                &mut parsed.ir.use_declarations,
+                &mut parsed.ir,
                 &lowered,
                 lowered_source_id,
                 original_source_id,
@@ -818,10 +811,7 @@ fn parse_lowered_repl_with_mapping(
 /// `lowered.byte_mapping`, which is generated during lowering — never from
 /// searching the source text afterwards.
 fn remap_lowered_spans(
-    parsed_index: Option<&mut crate::compiler::ir::ParsedSemanticIndex>,
-    unknown_type_spans: &mut [Span],
-    lexer_tokens: &mut [crate::compiler::ir::LexerToken],
-    use_declarations: &mut [crate::compiler::modules::UseDecl],
+    ir: &mut FrontendIr,
     lowered: &LoweredSource,
     lowered_source_id: u32,
     original_source_id: u32,
@@ -836,11 +826,37 @@ fn remap_lowered_spans(
         }
     };
 
-    if let Some(index) = parsed_index {
+    for stmt in &mut ir.stmts {
+        remap_result_stmt_spans(stmt, &map);
+    }
+    for function in ir.function_impls.values_mut() {
+        for stmt in &mut function.body_stmts {
+            remap_result_stmt_spans(stmt, &map);
+        }
+        remap_result_expr_spans(&mut function.body_expr, &map);
+    }
+    if let Some(index) = ir.parsed_semantic_index.as_mut() {
         for site in &mut index.call_sites {
             map(&mut site.callee_span);
             map(&mut site.expr_span);
         }
+        index.call_arguments.retain_mut(|site| {
+            let remap = |span: &mut Span| {
+                if let Some(mapped) =
+                    lowered
+                        .byte_mapping
+                        .map_span(original_source_id, *span, lowered_source_id)
+                {
+                    *span = mapped;
+                    true
+                } else {
+                    false
+                }
+            };
+            remap(&mut site.callee_span)
+                && remap(&mut site.expr_span)
+                && site.arguments.iter_mut().all(|arg| remap(&mut arg.span))
+        });
         for decl in &mut index.local_decls {
             map(&mut decl.ident_span);
             map(&mut decl.stmt_span);
@@ -861,14 +877,173 @@ fn remap_lowered_spans(
             map(&mut site.span);
         }
     }
-    for span in unknown_type_spans {
+    for span in &mut ir.unknown_type_spans {
         map(span);
     }
-    for token in lexer_tokens {
+    for token in &mut ir.lexer_tokens {
         map(&mut token.span);
     }
-    for decl in use_declarations {
+    for decl in &mut ir.use_declarations {
         map(&mut decl.span);
+    }
+}
+
+// Result nodes carry diagnostic spans outside the semantic index. Walk all
+// expression/statement children, including closures and ordinary match defaults,
+// at the same frontend boundary; leave schemas and semantic identities intact.
+fn remap_result_stmt_spans(stmt: &mut super::ir::Stmt, map: &impl Fn(&mut Span)) {
+    use super::ir::Stmt;
+    match stmt {
+        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+            remap_result_expr_spans(expr, map);
+        }
+        Stmt::ClosureLet { closure, .. } => remap_result_expr_spans(&mut closure.body, map),
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            remap_result_expr_spans(condition, map);
+            for stmt in then_branch.iter_mut().chain(else_branch) {
+                remap_result_stmt_spans(stmt, map);
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            remap_result_stmt_spans(init, map);
+            remap_result_expr_spans(condition, map);
+            remap_result_stmt_spans(post, map);
+            for stmt in body {
+                remap_result_stmt_spans(stmt, map);
+            }
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            remap_result_expr_spans(condition, map);
+            for stmt in body {
+                remap_result_stmt_spans(stmt, map);
+            }
+        }
+        Stmt::Noop { .. }
+        | Stmt::FuncDecl { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Drop { .. } => {}
+    }
+}
+
+fn remap_result_expr_spans(expr: &mut super::ir::Expr, map: &impl Fn(&mut Span)) {
+    use super::ir::Expr;
+    match expr {
+        Expr::ResultConstruct { payload, span, .. } => {
+            map(span);
+            remap_result_expr_spans(payload, map);
+        }
+        Expr::ResultQuery { value, span, .. } | Expr::ResultTry { value, span, .. } => {
+            map(span);
+            remap_result_expr_spans(value, map);
+        }
+        Expr::ResultMatch {
+            value,
+            ok_expr,
+            err_expr,
+            span,
+            ..
+        } => {
+            map(span);
+            remap_result_expr_spans(value, map);
+            remap_result_expr_spans(ok_expr, map);
+            remap_result_expr_spans(err_expr, map);
+        }
+        Expr::OptionalGet { container, key, .. } => {
+            remap_result_expr_spans(container, map);
+            remap_result_expr_spans(key, map);
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            remap_result_expr_spans(value, map);
+            remap_result_expr_spans(fallback, map);
+        }
+        Expr::Call(_, _, args, _, _)
+        | Expr::ModuleCall(_, _, args, _)
+        | Expr::LocalCall(_, _, args, _) => {
+            for arg in args {
+                remap_result_expr_spans(arg, map);
+            }
+        }
+        Expr::Closure(closure) => remap_result_expr_spans(&mut closure.body, map),
+        Expr::ClosureCall(closure, args) => {
+            remap_result_expr_spans(&mut closure.body, map);
+            for arg in args {
+                remap_result_expr_spans(arg, map);
+            }
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            remap_result_expr_spans(lhs, map);
+            remap_result_expr_spans(rhs, map);
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => remap_result_expr_spans(inner, map),
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            remap_result_expr_spans(condition, map);
+            remap_result_expr_spans(then_expr, map);
+            remap_result_expr_spans(else_expr, map);
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            remap_result_expr_spans(value, map);
+            for (_, arm) in arms {
+                remap_result_expr_spans(arm, map);
+            }
+            remap_result_expr_spans(default, map);
+        }
+        Expr::Block { stmts, expr } => {
+            for stmt in stmts {
+                remap_result_stmt_spans(stmt, map);
+            }
+            remap_result_expr_spans(expr, map);
+        }
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::Bytes(_)
+        | Expr::FunctionRef(..)
+        | Expr::ModuleFunctionRef(..)
+        | Expr::UnresolvedFunctionRef { .. }
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. } => {}
     }
 }
 
@@ -1854,6 +2029,144 @@ mod lowered_provenance_remap_tests {
             .get(span.lo..span.hi)
             .expect("span must slice source")
             .to_string()
+    }
+
+    #[test]
+    fn result_nodes_remap_in_ordinary_and_repl_with_nonidentity_lowering() {
+        use crate::compiler::ir::{Expr, Stmt};
+
+        let source = "// 変換\r\nlet value: Result<int, string> = Result::Ok(7);\r\nlet flag = value.is_ok();\r\nlet picked = match value { Result::Ok(v) => v, Result::Err(e) => 0 };\r\nfn relay(input: Result<int, string>) -> Result<int, string> { let number = input?; Result::Ok(number) }\r\n";
+        for original_id in [7, 17] {
+            for repl in [false, true] {
+                let mut builder = LoweringBuilder::new(source);
+                builder.insert("// generated prefix\n");
+                builder.copy_rest();
+                let lowered = builder.finish();
+                let ir = if repl {
+                    super::parse_lowered_repl_with_mapping(
+                        source,
+                        lowered,
+                        &[],
+                        (original_id, false),
+                        false,
+                        true,
+                        None,
+                    )
+                    .expect("REPL Result source parses")
+                    .ir
+                } else {
+                    parse_lowered_with_mapping(
+                        source,
+                        lowered,
+                        false,
+                        false,
+                        true,
+                        original_id,
+                        false,
+                        None,
+                    )
+                    .expect("ordinary Result source parses")
+                };
+                let mut spans = Vec::new();
+                for stmt in &ir.stmts {
+                    if let Stmt::Let {
+                        expr:
+                            Expr::ResultConstruct {
+                                span, semantic_id, ..
+                            }
+                            | Expr::ResultQuery {
+                                span, semantic_id, ..
+                            }
+                            | Expr::ResultMatch {
+                                span, semantic_id, ..
+                            },
+                        ..
+                    } = stmt
+                    {
+                        spans.push(*span);
+                        assert!(semantic_id.is_none(), "parser Result identity is unchanged");
+                    }
+                }
+                let function = ir.function_impls.values().next().unwrap();
+                let Stmt::Let {
+                    expr:
+                        Expr::ResultTry {
+                            span, semantic_id, ..
+                        },
+                    ..
+                } = &function.body_stmts[0]
+                else {
+                    panic!("expected try in function statement");
+                };
+                assert!(semantic_id.is_none());
+                spans.push(*span);
+                let Expr::ResultConstruct { span, .. } = &function.body_expr else {
+                    panic!("expected Result function tail");
+                };
+                spans.push(*span);
+                assert_eq!(spans.len(), 5);
+                let slices: Vec<_> = spans
+                    .iter()
+                    .map(|span| {
+                        assert_eq!(span.source_id, original_id);
+                        span_slice(source, *span)
+                    })
+                    .collect();
+                assert_eq!(
+                    slices,
+                    [
+                        "Result::Ok(7)",
+                        "value.is_ok()",
+                        ";",
+                        "?",
+                        "Result::Ok(number)"
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn result_remap_preserves_other_source_ids_and_semantic_identity() {
+        use crate::compiler::ir::{Expr, SemanticNodeId, Stmt};
+
+        let source = "let value: Result<int, string> = Result::Ok(7);";
+        let lowered = rustscript::lower(source).unwrap();
+        let mut ir =
+            parse_lowered_with_mapping(source, lowered.clone(), false, false, true, 7, false, None)
+                .unwrap();
+        let Stmt::Let {
+            expr: Expr::ResultConstruct { semantic_id, .. },
+            ..
+        } = &mut ir.stmts[0]
+        else {
+            panic!("expected Result constructor");
+        };
+        *semantic_id = Some(SemanticNodeId(42));
+        for source_id in [7, 41] {
+            let Stmt::Let {
+                expr: Expr::ResultConstruct { span, .. },
+                ..
+            } = &mut ir.stmts[0]
+            else {
+                unreachable!()
+            };
+            span.source_id = source_id;
+            let expected = *span;
+            super::remap_lowered_spans(&mut ir, &lowered, 8, 7);
+            let Stmt::Let {
+                expr:
+                    Expr::ResultConstruct {
+                        span, semantic_id, ..
+                    },
+                ..
+            } = &ir.stmts[0]
+            else {
+                unreachable!()
+            };
+            assert_eq!(*span, expected);
+            assert_eq!(*semantic_id, Some(SemanticNodeId(42)));
+        }
     }
 
     /// Identity lowering: every provenance span carries the original source

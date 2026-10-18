@@ -118,8 +118,8 @@ pub use typed::HostCallResult;
 use typed::{AnyValue, IntoBuiltinCallOutcome, NumberValue, UnknownValue, VmArray, VmBytes, VmMap};
 #[allow(unused_imports)]
 pub use typed::{
-    BorrowVmValue, FromVmValue, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg, return_none,
-    return_one, take_arg,
+    BorrowVmValue, FromVmValue, IntoHostCallOutcome, IntoVmValue, TakeVmValue, arg, borrow_arg,
+    return_none, return_one, take_arg,
 };
 
 pub(crate) enum BuiltinCallOutcome {

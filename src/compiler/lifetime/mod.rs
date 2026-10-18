@@ -69,6 +69,7 @@ pub(super) fn enforce_local_availability_with_entry_locals(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Keep source policy and private rejection provenance explicit.
 pub(super) fn enforce_source_availability_with_entry_locals(
     ir: FrontendIr,
     entry_locals: &[EntryLocalAvailability],
@@ -77,6 +78,7 @@ pub(super) fn enforce_source_availability_with_entry_locals(
     policies: &std::collections::HashMap<String, bool>,
     default_policy: bool,
     sources: &super::source_map::SourceMap,
+    rejections: &[super::typing::CanonicalHostRejection],
 ) -> Result<FrontendIr, ParseError> {
     availability::enforce_source_availability(
         ir,
@@ -86,6 +88,7 @@ pub(super) fn enforce_source_availability_with_entry_locals(
         owned_local_slots,
         Some(policies),
         Some(sources),
+        rejections,
     )
 }
 

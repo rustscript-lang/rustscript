@@ -18,6 +18,16 @@ pub(crate) struct MapIteratorState {
 }
 
 impl MapIteratorState {
+    /// Non-owning projection for the SDK's pre-abort ownership inspection.
+    /// Includes the iterator's owner and separately retained current values.
+    pub(super) fn publication_roots(&self) -> (&SharedMap, Option<&Value>, Option<&Value>) {
+        (
+            self.iter.borrow_owner(),
+            self.current_key.as_ref(),
+            self.current_value.as_ref(),
+        )
+    }
+
     pub(crate) fn new(map: SharedMap) -> Self {
         Self {
             iter: OwnedMapIter::new(map, |map| map.iter()),

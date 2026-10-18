@@ -547,6 +547,169 @@ fn wrong_resource_kind_is_rejected_by_each_accessor_family() {
 }
 
 #[test]
+fn rejected_argument_contract_survives_expression_contexts() {
+    let prefix = "use http; let request = http::request::new(\"GET\", \"http://127.0.0.1:1/x\"); ";
+    for expression in [
+        "http::client::request(request.copy());",
+        "let response = http::client::request(request.copy());",
+        "let response = if true => { http::client::request(request.copy()) } else => { http::client::request(request.copy()) };",
+        "println(http::client::request(request.copy()));",
+    ] {
+        let message = compile_err(&format!("{prefix}{expression}"));
+        assert!(
+            message.contains("expected passing take_owned, found passing value"),
+            "{expression}: {message}"
+        );
+    }
+    let message = compile_err(
+        "use http; fn bad() -> int { let request = http::request::new(\"GET\", \"http://127.0.0.1:1/x\"); http::response::status(&request) } bad();",
+    );
+    assert!(
+        message.contains("expected resource<http.response>, found resource<http.request>"),
+        "{message}"
+    );
+}
+
+#[test]
+fn rejected_argument_continues_independent_ownership_on_both_sides() {
+    let prefix = "use http; let request = http::request::new(\"GET\", \"http://127.0.0.1:1/x\"); let other = http::request::new(\"GET\", \"http://127.0.0.1:1/y\"); ";
+    let bad = "http::client::request(request.copy());";
+    for independent in [
+        "other.copy();",
+        "http::client::request(other); http::client::request(other);",
+        "let escaped = &other;",
+    ] {
+        for body in [
+            format!("{independent} {bad}"),
+            format!("{bad} {independent}"),
+        ] {
+            let message = compile_err(&format!("{prefix}{body}"));
+            let expected = if independent.contains("copy") {
+                "cannot copy resource value 'other'"
+            } else if independent.contains("escaped") {
+                "borrow of resource value 'other'"
+            } else {
+                "local 'other' was moved earlier"
+            };
+            assert!(
+                message.contains(expected),
+                "independent ownership must remain: {body}: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rejected_argument_recovery_retains_canonical_diagnostics_without_codegen() {
+    let prefix = "use http; let request = http::request::new(\"GET\", \"http://127.0.0.1:1/x\"); ";
+    for (body, callee, diagnostic) in [
+        (
+            "let response = http::client::request(request.copy());",
+            "http::client::request",
+            "expected passing take_owned, found passing value",
+        ),
+        (
+            "http::response::status(&request);",
+            "http::response::status",
+            "expected resource<http.response>, found resource<http.request>",
+        ),
+    ] {
+        let source = format!("{prefix}{body}");
+        let options =
+            || CompileSourceFileOptions::default().with_host_api_catalog(standard_host_catalog());
+        let model =
+            vm::compiler::analyze_source_from_string_with_options("main.rss", &source, options())
+                .unwrap();
+        assert_eq!(model.diagnostics().len(), 1);
+        assert!(
+            model.diagnostics()[0].message.contains(diagnostic),
+            "{:?}",
+            model.diagnostics()
+        );
+        let span = model.diagnostics()[0].span.unwrap();
+        assert_eq!(model.sources().span_text(span), Some(callee));
+        let error = vm::compiler::collect_inferred_local_type_hints_with_options(
+            &source,
+            SourceFlavor::RustScript,
+            options(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(diagnostic), "{error}");
+        assert!(
+            compile_with_standard_catalog(&source).is_err(),
+            "rejected IR cannot become executable"
+        );
+    }
+}
+
+#[test]
+fn rejected_argument_keeps_other_arguments_children_and_module_owners() {
+    let prefix = "use http; let mut request = http::request::new(\"GET\", \"http://127.0.0.1:1/x\"); let other = http::request::new(\"GET\", \"http://127.0.0.1:1/y\"); ";
+    for body in [
+        "http::request::set_header(&request, other.copy(), \"value\");",
+        "http::client::request(if true => { other.copy(); request.copy() } else => { request.copy() });",
+        "http::response::status(&request); let escaped = &other;",
+        "http::response::status(&request); let child = || if true => { let other = http::request::new(\"GET\", \"http://127.0.0.1:1/z\"); other.copy() } else => { http::request::new(\"GET\", \"http://127.0.0.1:1/z\") }; child();",
+    ] {
+        let error = compile_err(&format!("{prefix}{body}"));
+        assert!(
+            error.contains("cannot copy resource value 'other'")
+                || error.contains("borrow of resource value 'other'"),
+            "{body}: {error}"
+        );
+    }
+    let source = "use http; use dep as d; let request = http::request::new(\"GET\", \"http://127.0.0.1:1/x\"); http::response::status(&request); d::reject();";
+    let dependency = "use http; pub fn reject() { let request = http::request::new(\"GET\", \"http://127.0.0.1:1/y\"); request.copy(); }";
+    let configured = CompileSourceFileOptions::default()
+        .with_host_api_catalog(standard_host_catalog())
+        .with_module_override_source("dep.rss", dependency);
+    let error =
+        compile_source_with_flavor_and_options(source, SourceFlavor::RustScript, configured)
+            .err()
+            .expect("dependency ownership must reject");
+    let vm::SourcePathError::SourceWithMap {
+        error: vm::SourceError::Parse(error),
+        sources,
+    } = error
+    else {
+        panic!("module ownership diagnostic required");
+    };
+    assert_eq!(error.code.as_deref(), Some("E_OWNERSHIP_COPY_RESOURCE"));
+    assert!(
+        sources
+            .file_name(error.span.unwrap().source_id)
+            .unwrap()
+            .ends_with("dep.rss")
+    );
+    let dependency = "use http; pub fn reject() -> int { let request = http::request::new(\"GET\", \"http://127.0.0.1:1/y\"); http::response::status(&request); 1 }";
+    let configured = || {
+        CompileSourceFileOptions::default()
+            .with_host_api_catalog(standard_host_catalog())
+            .with_module_override_source("dep.rss", dependency)
+    };
+    let error =
+        compile_source_with_flavor_and_options(source, SourceFlavor::RustScript, configured())
+            .err()
+            .expect("both source-qualified rejected calls remain invalid");
+    assert!(
+        error
+            .to_string()
+            .contains("expected resource<http.response>, found resource<http.request>"),
+        "{error}"
+    );
+    let model =
+        vm::compiler::analyze_source_from_string_with_options("main.rss", source, configured())
+            .unwrap();
+    assert_eq!(model.diagnostics().len(), 1);
+    assert_eq!(
+        model
+            .sources()
+            .span_text(model.diagnostics()[0].span.unwrap()),
+        Some("http::response::status")
+    );
+}
+
+#[test]
 fn sse_callback_shape_mismatches_name_the_positional_signature() {
     let wrong_arity = compile_err(
         r#"
@@ -720,8 +883,8 @@ fn sse_event_timeout_and_open_overloads_compile() {
         }
     "#;
 
-    // Each overload is exercised in its own module; repeated use of the same
-    // import name in one module currently reports a duplicate declaration.
+    // Exercise every overload independently; the mixed-use case below also
+    // verifies that shared names retain distinct typed import identities.
     compile_ok(&format!(
         "{CALLBACKS}
         let request = http::request::new(\"GET\", \"http://127.0.0.1:1/events\");
@@ -749,8 +912,8 @@ fn sse_event_timeout_and_open_overloads_compile() {
 }
 
 #[test]
-fn sse_repeated_import_name_reports_duplicate_declaration() {
-    let error = compile_err(
+fn sse_repeated_import_name_keeps_distinct_typed_overloads() {
+    let compiled = compile_with_standard_catalog(
         r#"
         use http;
         fn on_event(kind: string, data: string, id: string, retry: string) -> bool { true }
@@ -761,11 +924,26 @@ fn sse_repeated_import_name_reports_duplicate_declaration() {
         let timed = http::client::sse(second, on_event, 5000);
         http::sse_summary::items(&timed);
         "#,
-    );
-    assert!(
-        error.contains("duplicate local declaration 'http::client::sse'"),
-        "{error}"
-    );
+    )
+    .expect("same-name overloads share their catalog identity, not their arity");
+    let schemas = compiled
+        .program
+        .host_import_schemas()
+        .iter()
+        .flatten()
+        .filter(|schema| schema.name == "http::client::sse")
+        .collect::<Vec<_>>();
+    let mut arities = schemas
+        .iter()
+        .map(|schema| schema.params.len())
+        .collect::<Vec<_>>();
+    arities.sort_unstable();
+    assert_eq!(arities, vec![2, 3]);
+    let catalog = standard_host_catalog();
+    let expected = catalog_import_schemas(&catalog, "http::client::sse");
+    for schema in schemas {
+        assert!(expected.contains(schema));
+    }
 }
 
 #[test]
@@ -817,12 +995,30 @@ fn guest_struct_declaration_of_a_former_http_name_stays_a_guest_struct() {
         "#,
     )
     .unwrap_or_else(|err| panic!("a guest SseEvent must compile, got {err}"));
-    assert!(
-        compiled
-            .program
-            .named_struct_decls()
-            .contains_key("SseEvent"),
-        "the guest declaration must own the VMBC struct table entry"
+    let declaration = compiled
+        .program
+        .named_struct_decls()
+        .get("__guest_type_m0_s1")
+        .expect("source-scoped guest declaration");
+    assert_eq!(declaration.origin, vm::compiler::StructDeclOrigin::Guest);
+    assert_eq!(
+        declaration.body_schema,
+        vm::TypeSchema::Object(std::collections::HashMap::from([(
+            "kind".into(),
+            vm::TypeSchema::String
+        )]))
+    );
+    let program = compiled.program.with_local_count(compiled.locals);
+    let bytes = vm::encode_program(&program).unwrap();
+    let mut machine = Vm::new(vm::decode_program(&bytes).unwrap());
+    machine.set_fuel(100_000);
+    assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+    let Value::Map(value) = machine.stack().last().unwrap() else {
+        panic!("guest struct result");
+    };
+    assert_eq!(
+        value.get(&Value::string("kind")),
+        Some(&Value::string("event"))
     );
     assert!(
         http_host_catalog().structs().is_empty(),

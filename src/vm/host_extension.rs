@@ -705,24 +705,41 @@ fn collect_schema_resource_keys(schema: &HostTypeSchema, seen: &mut Vec<SeenReso
 }
 
 fn expected_guest_resource_effects(schema: &HostFunctionSchema) -> Vec<ResourceEffect> {
-    let mut expected = Vec::new();
-    for param in &schema.params {
-        if let HostTypeSchema::Resource(key) = &param.ty {
-            match param.passing {
-                HostParamPassing::Borrow => expected.push(ResourceEffect::borrow(key.clone())),
-                HostParamPassing::BorrowMut => {
-                    expected.push(ResourceEffect::borrow_mut(key.clone()))
-                }
-                HostParamPassing::TakeOwned => {
-                    expected.push(ResourceEffect::take_owned(key.clone()))
-                }
-                HostParamPassing::Value => {}
+    // A Result statically declares both alternatives, including repeated keys.
+    // Container and callable mentions do not confer an active payload effect.
+    fn visit(
+        ty: &HostTypeSchema,
+        effect: &dyn Fn(ResourceTypeKey) -> Option<ResourceEffect>,
+        out: &mut Vec<ResourceEffect>,
+    ) {
+        match ty {
+            HostTypeSchema::Resource(key) => out.extend(effect(key.clone())),
+            HostTypeSchema::Result { ok, err } => {
+                visit(ok, effect, out);
+                visit(err, effect, out);
             }
+            HostTypeSchema::Optional(inner) => visit(inner, effect, out),
+            _ => {}
         }
     }
-    if let HostTypeSchema::Resource(key) = &schema.return_type {
-        expected.push(ResourceEffect::create(key.clone()));
+    let mut expected = Vec::new();
+    for param in &schema.params {
+        visit(
+            &param.ty,
+            &|key| match param.passing {
+                HostParamPassing::Borrow => Some(ResourceEffect::borrow(key)),
+                HostParamPassing::BorrowMut => Some(ResourceEffect::borrow_mut(key)),
+                HostParamPassing::TakeOwned => Some(ResourceEffect::take_owned(key)),
+                HostParamPassing::Value => None,
+            },
+            &mut expected,
+        );
     }
+    visit(
+        &schema.return_type,
+        &|key| Some(ResourceEffect::create(key)),
+        &mut expected,
+    );
     expected
 }
 
@@ -769,6 +786,10 @@ fn collect_named_structs_from_type(
             for field in fields {
                 collect_named_structs_from_type(&field.ty, seen, builder)?;
             }
+        }
+        HostTypeSchema::Result { ok, err } => {
+            collect_named_structs_from_type(ok, seen, builder)?;
+            collect_named_structs_from_type(err, seen, builder)?;
         }
         HostTypeSchema::Array(inner)
         | HostTypeSchema::Map(inner)
@@ -1489,6 +1510,93 @@ mod tests {
         schema: impl CatalogSchemaSelection,
     ) -> Result<(), CatalogRegistrationError> {
         register_catalog_function(registry, catalog, name, schema, || Box::new(Noop))
+    }
+
+    #[test]
+    fn result_resource_effects_preserve_multiplicity_modes_and_callable_boundary() {
+        use crate::host_api::HostParamPassing;
+        let key = ResourceTypeKey::new("test.result").unwrap();
+        let resource = HostTypeSchema::Resource(key.clone());
+        let result = HostTypeSchema::Result {
+            ok: Box::new(resource.clone()),
+            err: Box::new(HostTypeSchema::Optional(Box::new(resource.clone()))),
+        };
+        for (passing, effect) in [
+            (
+                HostParamPassing::Borrow,
+                ResourceEffect::borrow(key.clone()),
+            ),
+            (
+                HostParamPassing::BorrowMut,
+                ResourceEffect::borrow_mut(key.clone()),
+            ),
+            (
+                HostParamPassing::TakeOwned,
+                ResourceEffect::take_owned(key.clone()),
+            ),
+        ] {
+            let schema = HostFunctionSchema::with_return(
+                "test::result",
+                vec![HostParamSchema::with_passing(
+                    "value",
+                    result.clone(),
+                    passing,
+                )],
+                result.clone(),
+            );
+            assert_eq!(
+                expected_guest_resource_effects(&schema),
+                vec![
+                    effect.clone(),
+                    effect,
+                    ResourceEffect::create(key.clone()),
+                    ResourceEffect::create(key.clone())
+                ]
+            );
+        }
+        let schema = HostFunctionSchema::with_return(
+            "test::result",
+            vec![HostParamSchema::value("value", result.clone())],
+            HostTypeSchema::Callable {
+                params: vec![result],
+                result: Box::new(resource.clone()),
+            },
+        );
+        assert!(expected_guest_resource_effects(&schema).is_empty());
+        for unsupported in [
+            HostTypeSchema::Array(Box::new(resource.clone())),
+            HostTypeSchema::Map(Box::new(resource)),
+        ] {
+            let schema = HostFunctionSchema::with_return("test::result", vec![], unsupported);
+            assert!(expected_guest_resource_effects(&schema).is_empty());
+        }
+    }
+
+    #[test]
+    fn result_named_collector_preserves_duplicate_body_conflicts() {
+        use crate::host_api::HostStructField;
+        let named = HostTypeSchema::Named {
+            name: "NestedResult".into(),
+            fields: vec![HostStructField::new("value", HostTypeSchema::Int)],
+        };
+        let mut seen = Vec::new();
+        let mut builder = HostApiBuilder::new();
+        let mut schema = HostTypeSchema::Result {
+            ok: Box::new(named.clone()),
+            err: Box::new(named),
+        };
+        collect_named_structs_from_type(&schema, &mut seen, &mut builder).unwrap();
+        assert_eq!(seen.len(), 1);
+        if let HostTypeSchema::Result { err, .. } = &mut schema {
+            **err = HostTypeSchema::Named {
+                name: "NestedResult".into(),
+                fields: vec![HostStructField::new("value", HostTypeSchema::String)],
+            };
+        }
+        assert!(matches!(
+            collect_named_structs_from_type(&schema, &mut seen, &mut builder),
+            Err(HostApiCatalogError::StructFieldMismatch { .. })
+        ));
     }
 
     #[test]

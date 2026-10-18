@@ -79,6 +79,9 @@ pub(crate) struct Instance {
     pub(crate) run_depth: usize,
     pub(crate) max_script_call_depth: usize,
     pub(crate) host_return: Option<Value>,
+    // Sticky across interpreter reset while the old scope is still closing.
+    // Only the facade's completed scope replacement clears this quarantine.
+    pub(crate) callback_publication_unresolved: bool,
     pub(crate) queued_callables: VecDeque<QueuedCallable>,
     pub(crate) completed_callable_results: VecDeque<Value>,
     pub(crate) owned_callables: Vec<Weak<CallableValue>>,
@@ -122,6 +125,7 @@ impl Instance {
             run_depth: 0,
             max_script_call_depth: DEFAULT_MAX_SCRIPT_CALL_DEPTH,
             host_return: None,
+            callback_publication_unresolved: false,
             queued_callables: VecDeque::new(),
             completed_callable_results: VecDeque::new(),
             owned_callables: Vec::new(),
@@ -193,6 +197,7 @@ impl Instance {
             || self.active_operand_stack_base_cache != 0
             || self.call_depth != 0
             || self.host_return.is_some()
+            || self.callback_publication_unresolved
             || !self.queued_callables.is_empty()
             || !self.completed_callable_results.is_empty()
             || self.draining_queued_callables

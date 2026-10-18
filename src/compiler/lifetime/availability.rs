@@ -7,7 +7,7 @@ use crate::host_api::HostParamPassing;
 
 use super::super::ParseError;
 use super::super::ir::{
-    ClosureExpr, Expr, FrontendIr, FunctionImpl, LocalSlot, ResolvedHostCall, Stmt,
+    ClosureExpr, Expr, FrontendIr, FunctionImpl, LocalSlot, ResolvedHostCall, Stmt, TypeSchema,
 };
 use super::EntryLocalAvailability;
 use super::liveness::{LivenessRewriter, LocalSlotAllocator, persistent_capture_slots};
@@ -34,6 +34,10 @@ struct FlowState {
     moved_definite: HashSet<MovedFieldPath>,
     moved_possible: HashSet<MovedFieldPath>,
     copyable_fields: HashSet<MovedFieldPath>,
+    /// Current-invocation owners. A resource schema bit alone is not ownership:
+    /// borrowed parameters and persistent captures stay false until an explicit
+    /// move/detach creates a fresh current-owned local.
+    current_owned: Vec<bool>,
 }
 
 #[derive(Default)]
@@ -78,6 +82,7 @@ impl FlowState {
             moved_definite: HashSet::new(),
             moved_possible: HashSet::new(),
             copyable_fields: HashSet::new(),
+            current_owned: vec![false; local_count],
         }
     }
 
@@ -97,6 +102,9 @@ impl FlowState {
             state.movable_locals[slot] = entry.movable;
             state.moved_local_definite[slot] = entry.moved;
             state.moved_local_possible[slot] = entry.moved;
+            // Entry seeds are caller-owned until this invocation explicitly
+            // detaches them. Do not infer ownership from the schema bit.
+            state.current_owned[slot] = false;
         }
         state
     }
@@ -117,9 +125,11 @@ pub(super) fn enforce_local_availability(
         owned_local_slots,
         None,
         None,
+        &[],
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Source policy and admission provenance are independent inputs.
 pub(super) fn enforce_source_availability(
     mut ir: FrontendIr,
     entry_locals: &[EntryLocalAvailability],
@@ -128,6 +138,7 @@ pub(super) fn enforce_source_availability(
     owned_local_slots: &[bool],
     source_policies: Option<&HashMap<String, bool>>,
     sources: Option<&super::super::source_map::SourceMap>,
+    rejections: &[super::super::typing::CanonicalHostRejection],
 ) -> Result<FrontendIr, ParseError> {
     // Pad the post-legalize ownership metadata to the analyzer's local space.
     // Availability runs pre-compaction, so the logical slot indices align with
@@ -172,9 +183,18 @@ pub(super) fn enforce_source_availability(
             &initial_impls,
             policy,
             &owned_slots,
+        )
+        .with_rejections(
+            rejections,
+            ir.parsed_semantic_index.as_ref(),
+            sources.and_then(|sources| {
+                ir.function_sources
+                    .get(index)
+                    .and_then(|source| sources.source_id_by_name(source))
+            }),
         );
         let rewritten = analyzer
-            .analyze_function_impl(function_impl.clone())
+            .analyze_function_impl(*index, function_impl.clone())
             .map_err(|error| {
                 attach_owner(error, ir.function_sources.get(index).map(String::as_str))
             })?;
@@ -210,6 +230,11 @@ pub(super) fn enforce_source_availability(
             &rewritten_impls,
             policy,
             &owned_slots,
+        )
+        .with_rejections(
+            rejections,
+            ir.parsed_semantic_index.as_ref(),
+            sources.and_then(|sources| source.and_then(|source| sources.source_id_by_name(source))),
         );
         let (stmts, next) = analyzer
             .analyze_block(&ir.stmts[start..end], state, true)
@@ -302,6 +327,7 @@ struct AvailabilityAnalyzer {
     /// anywhere. Owned slots are move-only and cannot be copied or borrowed
     /// outside exact host-call arguments.
     owned_local_slots: Vec<bool>,
+    rejections: Vec<super::super::typing::CanonicalHostRejection>,
 }
 
 impl AvailabilityAnalyzer {
@@ -345,11 +371,125 @@ impl AvailabilityAnalyzer {
             next_collection_alias_id: Cell::new(1),
             enable_local_move_semantics,
             owned_local_slots: owned,
+            rejections: Vec::new(),
+        }
+    }
+
+    fn with_rejections(
+        mut self,
+        rejections: &[super::super::typing::CanonicalHostRejection],
+        parsed: Option<&super::super::ir::ParsedSemanticIndex>,
+        source: Option<super::super::source_map::SourceId>,
+    ) -> Self {
+        if let (Some(parsed), Some(source)) = (parsed, source) {
+            self.rejections = rejections
+                .iter()
+                .filter(|rejection| {
+                    let site = &rejection.provenance;
+                    let reason_in_range = match rejection.reason {
+                        Some(
+                            super::super::host_call_resolve::ArgumentRejection::Schema { argument }
+                            | super::super::host_call_resolve::ArgumentRejection::Passing {
+                                argument,
+                                ..
+                            },
+                        ) => argument < site.arguments.len(),
+                        None => true,
+                    };
+                    reason_in_range
+                        && site.callee_span.source_id == source
+                        && parsed
+                            .call_arguments
+                            .iter()
+                            .filter(|args| *args == site)
+                            .count()
+                            == 1
+                        && parsed
+                            .call_sites
+                            .iter()
+                            .filter(|call| {
+                                call.id == site.call_id
+                                    && call.callee_span == site.callee_span
+                                    && call.expr_span == site.expr_span
+                            })
+                            .count()
+                            == 1
+                })
+                .cloned()
+                .collect();
+        }
+        self
+    }
+
+    /// Only parser-proven direct wrappers of this recorded failed host call
+    /// participate. These are admission facts, never runtime passing modes.
+    fn analyze_rejected_arg(
+        &self,
+        id: Option<super::super::ir::SemanticNodeId>,
+        position: usize,
+        arg: &Expr,
+        state: &FlowState,
+        line: u32,
+    ) -> Option<Result<FlowState, ParseError>> {
+        use super::super::host_call_resolve::ArgumentRejection;
+        use super::super::ir::ParsedArgumentShape;
+        let mut matching = self
+            .rejections
+            .iter()
+            .filter(|rejection| Some(rejection.provenance.call_id) == id);
+        let rejection = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        let site = rejection.provenance.arguments.get(position)?;
+        let (shape, inner) = match arg {
+            Expr::Borrow(inner) => (ParsedArgumentShape::Borrow, inner.as_ref()),
+            Expr::BorrowMut(inner) => (ParsedArgumentShape::BorrowMut, inner.as_ref()),
+            Expr::ToOwned(inner) => (ParsedArgumentShape::Copy, inner.as_ref()),
+            _ => return None,
+        };
+        if shape != site.shape
+            || site.span.source_id != rejection.provenance.callee_span.source_id
+            || site.span.lo < rejection.provenance.callee_span.hi
+            || site.span.hi >= rejection.provenance.expr_span.hi
+        {
+            return None;
+        }
+        let local = match inner {
+            Expr::Var(slot) | Expr::MoveVar(slot) => Some(*slot),
+            _ => None,
+        };
+        if local != site.local {
+            return None;
+        }
+        match shape {
+            ParsedArgumentShape::Borrow | ParsedArgumentShape::BorrowMut => {
+                Some(self.analyze_expr_to_owned(inner, state, line))
+            }
+            ParsedArgumentShape::Copy
+                if matches!(rejection.reason,
+                Some(ArgumentRejection::Passing { argument, expected: HostParamPassing::TakeOwned | HostParamPassing::Borrow | HostParamPassing::BorrowMut,
+                    actual: HostParamPassing::Value }) if argument == position) =>
+            {
+                let slot = local?;
+                if !self.is_owned_slot(slot) {
+                    return None;
+                }
+                // Same invalid copy argument owns the canonical passing error,
+                // including an already moved local. Preserve state unchanged;
+                // all other arguments and subsequent uses still run normally.
+                Some(
+                    self.require_available(slot, state, line)
+                        .map(|()| state.clone()),
+                )
+            }
+            _ => None,
         }
     }
 
     fn analyze_function_impl(
         &self,
+        function_index: u16,
         function_impl: FunctionImpl,
     ) -> Result<FunctionImpl, ParseError> {
         let FunctionImpl {
@@ -360,18 +500,31 @@ impl AvailabilityAnalyzer {
             body_expr_line,
         } = function_impl;
         let mut state = FlowState::reachable(self.local_count);
-        for slot in &param_slots {
+        let consumed = self.function_consumed_params.get(&function_index);
+        for (position, slot) in param_slots.iter().enumerate() {
             self.mark_available(&mut state, *slot, 1)?;
             // Resource-typed parameters are move-only inside the body: they
             // can be returned (moved out), passed by ownership, or borrowed
             // through exact host-call arguments, but never copied.
+            // Ownership for exit cleanup follows the existing consumed-param
+            // contract, not the schema bit. Borrowed params stay caller-owned.
             if self.is_owned_slot(*slot) {
                 state.copyable_locals[*slot as usize] = false;
                 state.movable_locals[*slot as usize] = true;
+                if consumed.is_some_and(|positions| positions.contains(&position)) {
+                    state.current_owned[*slot as usize] = true;
+                }
             }
         }
         for (_, captured_slot) in &capture_copies {
             self.mark_available(&mut state, *captured_slot, 1)?;
+            // Persistent environment captures are not this invocation's
+            // owners, even when the environment was created by Move.
+            if self.is_owned_slot(*captured_slot) {
+                state.copyable_locals[*captured_slot as usize] = false;
+                state.movable_locals[*captured_slot as usize] = true;
+                state.current_owned[*captured_slot as usize] = false;
+            }
         }
         let (rewritten_body, body_state) = self.analyze_block(&body_stmts, state, true)?;
         let rewritten_body_expr = self.rewrite_function_return_expr(&body_expr, &body_state)?;
@@ -536,6 +689,7 @@ impl AvailabilityAnalyzer {
                     };
                     self.set_local_copyable_state(&mut out, *index, is_copyable);
                     self.set_local_movable_state(&mut out, *index, is_movable);
+                    self.note_rebind_ownership(&mut out, *index, expr);
                     rewritten_expr =
                         self.rewrite_local_source_move_on_rebind(&mut out, *index, expr);
                     rewritten_expr = self.rewrite_expr_for_ownership_with_state(
@@ -579,6 +733,7 @@ impl AvailabilityAnalyzer {
                     };
                     self.set_local_copyable_state(&mut out, *index, is_copyable);
                     self.set_local_movable_state(&mut out, *index, is_movable);
+                    self.note_rebind_ownership(&mut out, *index, expr);
                     rewritten_expr =
                         self.rewrite_local_source_move_on_rebind(&mut out, *index, expr);
                     rewritten_expr =
@@ -595,7 +750,7 @@ impl AvailabilityAnalyzer {
                     out,
                 ))
             }
-            Stmt::ClosureLet { line, closure } => {
+            Stmt::ClosureLet { line, closure, .. } => {
                 let mut out = state.clone();
                 if out.reachable {
                     self.analyze_closure(closure, &out, *line)?;
@@ -639,7 +794,8 @@ impl AvailabilityAnalyzer {
                 else_branch,
                 line,
             } => {
-                let cond_state = self.analyze_expr(condition, &state, *line)?;
+                let (condition, cond_state) =
+                    self.rewrite_expr_and_state(condition, false, &state, *line)?;
                 let (rewritten_then, then_state, rewritten_else, else_state) =
                     if let Some(control) = loop_control {
                         let (rewritten_then, then_state) = self.analyze_block_with_loop_control(
@@ -665,7 +821,7 @@ impl AvailabilityAnalyzer {
                 let merged = self.merge_states(then_state, else_state);
 
                 let rewritten = Stmt::IfElse {
-                    condition: condition.clone(),
+                    condition,
                     then_branch: rewritten_then,
                     else_branch: rewritten_else,
                     line: *line,
@@ -755,7 +911,8 @@ impl AvailabilityAnalyzer {
         }
 
         self.next_collection_alias_id.set(alias_seed);
-        let cond_state = self.analyze_expr(condition, &loop_entry, line)?;
+        let (condition, cond_state) =
+            self.rewrite_expr_and_state(condition, false, &loop_entry, line)?;
         let mut loop_control = LoopControlFlow::default();
         let (rewritten_body, _) = self.analyze_block_with_loop_control(
             body,
@@ -770,7 +927,7 @@ impl AvailabilityAnalyzer {
         };
 
         let rewritten = Stmt::While {
-            condition: condition.clone(),
+            condition,
             body: rewritten_body,
             line,
         };
@@ -817,7 +974,8 @@ impl AvailabilityAnalyzer {
         }
 
         self.next_collection_alias_id.set(alias_seed);
-        let cond_state = self.analyze_expr(condition, &loop_entry, line)?;
+        let (condition, cond_state) =
+            self.rewrite_expr_and_state(condition, false, &loop_entry, line)?;
         let mut loop_control = LoopControlFlow::default();
         let (rewritten_body, body_state) = self.analyze_block_with_loop_control(
             body,
@@ -838,7 +996,7 @@ impl AvailabilityAnalyzer {
 
         let rewritten = Stmt::For {
             init: Box::new(rewritten_init),
-            condition: condition.clone(),
+            condition,
             post: Box::new(rewritten_post),
             body: rewritten_body,
             line,
@@ -907,15 +1065,35 @@ impl AvailabilityAnalyzer {
                 let mut value_state = self.analyze_expr(value, state, line)?;
                 self.mark_owned_value_reads_moved(value, &mut value_state);
                 self.mark_available(&mut value_state, *value_slot, line)?;
-                let then_state = self.analyze_expr(fallback, &value_state, line)?;
-                let mut out = self.merge_states(then_state, value_state);
-                self.mark_owned_value_reads_moved(fallback, &mut out);
-                Ok(out)
+                let mut fallback_state = self.analyze_expr(fallback, &value_state, line)?;
+                self.mark_owned_value_reads_moved(fallback, &mut fallback_state);
+                Ok(self.merge_states(fallback_state, value_state))
             }
             // Resolved module calls (pre-merge only) analyze their arguments;
             // interprocedural effects apply to the post-merge flat call.
             Expr::ModuleCall(_, _, args, _) => self.analyze_args(args, state, line),
-            Expr::Call(index, _, args, resolution, _) => {
+            Expr::Call(index, _, args, resolution, semantic_id) => {
+                if resolution.is_none()
+                    && self
+                        .rejections
+                        .iter()
+                        .any(|rejection| Some(rejection.provenance.call_id) == *semantic_id)
+                {
+                    let mut out = state.clone();
+                    for (position, arg) in args.iter().enumerate() {
+                        out = match self.analyze_rejected_arg(
+                            *semantic_id,
+                            position,
+                            arg,
+                            &out,
+                            line,
+                        ) {
+                            Some(result) => result?,
+                            None => self.analyze_expr(arg, &out, line)?,
+                        };
+                    }
+                    return Ok(out);
+                }
                 if !self.enable_local_move_semantics {
                     if let Some(root_slot) = self.extract_collection_mutation_root(*index, args) {
                         let mut out = self.analyze_args(args, state, line)?;
@@ -1018,13 +1196,17 @@ impl AvailabilityAnalyzer {
             | Expr::Mul(lhs, rhs)
             | Expr::Div(lhs, rhs)
             | Expr::Mod(lhs, rhs)
-            | Expr::And(lhs, rhs)
-            | Expr::Or(lhs, rhs)
             | Expr::Eq(lhs, rhs)
             | Expr::Lt(lhs, rhs)
             | Expr::Gt(lhs, rhs) => {
                 let lhs_state = self.analyze_expr(lhs, state, line)?;
                 self.analyze_expr(rhs, &lhs_state, line)
+            }
+            Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+                let lhs_state = self.analyze_expr(lhs, state, line)?;
+                let rhs_state = self.analyze_expr(rhs, &lhs_state, line)?;
+                // The RHS transfers apply only on its executed edge.
+                Ok(self.merge_states(lhs_state, rhs_state))
             }
             Expr::Neg(inner) | Expr::Not(inner) => self.analyze_expr(inner, state, line),
             Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
@@ -1096,6 +1278,44 @@ impl AvailabilityAnalyzer {
                 if out.reachable {
                     self.mark_available(&mut out, *result_slot, line)?;
                 }
+                Ok(out)
+            }
+            Expr::ResultConstruct { payload, .. } => {
+                let mut out = self.analyze_expr(payload, state, line)?;
+                self.mark_owned_value_reads_moved(payload, &mut out);
+                Ok(out)
+            }
+            Expr::ResultQuery { value, .. } => self.analyze_expr_to_owned(value, state, line),
+            Expr::ResultTry {
+                value, value_slot, ..
+            } => {
+                let mut out = self.analyze_expr(value, state, line)?;
+                self.mark_owned_value_reads_moved(value, &mut out);
+                self.mark_available(&mut out, *value_slot, line)?;
+                Ok(out)
+            }
+            Expr::ResultMatch {
+                value,
+                value_slot,
+                ok_binding,
+                ok_expr,
+                err_binding,
+                err_expr,
+                ..
+            } => {
+                let (ok_in, err_in) = self.result_match_arm_states(
+                    value,
+                    *value_slot,
+                    *ok_binding,
+                    *err_binding,
+                    state,
+                    line,
+                )?;
+                let ok_state = self.analyze_expr(ok_expr, &ok_in, line)?;
+                let err_state = self.analyze_expr(err_expr, &err_in, line)?;
+                let mut out = self.merge_states(ok_state, err_state);
+                self.mark_owned_value_reads_moved(ok_expr, &mut out);
+                self.mark_owned_value_reads_moved(err_expr, &mut out);
                 Ok(out)
             }
             Expr::ToOwned(inner) => {
@@ -1201,6 +1421,93 @@ impl AvailabilityAnalyzer {
         self.analyze_expr(inner, state, line)
     }
 
+    /// Whether this slot is a current-invocation owner that Err cleanup may close.
+    /// The resource schema bit is necessary but not sufficient.
+    fn is_current_cleanup_owner(&self, slot: LocalSlot, state: &FlowState) -> bool {
+        self.is_owned_slot(slot)
+            && state
+                .current_owned
+                .get(slot as usize)
+                .copied()
+                .unwrap_or(false)
+    }
+
+    /// A rebind establishes current ownership when it detaches an owned value
+    /// into this local or materializes a fresh owned result. A bare read of a
+    /// caller-owned local does not.
+    fn note_rebind_ownership(&self, state: &mut FlowState, target: LocalSlot, expr: &Expr) {
+        let slot = target as usize;
+        if slot >= self.local_count {
+            return;
+        }
+        state.current_owned[slot] =
+            self.is_owned_slot(target) && self.expr_establishes_current_ownership(expr, state);
+    }
+
+    fn expr_establishes_current_ownership(&self, expr: &Expr, state: &FlowState) -> bool {
+        match expr {
+            Expr::Var(slot) | Expr::MoveVar(slot) => {
+                state
+                    .current_owned
+                    .get(*slot as usize)
+                    .copied()
+                    .unwrap_or(false)
+                    || self.should_move_local_on_rebind_source(*slot, state)
+            }
+            Expr::Block { expr, .. } => self.expr_establishes_current_ownership(expr, state),
+            Expr::Borrow(_) | Expr::BorrowMut(_) => false,
+            _ => true,
+        }
+    }
+
+    /// Arm entry states shared by analysis and ownership rewrite. Payload
+    /// bindings receive the same current-ownership fact in both.
+    fn result_match_arm_states(
+        &self,
+        value: &Expr,
+        value_slot: LocalSlot,
+        ok_binding: Option<LocalSlot>,
+        err_binding: Option<LocalSlot>,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<(FlowState, FlowState), ParseError> {
+        let mut value_state = self.analyze_expr(value, state, line)?;
+        self.mark_owned_value_reads_moved(value, &mut value_state);
+        self.mark_available(&mut value_state, value_slot, line)?;
+        let mut ok_in = value_state.clone();
+        if let Some(slot) = ok_binding {
+            self.mark_available(&mut ok_in, slot, line)?;
+            // Each selected arm installs a fresh payload, including on a
+            // backedge after the previous iteration transferred that binding.
+            self.clear_local_moved_state(&mut ok_in, slot);
+            self.note_result_payload_owner(&mut ok_in, slot, value);
+        }
+        let mut err_in = value_state;
+        if let Some(slot) = err_binding {
+            self.mark_available(&mut err_in, slot, line)?;
+            self.clear_local_moved_state(&mut err_in, slot);
+            self.note_result_payload_owner(&mut err_in, slot, value);
+        }
+        Ok((ok_in, err_in))
+    }
+
+    fn note_result_payload_owner(
+        &self,
+        state: &mut FlowState,
+        binding: LocalSlot,
+        scrutinee: &Expr,
+    ) {
+        let index = binding as usize;
+        if index >= self.local_count {
+            return;
+        }
+        // This binding's post-legalize projection already resolves Named
+        // bodies. A declaration-blind schema walk would lose non-generic
+        // resource holders. Runtime ownership still comes from the scrutinee.
+        state.current_owned[index] = self.is_owned_slot(binding)
+            && self.expr_establishes_current_ownership(scrutinee, state);
+    }
+
     /// Whether a logical local slot carries a resource anywhere in its
     /// post-legalize schema (direct or nested).
     fn is_owned_slot(&self, index: LocalSlot) -> bool {
@@ -1208,6 +1515,49 @@ impl AvailabilityAnalyzer {
             .get(index as usize)
             .copied()
             .unwrap_or(false)
+    }
+
+    /// Frame-owned locals that may still be present when `?` takes the Err
+    /// return. The try's own operand temps are excluded so the returned Err
+    /// carrier is not closed; legitimate per-edge absence is Optional.
+    fn err_exit_cleanup_slots(
+        &self,
+        state: &FlowState,
+        exclude: &[LocalSlot],
+    ) -> Vec<(LocalSlot, TypeSchema)> {
+        let mut slots = Vec::new();
+        if !state.reachable {
+            return slots;
+        }
+        for slot in 0..self.local_count {
+            let slot = slot as LocalSlot;
+            if exclude.contains(&slot) || !self.is_current_cleanup_owner(slot, state) {
+                continue;
+            }
+            let index = slot as usize;
+            if !state.possible.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            if state
+                .moved_local_definite
+                .get(index)
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            // Whole-slot MoveVar detaches to Null. Preserve provenance across
+            // the join, permitting absence only on this Err edge when a
+            // predecessor moved this owner or never initialized a branch-local
+            // owner. Schema attachment preserves this per-edge Optional view.
+            let schema = if state.moved_local_possible[index] || !state.definite[index] {
+                TypeSchema::Optional(Box::new(TypeSchema::Unknown))
+            } else {
+                TypeSchema::Unknown
+            };
+            slots.push((slot, schema));
+        }
+        slots
     }
 
     /// Analyzes the arguments of a catalog-resolved host call against its
@@ -1228,26 +1578,30 @@ impl AvailabilityAnalyzer {
     ) -> Result<FlowState, ParseError> {
         let mut out = state.clone();
         for (position, arg) in args.iter().enumerate() {
-            out = match resolution.passing.get(position).copied() {
-                Some(HostParamPassing::TakeOwned) => {
-                    self.legalize_take_owned_arg(arg, &out, line)?
-                }
-                Some(HostParamPassing::Borrow) | Some(HostParamPassing::BorrowMut) => {
-                    // The parser wraps borrowed arguments in Borrow/BorrowMut;
-                    // unwrap them here into a non-consuming read so the
-                    // generic borrow arm (which rejects resource escapes)
-                    // never sees them.
-                    match arg {
-                        Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
-                            self.analyze_expr_to_owned(inner, &out, line)?
-                        }
-                        other => self.analyze_expr_to_owned(other, &out, line)?,
-                    }
-                }
-                _ => self.analyze_expr(arg, &out, line)?,
-            };
+            out =
+                self.analyze_call_arg(arg, resolution.passing.get(position).copied(), &out, line)?;
         }
         Ok(out)
+    }
+
+    /// Shared exact passing-mode transfer for analysis and lexical rewrite.
+    fn analyze_call_arg(
+        &self,
+        arg: &Expr,
+        passing: Option<HostParamPassing>,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<FlowState, ParseError> {
+        match passing {
+            Some(HostParamPassing::TakeOwned) => self.legalize_take_owned_arg(arg, state, line),
+            Some(HostParamPassing::Borrow | HostParamPassing::BorrowMut) => match arg {
+                Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+                    self.analyze_expr_to_owned(inner, state, line)
+                }
+                other => self.analyze_expr_to_owned(other, state, line),
+            },
+            _ => self.analyze_expr(arg, state, line),
+        }
     }
 
     /// Flow effect of a `TakeOwned` argument: the source local or literal-key
@@ -1480,6 +1834,14 @@ impl AvailabilityAnalyzer {
                         .any(|(_, arm_expr)| self.expr_contains_owned_local(arm_expr))
                     || self.expr_contains_owned_local(default)
             }
+            other @ (Expr::ResultConstruct { .. }
+            | Expr::ResultQuery { .. }
+            | Expr::ResultMatch { .. }
+            | Expr::ResultTry { .. }) => {
+                let mut found = false;
+                other.visit_result_children(|child| found |= self.expr_contains_owned_local(child));
+                found
+            }
             Expr::Block { stmts, expr } => {
                 stmts
                     .iter()
@@ -1599,11 +1961,10 @@ impl AvailabilityAnalyzer {
                 then_expr,
                 else_expr,
             } => {
-                let condition_state = self.analyze_expr(condition, state, line)?;
+                let (condition, condition_state) =
+                    self.rewrite_expr_and_state(condition, false, state, line)?;
                 Ok(Expr::IfElse {
-                    condition: Box::new(
-                        self.rewrite_expr_for_ownership_with_state(condition, state, line)?,
-                    ),
+                    condition: Box::new(condition),
                     then_expr: Box::new(self.rewrite_expr_for_ownership_with_state(
                         then_expr,
                         &condition_state,
@@ -1623,10 +1984,10 @@ impl AvailabilityAnalyzer {
                 arms,
                 default,
             } => {
-                let mut value_state = self.analyze_expr(value, state, line)?;
+                let (rewritten_value, mut value_state) =
+                    self.rewrite_expr_and_state(value, false, state, line)?;
+                self.mark_owned_value_reads_moved(&rewritten_value, &mut value_state);
                 self.mark_available(&mut value_state, *value_slot, line)?;
-                let rewritten_value =
-                    self.rewrite_expr_for_ownership_with_state(value, state, line)?;
                 let mut rewritten_arms = Vec::with_capacity(arms.len());
                 for (pattern, arm_expr) in arms {
                     let mut arm_state = value_state.clone();
@@ -1674,6 +2035,25 @@ impl AvailabilityAnalyzer {
         self.rewrite_expr_ownership_inner(expr, false, state)
     }
 
+    /// Pair emitted ownership syntax with its continuation facts. Replaying
+    /// transfer rules is metadata work only; no runtime expression is copied.
+    /// Use the same alias seed for rewrite and analysis, so nested replay does
+    /// not spend a second set of alias IDs or change fixed-point convergence.
+    fn rewrite_expr_and_state(
+        &self,
+        expr: &Expr,
+        in_call_arg: bool,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<(Expr, FlowState), ParseError> {
+        let seed = self.next_collection_alias_id.get();
+        let rewritten = self.rewrite_expr_ownership_inner(expr, in_call_arg, state);
+        self.next_collection_alias_id.set(seed);
+        let rewritten = rewritten?;
+        let out = self.analyze_expr(&rewritten, state, line)?;
+        Ok((rewritten, out))
+    }
+
     fn rewrite_expr_ownership_inner(
         &self,
         expr: &Expr,
@@ -1683,21 +2063,47 @@ impl AvailabilityAnalyzer {
         match expr {
             Expr::Call(index, type_args, args, resolution, source_node_id) => {
                 let mut rewritten_args = Vec::with_capacity(args.len());
-                for arg in args {
-                    rewritten_args.push(self.rewrite_expr_ownership_inner(arg, true, state)?);
+                let mut arg_state = state.clone();
+                for (position, arg) in args.iter().enumerate() {
+                    if resolution.is_none()
+                        && let Some(result) =
+                            self.analyze_rejected_arg(*source_node_id, position, arg, &arg_state, 1)
+                    {
+                        arg_state = result?;
+                        rewritten_args.push(arg.clone());
+                        continue;
+                    }
+                    let seed = self.next_collection_alias_id.get();
+                    let mut arg = self.rewrite_expr_ownership_inner(arg, true, &arg_state)?;
+                    let passing = resolution
+                        .as_deref()
+                        .and_then(|r| r.passing.get(position))
+                        .copied();
+                    match passing {
+                        Some(HostParamPassing::TakeOwned) => {
+                            arg = self.rewrite_take_owned_arg(&arg)?
+                        }
+                        Some(HostParamPassing::Borrow | HostParamPassing::BorrowMut) => {
+                            arg = self.rewrite_borrow_arg(&arg)
+                        }
+                        _ => {}
+                    }
+                    self.next_collection_alias_id.set(seed);
+                    arg_state = if resolution.is_none()
+                        && position == 0
+                        && matches!(
+                            BuiltinFunction::from_call_index(*index),
+                            Some(BuiltinFunction::Get | BuiltinFunction::Set)
+                        ) {
+                        // A projection may read an available remaining child
+                        // of a partially moved root; it is not a whole read.
+                        self.analyze_projection_root_expr(&arg, &arg_state, 1)?
+                    } else {
+                        self.analyze_call_arg(&arg, passing, &arg_state, 1)?
+                    };
+                    rewritten_args.push(arg);
                 }
                 if let Some(resolution) = resolution.as_deref() {
-                    for (position, arg) in rewritten_args.iter_mut().enumerate() {
-                        match resolution.passing.get(position).copied() {
-                            Some(HostParamPassing::TakeOwned) => {
-                                *arg = self.rewrite_take_owned_arg(arg)?;
-                            }
-                            Some(HostParamPassing::Borrow) | Some(HostParamPassing::BorrowMut) => {
-                                *arg = self.rewrite_borrow_arg(arg);
-                            }
-                            _ => {}
-                        }
-                    }
                     return Ok(Expr::Call(
                         *index,
                         type_args.clone(),
@@ -1753,35 +2159,54 @@ impl AvailabilityAnalyzer {
                 container_slot,
                 key_slot,
                 semantic_id,
-            } => Ok(Expr::OptionalGet {
-                field_projection: *field_projection,
-                container: Box::new(self.rewrite_expr_ownership_inner(container, false, state)?),
-                key: Box::new(self.rewrite_expr_ownership_inner(key, false, state)?),
-                container_slot: *container_slot,
-                key_slot: *key_slot,
-                semantic_id: *semantic_id,
-            }),
+            } => {
+                let (container, mut container_state) =
+                    self.rewrite_expr_and_state(container, false, state, 1)?;
+                self.mark_owned_value_reads_moved(&container, &mut container_state);
+                Ok(Expr::OptionalGet {
+                    field_projection: *field_projection,
+                    container: Box::new(container),
+                    key: Box::new(self.rewrite_expr_ownership_inner(
+                        key,
+                        false,
+                        &container_state,
+                    )?),
+                    container_slot: *container_slot,
+                    key_slot: *key_slot,
+                    semantic_id: *semantic_id,
+                })
+            }
             Expr::OptionUnwrapOr {
                 value,
                 value_slot,
                 fallback,
                 semantic_id,
-            } => Ok(Expr::OptionUnwrapOr {
-                value: Box::new(self.rewrite_expr_ownership_inner(value, false, state)?),
-                value_slot: *value_slot,
-                fallback: Box::new(self.rewrite_expr_ownership_inner(fallback, false, state)?),
-                semantic_id: *semantic_id,
-            }),
+            } => {
+                let (value, mut value_state) =
+                    self.rewrite_expr_and_state(value, false, state, 1)?;
+                self.mark_owned_value_reads_moved(&value, &mut value_state);
+                self.mark_available(&mut value_state, *value_slot, 1)?;
+                Ok(Expr::OptionUnwrapOr {
+                    value: Box::new(value),
+                    value_slot: *value_slot,
+                    fallback: Box::new(self.rewrite_expr_ownership_inner(
+                        fallback,
+                        false,
+                        &value_state,
+                    )?),
+                    semantic_id: *semantic_id,
+                })
+            }
             Expr::LocalCall(index, type_args, args, semantic_id) => Ok(Expr::LocalCall(
                 *index,
                 type_args.clone(),
-                self.rewrite_call_args(args, state)?,
+                self.rewrite_call_args(args, state)?.0,
                 *semantic_id,
             )),
             Expr::ModuleCall(index, type_args, args, semantic_id) => Ok(Expr::ModuleCall(
                 *index,
                 type_args.clone(),
-                self.rewrite_call_args(args, state)?,
+                self.rewrite_call_args(args, state)?.0,
                 *semantic_id,
             )),
             Expr::Closure(closure) => {
@@ -1797,7 +2222,8 @@ impl AvailabilityAnalyzer {
                 }))
             }
             Expr::ClosureCall(closure, args) => {
-                let closure_state = self.closure_flow_state(closure, state, 0)?;
+                let (args, arg_state) = self.rewrite_call_args(args, state)?;
+                let closure_state = self.closure_flow_state(closure, &arg_state, 0)?;
                 Ok(Expr::ClosureCall(
                     ClosureExpr {
                         param_slots: closure.param_slots.clone(),
@@ -1808,7 +2234,7 @@ impl AvailabilityAnalyzer {
                             &closure_state,
                         )?),
                     },
-                    self.rewrite_call_args(args, state)?,
+                    args,
                 ))
             }
             Expr::Add(lhs, rhs)
@@ -1821,8 +2247,35 @@ impl AvailabilityAnalyzer {
             | Expr::Eq(lhs, rhs)
             | Expr::Lt(lhs, rhs)
             | Expr::Gt(lhs, rhs) => {
-                let lhs = self.rewrite_expr_ownership_inner(lhs, false, state)?;
-                let rhs = self.rewrite_expr_ownership_inner(rhs, false, state)?;
+                let copy = matches!(expr, Expr::Add(..));
+                let observation = matches!(
+                    expr,
+                    Expr::Eq(..) | Expr::Lt(..) | Expr::Gt(..) | Expr::And(..) | Expr::Or(..)
+                );
+                let (lhs, lhs_state) = if copy {
+                    let seed = self.next_collection_alias_id.get();
+                    let lhs = self.rewrite_expr_ownership_inner(lhs, true, state)?;
+                    self.next_collection_alias_id.set(seed);
+                    // Add's existing projection-copy transfer must not become
+                    // a consuming Get merely because its RHS needs the state.
+                    let out = self.analyze_expr_to_owned(&lhs, state, 1)?;
+                    (lhs, out)
+                } else {
+                    // Only bare observations use the plain-read context.
+                    // Nested projections and explicit calls keep their own
+                    // consuming transfer rules, matching source analysis.
+                    self.rewrite_expr_and_state(
+                        lhs,
+                        observation && matches!(lhs.as_ref(), Expr::Var(_)),
+                        state,
+                        1,
+                    )?
+                };
+                let rhs = self.rewrite_expr_ownership_inner(
+                    rhs,
+                    copy || (observation && matches!(rhs.as_ref(), Expr::Var(_))),
+                    &lhs_state,
+                )?;
                 Ok(match expr {
                     Expr::Add(..) => Expr::Add(Box::new(lhs), Box::new(rhs)),
                     Expr::Sub(..) => Expr::Sub(Box::new(lhs), Box::new(rhs)),
@@ -1866,31 +2319,112 @@ impl AvailabilityAnalyzer {
                 condition,
                 then_expr,
                 else_expr,
-            } => Ok(Expr::IfElse {
-                condition: Box::new(self.rewrite_expr_ownership_inner(condition, false, state)?),
-                then_expr: Box::new(self.rewrite_expr_ownership_inner(then_expr, false, state)?),
-                else_expr: Box::new(self.rewrite_expr_ownership_inner(else_expr, false, state)?),
-            }),
-            Expr::Match {
-                value_slot,
-                result_slot,
-                value,
-                arms,
-                default,
             } => {
-                let mut rewritten_arms = Vec::with_capacity(arms.len());
-                for (pattern, arm_expr) in arms {
-                    rewritten_arms.push((
-                        pattern.clone(),
-                        self.rewrite_expr_ownership_inner(arm_expr, false, state)?,
-                    ));
-                }
-                Ok(Expr::Match {
+                let (condition, condition_state) =
+                    self.rewrite_expr_and_state(condition, false, state, 1)?;
+                Ok(Expr::IfElse {
+                    condition: Box::new(condition),
+                    then_expr: Box::new(self.rewrite_expr_ownership_inner(
+                        then_expr,
+                        false,
+                        &condition_state,
+                    )?),
+                    else_expr: Box::new(self.rewrite_expr_ownership_inner(
+                        else_expr,
+                        false,
+                        &condition_state,
+                    )?),
+                })
+            }
+            Expr::Match { .. } => self.rewrite_expr_for_ownership_with_state(expr, state, 1),
+            Expr::ResultConstruct {
+                ok,
+                payload,
+                result_schema,
+                span,
+                semantic_id,
+            } => Ok(Expr::ResultConstruct {
+                ok: *ok,
+                payload: Box::new(self.rewrite_expr_ownership_inner(payload, false, state)?),
+                result_schema: result_schema.clone(),
+                span: *span,
+                semantic_id: *semantic_id,
+            }),
+            Expr::ResultQuery {
+                value,
+                ok,
+                span,
+                semantic_id,
+            } => Ok(Expr::ResultQuery {
+                // Tag reads must not detach a resource-bearing carrier. The
+                // call-arg flag keeps an owned local as `Var` instead of `MoveVar`.
+                value: Box::new(self.rewrite_expr_ownership_inner(value, true, state)?),
+                ok: *ok,
+                span: *span,
+                semantic_id: *semantic_id,
+            }),
+            Expr::ResultTry {
+                value,
+                value_slot,
+                payload_slot,
+                operand_schema,
+                return_schema,
+                span,
+                semantic_id,
+                ..
+            } => {
+                let value = self.rewrite_expr_ownership_inner(value, false, state)?;
+                // Err returns after evaluating and consuming the operand. Replay
+                // the existing transfer rules on the emitted operand so detached
+                // sources are excluded while fresh frame-owned locals remain.
+                // This only derives metadata; the operand still executes once.
+                let mut operand_state = self.analyze_expr(&value, state, 1)?;
+                self.mark_owned_value_reads_moved(&value, &mut operand_state);
+                Ok(Expr::ResultTry {
+                    value: Box::new(value),
                     value_slot: *value_slot,
-                    result_slot: *result_slot,
-                    value: Box::new(self.rewrite_expr_ownership_inner(value, false, state)?),
-                    arms: rewritten_arms,
-                    default: Box::new(self.rewrite_expr_ownership_inner(default, false, state)?),
+                    payload_slot: *payload_slot,
+                    operand_schema: operand_schema.clone(),
+                    return_schema: return_schema.clone(),
+                    exit_cleanup: self
+                        .err_exit_cleanup_slots(&operand_state, &[*value_slot, *payload_slot]),
+                    span: *span,
+                    semantic_id: *semantic_id,
+                })
+            }
+            Expr::ResultMatch {
+                value,
+                value_slot,
+                ok_binding,
+                ok_expr,
+                err_binding,
+                err_expr,
+                scrutinee_schema,
+                span,
+                semantic_id,
+            } => {
+                let line = 1u32;
+                let value = self.rewrite_expr_ownership_inner(value, false, state)?;
+                let (ok_in, err_in) = self.result_match_arm_states(
+                    &value,
+                    *value_slot,
+                    *ok_binding,
+                    *err_binding,
+                    state,
+                    line,
+                )?;
+                Ok(Expr::ResultMatch {
+                    value: Box::new(value),
+                    value_slot: *value_slot,
+                    ok_binding: *ok_binding,
+                    ok_expr: Box::new(self.rewrite_expr_ownership_inner(ok_expr, false, &ok_in)?),
+                    err_binding: *err_binding,
+                    err_expr: Box::new(
+                        self.rewrite_expr_ownership_inner(err_expr, false, &err_in)?,
+                    ),
+                    scrutinee_schema: scrutinee_schema.clone(),
+                    span: *span,
+                    semantic_id: *semantic_id,
                 })
             }
             Expr::Block { .. } => self.rewrite_expr_for_ownership_with_state(expr, state, 0),
@@ -1906,12 +2440,19 @@ impl AvailabilityAnalyzer {
         }
     }
 
-    fn rewrite_call_args(&self, args: &[Expr], state: &FlowState) -> Result<Vec<Expr>, ParseError> {
+    fn rewrite_call_args(
+        &self,
+        args: &[Expr],
+        state: &FlowState,
+    ) -> Result<(Vec<Expr>, FlowState), ParseError> {
         let mut rewritten = Vec::with_capacity(args.len());
+        let mut arg_state = state.clone();
         for arg in args {
-            rewritten.push(self.rewrite_expr_ownership_inner(arg, true, state)?);
+            let (arg, next) = self.rewrite_expr_and_state(arg, true, &arg_state, 1)?;
+            rewritten.push(arg);
+            arg_state = next;
         }
-        Ok(rewritten)
+        Ok((rewritten, arg_state))
     }
 
     /// Rewrites a `TakeOwned` argument: a local becomes `MoveVar`, a literal
@@ -2352,6 +2893,7 @@ impl AvailabilityAnalyzer {
                 moved_definite: HashSet::new(),
                 moved_possible: HashSet::new(),
                 copyable_fields: HashSet::new(),
+                current_owned: vec![false; self.local_count],
             },
             (true, false) => lhs,
             (false, true) => rhs,
@@ -2363,6 +2905,7 @@ impl AvailabilityAnalyzer {
                 let mut collection_aliases = vec![HashSet::new(); self.local_count];
                 let mut moved_local_definite = vec![false; self.local_count];
                 let mut moved_local_possible = vec![false; self.local_count];
+                let mut current_owned = vec![false; self.local_count];
                 for idx in 0..self.local_count {
                     definite[idx] = lhs.definite[idx] && rhs.definite[idx];
                     possible[idx] = lhs.possible[idx] || rhs.possible[idx];
@@ -2376,6 +2919,12 @@ impl AvailabilityAnalyzer {
                         lhs.moved_local_definite[idx] && rhs.moved_local_definite[idx];
                     moved_local_possible[idx] =
                         lhs.moved_local_possible[idx] || rhs.moved_local_possible[idx];
+                    // A branch-local owner remains ours when the other edge
+                    // never initialized the slot (Null at runtime). Do not turn
+                    // a real caller-owned/borrowed predecessor into ownership.
+                    current_owned[idx] = (lhs.current_owned[idx]
+                        && (rhs.current_owned[idx] || !rhs.possible[idx]))
+                        || (rhs.current_owned[idx] && !lhs.possible[idx]);
                 }
                 let moved_possible = lhs
                     .moved_possible
@@ -2404,6 +2953,7 @@ impl AvailabilityAnalyzer {
                     moved_definite,
                     moved_possible,
                     copyable_fields,
+                    current_owned,
                 }
             }
         }
@@ -2496,6 +3046,151 @@ mod tests {
             })),
             None,
         )
+    }
+
+    #[test]
+    fn postoperand_join_retains_branch_local_owner_but_not_borrowed_predecessor() {
+        let analyzer = AvailabilityAnalyzer::new(1, &[], &HashMap::new(), true, &[true]);
+        let absent = FlowState::reachable(1);
+        let mut owned = absent.clone();
+        analyzer.mark_available(&mut owned, 0, 1).unwrap();
+        owned.current_owned[0] = true;
+        for (lhs, rhs) in [(owned.clone(), absent.clone()), (absent, owned.clone())] {
+            let merged = analyzer.merge_states(lhs, rhs);
+            assert!(merged.current_owned[0]);
+            assert!(!merged.definite[0]);
+            assert_eq!(
+                analyzer.err_exit_cleanup_slots(&merged, &[]),
+                vec![(0, TypeSchema::Optional(Box::new(TypeSchema::Unknown)))]
+            );
+            assert!(analyzer.err_exit_cleanup_slots(&merged, &[0]).is_empty());
+        }
+        let mut borrowed = owned.clone();
+        borrowed.current_owned[0] = false;
+        for (lhs, rhs) in [(owned.clone(), borrowed.clone()), (borrowed, owned)] {
+            let merged = analyzer.merge_states(lhs, rhs);
+            assert!(!merged.current_owned[0]);
+            assert!(analyzer.err_exit_cleanup_slots(&merged, &[]).is_empty());
+        }
+    }
+
+    fn polex_try_expr() -> Expr {
+        let schema = TypeSchema::Result {
+            ok: Box::new(TypeSchema::Int),
+            err: Box::new(TypeSchema::Int),
+        };
+        let span = crate::compiler::source_map::Span {
+            source_id: 0,
+            lo: 0,
+            hi: 1,
+        };
+        Expr::ResultTry {
+            value: Box::new(Expr::ResultConstruct {
+                ok: false,
+                payload: Box::new(Expr::Int(9)),
+                result_schema: schema.clone(),
+                span,
+                semantic_id: None,
+            }),
+            value_slot: 2,
+            payload_slot: 3,
+            operand_schema: schema.clone(),
+            return_schema: schema,
+            exit_cleanup: Vec::new(),
+            span,
+            semantic_id: None,
+        }
+    }
+
+    #[test]
+    fn polex_metadata_optional_container_and_exact_host_args_thread_consumption() {
+        let key = ResourceTypeKey::new("test.resource").unwrap();
+        let analyzer = AvailabilityAnalyzer::new(
+            6,
+            &[],
+            &HashMap::new(),
+            true,
+            &[true, true, false, false, false, false],
+        );
+        let mut state = FlowState::reachable(6);
+        for slot in [0, 1] {
+            analyzer.mark_available(&mut state, slot, 1).unwrap();
+            state.current_owned[slot as usize] = true;
+        }
+        let optional = Expr::OptionalGet {
+            field_projection: false,
+            container: Box::new(take_call(Expr::Var(0), &key)),
+            key: Box::new(polex_try_expr()),
+            container_slot: 4,
+            key_slot: 5,
+            semantic_id: None,
+        };
+        let mut resolution = take_resolution(&key);
+        resolution.passing.push(HostParamPassing::Value);
+        resolution.params.push(ResolvedHostParam {
+            name: "next".into(),
+            schema: TypeSchema::Int,
+        });
+        let call = Expr::Call(
+            99,
+            vec![],
+            vec![Expr::Var(0), polex_try_expr()],
+            Some(resolution),
+            None,
+        );
+        for expr in [optional, call] {
+            let rewritten = analyzer
+                .rewrite_expr_ownership_inner(&expr, false, &state)
+                .unwrap();
+            let nested = match &rewritten {
+                Expr::OptionalGet { key, .. } => key.as_ref(),
+                Expr::Call(_, _, args, _, _) => &args[1],
+                _ => unreachable!(),
+            };
+            let Expr::ResultTry { exit_cleanup, .. } = nested else {
+                panic!("missing Try")
+            };
+            assert_eq!(*exit_cleanup, vec![(1, TypeSchema::Unknown)]);
+        }
+    }
+
+    #[test]
+    fn polex_for_post_cleanup_uses_continue_edge_fresh_owner() {
+        let key = ResourceTypeKey::new("test.resource").unwrap();
+        let analyzer =
+            AvailabilityAnalyzer::new(4, &[], &HashMap::new(), true, &[true, true, false, false]);
+        let mut state = FlowState::reachable(4);
+        analyzer.mark_available(&mut state, 0, 1).unwrap();
+        state.current_owned[0] = true;
+        let init = Stmt::Noop { line: 1 };
+        let condition = Expr::Bool(true);
+        let post = Stmt::Expr {
+            expr: polex_try_expr(),
+            line: 1,
+        };
+        let body = vec![resource_binding(1, &key), Stmt::Continue { line: 1 }];
+        let parts = ForLoopParts {
+            init: &init,
+            condition: &condition,
+            post: &post,
+            body: &body,
+            line: 1,
+        };
+        let (rewritten, _) = analyzer.analyze_for_loop(parts, state, true).unwrap();
+        let Stmt::For { post, .. } = rewritten else {
+            unreachable!()
+        };
+        let Stmt::Expr {
+            expr: Expr::ResultTry { exit_cleanup, .. },
+            ..
+        } = *post
+        else {
+            panic!("missing post Try")
+        };
+        assert_eq!(
+            exit_cleanup,
+            vec![(0, TypeSchema::Unknown), (1, TypeSchema::Unknown)]
+        );
     }
 
     #[test]

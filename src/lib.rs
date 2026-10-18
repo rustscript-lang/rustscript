@@ -7,6 +7,10 @@ pub mod debug_info;
 #[cfg(feature = "runtime")]
 pub mod debugger;
 pub mod host_api;
+pub mod result;
+pub use result::GuestResult;
+#[cfg(feature = "runtime")]
+pub use result::{ScriptValueContext, VmScriptArgs, VmScriptValue};
 #[cfg(feature = "runtime")]
 pub mod jit {
     pub use crate::vm::jit::{
@@ -62,8 +66,8 @@ pub use builtins::runtime::http::{
 };
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
-    BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, TakeVmValue, arg, borrow_arg,
-    return_one, take_arg,
+    BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, IntoVmValue, TakeVmValue, arg,
+    borrow_arg, return_one, take_arg,
 };
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
@@ -84,7 +88,8 @@ pub use builtins::{
 pub use bytecode::{
     CallableEnvironment, CallableKind, CallablePrototype, CallableTarget, CallableValue,
     CaptureBindingMode, ExportedCallable, FunctionRegion, HostImport, MAX_FRAME_LOCAL_COUNT,
-    OpCode, Program, RootCallableBinding, ScriptFunction, TypeMap, Value, ValueType, VmMap,
+    OpCode, Program, RetCleanupLocal, RetCleanupPlan, RootCallableBinding, ScriptFunction, TypeMap,
+    Value, ValueType, VmMap,
 };
 pub use host_api::{
     FunctionNameError, HostApiBuilder, HostApiCatalog, HostApiCatalogError, HostApiFingerprint,

@@ -3,6 +3,7 @@ use super::*;
 type MatchBinding = Option<(String, Span, LocalSlot)>;
 type ParsedMatchPattern = (Option<MatchPattern>, MatchBinding);
 type ParsedMatchConstructor = Option<(MatchPattern, MatchBinding)>;
+type ResultConstructorPattern = (bool, Option<(String, Span, LocalSlot)>);
 
 impl Parser {
     pub(super) fn parse_expr(&mut self) -> Result<Expr, ParseError> {
@@ -166,7 +167,9 @@ impl Parser {
             let inner = self.parse_unary()?;
             Ok(Expr::Not(Box::new(inner)))
         } else {
-            self.parse_primary()
+            let start = self.current_span();
+            let expr = self.parse_primary()?;
+            self.parse_postfix_access(expr, start)
         }
     }
 
@@ -359,6 +362,11 @@ impl Parser {
                 .get(self.pos.saturating_sub(1))
                 .map(|t| t.span)
                 .unwrap_or_else(|| self.current_span());
+            if self.dialect.allow_result_syntax() && name == "Result" && self.check_path_separator()
+            {
+                let expr = self.parse_result_constructor(name_span)?;
+                return self.parse_postfix_access(expr, name_span);
+            }
             if self.dialect.allow_dotted_call()
                 && let Some(expr) = self.try_parse_js_dotted_call(&name, name_span)?
             {
@@ -828,6 +836,96 @@ impl Parser {
         Ok(expr)
     }
 
+    pub(super) fn parse_result_constructor(&mut self, start: Span) -> Result<Expr, ParseError> {
+        if !self.match_path_separator() {
+            return Err(ParseError {
+                span: Some(start),
+                code: None,
+                line: self.current_line(),
+                message: "expected '::' after Result".to_string(),
+            });
+        }
+        let ctor = self.expect_ident("expected Result constructor 'Ok' or 'Err'")?;
+        let ok = match ctor.as_str() {
+            "Ok" => true,
+            "Err" => false,
+            other => {
+                return Err(ParseError {
+                    span: Some(start),
+                    code: None,
+                    line: self.current_line(),
+                    message: format!("unknown Result constructor '{other}'"),
+                });
+            }
+        };
+        self.expect(&TokenKind::LParen, "expected '(' after Result constructor")?;
+        let payload = self.parse_expr()?;
+        self.expect(
+            &TokenKind::RParen,
+            "expected ')' after Result constructor payload",
+        )?;
+        let hi = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span.hi)
+            .unwrap_or(start.hi);
+        Ok(Expr::ResultConstruct {
+            ok,
+            payload: Box::new(payload),
+            result_schema: TypeSchema::Unknown,
+            span: Span::new(start.source_id, start.lo, hi),
+            semantic_id: None,
+        })
+    }
+
+    fn peek_result_constructor_pattern(&self) -> bool {
+        self.dialect.allow_result_syntax()
+            && self.check_ident_literal("Result")
+            && self.check_kind_at(self.pos + 1, &TokenKind::Colon)
+            && self.check_kind_at(self.pos + 2, &TokenKind::Colon)
+    }
+
+    fn parse_result_constructor_pattern(&mut self) -> Result<ResultConstructorPattern, ParseError> {
+        let start = self.current_span();
+        let name = self.expect_ident("expected Result")?;
+        if name != "Result" || !self.match_path_separator() {
+            return Err(ParseError {
+                span: Some(start),
+                code: None,
+                line: self.current_line(),
+                message: "expected Result::Ok or Result::Err match pattern".to_string(),
+            });
+        }
+        let ctor = self.expect_ident("expected Result constructor in match pattern")?;
+        let ok = match ctor.as_str() {
+            "Ok" => true,
+            "Err" => false,
+            other => {
+                return Err(ParseError {
+                    span: Some(start),
+                    code: None,
+                    line: self.current_line(),
+                    message: format!("unknown Result match constructor '{other}'"),
+                });
+            }
+        };
+        self.expect(&TokenKind::LParen, "expected '(' in Result match pattern")?;
+        let binding = if self.match_ident_literal("_") {
+            None
+        } else {
+            let (binding_name, binding_span) =
+                self.expect_ident_with_span("expected binding name in Result match pattern")?;
+            let slot = self.allocate_hidden_local()?;
+            self.set_local_slot_mutable(slot, false);
+            Some((binding_name, binding_span, slot))
+        };
+        self.expect(
+            &TokenKind::RParen,
+            "expected ')' after Result match pattern",
+        )?;
+        Ok((ok, binding))
+    }
+
     pub(super) fn parse_match_expr(&mut self) -> Result<Expr, ParseError> {
         let value = self.parse_expr()?;
         self.expect(&TokenKind::LBrace, "expected '{' after match value")?;
@@ -836,6 +934,9 @@ impl Parser {
         let result_slot = self.allocate_hidden_local()?;
         let mut arms = Vec::<(MatchPattern, Expr)>::new();
         let mut default: Option<Expr> = None;
+        let mut result_ok: Option<(Option<LocalSlot>, Expr)> = None;
+        let mut result_err: Option<(Option<LocalSlot>, Expr)> = None;
+        let mut saw_result_arm = false;
 
         while !self.check(&TokenKind::RBrace) {
             if self.check(&TokenKind::Eof) {
@@ -848,55 +949,90 @@ impl Parser {
             }
 
             let pattern_token_line = self.current_line();
-            let (pattern, arm_binding) = self.parse_match_pattern()?;
-            self.expect(&TokenKind::FatArrow, "expected '=>' in match arm")?;
-            let arm_expr = if let Some((name, ident_span, slot)) = arm_binding {
-                let mut scope = HashMap::new();
-                scope.insert(name.clone(), slot);
-                self.closure_scopes.push(scope);
-                let arm_open = self.current_span();
-                let arm_result = self.with_scope(arm_open, |parser| {
-                    // Record the match pattern binding inside the arm body
-                    // scope, with the exact identifier token span.
-                    parser.record_local_decl(ident_span, ident_span, slot, name.clone());
-                    parser.parse_expr()
-                });
-                if pattern
-                    .as_ref()
-                    .and_then(MatchPattern::binding_slot)
-                    .is_some()
-                {
+            if self.peek_result_constructor_pattern() {
+                let (ok, binding) = self.parse_result_constructor_pattern()?;
+                self.expect(&TokenKind::FatArrow, "expected '=>' in match arm")?;
+                let arm_expr = if let Some((name, ident_span, slot)) = binding.clone() {
+                    let mut scope = HashMap::new();
+                    scope.insert(name.clone(), slot);
+                    self.closure_scopes.push(scope);
+                    let arm_open = self.current_span();
+                    let arm_result = self.with_scope(arm_open, |parser| {
+                        parser.record_local_decl(ident_span, ident_span, slot, name);
+                        parser.parse_expr()
+                    });
                     self.closure_scopes.pop();
+                    arm_result?
+                } else {
+                    let arm_open = self.current_span();
+                    self.with_scope(arm_open, |parser| parser.parse_expr())?
+                };
+                saw_result_arm = true;
+                let slot = binding.map(|(_, _, slot)| slot);
+                let target = if ok { &mut result_ok } else { &mut result_err };
+                if target.is_some() {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: pattern_token_line,
+                        message: format!(
+                            "duplicate Result::{} match arm",
+                            if ok { "Ok" } else { "Err" }
+                        ),
+                    });
                 }
-                arm_result?
+                *target = Some((slot, arm_expr));
             } else {
-                let arm_open = self.current_span();
-                self.with_scope(arm_open, |parser| parser.parse_expr())?
-            };
+                let (pattern, arm_binding) = self.parse_match_pattern()?;
+                self.expect(&TokenKind::FatArrow, "expected '=>' in match arm")?;
+                let arm_expr = if let Some((name, ident_span, slot)) = arm_binding {
+                    let mut scope = HashMap::new();
+                    scope.insert(name.clone(), slot);
+                    self.closure_scopes.push(scope);
+                    let arm_open = self.current_span();
+                    let arm_result = self.with_scope(arm_open, |parser| {
+                        // Record the match pattern binding inside the arm body
+                        // scope, with the exact identifier token span.
+                        parser.record_local_decl(ident_span, ident_span, slot, name.clone());
+                        parser.parse_expr()
+                    });
+                    if pattern
+                        .as_ref()
+                        .and_then(MatchPattern::binding_slot)
+                        .is_some()
+                    {
+                        self.closure_scopes.pop();
+                    }
+                    arm_result?
+                } else {
+                    let arm_open = self.current_span();
+                    self.with_scope(arm_open, |parser| parser.parse_expr())?
+                };
 
-            match pattern {
-                Some(pattern) => {
-                    if default.is_some() {
-                        return Err(ParseError {
-                            span: None,
-                            code: None,
-                            line: pattern_token_line,
-                            message: "non-wildcard match arm cannot appear after '_' arm"
-                                .to_string(),
-                        });
+                match pattern {
+                    Some(pattern) => {
+                        if default.is_some() {
+                            return Err(ParseError {
+                                span: None,
+                                code: None,
+                                line: pattern_token_line,
+                                message: "non-wildcard match arm cannot appear after '_' arm"
+                                    .to_string(),
+                            });
+                        }
+                        arms.push((pattern, arm_expr));
                     }
-                    arms.push((pattern, arm_expr));
-                }
-                None => {
-                    if default.is_some() {
-                        return Err(ParseError {
-                            span: None,
-                            code: None,
-                            line: pattern_token_line,
-                            message: "duplicate '_' match arm".to_string(),
-                        });
+                    None => {
+                        if default.is_some() {
+                            return Err(ParseError {
+                                span: None,
+                                code: None,
+                                line: pattern_token_line,
+                                message: "duplicate '_' match arm".to_string(),
+                            });
+                        }
+                        default = Some(arm_expr);
                     }
-                    default = Some(arm_expr);
                 }
             }
 
@@ -916,6 +1052,67 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RBrace, "expected '}' after match expression")?;
+
+        if saw_result_arm {
+            if !arms.is_empty() {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: "Result match cannot mix constructor arms with value patterns"
+                        .to_string(),
+                });
+            }
+            let (ok_binding, ok_expr) = if let Some((slot, expr)) = result_ok {
+                if result_err.is_none() && default.is_some() {
+                    (slot, expr)
+                } else if result_err.is_some() && default.is_some() {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: self.current_line(),
+                        message:
+                            "Result match with both constructor arms cannot also have a wildcard"
+                                .to_string(),
+                    });
+                } else {
+                    (slot, expr)
+                }
+            } else if let Some(expr) = default.clone() {
+                (None, expr)
+            } else {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: "Result match is missing Result::Ok arm".to_string(),
+                });
+            };
+            let (err_binding, err_expr) = if let Some((slot, expr)) = result_err {
+                (slot, expr)
+            } else if let Some(expr) = default {
+                (None, expr)
+            } else {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: "Result match is missing Result::Err arm".to_string(),
+                });
+            };
+            let span = self.current_span();
+            return Ok(Expr::ResultMatch {
+                value: Box::new(value),
+                value_slot,
+                ok_binding,
+                ok_expr: Box::new(ok_expr),
+                err_binding,
+                err_expr: Box::new(err_expr),
+                scrutinee_schema: TypeSchema::Unknown,
+                span,
+                semantic_id: None,
+            });
+        }
 
         let default = default.ok_or_else(|| ParseError {
             span: None,
@@ -1150,6 +1347,23 @@ impl Parser {
                         expr_span,
                         "unwrap_or".to_string(),
                     )?;
+                } else if self.dialect.allow_result_syntax()
+                    && (member == "is_ok" || member == "is_err")
+                    && self.check(&TokenKind::LParen)
+                {
+                    self.expect(&TokenKind::LParen, "expected '(' after Result query")?;
+                    self.expect(&TokenKind::RParen, "Result query does not take arguments")?;
+                    let expr_span = Span::new(
+                        chain_start.source_id,
+                        chain_start.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    expr = Expr::ResultQuery {
+                        value: Box::new(expr),
+                        ok: member == "is_ok",
+                        span: expr_span,
+                        semantic_id: None,
+                    };
                 } else if member == "length" {
                     let expr_span =
                         Span::new(chain_start.source_id, chain_start.lo, member_span.hi);
@@ -1200,6 +1414,30 @@ impl Parser {
                 continue;
             }
             if self.match_kind(&TokenKind::Question) {
+                if !self.check(&TokenKind::Dot) {
+                    if self.dialect.allow_result_try() {
+                        let question_span = self.tokens[self.pos - 1].span;
+                        let value_slot = self.allocate_hidden_local()?;
+                        let payload_slot = self.allocate_hidden_local()?;
+                        expr = Expr::ResultTry {
+                            value: Box::new(expr),
+                            value_slot,
+                            payload_slot,
+                            operand_schema: TypeSchema::Unknown,
+                            return_schema: TypeSchema::Unknown,
+                            exit_cleanup: Vec::new(),
+                            span: question_span,
+                            semantic_id: None,
+                        };
+                        continue;
+                    }
+                    return Err(ParseError {
+                        line: self.current_line(),
+                        message: "expected '.' after '?' in optional access".to_string(),
+                        span: Some(self.tokens[self.pos - 1].span),
+                        code: None,
+                    });
+                }
                 self.expect(&TokenKind::Dot, "expected '.' after '?' in optional access")?;
                 if self.match_kind(&TokenKind::LBracket) {
                     let bracket_open = self
@@ -2272,6 +2510,10 @@ impl Parser {
                     .collect(),
                 result: Box::new(Self::substitute_contextual_schema(result, bindings)),
             },
+            TypeSchema::Result { ok, err } => TypeSchema::Result {
+                ok: Box::new(Self::substitute_contextual_schema(ok, bindings)),
+                err: Box::new(Self::substitute_contextual_schema(err, bindings)),
+            },
             _ => schema.clone(),
         }
     }
@@ -2812,9 +3054,31 @@ impl Parser {
 
     pub(super) fn parse_call_args(&mut self) -> Result<Vec<Expr>, ParseError> {
         let mut args = Vec::new();
+        let mut arguments = Vec::new();
         if !self.check(&TokenKind::RParen) {
             loop {
-                args.push(self.parse_expr()?);
+                let start = self.tokens[self.pos].span;
+                let arg = self.parse_expr()?;
+                let end = self.tokens[self.pos - 1].span;
+                use super::super::ir::{ParsedArgumentShape, ParsedCallArgument};
+                let (shape, inner) = match &arg {
+                    Expr::Borrow(inner) => (ParsedArgumentShape::Borrow, Some(inner.as_ref())),
+                    Expr::BorrowMut(inner) => {
+                        (ParsedArgumentShape::BorrowMut, Some(inner.as_ref()))
+                    }
+                    Expr::ToOwned(inner) => (ParsedArgumentShape::Copy, Some(inner.as_ref())),
+                    _ => (ParsedArgumentShape::Other, None),
+                };
+                let local = match inner {
+                    Some(Expr::Var(slot)) => Some(*slot),
+                    _ => None,
+                };
+                arguments.push(ParsedCallArgument {
+                    span: Span::new(start.source_id, start.lo, end.hi),
+                    shape,
+                    local,
+                });
+                args.push(arg);
                 if self.match_kind(&TokenKind::Comma) {
                     continue;
                 }
@@ -2822,6 +3086,8 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RParen, "expected ')' after arguments")?;
+        self.call_args_by_end
+            .insert(self.tokens[self.pos - 1].span.hi, arguments);
         Ok(args)
     }
 }

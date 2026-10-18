@@ -1,0 +1,17 @@
+error[E0277]: the trait bound `ResourceOwned<Counter>: FromVmValue<'_>` is not satisfied
+ --> tests/ui/fail/guest_result_owned_borrow_decode.rs:4:14
+  |
+4 |     let _ = <GuestResult<ResourceOwned<Counter>, i64> as FromVmValue<'_>>::from_vm_value(
+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `FromVmValue<'_>` is not implemented for `ResourceOwned<Counter>`
+  |
+  = help: the following other types implement trait `FromVmValue<'a>`:
+            `&'a VmMap` implements `FromVmValue<'a>`
+            `&'a [u8]` implements `FromVmValue<'a>`
+            `&'a [vm::Value]` implements `FromVmValue<'a>`
+            `&'a str` implements `FromVmValue<'a>`
+            `&'a vm::Value` implements `FromVmValue<'a>`
+            `()` implements `FromVmValue<'_>`
+            `Arc<Vec<u8>>` implements `FromVmValue<'_>`
+            `Arc<Vec<vm::Value>>` implements `FromVmValue<'_>`
+          and $N others
+  = note: required for `GuestResult<ResourceOwned<Counter>, i64>` to implement `FromVmValue<'_>`

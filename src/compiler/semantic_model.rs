@@ -642,6 +642,10 @@ impl SemanticModel {
                 result: Box::new(self.compiler_schema_to_host_schema(result)),
             },
             TypeSchema::Resource(key) => HostTypeSchema::Resource(key.clone()),
+            TypeSchema::Result { ok, err } => HostTypeSchema::Result {
+                ok: Box::new(self.compiler_schema_to_host_schema(ok)),
+                err: Box::new(self.compiler_schema_to_host_schema(err)),
+            },
             TypeSchema::Named(name, _type_args) => self
                 .catalog
                 .struct_named(name)
@@ -1673,6 +1677,7 @@ impl std::fmt::Display for TypeSchema {
                 write!(f, "fn({}) -> {result}", params_str.join(", "))
             }
             TypeSchema::Resource(key) => write!(f, "resource<{key}>"),
+            TypeSchema::Result { ok, err } => write!(f, "Result<{ok}, {err}>"),
         }
     }
 }

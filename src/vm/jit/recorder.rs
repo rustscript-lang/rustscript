@@ -464,9 +464,10 @@ fn inline_schema_guard_type(schema: &TypeSchema) -> Option<Option<ValueType>> {
         TypeSchema::Bool => Some(Some(ValueType::Bool)),
         TypeSchema::String => Some(Some(ValueType::String)),
         TypeSchema::Bytes => Some(Some(ValueType::Bytes)),
-        TypeSchema::Named(_, _) | TypeSchema::Map(_) | TypeSchema::Object(_) => {
-            Some(Some(ValueType::Map))
-        }
+        TypeSchema::Named(_, _)
+        | TypeSchema::Map(_)
+        | TypeSchema::Object(_)
+        | TypeSchema::Result { .. } => Some(Some(ValueType::Map)),
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
             Some(Some(ValueType::Array))
         }
@@ -2788,7 +2789,13 @@ fn select_numeric_compare(
     lhs: ValueInfo,
     rhs: ValueInfo,
 ) -> Result<NumericCompareKind, TraceRecordError> {
-    if lhs.force_value_eq || rhs.force_value_eq {
+    if lhs.force_value_eq
+        || rhs.force_value_eq
+        || [lhs.known_type, rhs.known_type]
+            .into_iter()
+            .flatten()
+            .any(|ty| !matches!(ty, ValueType::Int | ValueType::Float | ValueType::Unknown))
+    {
         return Err(TraceRecordError::UnsupportedTrace(
             "SSA recorder requires value equality for known non-numeric operands".to_string(),
         ));

@@ -4,9 +4,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Value;
 use crate::compiler::TypeSchema;
+use crate::host_api::HostTypeSchema;
+use crate::result::{PendingScriptResource, ScriptValueContext, VmScriptArgs, VmScriptValue};
 
 use super::execution_scope::ExecutionScopeError;
 use super::{EpochCheckpoint, EpochHandle, FuelCheckpoint, Vm, VmError, VmResult, VmStatus};
+
+mod publication;
 
 /// Lightweight Wasmtime-style store wrapper for VM state and host context data.
 pub struct Store<T = ()> {
@@ -76,11 +80,7 @@ impl<Args, Ret> Clone for ScriptCallback<Args, Ret> {
     }
 }
 
-impl<Args, Ret> ScriptCallback<Args, Ret>
-where
-    Args: ScriptArgs,
-    Ret: ScriptResult,
-{
+impl<Args, Ret> ScriptCallback<Args, Ret> {
     pub fn schema(&self) -> Option<&TypeSchema> {
         self.schema.as_ref()
     }
@@ -92,7 +92,9 @@ where
     pub fn unsubscribe(&self) {
         self.subscription.store(false, Ordering::Release);
     }
+}
 
+impl<Args: ScriptArgs, Ret: ScriptResult> ScriptCallback<Args, Ret> {
     pub fn call<T>(&self, store: &mut Store<T>, args: Args) -> VmResult<Ret> {
         let invocation = self.prepare(args)?;
         store.validate_invocation(&invocation)?;
@@ -128,6 +130,320 @@ where
             callable: self.callable.clone(),
             args: args.into_values(),
         })
+    }
+}
+
+impl ScriptValueContext<'_> {
+    /// Inserts one owned value through the normal typed publication authority.
+    /// Conversion/admission failure rolls this insertion back; after admission
+    /// the journal reclaims only abandoned owners when invocation completes.
+    pub fn publish_owned<T: crate::HostResourceType>(
+        &mut self,
+        value: crate::ResourceOwned<T>,
+    ) -> VmResult<Value> {
+        let value = crate::result::publish_owned(
+            self.vm,
+            value,
+            &<crate::ResourceOwned<T> as VmScriptValue>::schema()?,
+            Ok,
+        )?;
+        let handle = crate::result::resource_handle(&value)?;
+        self.pending.push(PendingScriptResource {
+            handle,
+            key: T::KEY,
+            close: close_unpublished::<T>,
+        });
+        Ok(value)
+    }
+
+    fn rollback(&mut self, primary: VmError) -> VmError {
+        let mut failures = Vec::new();
+        for pending in self.pending.drain(..).rev() {
+            if let Err(error) = (pending.close)(self.vm, pending.handle) {
+                failures.push(error.to_string());
+            }
+        }
+        if failures.is_empty() {
+            primary
+        } else {
+            VmError::HostError(format!(
+                "{primary}; callback publication rollback: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+}
+
+fn close_unpublished<T: crate::HostResourceType>(
+    vm: &mut Vm,
+    handle: crate::ResourceHandle,
+) -> VmResult<()> {
+    // Frame admission can reject after the normal abort protocol retired the
+    // entry. Never reinterpret a stale handle as a new generation to close.
+    let key = crate::ResourceTypeKey::new(T::KEY)
+        .map_err(|error| VmError::HostError(error.to_string()))?;
+    if vm
+        .host_context()
+        .typed_resource_with_key::<T>(handle, &key)
+        .is_ok()
+    {
+        vm.host_context()
+            .close_resource::<T>(handle, crate::ResourceCloseReason::Requested)
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+    }
+    Ok(())
+}
+
+impl<T: crate::HostResourceType> VmScriptValue for crate::ResourceOwned<T> {
+    fn schema() -> VmResult<HostTypeSchema> {
+        crate::ResourceTypeKey::new(T::KEY)
+            .map(HostTypeSchema::Resource)
+            .map_err(|error| VmError::HostError(error.to_string()))
+    }
+    fn into_value(self, context: &mut ScriptValueContext<'_>) -> VmResult<Value> {
+        context.publish_owned(self)
+    }
+    fn from_value(vm: &mut Vm, value: Value) -> VmResult<Self> {
+        let key = crate::ResourceTypeKey::new(T::KEY)
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        vm.host_context()
+            .take_resource_with_key::<T>(crate::result::resource_handle(&value)?, &key)
+            .map(crate::ResourceOwned::new)
+            .map_err(|error| VmError::HostError(error.to_string()))
+    }
+}
+
+macro_rules! impl_vm_script_scalar {
+    ($ty:ty, $schema:ident) => {
+        impl VmScriptValue for $ty {
+            fn schema() -> VmResult<HostTypeSchema> {
+                Ok(HostTypeSchema::$schema)
+            }
+            fn into_value(self, _: &mut ScriptValueContext<'_>) -> VmResult<Value> {
+                Ok(crate::IntoVmValue::into_vm_value(self))
+            }
+            fn from_value(_: &mut Vm, value: Value) -> VmResult<Self> {
+                crate::FromVmValue::from_vm_value(&value, "callback result")
+            }
+        }
+    };
+}
+impl_vm_script_scalar!(i64, Int);
+impl_vm_script_scalar!(bool, Bool);
+impl_vm_script_scalar!(String, String);
+impl_vm_script_scalar!((), Null);
+
+impl<T: VmScriptValue, E: VmScriptValue> VmScriptValue for crate::GuestResult<T, E> {
+    fn schema() -> VmResult<HostTypeSchema> {
+        Ok(HostTypeSchema::Result {
+            ok: Box::new(T::schema()?),
+            err: Box::new(E::schema()?),
+        })
+    }
+    fn into_value(self, context: &mut ScriptValueContext<'_>) -> VmResult<Value> {
+        match self {
+            Self::Ok(value) => Ok(crate::result::carrier(true, value.into_value(context)?)),
+            Self::Err(value) => Ok(crate::result::carrier(false, value.into_value(context)?)),
+        }
+    }
+    fn from_value(vm: &mut Vm, value: Value) -> VmResult<Self> {
+        vm.validate_guest_result_value(&value, &Self::schema()?)?;
+        let (tag, payload) = crate::result::payload(&value)?;
+        if tag {
+            T::from_value(vm, payload.clone()).map(Self::Ok)
+        } else {
+            E::from_value(vm, payload.clone()).map(Self::Err)
+        }
+    }
+}
+
+impl<T: VmScriptValue> VmScriptValue for Option<T> {
+    fn schema() -> VmResult<HostTypeSchema> {
+        Ok(HostTypeSchema::Optional(Box::new(T::schema()?)))
+    }
+    fn into_value(self, context: &mut ScriptValueContext<'_>) -> VmResult<Value> {
+        self.map_or(Ok(Value::Null), |value| value.into_value(context))
+    }
+    fn from_value(vm: &mut Vm, value: Value) -> VmResult<Self> {
+        if matches!(value, Value::Null) {
+            Ok(None)
+        } else {
+            T::from_value(vm, value).map(Some)
+        }
+    }
+}
+
+impl VmScriptArgs for () {
+    fn schemas() -> VmResult<Vec<HostTypeSchema>> {
+        Ok(Vec::new())
+    }
+    fn into_values(self, _: &mut ScriptValueContext<'_>) -> VmResult<Vec<Value>> {
+        Ok(Vec::new())
+    }
+}
+macro_rules! impl_vm_script_args {
+    ($($name:ident),+) => {
+        impl<$($name: VmScriptValue),+> VmScriptArgs for ($($name,)+) {
+            fn schemas() -> VmResult<Vec<HostTypeSchema>> { Ok(vec![$($name::schema()?),+]) }
+            #[allow(non_snake_case)]
+            fn into_values(self, context: &mut ScriptValueContext<'_>) -> VmResult<Vec<Value>> {
+                let ($($name,)+) = self;
+                Ok(vec![$($name.into_value(context)?),+])
+            }
+        }
+    };
+}
+impl_vm_script_args!(A);
+impl_vm_script_args!(A, B);
+impl_vm_script_args!(A, B, C);
+impl_vm_script_args!(A, B, C, D);
+
+impl<Args: VmScriptArgs, Ret: VmScriptValue> ScriptCallback<Args, Ret> {
+    /// Synchronously invokes an RSS callback using live-VM owned conversions.
+    /// Context-free prepare/start/queued callbacks retain their existing API.
+    /// A native handler retaining an owned resource in opaque Rust state must
+    /// take it through the typed resource API (or a `ResourceOwned` parameter).
+    /// Copying an encoded integer token alone does not transfer ownership.
+    /// If bounded ownership inspection fails, execution roots are retained and
+    /// the VM requires explicit shutdown/reset; no successful abort is claimed.
+    pub fn call_with_vm<T>(&self, store: &mut Store<T>, args: Args) -> VmResult<Ret> {
+        let invocation = QueuedScriptInvocation {
+            registry: Arc::clone(&self.registry),
+            subscription: Arc::clone(&self.subscription),
+            callable: self.callable.clone(),
+            args: Vec::new(),
+        };
+        store.validate_invocation(&invocation)?;
+        store.vm.ensure_scope_ready()?;
+        // Reuse the ordinary callback's prototype/identity/schema authority.
+        store.vm_script_callback::<Args, Ret>(self.callable.clone())?;
+        if !store.vm.instance.execution_frames.is_empty() {
+            return Err(VmError::InvalidFrameState(
+                "host invocation requires a halted VM",
+            ));
+        }
+        let mut context = ScriptValueContext {
+            vm: &mut store.vm,
+            pending: Vec::new(),
+        };
+        let values = match args.into_values(&mut context).and_then(|values| {
+            let schemas = Args::schemas()?;
+            if values.len() != schemas.len() {
+                return Err(VmError::TypeMismatch("callback argument count"));
+            }
+            for (value, schema) in values.iter().zip(&schemas) {
+                context.vm.validate_guest_result_value(value, schema)?;
+            }
+            Ok(values)
+        }) {
+            Ok(values) => values,
+            Err(error) => return Err(context.rollback(error)),
+        };
+        let argc = match u8::try_from(values.len()) {
+            Ok(argc) => argc,
+            Err(_) => {
+                return Err(context.rollback(VmError::InvalidFrameState("too many arguments")));
+            }
+        };
+        let stack_base = context.vm.instance.stack.len();
+        let frame_count = context.vm.instance.execution_frames.len();
+        let local_base = context.vm.instance.locals.len();
+        context.vm.instance.stack.push(self.callable.clone());
+        context.vm.instance.stack.extend(values);
+        context.vm.instance.host_return = None;
+        // This is the same frame-entry seam as Vm::start_callable. The narrow
+        // RSS-only hook separates rejection from execution without guessing
+        // from errors or closing guest-owned entries after execution starts.
+        if let Err(error) = context.vm.execute_call_value(argc, None) {
+            context.vm.abort_host_invocation(stack_base, frame_count);
+            return Err(context.rollback(error));
+        }
+        if let Some(frame) = context.vm.instance.execution_frames.last_mut() {
+            frame.continuation = super::FrameContinuation::ReturnToHost;
+        }
+        let result = match context.vm.run_internal(None, false) {
+            Ok(VmStatus::Halted) => {
+                if !context.pending.is_empty() {
+                    // Keep the actual return rooted until classification is
+                    // complete: it and surviving captures retain their owners.
+                    let abandoned = publication::abandoned(
+                        context.vm,
+                        &context.pending,
+                        stack_base,
+                        local_base,
+                        frame_count,
+                    )
+                    .map_err(|projection| {
+                        context.vm.instance.callback_publication_unresolved = true;
+                        VmError::HostError(format!(
+                            "callback publication ownership unresolved (execution roots retained; explicit shutdown/reset required): {projection}"
+                        ))
+                    })?;
+                    for pending in context.pending.drain(..).rev() {
+                        if abandoned.contains(&pending.handle) {
+                            // A close failure stays tracked in the existing
+                            // resource table; preserve success and try siblings.
+                            let _ = (pending.close)(context.vm, pending.handle);
+                        }
+                    }
+                }
+                context
+                    .vm
+                    .instance
+                    .host_return
+                    .take()
+                    .ok_or(VmError::InvalidFrameState(
+                        "host invocation completed without a result",
+                    ))
+            }
+            Ok(VmStatus::Yielded) => Err(VmError::InvalidFrameState("host invocation yielded")),
+            Ok(VmStatus::Waiting(_)) => {
+                Err(VmError::InvalidFrameState("host invocation is waiting"))
+            }
+            Err(error) => Err(error),
+        };
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                if context.pending.is_empty() {
+                    context.vm.abort_host_invocation(stack_base, frame_count);
+                    return Err(error);
+                }
+                let abandoned = match publication::abandoned(
+                    context.vm,
+                    &context.pending,
+                    stack_base,
+                    local_base,
+                    frame_count,
+                ) {
+                    Ok(abandoned) => abandoned,
+                    Err(projection) => {
+                        // Preserve the actual topology when ownership cannot
+                        // be proven. Do not drain roots or claim reclamation.
+                        context.vm.instance.callback_publication_unresolved = true;
+                        return Err(VmError::HostError(format!(
+                            "{error}; callback publication ownership unresolved (execution roots retained; explicit shutdown/reset required): {projection}"
+                        )));
+                    }
+                };
+                // Project before draining roots, then let the ordinary abort
+                // cancel waiting operations before beginning resource close.
+                // Pending closes remain in the existing table for real polls.
+                context.vm.abort_host_invocation(stack_base, frame_count);
+                for pending in context.pending.drain(..).rev() {
+                    if abandoned.contains(&pending.handle) {
+                        // Keep the primary transport error and still try
+                        // eligible siblings after a close failure.
+                        let _ = (pending.close)(context.vm, pending.handle);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        context
+            .vm
+            .validate_guest_result_value(&value, &Ret::schema()?)?;
+        Ret::from_value(context.vm, value)
     }
 }
 
@@ -276,6 +592,95 @@ impl ScriptResult for bool {
     }
 }
 
+impl<T: IntoScriptValue, E: IntoScriptValue> IntoScriptValue for crate::GuestResult<T, E> {
+    fn into_script_value(self) -> Value {
+        match self {
+            Self::Ok(value) => crate::result::carrier(true, value.into_script_value()),
+            Self::Err(error) => crate::result::carrier(false, error.into_script_value()),
+        }
+    }
+
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::Result {
+            ok: Box::new(T::schema()?),
+            err: Box::new(E::schema()?),
+        })
+    }
+}
+
+impl<T: ScriptResult, E: ScriptResult> ScriptResult for crate::GuestResult<T, E> {
+    fn from_value(value: Value) -> VmResult<Self> {
+        let (tag, payload) = crate::result::payload(&value)?;
+        if tag {
+            T::from_value(payload.clone()).map(Self::Ok)
+        } else {
+            E::from_value(payload.clone()).map(Self::Err)
+        }
+    }
+
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::Result {
+            ok: Box::new(T::schema()?),
+            err: Box::new(E::schema()?),
+        })
+    }
+}
+
+impl ScriptResult for String {
+    fn from_value(value: Value) -> VmResult<Self> {
+        match value {
+            Value::String(text) => Ok(text.to_string()),
+            _ => Err(VmError::TypeMismatch("string callback result")),
+        }
+    }
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::String)
+    }
+}
+
+impl<T: IntoScriptValue> IntoScriptValue for Option<T> {
+    fn into_script_value(self) -> Value {
+        self.map_or(Value::Null, T::into_script_value)
+    }
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::Optional(Box::new(T::schema()?)))
+    }
+}
+
+impl<T: ScriptResult> ScriptResult for Option<T> {
+    fn from_value(value: Value) -> VmResult<Self> {
+        if matches!(value, Value::Null) {
+            Ok(None)
+        } else {
+            T::from_value(value).map(Some)
+        }
+    }
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::Optional(Box::new(T::schema()?)))
+    }
+}
+
+impl<T: IntoScriptValue> IntoScriptValue for Vec<T> {
+    fn into_script_value(self) -> Value {
+        Value::array(self.into_iter().map(T::into_script_value).collect())
+    }
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::Array(Box::new(T::schema()?)))
+    }
+}
+
+impl<T: ScriptResult> ScriptResult for Vec<T> {
+    fn from_value(value: Value) -> VmResult<Self> {
+        let Value::Array(values) = value else {
+            return Err(VmError::TypeMismatch("array callback result"));
+        };
+        values.iter().cloned().map(T::from_value).collect()
+    }
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::Array(Box::new(T::schema()?)))
+    }
+}
+
 impl<T> Store<T> {
     pub fn new(mut vm: Vm, data: T) -> Self {
         let callback_registry = Arc::new(AtomicBool::new(true));
@@ -339,6 +744,16 @@ impl<T> Store<T> {
         Args: ScriptArgs,
         Ret: ScriptResult,
     {
+        self.build_script_callback(callable, Args::ARITY, Args::schemas(), Ret::schema())
+    }
+
+    fn build_script_callback<Args, Ret>(
+        &mut self,
+        callable: Value,
+        arity: Option<usize>,
+        argument_schemas: Option<Vec<TypeSchema>>,
+        result_schema: Option<TypeSchema>,
+    ) -> VmResult<ScriptCallback<Args, Ret>> {
         if let Some(error) = self.vm.scope_reset_error().cloned() {
             return Err(VmError::ExecutionScope(error));
         }
@@ -362,7 +777,7 @@ impl<T> Store<T> {
             .callable_prototypes
             .get(value.prototype_id as usize)
             .ok_or(VmError::InvalidCallablePrototype(value.prototype_id))?;
-        if let Some(arity) = Args::ARITY
+        if let Some(arity) = arity
             && arity != usize::from(prototype.arity)
         {
             return Err(VmError::CallableArityMismatch {
@@ -372,7 +787,7 @@ impl<T> Store<T> {
             });
         }
         if let Some(TypeSchema::Callable { params, result }) = prototype.schema.as_ref() {
-            if let Some(args) = Args::schemas()
+            if let Some(args) = argument_schemas
                 && (args.len() != params.len()
                     || !args
                         .iter()
@@ -381,7 +796,7 @@ impl<T> Store<T> {
             {
                 return Err(VmError::TypeMismatch("script callback argument schema"));
             }
-            if let Some(actual) = Ret::schema()
+            if let Some(actual) = result_schema
                 && !callback_schema_accepts(result, &actual)
             {
                 return Err(VmError::TypeMismatch("script callback result schema"));
@@ -394,6 +809,52 @@ impl<T> Store<T> {
             subscription: Arc::new(AtomicBool::new(true)),
             marker: PhantomData,
         })
+    }
+
+    pub fn vm_script_callback_by_name<Args: VmScriptArgs, Ret: VmScriptValue>(
+        &mut self,
+        name: &str,
+    ) -> VmResult<ScriptCallback<Args, Ret>> {
+        let callable = self.resolve_exported_callable(name)?;
+        self.vm_script_callback(callable)
+    }
+
+    pub fn vm_script_callback<Args: VmScriptArgs, Ret: VmScriptValue>(
+        &mut self,
+        callable: Value,
+    ) -> VmResult<ScriptCallback<Args, Ret>> {
+        let args = Args::schemas()?;
+        for schema in &args {
+            schema
+                .validate()
+                .map_err(|error| VmError::HostError(error.to_string()))?;
+        }
+        let ret = Ret::schema()?;
+        ret.validate()
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        let callback = self.build_script_callback(
+            callable,
+            Some(args.len()),
+            Some(
+                args.iter()
+                    .map(HostTypeSchema::to_compiler_schema)
+                    .collect(),
+            ),
+            Some(ret.to_compiler_schema()),
+        )?;
+        let Value::Callable(value) = &callback.callable else {
+            return Err(VmError::InvalidCallable);
+        };
+        let prototype = &self.vm.program().callable_prototypes[value.prototype_id as usize];
+        if !matches!(prototype.target, super::CallableTarget::ScriptFunction(_)) {
+            return Err(VmError::InvalidFrameState(
+                "VM-aware callbacks require an RSS callable",
+            ));
+        }
+        if !matches!(prototype.schema, Some(TypeSchema::Callable { .. })) {
+            return Err(VmError::TypeMismatch("typed script callback schema"));
+        }
+        Ok(callback)
     }
 
     pub fn enqueue_callback(&mut self, invocation: QueuedScriptInvocation) -> VmResult<()> {

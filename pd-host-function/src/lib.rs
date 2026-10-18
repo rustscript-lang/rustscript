@@ -1,3 +1,5 @@
+mod guest_result;
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
@@ -86,6 +88,13 @@ fn expand_pd_host_function(
     validate_sync_vm_state_conflict(&item, &state_params)?;
     validate_state_resource_combination(&state_params, &resource_params)?;
     validate_return_type(&item.sig.output, has_named_struct_attr(&item.attrs))?;
+    if (is_async || return_is_host_future_output(&item.sig.output)) && guest_result::uses_vm(&item)
+    {
+        return Err(Error::new_spanned(
+            &item.sig,
+            "GuestResult owned resources cannot cross async/future publication; use a synchronous live-VM adapter",
+        ));
+    }
     if contract.is_some() && has_named_struct_attr(&item.attrs) {
         return Err(Error::new_spanned(
             &item.sig.ident,
@@ -526,7 +535,10 @@ fn generate_vm_wrapper(
         FnArg::Typed(pat_type) => is_vm_context_type(&pat_type.ty),
         FnArg::Receiver(_) => false,
     });
-    let needs_vm = has_vm || !resource_params.is_empty() || !state_params.is_empty();
+    let needs_vm = has_vm
+        || !resource_params.is_empty()
+        || !state_params.is_empty()
+        || guest_result::uses_vm(item);
     if needs_vm {
         wrapper_params.push(quote!(vm: &mut super::super::Vm));
         if has_vm {
@@ -621,6 +633,28 @@ fn generate_vm_wrapper(
             proc_macro2::Span::call_site(),
         );
         let index = syn::Index::from(arg_index);
+        if let Some(shape) = guest_result::shape(ty)? {
+            let decoded = guest_result::decode(
+                &shape,
+                quote!(args.get(#index).ok_or_else(|| #sdk::VmError::HostError(format!("missing {}", #label)))?),
+            );
+            let mode = shape
+                .resource_mode()
+                .map_err(|message| Error::new_spanned(ty, message))?;
+            let context = mode.map(|mode| {
+                if mode == ResourceMode::Borrow {
+                    quote!(let __pd_guest_context = vm.host_context();)
+                } else {
+                    quote!(let mut __pd_guest_context = vm.host_context();)
+                }
+            });
+            let extract = quote! { #context let #ident: #ty = #decoded; };
+            imm_extract_stmts.push(extract.clone());
+            mut_extract_stmts.push(extract);
+            call_args.push(quote!(#ident));
+            arg_index += 1;
+            continue;
+        }
         imm_extract_stmts.push(quote! {
             let #ident = super::borrow_arg::<#ty>(args, #index, #label)?;
         });
@@ -636,12 +670,27 @@ fn generate_vm_wrapper(
         arg_index += 1;
     }
 
-    let wrapper_output = wrapper_output_type(&item.sig.output)?;
-    let call_expr = if return_is_vm_result(&item.sig.output) {
+    let mut wrapper_output = wrapper_output_type(&item.sig.output)?;
+    let mut call_expr = if return_is_vm_result(&item.sig.output) {
         quote!(#impl_name(#(#call_args),*))
     } else {
         quote!(Ok(#impl_name(#(#call_args),*)))
     };
+    if let ReturnType::Type(_, ty) = &item.sig.output
+        && let Some(shape) = guest_result::shape(unwrap_transparent_return(ty))?
+    {
+        let schema = guest_result::schema(&shape)?;
+        let encoded = guest_result::encode(&shape, quote!(__pd_result), &schema);
+        let validation = (!shape.resources().is_empty())
+            .then(|| quote!(vm.validate_guest_result_value(&__pd_value, &#schema)?;));
+        wrapper_output = quote!(#sdk::VmResult<#sdk::Value>);
+        let invoke = if return_is_vm_result(&item.sig.output) {
+            quote!(#impl_name(#(#call_args),*)?)
+        } else {
+            quote!(#impl_name(#(#call_args),*))
+        };
+        call_expr = quote! { let __pd_result = #invoke; let __pd_value = #encoded; #validation Ok(__pd_value) };
+    }
 
     Ok(quote! {
         #[allow(dead_code)]
@@ -1051,6 +1100,28 @@ fn generate_host_function_descriptor(
             });
             continue;
         }
+        if let Some(shape) = guest_result::shape(&pat_type.ty)? {
+            let schema = guest_result::schema(&shape)?;
+            let mode = shape
+                .resource_mode()
+                .map_err(|message| Error::new_spanned(&pat_type.ty, message))?;
+            let passing = match mode {
+                Some(ResourceMode::Borrow) => quote!(#sdk::HostParamPassing::Borrow),
+                Some(ResourceMode::BorrowMut) => quote!(#sdk::HostParamPassing::BorrowMut),
+                Some(ResourceMode::TakeOwned) => quote!(#sdk::HostParamPassing::TakeOwned),
+                _ => quote!(#sdk::HostParamPassing::Value),
+            };
+            param_tokens
+                .push(quote!(#sdk::HostParamSchema::with_passing(#param_name, #schema, #passing)));
+            for spec in shape.resources() {
+                let key = resource_key_tokens(spec);
+                if let Some(effect) = resource_effect_tokens(spec.mode, &key) {
+                    effect_tokens.push(effect);
+                }
+                resource_meta_tokens.push(resource_meta_tokens_for(spec));
+            }
+            continue;
+        }
         if let Some((_, spec)) = resource_params.iter().find(|(name, _)| name == &param_name) {
             let key_expr = resource_key_tokens(spec);
             let passing = match spec.mode {
@@ -1314,7 +1385,12 @@ fn classify_generated_binding(
 ) -> GeneratedBinding {
     let is_async = item.sig.asyncness.is_some();
     let has_vm = item.sig.inputs.iter().any(is_vm_context_param);
-    if is_async || has_vm || !resource_params.is_empty() || !state_params.is_empty() {
+    if is_async
+        || has_vm
+        || !resource_params.is_empty()
+        || !state_params.is_empty()
+        || guest_result::uses_vm(item)
+    {
         return GeneratedBinding::Stack;
     }
     match &item.sig.output {
@@ -1462,6 +1538,22 @@ fn return_schema_tokens(
         ));
     };
     let surface = unwrap_transparent_return(ty);
+    if let Some(shape) = guest_result::shape(surface)? {
+        let schema = guest_result::schema(&shape)?;
+        let mut effects = Vec::new();
+        let mut metas = Vec::new();
+        for spec in shape.resources() {
+            let key = resource_key_tokens(spec);
+            effects
+                .push(quote!(#sdk::HostEffect::GuestResource(#sdk::ResourceEffect::create(#key))));
+            metas.push(resource_meta_tokens_for(spec));
+        }
+        return Ok((
+            schema,
+            (!effects.is_empty()).then(|| quote!(#(#effects),*)),
+            (!metas.is_empty()).then(|| quote!(#(#metas),*)),
+        ));
+    }
     if resource_return_kind(surface) == Some(ResourceReturnKind::Owned) {
         let inner = last_generic_type(surface).ok_or_else(|| {
             Error::new_spanned(surface, "Resource return must have a type argument")
@@ -1535,6 +1627,9 @@ fn host_type_schema_tokens(
     named_struct: bool,
 ) -> Result<proc_macro2::TokenStream, Error> {
     let sdk = sdk_path();
+    if let Some(shape) = guest_result::shape(ty)? {
+        return guest_result::schema(&shape);
+    }
     if named_struct {
         return Ok(quote!(<#ty as #sdk::host_extension::HostNamedStruct>::host_type_schema()));
     }
@@ -1609,6 +1704,19 @@ fn uses_taken_extractor(ty: &Type) -> bool {
 mod tests {
     use super::{expand_pd_host_function, type_label};
     use syn::{ItemFn, Meta, Token, Type, parse_quote, punctuated::Punctuated};
+
+    #[test]
+    fn guest_union_owned_resource_return_is_accepted_without_infallible_handle_conversion() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(name = "test::result_owned");
+        let item: ItemFn = parse_quote! {
+            /// Publishes only the selected resource.
+            fn result_owned() -> VmResult<GuestResult<ResourceOwned<Counter>, ResourceOwned<Failure>>> { todo!() }
+        };
+        let expanded = expand_pd_host_function(attr, item).unwrap().to_string();
+        assert!(expanded.contains("publish_owned"));
+        assert!(expanded.contains("HostTypeSchema :: Result"));
+        assert!(expanded.contains("ResourceEffect :: create"));
+    }
 
     #[test]
     fn accepts_host_call_result_from_the_function_signature() {
@@ -2009,6 +2117,30 @@ mod tests {
         let error = expand_pd_host_function(attr, item)
             .expect_err("resource Value passing must be rejected");
         assert!(error.to_string().contains("Value"));
+    }
+
+    #[test]
+    fn guest_result_owned_future_publication_has_explicit_diagnostic() {
+        let items: Vec<ItemFn> = vec![
+            parse_quote! {
+                /// An async owned guest payload needs a live VM publisher.
+                async fn pending() -> VmResult<GuestResult<ResourceOwned<Counter>, i64>> { todo!() }
+            },
+            parse_quote! {
+                /// A legacy future output cannot bypass owned publication.
+                fn legacy() -> VmResult<HostFutureOutput<GuestResult<i64, ResourceOwned<Counter>>>> { todo!() }
+            },
+        ];
+        for item in items {
+            let error = expand_pd_host_function(parse_quote!(name = "test::pending"), item)
+                .expect_err("GuestResult owned future publication must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("GuestResult owned resources cannot cross async/future publication"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

@@ -86,6 +86,60 @@ fn call_script_executes_direct_call() {
 }
 
 #[test]
+fn nostd_executes_std_encoded_result_ok_and_err_without_source() {
+    let cases = [
+        (
+            "let value: Result<int, int> = Result::Ok(7); match value { Result::Ok(v) => v, Result::Err(e) => e };",
+            EmbeddedValue::Int(7),
+        ),
+        (
+            "let value: Result<int, int> = Result::Err(4); match value { Result::Ok(v) => v, Result::Err(e) => e };",
+            EmbeddedValue::Int(4),
+        ),
+        (
+            "let value: Result<Result<int?, bool>, string> = Result::Ok(Result::Err(false)); match value { Result::Ok(inner) => match inner { Result::Ok(n) => true, Result::Err(flag) => flag, }, Result::Err(e) => true, };",
+            EmbeddedValue::Bool(false),
+        ),
+        (
+            "let value: Result<string, int?> = Result::Err(null); match value { Result::Ok(s) => 9, Result::Err(n) => n, };",
+            EmbeddedValue::Null,
+        ),
+    ];
+    for (source, expected) in cases {
+        let compiled = compile_source(source).expect("Result source should compile");
+        let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
+            .expect("Result program should encode");
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
+        let std_program = vm::decode_program(&bytes).expect("std current v13 decode");
+        assert_eq!(encode_program(&std_program).unwrap(), bytes);
+        let mut std_vm = vm::Vm::new_with_jit_config(
+            std_program,
+            vm::JitConfig {
+                enabled: false,
+                hot_loop_threshold: 1,
+                max_trace_len: 512,
+            },
+        );
+        std_vm.set_fuel(100_000);
+        assert_eq!(std_vm.run().unwrap(), vm::VmStatus::Halted);
+        let std_expected = match &expected {
+            EmbeddedValue::Int(n) => vm::Value::Int(*n),
+            EmbeddedValue::Bool(b) => vm::Value::Bool(*b),
+            EmbeddedValue::Null => vm::Value::Null,
+            _ => unreachable!(),
+        };
+        assert_eq!(std_vm.stack().last(), Some(&std_expected));
+        let program = decode_program(&bytes).expect("no-std should decode v13 Result program");
+        let mut vm = EmbeddedVm::new(program);
+        assert_eq!(
+            vm.run().expect("decoded Result program should halt"),
+            EmbeddedVmStatus::Halted
+        );
+        assert_eq!(vm.stack().last().cloned(), Some(expected));
+    }
+}
+
+#[test]
 fn call_script_executes_nested_direct_calls() {
     let compiled = compile_source(
         "fn add2(value: int) -> int { value + 2 } fn add5(value: int) -> int { add2(value) + 3 } add5(0);",
@@ -361,5 +415,289 @@ fn call_script_binding_outside_frame_fails_typed() {
             VmError::InvalidFrameState("root callable binding is outside the script frame")
         ),
         "expected InvalidFrameState for the out-of-frame binding, got {err:?}"
+    );
+}
+
+#[test]
+fn nostd_executes_empty_cleanup_try_ok_and_err_without_source() {
+    let ok_source = r#"
+        fn pass() -> Result<int, int> { Result::Ok(7) }
+        fn relay() -> Result<int, int> {
+            let x: int = pass()?;
+            Result::Ok(x + 1)
+        }
+        let value = match relay() {
+            Result::Ok(v) => v,
+            Result::Err(e) => e,
+        };
+        value;
+    "#;
+    let err_source = r#"
+        fn fail() -> Result<int, int> { Result::Err(4) }
+        fn relay() -> Result<int, int> {
+            let x: int = fail()?;
+            Result::Ok(x)
+        }
+        let value = match relay() {
+            Result::Ok(v) => v,
+            Result::Err(e) => e,
+        };
+        value;
+    "#;
+    for (source, expected) in [(ok_source, 8), (err_source, 4)] {
+        let compiled = compile_source(source).expect("empty-cleanup try should compile");
+        let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
+            .expect("empty-cleanup try should encode");
+        let decoded = decode_program(&bytes).expect("no-std should decode an empty cleanup plan");
+        let mut vm = EmbeddedVm::new(decoded);
+        assert_eq!(
+            vm.run()
+                .expect("empty-cleanup try should execute without source"),
+            EmbeddedVmStatus::Halted
+        );
+        assert_eq!(vm.stack(), &[EmbeddedValue::Int(expected)]);
+    }
+}
+
+#[test]
+fn nostd_rejects_nonempty_resource_cleanup_without_executing() {
+    use std::sync::Arc;
+    use vm::{
+        CompileSourceFileOptions, HostApiBuilder, HostFunctionSchema, HostTypeSchema,
+        ResourceTypeKey, ResourceTypeSchema, SourceFlavor, compile_source_with_flavor_and_options,
+    };
+
+    let key = ResourceTypeKey::new("pr24.closure").expect("resource key");
+    let mut builder = HostApiBuilder::new();
+    builder.resource(ResourceTypeSchema::new(key.clone(), "closure resource"));
+    builder.function(HostFunctionSchema::with_return(
+        "test::make_local",
+        Vec::new(),
+        HostTypeSchema::Resource(key.clone()),
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "test::make_err_result",
+        Vec::new(),
+        HostTypeSchema::Result {
+            ok: Box::new(HostTypeSchema::Int),
+            err: Box::new(HostTypeSchema::Resource(key)),
+        },
+    ));
+    let catalog = Arc::new(builder.build().expect("catalog"));
+    let source = r#"
+        fn relay() -> Result<int, resource<pr24.closure>> {
+            let local: resource<pr24.closure> = test::make_local();
+            let value: int = test::make_err_result()?;
+            Result::Ok(value)
+        }
+        let carried = relay();
+        carried;
+    "#;
+    let compiled = compile_source_with_flavor_and_options(
+        source,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::new().with_host_api_catalog(catalog),
+    )
+    .expect("resource try should compile");
+    let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
+        .expect("resource try should encode");
+    let err = decode_program(&bytes).expect_err("no-std must reject a nonempty resource cleanup");
+    assert!(
+        matches!(
+            err,
+            WireError::UnsupportedCapability("ret cleanup resource plans")
+        ),
+        "expected an explicit capability rejection before execution, got {err:?}"
+    );
+}
+
+fn resource_cleanup_bytes() -> Vec<u8> {
+    use std::sync::Arc;
+    use vm::{
+        CompileSourceFileOptions, HostApiBuilder, HostFunctionSchema, HostTypeSchema,
+        ResourceTypeKey, ResourceTypeSchema, SourceFlavor, compile_source_with_flavor_and_options,
+    };
+    let key = ResourceTypeKey::new("pr24.closure").expect("resource key");
+    let mut builder = HostApiBuilder::new();
+    builder.resource(ResourceTypeSchema::new(key.clone(), "closure resource"));
+    builder.function(HostFunctionSchema::with_return(
+        "test::make_local",
+        Vec::new(),
+        HostTypeSchema::Resource(key.clone()),
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "test::make_err_result",
+        Vec::new(),
+        HostTypeSchema::Result {
+            ok: Box::new(HostTypeSchema::Int),
+            err: Box::new(HostTypeSchema::Resource(key)),
+        },
+    ));
+    let catalog = Arc::new(builder.build().expect("catalog"));
+    let source = r#"
+        fn relay() -> Result<int, resource<pr24.closure>> {
+            let local: resource<pr24.closure> = test::make_local();
+            let value: int = test::make_err_result()?;
+            Result::Ok(value)
+        }
+        let carried = relay();
+        carried;
+    "#;
+    let compiled = compile_source_with_flavor_and_options(
+        source,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::new().with_host_api_catalog(catalog),
+    )
+    .expect("resource try should compile");
+    encode_program(&compiled.program.with_local_count(compiled.locals)).expect("encode")
+}
+
+fn u32_le(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+}
+
+fn replace_cleanup(bytes: &[u8], decls: &[u8], schema: &[u8]) -> Vec<u8> {
+    let key = b"pr24.closure";
+    let mut suffix = vec![17u8];
+    suffix.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    suffix.extend_from_slice(key);
+    assert!(
+        bytes.ends_with(&suffix),
+        "compiled cleanup should end in the resource schema, tail {:02x?}",
+        &bytes[bytes.len().saturating_sub(48)..]
+    );
+    let schema_at = bytes.len() - suffix.len();
+    let slot_at = schema_at - 2;
+    let locals_at = slot_at - 4;
+    let site_at = locals_at - 4;
+    let plans_at = site_at - 4;
+    let decls_at = plans_at - 4;
+    assert_eq!(
+        u32_le(bytes, decls_at),
+        0,
+        "fixture should have no named decls"
+    );
+    assert_eq!(u32_le(bytes, plans_at), 1);
+    assert_eq!(u32_le(bytes, locals_at), 1);
+    let site = &bytes[site_at..site_at + 4];
+    let slot = &bytes[slot_at..schema_at];
+    let mut out = bytes[..decls_at].to_vec();
+    out.extend_from_slice(decls);
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(site);
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(slot);
+    out.extend_from_slice(schema);
+    out
+}
+
+fn named_decl(name: &str, params: &[&str], body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(&(params.len() as u32).to_le_bytes());
+    for param in params {
+        out.extend_from_slice(&(param.len() as u32).to_le_bytes());
+        out.extend_from_slice(param.as_bytes());
+    }
+    out.extend_from_slice(body);
+    out
+}
+
+fn schema_resource() -> Vec<u8> {
+    let key = b"pr24.closure";
+    let mut out = vec![17u8];
+    out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    out.extend_from_slice(key);
+    out
+}
+
+fn schema_named(name: &str, args: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = vec![9u8];
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(&(args.len() as u32).to_le_bytes());
+    for arg in args {
+        out.extend_from_slice(arg);
+    }
+    out
+}
+
+fn schema_map(inner: &[u8]) -> Vec<u8> {
+    let mut out = vec![13u8];
+    out.extend_from_slice(inner);
+    out
+}
+
+fn schema_result(ok: &[u8], err: &[u8]) -> Vec<u8> {
+    let mut out = vec![18u8];
+    out.extend_from_slice(ok);
+    out.extend_from_slice(err);
+    out
+}
+
+#[test]
+fn nostd_named_validity_precedes_nonempty_capability_refusal() {
+    let base = resource_cleanup_bytes();
+    let body = schema_resource();
+    let named = replace_cleanup(
+        &base,
+        &named_decl("Holder", &[], &body),
+        &schema_named("Holder", &[]),
+    );
+    assert_eq!(
+        decode_program(&named),
+        Err(WireError::UnsupportedCapability(
+            "ret cleanup resource plans"
+        )),
+        "a valid nongeneric resource body is a nonempty plan, not a missing resource"
+    );
+    let map = replace_cleanup(&base, &0u32.to_le_bytes(), &schema_map(&body));
+    assert_eq!(
+        decode_program(&map),
+        Err(WireError::UnsupportedCapability(
+            "ret cleanup resource plans"
+        ))
+    );
+    let unresolved = replace_cleanup(
+        &base,
+        &0u32.to_le_bytes(),
+        &schema_result(&body, &schema_named("Missing", &[])),
+    );
+    assert_eq!(
+        decode_program(&unresolved),
+        Err(WireError::InvalidRetCleanup(
+            "unresolved named cleanup schema"
+        ))
+    );
+    let unresolved_ok = replace_cleanup(
+        &base,
+        &0u32.to_le_bytes(),
+        &schema_result(&schema_named("Missing", &[]), &body),
+    );
+    assert_eq!(
+        decode_program(&unresolved_ok),
+        Err(WireError::InvalidRetCleanup(
+            "unresolved named cleanup schema"
+        ))
+    );
+    let arity = replace_cleanup(
+        &base,
+        &named_decl("Holder", &["T"], &schema_resource()),
+        &schema_named("Holder", &[]),
+    );
+    assert_eq!(
+        decode_program(&arity),
+        Err(WireError::InvalidRetCleanup("named cleanup schema arity"))
+    );
+    let cycle = replace_cleanup(
+        &base,
+        &named_decl("Holder", &[], &schema_named("Holder", &[])),
+        &schema_named("Holder", &[]),
+    );
+    assert_eq!(
+        decode_program(&cycle),
+        Err(WireError::InvalidRetCleanup("named cleanup schema cycle"))
     );
 }

@@ -395,6 +395,10 @@ fn host_schema_contains_resource(schema: &HostTypeSchema) -> Result<bool, String
                     pending.push((param, depth + 1));
                 }
             }
+            HostTypeSchema::Result { ok, err } => {
+                pending.push((err, depth + 1));
+                pending.push((ok, depth + 1));
+            }
             HostTypeSchema::Named { fields, .. } => {
                 for field in fields {
                     pending.push((&field.ty, depth + 1));
@@ -428,6 +432,46 @@ fn addressable_host_resource_key(schema: &HostTypeSchema) -> Option<(ResourceTyp
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Precisely supported union resource paths: Result/Optional nodes leading to
+/// a direct resource or a resource-free leaf. Other aggregates remain refused.
+fn addressable_result_resources(schema: &HostTypeSchema) -> bool {
+    fn branch(schema: &HostTypeSchema, depth: u8) -> bool {
+        if depth > MAX_REGISTRATION_SCHEMA_DEPTH {
+            return false;
+        }
+        match schema {
+            HostTypeSchema::Result { ok, err } => branch(ok, depth + 1) && branch(err, depth + 1),
+            HostTypeSchema::Optional(inner) => branch(inner, depth + 1),
+            HostTypeSchema::Resource(_) => true,
+            _ => host_schema_contains_resource(schema) == Ok(false),
+        }
+    }
+    match schema {
+        HostTypeSchema::Result { .. } => branch(schema, 0),
+        HostTypeSchema::Optional(inner) => addressable_result_resources(inner),
+        _ => false,
+    }
+}
+
+fn active_result_resource<'a>(
+    schema: &HostTypeSchema,
+    value: &'a Value,
+) -> VmResult<Option<(ResourceTypeKey, &'a Value)>> {
+    match schema {
+        HostTypeSchema::Result { ok, err } => {
+            let (tag, payload) = crate::result::payload(value)?;
+            active_result_resource(if tag { ok } else { err }, payload)
+        }
+        HostTypeSchema::Optional(_) if matches!(value, Value::Null) => Ok(None),
+        HostTypeSchema::Optional(inner) => active_result_resource(inner, value),
+        HostTypeSchema::Resource(key) => Ok(Some((key.clone(), value))),
+        _ if !host_schema_contains_resource(schema).map_err(VmError::HostError)? => Ok(None),
+        _ => Err(VmError::HostError(
+            "Result resource branch is not addressable".into(),
+        )),
     }
 }
 
@@ -476,7 +520,10 @@ fn validate_registration_passing(
                 param.name, param.schema,
             ));
         }
-        if owned_value_transfer && addressable_host_resource_key(&param.schema).is_none() {
+        if owned_value_transfer
+            && addressable_host_resource_key(&param.schema).is_none()
+            && !addressable_result_resources(&param.schema)
+        {
             return Err(format!(
                 "resource-passing parameter '{}' schema {:#?} is not directly addressable by the \
                  handle ABI",
@@ -489,6 +536,7 @@ fn validate_registration_passing(
     if return_has_resource
         && owned_value_transfer
         && addressable_host_resource_key(&schema.return_type).is_none()
+        && !addressable_result_resources(&schema.return_type)
     {
         return Err(format!(
             "exact return schema {:#?} contains a resource nested inside an aggregate; only \
@@ -509,7 +557,8 @@ fn validate_registration_passing(
 fn schema_requires_guard(schema: &HostImportSchema) -> bool {
     schema.params.iter().any(|param| {
         param.passing != HostParamPassing::Value
-            && addressable_host_resource_key(&param.schema).is_some()
+            && (addressable_host_resource_key(&param.schema).is_some()
+                || addressable_result_resources(&param.schema))
     })
 }
 
@@ -639,6 +688,22 @@ impl ExactHostCallContract {
                      contains no resource",
                     param.name, param.schema,
                 )));
+            }
+            if addressable_result_resources(&param.schema) {
+                let value = args.get(index).ok_or_else(|| {
+                    invalid_resource_handle_error(format!(
+                        "exact host call is missing argument at index {index}"
+                    ))
+                })?;
+                if let Some((key, value)) = active_result_resource(&param.schema, value)? {
+                    specs.push(ExactResourceSpec {
+                        arg_index: index,
+                        handle: resource_handle_argument(value)?,
+                        key,
+                        mode,
+                    });
+                }
+                continue;
             }
             let Some((key, optional)) = addressable_host_resource_key(&param.schema) else {
                 return Err(VmError::HostError(format!(
@@ -2055,6 +2120,27 @@ fn validate_coarse_host_value(value: &Value, expected: ValueType) -> VmResult<()
     Err(VmError::TypeMismatch(expected))
 }
 
+impl Vm {
+    /// Validates a generated typed guest value against this VM's live catalog
+    /// and resource arena before the adapter publishes it.
+    #[doc(hidden)]
+    pub fn validate_guest_result_value(
+        &self,
+        value: &Value,
+        schema: &HostTypeSchema,
+    ) -> VmResult<()> {
+        schema
+            .validate()
+            .map_err(|error| VmError::HostError(error.to_string()))?;
+        validate_host_value(
+            value,
+            schema,
+            self.program(),
+            self.host.execution_scope.resources(),
+        )
+    }
+}
+
 pub(crate) fn validate_host_call_return(
     values: &CallReturn,
     expected: Option<ValueType>,
@@ -2420,6 +2506,21 @@ fn validate_host_value(
                 }
             }
             Ok(())
+        }
+        HostTypeSchema::Result { ok, err } => {
+            let (is_ok, payload) = super::split_result_carrier(value)?;
+            let active = if is_ok { ok.as_ref() } else { err.as_ref() };
+            match payload {
+                Some(payload) => validate_host_value(payload, active, program, resources),
+                None if matches!(
+                    active,
+                    HostTypeSchema::Null | HostTypeSchema::Optional(_) | HostTypeSchema::Unknown
+                ) =>
+                {
+                    validate_host_value(&Value::Null, active, program, resources)
+                }
+                None => Err(VmError::TypeMismatch("result")),
+            }
         }
     }
 }

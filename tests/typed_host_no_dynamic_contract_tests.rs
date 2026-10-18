@@ -43,6 +43,10 @@ fn visit(path: &str, schema: &HostTypeSchema, seen: &mut BTreeSet<String>, polic
         }
         HostTypeSchema::Array(inner) => visit(&format!("{path}[]"), inner, seen, policy),
         HostTypeSchema::Optional(inner) => visit(&format!("{path}?"), inner, seen, policy),
+        HostTypeSchema::Result { ok, err } => {
+            visit(&format!("{path}.ok"), ok, seen, policy);
+            visit(&format!("{path}.err"), err, seen, policy);
+        }
         HostTypeSchema::Named { name, fields } => {
             if !seen.insert(name.clone()) {
                 return;
