@@ -1,0 +1,5 @@
+error: GuestResult payload must have a fully typed public schema
+ --> tests/ui/fail/guest_result_dynamic.rs:7:17
+  |
+7 | fn invalid() -> VmResult<GuestResult<Value, String>> {
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

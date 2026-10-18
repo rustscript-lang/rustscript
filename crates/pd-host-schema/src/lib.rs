@@ -567,6 +567,7 @@ pub fn type_label(ty: &Type) -> Result<String, String> {
                 "ResourceOwned" => Err(
                     "ResourceOwned is input-only; it cannot be used as a return schema".to_string(),
                 ),
+                "GuestResult" => Ok(guest_type_shape(ty)?.label()),
                 "VmCallable" => callable_type_label(segment),
                 "Unknown" | "UnknownValue" => Ok("unknown".to_string()),
                 "CallOutcome" => Ok("unknown".to_string()),
@@ -606,6 +607,162 @@ pub fn parameter_type_label(ty: &Type) -> Result<(String, bool), String> {
 fn parameter_type_label_inner(ty: &Type) -> Result<(String, bool), String> {
     let optional = path_last_ident(ty).as_deref() == Some("Option");
     Ok((type_label(ty)?, optional))
+}
+
+/// Explicit typed shape within a guest union. Both generators use this tree;
+/// no branch is inferred from Rust's standard Result or from a runtime map.
+#[derive(Clone, Debug)]
+pub enum GuestTypeShape<'a> {
+    Result(Box<Self>, Box<Self>),
+    Optional(Box<Self>),
+    Array(Box<Self>),
+    Resource(Box<ResourceSpec>),
+    Scalar(&'static str),
+    Named(&'a Type),
+}
+
+impl GuestTypeShape<'_> {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Result(ok, err) => format!("Result<{}, {}>", ok.label(), err.label()),
+            Self::Optional(inner) => format!("{} | null", inner.label()),
+            Self::Array(inner) => format!("array<{}>", inner.label()),
+            Self::Resource(_) => "resource".into(),
+            Self::Scalar(label) => (*label).into(),
+            Self::Named(ty) => path_last_ident(ty).expect("named path"),
+        }
+    }
+
+    /// Resource leaves in declaration order, including the unselected branch.
+    pub fn resources(&self) -> Vec<&ResourceSpec> {
+        match self {
+            Self::Result(ok, err) => {
+                let mut out = ok.resources();
+                out.extend(err.resources());
+                out
+            }
+            Self::Optional(inner) | Self::Array(inner) => inner.resources(),
+            Self::Resource(spec) => vec![spec],
+            _ => Vec::new(),
+        }
+    }
+
+    /// One parameter has one passing mode. Mixed branch access is ambiguous.
+    pub fn resource_mode(&self) -> Result<Option<ResourceMode>, String> {
+        let leaves = self.resources();
+        let Some(first) = leaves.first() else {
+            return Ok(None);
+        };
+        if leaves.iter().any(|leaf| leaf.mode != first.mode) {
+            return Err("GuestResult resource branches must use the same passing mode".into());
+        }
+        Ok(Some(first.mode))
+    }
+}
+
+/// Parses a fully typed guest payload. Dynamic map/unknown payload signatures
+/// are rejected; named leaves retain their real Rust type for HostNamedStruct.
+pub fn guest_type_shape(ty: &Type) -> Result<GuestTypeShape<'_>, String> {
+    fn walk(ty: &Type, depth: usize) -> Result<GuestTypeShape<'_>, String> {
+        if depth > 64 {
+            return Err("GuestResult schema exceeds nesting limit".into());
+        }
+        let ty = unwrap_surface(ty);
+        if let Some((ok, err)) = guest_result_arguments(ty)? {
+            return Ok(GuestTypeShape::Result(
+                Box::new(walk(ok, depth + 1)?),
+                Box::new(walk(err, depth + 1)?),
+            ));
+        }
+        if let Some(spec) = resource_spec(ty, &[])? {
+            return Ok(GuestTypeShape::Resource(Box::new(spec)));
+        }
+        if let Type::Path(path) = ty {
+            let segment = path.path.segments.last().ok_or("empty type path")?;
+            let ident = segment.ident.to_string();
+            if ident == "Option" || ident == "Vec" {
+                let argument = one_type_argument(segment, &ident)?;
+                if ident == "Vec" && path_last_ident(argument).as_deref() == Some("u8") {
+                    return Ok(GuestTypeShape::Scalar("bytes"));
+                }
+                let inner = walk(argument, depth + 1)?;
+                if ident == "Vec" && !inner.resources().is_empty() {
+                    return Err("resource arrays are not supported by the host handle ABI".into());
+                }
+                return Ok(if ident == "Option" {
+                    GuestTypeShape::Optional(Box::new(inner))
+                } else {
+                    GuestTypeShape::Array(Box::new(inner))
+                });
+            }
+            if matches!(
+                ident.as_str(),
+                "Result" | "VmResult" | "HostCallResult" | "HostFutureOutput"
+            ) {
+                return Err(
+                    "transport results cannot be nested in GuestResult; use GuestResult<T, E>"
+                        .into(),
+                );
+            }
+        }
+        match type_label(ty).as_deref() {
+            Ok("int") => Ok(GuestTypeShape::Scalar("int")),
+            Ok("float") => Ok(GuestTypeShape::Scalar("float")),
+            Ok("bool") => Ok(GuestTypeShape::Scalar("bool")),
+            Ok("string") => Ok(GuestTypeShape::Scalar("string")),
+            Ok("bytes") => Ok(GuestTypeShape::Scalar("bytes")),
+            Ok("null") => Ok(GuestTypeShape::Scalar("null")),
+            Ok(_) => Err("GuestResult payload must have a fully typed public schema".into()),
+            Err(_) if matches!(ty, Type::Path(_)) => Ok(GuestTypeShape::Named(ty)),
+            Err(message) => Err(message.clone()),
+        }
+    }
+    walk(ty, 0)
+}
+
+/// Returns a typed shape only for the explicit guest union and its supported
+/// outer value containers. Transport wrappers are stripped by the return owner.
+pub fn guest_result_shape(ty: &Type) -> Result<Option<GuestTypeShape<'_>>, String> {
+    fn contains(ty: &Type) -> bool {
+        match unwrap_surface(ty) {
+            Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+                segment.ident == "GuestResult"
+                    || matches!(segment.ident.to_string().as_str(), "Option" | "Vec")
+                        && one_type_argument(segment, &segment.ident.to_string())
+                            .is_ok_and(contains)
+            }),
+            _ => false,
+        }
+    }
+    if contains(ty) {
+        guest_type_shape(ty).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Recognizes the explicit guest union and validates its exact type arity.
+/// Rust `Result` and the outer VM transport are deliberately not matched.
+pub fn guest_result_arguments(ty: &Type) -> Result<Option<(&Type, &Type)>, String> {
+    let Type::Path(path) = unwrap_surface(ty) else {
+        return Ok(None);
+    };
+    let Some(segment) = path.path.segments.last() else {
+        return Ok(None);
+    };
+    if segment.ident != "GuestResult" {
+        return Ok(None);
+    }
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return Err("GuestResult<T, E> requires exactly two type arguments".into());
+    };
+    let mut args = args.args.iter();
+    match (args.next(), args.next(), args.next()) {
+        (Some(GenericArgument::Type(ok)), Some(GenericArgument::Type(err)), None) => {
+            Ok(Some((ok, err)))
+        }
+        _ => Err("GuestResult<T, E> requires exactly two type arguments".into()),
+    }
 }
 
 fn one_type_argument<'a>(segment: &'a syn::PathSegment, name: &str) -> Result<&'a Type, String> {
@@ -705,13 +862,11 @@ pub struct BorrowedResourceReturn {
     pub wrappers: Vec<String>,
 }
 
-/// Finds a borrowed resource wrapper nested inside supported return wrappers.
+/// Finds a borrowed resource wrapper nested in a return type's generic syntax.
 ///
-/// `VmResult<T>`, `Result<T, E>`, `Option<T>`, `HostCallResult<T>`, and
-/// `HostFutureOutput<T>` are transparent for this validation. The traversal is
-/// deliberately independent of the final schema label so a borrowed resource
-/// cannot be hidden behind a wrapper that would otherwise be flattened by the
-/// host-function parser.
+/// Transport, guest-union, optional/array, and generic named wrappers are all
+/// transparent for this validation. The traversal is independent of the final
+/// schema label, so a generic named payload cannot hide a resource borrow.
 pub fn borrowed_resource_return(ty: &Type) -> Option<BorrowedResourceReturn> {
     let ty = unwrap_return_surface(ty);
     if let Some(kind) = resource_return_kind(ty) {
@@ -731,12 +886,6 @@ pub fn borrowed_resource_return(ty: &Type) -> Option<BorrowedResourceReturn> {
     };
     let segment = path.path.segments.last()?;
     let wrapper = segment.ident.to_string();
-    if !matches!(
-        wrapper.as_str(),
-        "VmResult" | "Result" | "Option" | "HostCallResult" | "HostFutureOutput"
-    ) {
-        return None;
-    }
     let PathArguments::AngleBracketed(args) = &segment.arguments else {
         return None;
     };
