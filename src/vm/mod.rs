@@ -3092,9 +3092,11 @@ impl Vm {
                 .execution_frames
                 .last()
                 .and_then(|frame| frame.prototype_id);
-            let target_is_valid = if let Some(prototype_id) = active_prototype
-                && !self.has_aot_program()
-            {
+            // Specialized callable prototypes may share a script function's
+            // code region. Branch authority is that active function range in
+            // both backends, not equality with the region's representative
+            // prototype (which need not be the admitted specialization).
+            let target_is_valid = if let Some(prototype_id) = active_prototype {
                 self.program
                     .callable_prototypes
                     .get(prototype_id as usize)
@@ -4118,7 +4120,10 @@ impl Vm {
         if let Some(frame) = self.instance.execution_frames.last_mut() {
             frame.continuation = FrameContinuation::ReturnToHost;
         }
-        match self.run_internal(None, false) {
+        // Host-root frames use the same typed return continuation and native
+        // frame ABI as guest calls. Preserve configured backend execution here;
+        // disabling it silently made standalone callbacks interpreter-only.
+        match self.run_internal(None, true) {
             Ok(status) => Ok(status),
             Err(error) => {
                 self.abort_host_invocation(stack_base, frame_count);

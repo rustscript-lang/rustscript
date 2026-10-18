@@ -1588,10 +1588,10 @@ mod tests {
         collect_named_structs_from_type(&schema, &mut seen, &mut builder).unwrap();
         assert_eq!(seen.len(), 1);
         if let HostTypeSchema::Result { err, .. } = &mut schema {
-            *err = Box::new(HostTypeSchema::Named {
+            **err = HostTypeSchema::Named {
                 name: "NestedResult".into(),
                 fields: vec![HostStructField::new("value", HostTypeSchema::String)],
-            });
+            };
         }
         assert!(matches!(
             collect_named_structs_from_type(&schema, &mut seen, &mut builder),

@@ -1230,7 +1230,13 @@ async fn sse_total_deadline_releases_the_connection_permit_for_reuse() {
         .await
         .expect_err("the first stream should reach its total deadline");
     assert!(error.to_string().contains("total deadline"), "{error}");
-    vm.reset_for_reuse().expect("SSE reset should complete");
+    reset_and_wait(&mut vm)
+        .await
+        .expect("SSE reset should reach quiescence");
+    assert!(!vm.scope_reset_pending());
+    assert!(vm.is_reusable());
+    assert_eq!(vm.host_context().operation_count(), 0);
+    assert_eq!(vm.host_context().resource_count(), 0);
     drive(&mut vm)
         .await
         .expect("the second stream should acquire the released permit");
@@ -1315,7 +1321,13 @@ async fn sse_callback_stop_after_deadline_fails_and_releases_permit_without_anot
     assert_eq!(vm.host_context().resource_count(), 0);
     assert_eq!(vm.host_context().operation_count(), 0);
 
-    vm.reset_for_reuse().expect("SSE reset should complete");
+    reset_and_wait(&mut vm)
+        .await
+        .expect("SSE reset should reach quiescence");
+    assert!(!vm.scope_reset_pending());
+    assert!(vm.is_reusable());
+    assert_eq!(vm.host_context().operation_count(), 0);
+    assert_eq!(vm.host_context().resource_count(), 0);
     drive(&mut vm)
         .await
         .expect("the next stream should acquire the released permit");

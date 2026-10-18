@@ -125,9 +125,11 @@ pub(super) fn enforce_local_availability(
         owned_local_slots,
         None,
         None,
+        &[],
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Source policy and admission provenance are independent inputs.
 pub(super) fn enforce_source_availability(
     mut ir: FrontendIr,
     entry_locals: &[EntryLocalAvailability],
@@ -136,6 +138,7 @@ pub(super) fn enforce_source_availability(
     owned_local_slots: &[bool],
     source_policies: Option<&HashMap<String, bool>>,
     sources: Option<&super::super::source_map::SourceMap>,
+    rejections: &[super::super::typing::CanonicalHostRejection],
 ) -> Result<FrontendIr, ParseError> {
     // Pad the post-legalize ownership metadata to the analyzer's local space.
     // Availability runs pre-compaction, so the logical slot indices align with
@@ -180,6 +183,15 @@ pub(super) fn enforce_source_availability(
             &initial_impls,
             policy,
             &owned_slots,
+        )
+        .with_rejections(
+            rejections,
+            ir.parsed_semantic_index.as_ref(),
+            sources.and_then(|sources| {
+                ir.function_sources
+                    .get(index)
+                    .and_then(|source| sources.source_id_by_name(source))
+            }),
         );
         let rewritten = analyzer
             .analyze_function_impl(*index, function_impl.clone())
@@ -218,6 +230,11 @@ pub(super) fn enforce_source_availability(
             &rewritten_impls,
             policy,
             &owned_slots,
+        )
+        .with_rejections(
+            rejections,
+            ir.parsed_semantic_index.as_ref(),
+            sources.and_then(|sources| source.and_then(|source| sources.source_id_by_name(source))),
         );
         let (stmts, next) = analyzer
             .analyze_block(&ir.stmts[start..end], state, true)
@@ -310,6 +327,7 @@ struct AvailabilityAnalyzer {
     /// anywhere. Owned slots are move-only and cannot be copied or borrowed
     /// outside exact host-call arguments.
     owned_local_slots: Vec<bool>,
+    rejections: Vec<super::super::typing::CanonicalHostRejection>,
 }
 
 impl AvailabilityAnalyzer {
@@ -353,6 +371,119 @@ impl AvailabilityAnalyzer {
             next_collection_alias_id: Cell::new(1),
             enable_local_move_semantics,
             owned_local_slots: owned,
+            rejections: Vec::new(),
+        }
+    }
+
+    fn with_rejections(
+        mut self,
+        rejections: &[super::super::typing::CanonicalHostRejection],
+        parsed: Option<&super::super::ir::ParsedSemanticIndex>,
+        source: Option<super::super::source_map::SourceId>,
+    ) -> Self {
+        if let (Some(parsed), Some(source)) = (parsed, source) {
+            self.rejections = rejections
+                .iter()
+                .filter(|rejection| {
+                    let site = &rejection.provenance;
+                    let reason_in_range = match rejection.reason {
+                        Some(
+                            super::super::host_call_resolve::ArgumentRejection::Schema { argument }
+                            | super::super::host_call_resolve::ArgumentRejection::Passing {
+                                argument,
+                                ..
+                            },
+                        ) => argument < site.arguments.len(),
+                        None => true,
+                    };
+                    reason_in_range
+                        && site.callee_span.source_id == source
+                        && parsed
+                            .call_arguments
+                            .iter()
+                            .filter(|args| *args == site)
+                            .count()
+                            == 1
+                        && parsed
+                            .call_sites
+                            .iter()
+                            .filter(|call| {
+                                call.id == site.call_id
+                                    && call.callee_span == site.callee_span
+                                    && call.expr_span == site.expr_span
+                            })
+                            .count()
+                            == 1
+                })
+                .cloned()
+                .collect();
+        }
+        self
+    }
+
+    /// Only parser-proven direct wrappers of this recorded failed host call
+    /// participate. These are admission facts, never runtime passing modes.
+    fn analyze_rejected_arg(
+        &self,
+        id: Option<super::super::ir::SemanticNodeId>,
+        position: usize,
+        arg: &Expr,
+        state: &FlowState,
+        line: u32,
+    ) -> Option<Result<FlowState, ParseError>> {
+        use super::super::host_call_resolve::ArgumentRejection;
+        use super::super::ir::ParsedArgumentShape;
+        let mut matching = self
+            .rejections
+            .iter()
+            .filter(|rejection| Some(rejection.provenance.call_id) == id);
+        let rejection = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        let site = rejection.provenance.arguments.get(position)?;
+        let (shape, inner) = match arg {
+            Expr::Borrow(inner) => (ParsedArgumentShape::Borrow, inner.as_ref()),
+            Expr::BorrowMut(inner) => (ParsedArgumentShape::BorrowMut, inner.as_ref()),
+            Expr::ToOwned(inner) => (ParsedArgumentShape::Copy, inner.as_ref()),
+            _ => return None,
+        };
+        if shape != site.shape
+            || site.span.source_id != rejection.provenance.callee_span.source_id
+            || site.span.lo < rejection.provenance.callee_span.hi
+            || site.span.hi >= rejection.provenance.expr_span.hi
+        {
+            return None;
+        }
+        let local = match inner {
+            Expr::Var(slot) | Expr::MoveVar(slot) => Some(*slot),
+            _ => None,
+        };
+        if local != site.local {
+            return None;
+        }
+        match shape {
+            ParsedArgumentShape::Borrow | ParsedArgumentShape::BorrowMut => {
+                Some(self.analyze_expr_to_owned(inner, state, line))
+            }
+            ParsedArgumentShape::Copy
+                if matches!(rejection.reason,
+                Some(ArgumentRejection::Passing { argument, expected: HostParamPassing::TakeOwned | HostParamPassing::Borrow | HostParamPassing::BorrowMut,
+                    actual: HostParamPassing::Value }) if argument == position) =>
+            {
+                let slot = local?;
+                if !self.is_owned_slot(slot) {
+                    return None;
+                }
+                // Same invalid copy argument owns the canonical passing error,
+                // including an already moved local. Preserve state unchanged;
+                // all other arguments and subsequent uses still run normally.
+                Some(
+                    self.require_available(slot, state, line)
+                        .map(|()| state.clone()),
+                )
+            }
+            _ => None,
         }
     }
 
@@ -941,7 +1072,28 @@ impl AvailabilityAnalyzer {
             // Resolved module calls (pre-merge only) analyze their arguments;
             // interprocedural effects apply to the post-merge flat call.
             Expr::ModuleCall(_, _, args, _) => self.analyze_args(args, state, line),
-            Expr::Call(index, _, args, resolution, _) => {
+            Expr::Call(index, _, args, resolution, semantic_id) => {
+                if resolution.is_none()
+                    && self
+                        .rejections
+                        .iter()
+                        .any(|rejection| Some(rejection.provenance.call_id) == *semantic_id)
+                {
+                    let mut out = state.clone();
+                    for (position, arg) in args.iter().enumerate() {
+                        out = match self.analyze_rejected_arg(
+                            *semantic_id,
+                            position,
+                            arg,
+                            &out,
+                            line,
+                        ) {
+                            Some(result) => result?,
+                            None => self.analyze_expr(arg, &out, line)?,
+                        };
+                    }
+                    return Ok(out);
+                }
                 if !self.enable_local_move_semantics {
                     if let Some(root_slot) = self.extract_collection_mutation_root(*index, args) {
                         let mut out = self.analyze_args(args, state, line)?;
@@ -1325,11 +1477,15 @@ impl AvailabilityAnalyzer {
         let mut ok_in = value_state.clone();
         if let Some(slot) = ok_binding {
             self.mark_available(&mut ok_in, slot, line)?;
+            // Each selected arm installs a fresh payload, including on a
+            // backedge after the previous iteration transferred that binding.
+            self.clear_local_moved_state(&mut ok_in, slot);
             self.note_result_payload_owner(&mut ok_in, slot, value);
         }
         let mut err_in = value_state;
         if let Some(slot) = err_binding {
             self.mark_available(&mut err_in, slot, line)?;
+            self.clear_local_moved_state(&mut err_in, slot);
             self.note_result_payload_owner(&mut err_in, slot, value);
         }
         Ok((ok_in, err_in))
@@ -1909,6 +2065,14 @@ impl AvailabilityAnalyzer {
                 let mut rewritten_args = Vec::with_capacity(args.len());
                 let mut arg_state = state.clone();
                 for (position, arg) in args.iter().enumerate() {
+                    if resolution.is_none()
+                        && let Some(result) =
+                            self.analyze_rejected_arg(*source_node_id, position, arg, &arg_state, 1)
+                    {
+                        arg_state = result?;
+                        rewritten_args.push(arg.clone());
+                        continue;
+                    }
                     let seed = self.next_collection_alias_id.get();
                     let mut arg = self.rewrite_expr_ownership_inner(arg, true, &arg_state)?;
                     let passing = resolution

@@ -611,12 +611,8 @@ struct BufferedRequestShared {
     /// Waker registered by a pending operation poll. `register` is followed by
     /// a result recheck by the operation driver.
     waker: AtomicWaker,
-    /// The worker thread handle, taken during close to join.
-    join_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// Waker registered by the close poll when the worker is still running.
-    close_waker: AtomicWaker,
-    /// Waker registered by the operation registry while waiting for worker quiescence.
-    quiescence_waker: AtomicWaker,
+    /// Transport-free original native join and independent retirement wakes.
+    native_join: Arc<super::native_join::NativeJoin>,
     /// The connection permit, held until the shared state is dropped (after
     /// the worker exits and the resource is closed).
     _permit: ConnectionPermit,
@@ -639,8 +635,8 @@ impl BufferedRequestShared {
         self.thread_finished.store(true, Ordering::Release);
         self.worker_lifecycle
             .store(WorkerLifecycle::Finished as u8, Ordering::Release);
-        self.close_waker.wake();
-        self.quiescence_waker.wake();
+        self.native_join.close_waker.wake();
+        self.native_join.quiescence_waker.wake();
     }
 
     /// Publishes a terminal rollback result for a resource that never had a
@@ -659,19 +655,20 @@ impl BufferedRequestShared {
         {
             return false;
         }
+        self.native_join.workerless();
         self.request_stop();
         self.publish(result);
         self.thread_finished.store(true, Ordering::Release);
-        self.close_waker.wake();
-        self.quiescence_waker.wake();
+        self.native_join.close_waker.wake();
+        self.native_join.quiescence_waker.wake();
         true
     }
 
     fn request_stop(&self) {
         self.cancel.notify_one();
         self.waker.wake();
-        self.close_waker.wake();
-        self.quiescence_waker.wake();
+        self.native_join.close_waker.wake();
+        self.native_join.quiescence_waker.wake();
     }
 
     fn publish(&self, result: VmResult<HttpResponse>) {
@@ -682,8 +679,8 @@ impl BufferedRequestShared {
         // The result mutex write happens-before this release publication.
         self.done.store(true, Ordering::Release);
         self.waker.wake();
-        self.close_waker.wake();
-        self.quiescence_waker.wake();
+        self.native_join.close_waker.wake();
+        self.native_join.quiescence_waker.wake();
     }
 
     fn has_result(&self) -> bool {
@@ -700,24 +697,11 @@ impl BufferedRequestShared {
         {
             return Ok(false);
         }
-        let handle = {
-            let mut guard = self
-                .join_handle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.as_ref().is_some_and(|handle| !handle.is_finished()) {
-                return Ok(false);
-            }
-            guard.take()
-        };
-        let Some(handle) = handle else {
-            return Ok(true);
-        };
-        handle.join().map(|_| true).map_err(|panic| {
+        self.native_join.poll_join().map_err(|message| {
             ResourceError::new(
                 ResourceErrorCode::ResourceCleanupFailed,
                 "http::request::resource",
-                worker_panic_message(&panic),
+                message,
             )
         })
     }
@@ -726,11 +710,7 @@ impl BufferedRequestShared {
         self.worker_lifecycle.load(Ordering::Acquire) == WorkerLifecycle::Finished as u8
             && self.done.load(Ordering::Acquire)
             && self.thread_finished.load(Ordering::Acquire)
-            && self
-                .join_handle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none()
+            && self.native_join.is_joined()
     }
 }
 
@@ -745,12 +725,43 @@ fn worker_panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 }
 
 #[cfg(test)]
-static FAIL_NEXT_WORKER_SPAWN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+type NativeTailHook = Box<dyn FnOnce(Arc<BufferedRequestShared>) + Send>;
 
 #[cfg(test)]
-static REJECT_NEXT_OPERATION_ADMISSION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    // Per-admission hook runs after every existing producer wake, while the
+    // original native closure still owns its libstd thread packet.
+    static TEST_NATIVE_TAIL: std::cell::RefCell<Option<NativeTailHook>> = const { std::cell::RefCell::new(None) };
+    static FAIL_NEXT_NOTIFIER_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_NOTIFIER_EXIT: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn prearm_native_join(
+    completion: &Arc<super::native_join::NativeJoin>,
+) -> Result<super::native_join::PrearmedInput, String> {
+    #[cfg(test)]
+    if FAIL_NEXT_NOTIFIER_SPAWN.with(|fail| fail.replace(false)) {
+        return completion.prearm_with(|_task| {
+            Err(std::io::Error::other("injected HTTP join notifier failure"))
+        });
+    }
+    #[cfg(test)]
+    if let Some(exit) = TEST_NOTIFIER_EXIT.with(|hook| hook.borrow_mut().take()) {
+        return completion.prearm_with(|task| {
+            std::thread::Builder::new().spawn(move || {
+                task();
+                let _ = exit.send(());
+            })
+        });
+    }
+    completion.prearm()
+}
+
+#[cfg(test)]
+thread_local! { static FAIL_NEXT_WORKER_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[cfg(test)]
+thread_local! { static REJECT_NEXT_OPERATION_ADMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 #[allow(clippy::result_large_err)]
 fn start_operation<T: HostOperation>(
@@ -758,7 +769,7 @@ fn start_operation<T: HostOperation>(
     operation: T,
 ) -> crate::vm::host_context::HostContextResult<OperationId> {
     #[cfg(test)]
-    if REJECT_NEXT_OPERATION_ADMISSION.swap(false, Ordering::AcqRel) {
+    if REJECT_NEXT_OPERATION_ADMISSION.with(|fail| fail.replace(false)) {
         return Err(crate::vm::host_context::HostContextError::new(
             "http::operation",
             "injected operation admission rejection",
@@ -773,7 +784,7 @@ where
     F: FnOnce() + Send + 'static,
 {
     #[cfg(test)]
-    if FAIL_NEXT_WORKER_SPAWN.swap(false, Ordering::AcqRel) {
+    if FAIL_NEXT_WORKER_SPAWN.with(|fail| fail.replace(false)) {
         return Err(std::io::Error::other("injected HTTP worker spawn failure"));
     }
     std::thread::Builder::new()
@@ -830,7 +841,7 @@ impl HostResource for HttpRequestResource {
         match shared.try_join_finished() {
             Ok(true) => Poll::Ready(Ok(())),
             Ok(false) => {
-                shared.close_waker.register(cx.waker());
+                shared.native_join.close_waker.register(cx.waker());
                 match shared.try_join_finished() {
                     Ok(true) => Poll::Ready(Ok(())),
                     Ok(false) => Poll::Pending,
@@ -902,14 +913,20 @@ impl HostOperation for HttpRequestOperation {
     }
 
     fn register_quiescence_waker(&mut self, cx: &Context<'_>) {
-        self.shared.quiescence_waker.register(cx.waker());
+        self.shared
+            .native_join
+            .quiescence_waker
+            .register(cx.waker());
     }
 
     fn poll_quiescent(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if self.shared.is_quiescent() {
             return Poll::Ready(());
         }
-        self.shared.quiescence_waker.register(cx.waker());
+        self.shared
+            .native_join
+            .quiescence_waker
+            .register(cx.waker());
         if self.shared.is_quiescent() {
             Poll::Ready(())
         } else {
@@ -1056,9 +1073,10 @@ pub(super) fn perform_buffered_request(
         thread_finished: std::sync::atomic::AtomicBool::new(false),
         worker_lifecycle: std::sync::atomic::AtomicU8::new(WorkerLifecycle::NotStarted as u8),
         waker: AtomicWaker::new(),
-        join_handle: std::sync::Mutex::new(None),
-        close_waker: AtomicWaker::new(),
-        quiescence_waker: AtomicWaker::new(),
+        native_join: Arc::new(super::native_join::NativeJoin::new(
+            "HTTP request",
+            "rustscript-http-join",
+        )),
         _permit: permit,
         rollback_finished: std::sync::atomic::AtomicBool::new(false),
     });
@@ -1160,6 +1178,21 @@ pub(super) fn perform_buffered_request(
         ));
     }
 
+    // Arming is fallible and must precede the original worker: quiescence's
+    // Poll<()> channel cannot propagate a later notifier spawn failure.
+    let native_input = match prearm_native_join(&shared.native_join) {
+        Ok(input) => input,
+        Err(message) => {
+            return Err(rollback_buffered_request(
+                vm,
+                resource_handle,
+                &shared,
+                Some(op_id),
+                VmError::HostError(message),
+            ));
+        }
+    };
+
     // Run the request on a worker thread; the operation driver polls the
     // shared completion cell. The worker uses tokio::select! to respond
     // promptly to cancellation even while blocked on network I/O.
@@ -1171,6 +1204,8 @@ pub(super) fn perform_buffered_request(
         headers: request.headers,
         body: request.body.into_bytes(),
     };
+    #[cfg(test)]
+    let native_tail = TEST_NATIVE_TAIL.with(|hook| hook.borrow_mut().take());
     let join_handle = match spawn_worker("rustscript-http-request", {
         let worker_shared = Arc::clone(&shared);
         move || {
@@ -1210,6 +1245,10 @@ pub(super) fn perform_buffered_request(
             worker_shared.publish(value);
             worker_state.mark_worker_finished();
             worker_state.waker.wake();
+            #[cfg(test)]
+            if let Some(native_tail) = native_tail {
+                native_tail(Arc::clone(&worker_state));
+            }
         }
     }) {
         Ok(join_handle) => join_handle,
@@ -1226,11 +1265,7 @@ pub(super) fn perform_buffered_request(
 
     shared.mark_worker_running();
 
-    // Store the join handle so the resource can join it during close.
-    *shared
-        .join_handle
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(join_handle);
+    native_input.install(join_handle);
 
     let raw = op_id.raw();
     Ok(HostCallResult::Pending(raw))
@@ -1883,9 +1918,10 @@ mod tests {
             thread_finished: AtomicBool::new(false),
             worker_lifecycle: AtomicU8::new(WorkerLifecycle::NotStarted as u8),
             waker: futures_util::task::AtomicWaker::new(),
-            join_handle: std::sync::Mutex::new(None),
-            close_waker: futures_util::task::AtomicWaker::new(),
-            quiescence_waker: futures_util::task::AtomicWaker::new(),
+            native_join: Arc::new(super::super::native_join::NativeJoin::new(
+                "HTTP request",
+                "rustscript-http-join",
+            )),
             _permit: permit,
             rollback_finished: AtomicBool::new(false),
         })
@@ -2135,7 +2171,7 @@ mod tests {
             .push_resource(HttpRequestResource::new(std::sync::Arc::clone(&shared)))
             .expect("request resource");
         let primary = VmError::HostError("operation admission rejected".to_string());
-        REJECT_NEXT_OPERATION_ADMISSION.store(true, Ordering::Release);
+        REJECT_NEXT_OPERATION_ADMISSION.with(|fail| fail.set(true));
         let admission = start_operation(&mut vm, HttpRequestOperation::new(Arc::clone(&shared)));
         assert!(admission.is_err());
 
@@ -2160,9 +2196,383 @@ mod tests {
         assert!(repeated.to_string().contains("repeated rollback"));
     }
 
+    fn accept_bounded(listener: std::net::TcpListener) -> std::net::TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fixture accept timeout"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("fixture accept failed: {error}"),
+            }
+        }
+    }
+
+    fn real_buffered_native_tail(reset: bool, native_panic: bool) {
+        use crate::builtins::runtime::http::{HttpHostExt, HttpHostState};
+        use crate::vm::resource::{HostResource, ResourceCloseReason};
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        use std::task::Context;
+        use std::time::Duration;
+
+        struct Wake(mpsc::Sender<()>);
+        impl futures_util::task::ArcWake for Wake {
+            fn wake_by_ref(this: &Arc<Self>) {
+                let _ = this.0.send(());
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let next_listener = listener.try_clone().unwrap();
+        let (connected_tx, connected_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut stream = accept_bounded(listener);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+                assert!(head.len() < 8192);
+            }
+            connected_tx.send(()).unwrap();
+            if reset {
+                let mut byte = [0];
+                assert_eq!(stream.read(&mut byte).unwrap(), 0);
+            } else {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .unwrap();
+            }
+        });
+        let source = format!(
+            "use http; let req = http::request::new(\"GET\", \"http://{address}/\"); http::client::request(req);"
+        );
+        let mut vm = crate::vm::Vm::new(crate::compile_source(&source).unwrap().program);
+        vm.configure_http(super::HttpConfig {
+            allow_private_ips: true,
+            allowed_schemes: vec!["http".into()],
+            allowed_hosts: vec!["127.0.0.1".into()],
+            allowed_ports: vec![address.port()],
+            ..Default::default()
+        })
+        .unwrap();
+        vm.set_http_max_in_flight(1);
+        crate::vm::HostFunctionRegistry::new()
+            .bind_vm_cached(&mut vm)
+            .unwrap();
+        let admission = vm
+            .host_context()
+            .module_state::<HttpHostState>()
+            .unwrap()
+            .admission
+            .clone();
+        let (body_tx, body_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        super::TEST_NATIVE_TAIL.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |shared| {
+                body_tx.send(shared).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(!native_panic, "buffered original native panic");
+            }))
+        });
+        assert!(matches!(vm.run().unwrap(), crate::vm::VmStatus::Waiting(_)));
+        connected_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        if reset {
+            vm.reset_for_reuse().unwrap();
+        }
+        let shared = body_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.join().unwrap();
+        assert!(shared.done.load(Ordering::Acquire));
+        assert!(shared.thread_finished.load(Ordering::Acquire));
+        assert!(!shared.is_quiescent(), "native tail is still held");
+        assert!(admission.acquire().is_err());
+        let mut close = HttpRequestResource::new(shared.clone());
+        assert_eq!(
+            close.begin_close(ResourceCloseReason::Requested).unwrap(),
+            crate::vm::resource::CloseProgress::Pending
+        );
+        let (op_tx, op_rx) = mpsc::channel();
+        let (close_tx, close_rx) = mpsc::channel();
+        let op_waker = futures_util::task::waker(Arc::new(Wake(op_tx)));
+        let close_waker = futures_util::task::waker(Arc::new(Wake(close_tx)));
+        let mut op_cx = Context::from_waker(&op_waker);
+        let mut close_cx = Context::from_waker(&close_waker);
+        let mut poll_vm = |cx: &mut Context<'_>| {
+            if reset {
+                vm.poll_reset_for_reuse(cx)
+            } else {
+                vm.poll_waiting_host_op(cx)
+            }
+        };
+        assert!(poll_vm(&mut op_cx).is_pending());
+        assert!(close.poll_close(&mut close_cx).is_pending());
+        // Every old producer wake and close/cancel wake is consumed before
+        // releasing only native exit. There is no timer driving either poller.
+        op_rx.try_iter().for_each(drop);
+        close_rx.try_iter().for_each(drop);
+        assert!(poll_vm(&mut op_cx).is_pending());
+        assert!(close.poll_close(&mut close_cx).is_pending());
+        release_tx.send(()).unwrap();
+        let op_wake = op_rx.recv_timeout(Duration::from_secs(2));
+        let close_wake = close_rx.recv_timeout(Duration::from_secs(2));
+        assert!(
+            op_wake.is_ok(),
+            "native exit supplied no automatic buffered retirement wake"
+        );
+        assert!(
+            close_wake.is_ok(),
+            "native exit supplied no independent buffered close wake"
+        );
+        if native_panic {
+            for _ in 0..2 {
+                let std::task::Poll::Ready(Err(error)) = close.poll_close(&mut close_cx) else {
+                    panic!("durable native cleanup failure required")
+                };
+                assert_eq!(
+                    error.code(),
+                    crate::vm::resource::ResourceErrorCode::ResourceCleanupFailed
+                );
+                assert!(error.to_string().contains("buffered original native panic"));
+            }
+            let std::task::Poll::Ready(Err(error)) = poll_vm(&mut op_cx) else {
+                panic!("actual buffered completion must report native cleanup failure")
+            };
+            assert!(error.to_string().contains("buffered original native panic"));
+        } else {
+            assert!(matches!(
+                close.poll_close(&mut close_cx),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            assert!(matches!(
+                poll_vm(&mut op_cx),
+                std::task::Poll::Ready(Ok(()))
+            ));
+        }
+        drop(close);
+        assert!(shared.is_quiescent());
+        assert_eq!(vm.host_context().operation_count(), 0);
+        if !reset {
+            if !native_panic {
+                assert_eq!(vm.run().unwrap(), crate::vm::VmStatus::Halted);
+                vm.reset_for_reuse().unwrap();
+                assert!(matches!(
+                    vm.poll_reset_for_reuse(&mut op_cx),
+                    std::task::Poll::Ready(Ok(()))
+                ));
+            } else {
+                let error = vm
+                    .reset_for_reuse()
+                    .expect_err("scope cleanup preserves native panic");
+                assert!(error.to_string().contains("buffered original native panic"));
+            }
+        }
+        assert_eq!(vm.host_context().resource_count(), 0);
+        assert_eq!(
+            Arc::strong_count(&shared),
+            1,
+            "retired owners retain no producer roots"
+        );
+        drop(shared);
+        let next = admission.acquire().expect("next single-permit admission");
+        assert!(admission.acquire().is_err());
+        drop(next);
+        if native_panic {
+            return;
+        }
+        assert!(vm.is_reusable());
+        let next_server = std::thread::spawn(move || {
+            let mut stream = accept_bounded(next_listener);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+                assert!(head.len() < 8192);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        assert!(matches!(vm.run().unwrap(), crate::vm::VmStatus::Waiting(_)));
+        super::runtime_block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), vm.await_waiting_host_op())
+                .await
+                .unwrap()
+                .unwrap();
+        })
+        .unwrap();
+        assert_eq!(vm.run().unwrap(), crate::vm::VmStatus::Halted);
+        vm.reset_for_reuse().unwrap();
+        super::runtime_block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                std::future::poll_fn(|cx| vm.poll_reset_for_reuse(cx)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        })
+        .unwrap();
+        next_server.join().unwrap();
+        assert_eq!(vm.host_context().resource_count(), 0);
+        assert_eq!(vm.host_context().operation_count(), 0);
+        assert!(vm.is_reusable());
+    }
+
+    #[test]
+    fn real_buffered_response_native_exit_wakes_retirement_and_close() {
+        real_buffered_native_tail(false, false);
+    }
+
+    #[test]
+    fn real_buffered_reset_native_exit_wakes_retirement_and_close() {
+        real_buffered_native_tail(true, false);
+    }
+
+    #[test]
+    fn real_buffered_native_panic_is_durable_cleanup_failure() {
+        real_buffered_native_tail(false, true);
+    }
+
+    fn real_admission_failure(which: &str) {
+        use crate::builtins::runtime::http::{HttpHostExt, HttpHostState};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let source = format!(
+            "use http; let req = http::request::new(\"GET\", \"http://{address}/\"); http::client::request(req);"
+        );
+        let mut vm = crate::vm::Vm::new(crate::compile_source(&source).unwrap().program);
+        vm.configure_http(super::HttpConfig {
+            allow_private_ips: true,
+            allowed_schemes: vec!["http".into()],
+            allowed_hosts: vec!["127.0.0.1".into()],
+            allowed_ports: vec![address.port()],
+            ..Default::default()
+        })
+        .unwrap();
+        vm.set_http_max_in_flight(1);
+        crate::vm::HostFunctionRegistry::new()
+            .bind_vm_cached(&mut vm)
+            .unwrap();
+        let admission = vm
+            .host_context()
+            .module_state::<HttpHostState>()
+            .unwrap()
+            .admission
+            .clone();
+        let (exit_tx, exit_rx) = mpsc::channel();
+        if which == "worker" {
+            super::TEST_NOTIFIER_EXIT.with(|hook| *hook.borrow_mut() = Some(exit_tx));
+            FAIL_NEXT_WORKER_SPAWN.with(|fail| fail.set(true));
+        } else if which == "notifier" {
+            super::FAIL_NEXT_NOTIFIER_SPAWN.with(|fail| fail.set(true));
+        } else {
+            REJECT_NEXT_OPERATION_ADMISSION.with(|fail| fail.set(true));
+        }
+        let error = vm
+            .run()
+            .expect_err("actual admission must fail before network");
+        let expected = match which {
+            "worker" => "injected HTTP worker spawn failure",
+            "notifier" => "injected HTTP join notifier failure",
+            _ => "injected operation admission rejection",
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(vm.host_context().operation_count(), 0);
+        assert_eq!(vm.host_context().resource_count(), 0);
+        assert!(
+            admission.acquire().is_ok(),
+            "workerless rollback releases permit"
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        if which == "worker" {
+            exit_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("workerless input must release the prearmed helper");
+        }
+        vm.reset_for_reuse().unwrap();
+        assert!(vm.is_reusable());
+    }
+
+    #[test]
+    fn real_buffered_prearm_failure_rolls_back_before_worker_and_network() {
+        real_admission_failure("notifier");
+    }
+
+    #[test]
+    fn real_buffered_worker_spawn_failure_releases_prearmed_helper() {
+        real_admission_failure("worker");
+    }
+
+    #[test]
+    fn real_buffered_operation_admission_failure_retires_workerless() {
+        real_admission_failure("operation");
+    }
+
+    #[test]
+    fn buffered_registry_preserves_first_cancel_reason_through_join() {
+        use crate::vm::operation::{OperationCancelReason, OperationOutcome, OperationSpec};
+        use std::task::Context;
+        let mut vm = empty_vm();
+        let shared = buffered_shared();
+        let operation = vm
+            .execution_scope()
+            .start_operation(OperationSpec::new(HttpRequestOperation::new(
+                shared.clone(),
+            )))
+            .unwrap();
+        assert!(
+            vm.execution_scope()
+                .cancel_operation(operation, OperationCancelReason::Deadline)
+                .unwrap()
+        );
+        assert!(
+            !vm.execution_scope()
+                .cancel_operation(operation, OperationCancelReason::VmReset)
+                .unwrap()
+        );
+        assert!(shared.terminalize_workerless(Err(VmError::HostError("not started".into()))));
+        assert!(matches!(
+            vm.execution_scope().poll_operation_quiescence(
+                operation,
+                &mut Context::from_waker(std::task::Waker::noop())
+            ),
+            std::task::Poll::Ready(Ok(OperationOutcome::Cancelled(
+                OperationCancelReason::Deadline
+            )))
+        ));
+        assert_eq!(vm.host_context().operation_count(), 0);
+    }
+
     #[test]
     fn worker_spawn_abstraction_can_inject_a_builder_failure() {
-        FAIL_NEXT_WORKER_SPAWN.store(true, Ordering::Release);
+        FAIL_NEXT_WORKER_SPAWN.with(|fail| fail.set(true));
         let result = spawn_worker("injected-http-worker", || {});
         let error = match result {
             Ok(handle) => {

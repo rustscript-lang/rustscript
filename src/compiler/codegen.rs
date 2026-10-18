@@ -1278,6 +1278,7 @@ impl Compiler {
         self.emit_copy_ldloc(value_slot)?;
         self.assembler
             .push_const(Value::string(super::result::RESULT_TAG_KEY));
+        self.record_operand_types(ValueType::Map, ValueType::String);
         self.assembler.call(BuiltinFunction::Get.call_index(), 2);
         let err_label = self.fresh_label("result_try_err");
         let ok_label = self.fresh_label("result_try_ok");

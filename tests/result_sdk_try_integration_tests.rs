@@ -149,6 +149,125 @@ fn machine(source: &str, decoded: bool) -> Vm {
     machine
 }
 
+#[cfg(feature = "cranelift-jit")]
+#[test]
+fn dynamic_resource_try_hot_loop_before_teardown_all_backends() {
+    let _lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for mode in ["interpreter", "aot", "trace"] {
+        for ok in [true, false] {
+            EVENTS.lock().unwrap().clear();
+            let source = format!(
+                r#"use joined;
+                fn relay(flag: bool) -> Result<resource<joined.token>, resource<joined.token>> {{
+                    let local = joined::make(true, 101);
+                    let mut i = 0;
+                    while i < 64 {{
+                        let produced = joined::make(flag || i != 48, i);
+                        let normalized: Result<resource<joined.token>, resource<joined.token>> = match produced {{
+                            Result::Ok(v) => Result::Ok(v),
+                            Result::Err(e) => Result::Err(e),
+                        }};
+                        let selected = normalized?;
+                        let temporary: Result<resource<joined.token>, resource<joined.token>> = Result::Ok(selected);
+                        let closed = joined::close(temporary);
+                        i = i + 1;
+                    }}
+                    let local_closed = joined::close(local);
+                    let after = joined::tick(2);
+                    joined::make(true, 501)
+                }}
+                let returned = relay(joined::tick({}) == 0);
+                joined::close(returned);"#,
+                if ok { 0 } else { 1 }
+            );
+            let mut machine = machine(&source, true);
+            machine.set_jit_config(vm::JitConfig {
+                enabled: mode == "trace",
+                hot_loop_threshold: 1,
+                max_trace_len: 512,
+            });
+            if mode == "aot" {
+                machine
+                    .compile_aot()
+                    .expect("required resource AOT admission");
+                assert!(machine.dump_aot_info().contains("lowering=ssa"));
+            }
+            assert_eq!(machine.run().expect("resource runtime"), VmStatus::Halted);
+            assert_eq!(
+                machine.stack().last(),
+                Some(&Value::Int(if ok { 501 } else { 48 }))
+            );
+            assert_eq!(machine.host_context().resource_count(), 0);
+            let events = EVENTS.lock().unwrap().clone();
+            let iterations = if ok { 64 } else { 49 };
+            for id in (0..iterations)
+                .chain([101])
+                .chain(if ok { Some(501) } else { None })
+            {
+                for kind in ["make", "close", "drop"] {
+                    assert_eq!(
+                        events.iter().filter(|e| **e == (kind, id)).count(),
+                        1,
+                        "{mode} {ok} {id} {kind}: {events:?}"
+                    );
+                }
+            }
+            assert_eq!(events.contains(&("tick", 2)), ok);
+            if !ok {
+                let err_make = events.iter().position(|e| *e == ("make", 48)).unwrap();
+                let local_close = events.iter().position(|e| *e == ("close", 101)).unwrap();
+                let err_close = events.iter().position(|e| *e == ("close", 48)).unwrap();
+                assert!(err_make < local_close && local_close < err_close);
+                assert!(!events.iter().any(|e| e.0 == "make" && e.1 == 49));
+            }
+            if mode == "aot" {
+                assert!(machine.aot_exec_count() > 0);
+            }
+            if mode == "trace" {
+                eprintln!(
+                    "R4 resource full trace\n{}",
+                    machine
+                        .dump_jit_info()
+                        .lines()
+                        .filter(|line| !line.trim_start().starts_with("code:"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                let snapshot = machine.jit_snapshot();
+                let relevant: Vec<_> = snapshot
+                    .traces
+                    .iter()
+                    .filter(|t| {
+                        t.executions > 0
+                            && t.op_names().iter().any(|op| op == "map_get")
+                            && t.ssa_text().contains("tag")
+                            && t.ssa_text().contains("payload")
+                    })
+                    .collect();
+                for trace in &relevant {
+                    eprintln!(
+                        "R4 resource trace root={} executions={} terminal={:?}\n{}",
+                        trace.root_ip,
+                        trace.executions,
+                        trace.terminal,
+                        trace.ssa_text()
+                    );
+                }
+                assert!(
+                    !relevant.is_empty(),
+                    "required resource tag/payload native region missing: {:?}",
+                    snapshot.attempts
+                );
+            }
+            eprintln!(
+                "R4 resource mode={mode} ok={ok} live_before_teardown=0 iterations={iterations} trace={} aot={} events={events:?}",
+                machine.jit_native_exec_count(),
+                machine.aot_exec_count()
+            );
+        }
+    }
+}
+
 #[test]
 fn generated_host_try_is_once_only_function_local_and_fatal_across_v13() {
     let _lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());

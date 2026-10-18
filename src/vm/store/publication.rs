@@ -13,9 +13,9 @@ const DISCARDED: u8 = 1;
 const SURVIVING: u8 = 2;
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod quarantine_tests;
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone)]
 enum Hold {

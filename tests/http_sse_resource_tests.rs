@@ -208,7 +208,11 @@ async fn resource_sse_reset_closes_pending_connection_and_scope() {
         assert!(stream.read(&mut bytes).unwrap() > 0);
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
         tx.send(()).unwrap();
-        assert_eq!(stream.read(&mut bytes).unwrap(), 0);
+        match stream.read(&mut bytes) {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            outcome => panic!("reset must close the connection: {outcome:?}"),
+        }
     });
     let source = format!(
         r#"use http;

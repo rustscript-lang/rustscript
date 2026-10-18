@@ -432,6 +432,9 @@ fn block_catalog() -> Arc<HostApiCatalog> {
 
 #[test]
 fn compiled_expression_block_detaches_taken_resource_once() {
+    // This producer shares BLOCK_CLOSES with Result/closure tests. Hold the
+    // same operation-wide guard through reset, execution, assertions and VM drop.
+    let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     BLOCK_CLOSES.store(0, Ordering::SeqCst);
     let options = CompileSourceFileOptions::new().with_host_api_catalog(block_catalog());
     let source = r#"
@@ -1957,10 +1960,8 @@ fn result_try_aot_artifact_closes_live_local_before_vm_drop() {
         hot_loop_threshold: 1,
         max_trace_len: 512,
     };
-    let mut producer = Vm::new_with_jit_config(
-        compiled.program.with_local_count(compiled.locals),
-        jit.clone(),
-    );
+    let mut producer =
+        Vm::new_with_jit_config(compiled.program.with_local_count(compiled.locals), jit);
     producer.set_fuel(100_000);
     bind_result_hosts(&mut producer);
     let artifact = producer

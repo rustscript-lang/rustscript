@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use futures_util::task::AtomicWaker;
 use pd_host_function::pd_host_function;
 use tokio::sync::{Notify, mpsc};
 
@@ -343,6 +342,8 @@ enum SseWorkerLifecycle {
     Finished = 2,
 }
 
+use super::native_join::NativeJoin as SseNativeJoin;
+
 pub(super) struct SseShared {
     /// Set on close/cancel; the worker stops polling the network.
     pub(super) stopping: AtomicBool,
@@ -356,9 +357,8 @@ pub(super) struct SseShared {
     /// One acknowledgement is issued by the VM after each callback. The
     /// acknowledgement arrives.
     pub(super) item_ack: Notify,
-    /// Waker registered by a pending stream poll. Channel readiness is handled
-    /// by `Receiver::poll_recv`; this waker covers stop and terminal state.
-    pub(super) waker: AtomicWaker,
+    /// Native completion is independent of resource-bearing shared state.
+    native_join: Arc<SseNativeJoin>,
     /// Bounded FIFO of published items awaiting the stream driver.
     /// The worker `send`s with backpressure; the driver `try_recv`s.
     /// This preserves item ordering and never drops events, unlike a
@@ -373,13 +373,6 @@ pub(super) struct SseShared {
     pub(super) worker_lifecycle: std::sync::atomic::AtomicU8,
     /// The final result from the worker thread (Ok or error).
     pub(super) result: std::sync::Mutex<Option<VmResult<()>>>,
-    /// The worker thread handle, taken during close to join.
-    pub(super) join_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// Waker registered by the close poll when the worker is still running.
-    pub(super) close_waker: AtomicWaker,
-    /// Waker registered by the scoped operation while the producer is still
-    /// running.
-    pub(super) quiescence_waker: AtomicWaker,
     /// The permit is owned by shared stream state, so dropping the driver
     /// cannot release admission while the worker or transport is alive.
     pub(super) _permit: super::ConnectionPermit,
@@ -401,8 +394,8 @@ impl SseShared {
         self.thread_finished.store(true, Ordering::Release);
         self.worker_lifecycle
             .store(SseWorkerLifecycle::Finished as u8, Ordering::Release);
-        self.close_waker.wake();
-        self.quiescence_waker.wake();
+        self.native_join.close_waker.wake();
+        self.native_join.quiescence_waker.wake();
     }
 
     fn terminalize_workerless(&self, reason: OperationCancelReason, result: VmResult<()>) -> bool {
@@ -418,11 +411,12 @@ impl SseShared {
         {
             return false;
         }
+        self.native_join.workerless();
         self.request_stop(reason);
         self.publish(result);
         self.thread_finished.store(true, Ordering::Release);
-        self.close_waker.wake();
-        self.quiescence_waker.wake();
+        self.native_join.close_waker.wake();
+        self.native_join.quiescence_waker.wake();
         true
     }
 
@@ -437,9 +431,9 @@ impl SseShared {
         }
         self.cancel.notify_one();
         self.cancel.notify_waiters();
-        self.waker.wake();
-        self.close_waker.wake();
-        self.quiescence_waker.wake();
+        self.native_join.wake_stream();
+        self.native_join.close_waker.wake();
+        self.native_join.quiescence_waker.wake();
     }
 
     fn publish(&self, result: VmResult<()>) {
@@ -449,9 +443,9 @@ impl SseShared {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
         // The result mutex write happens-before this release publication.
         self.done.store(true, Ordering::Release);
-        self.waker.wake();
-        self.close_waker.wake();
-        self.quiescence_waker.wake();
+        self.native_join.wake_stream();
+        self.native_join.close_waker.wake();
+        self.native_join.quiescence_waker.wake();
     }
 
     fn take_result(&self) -> Option<VmResult<()>> {
@@ -465,70 +459,27 @@ impl SseShared {
         self.worker_lifecycle.load(Ordering::Acquire) == SseWorkerLifecycle::Finished as u8
             && self.done.load(Ordering::Acquire)
             && self.thread_finished.load(Ordering::Acquire)
-            && self
-                .join_handle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none()
+            && self.native_join.is_joined()
     }
 
     fn join_worker(&self) -> Result<(), String> {
-        if self.worker_lifecycle.load(Ordering::Acquire) != SseWorkerLifecycle::Finished as u8
-            || !self.done.load(Ordering::Acquire)
-            || !self.thread_finished.load(Ordering::Acquire)
-        {
-            return Err("SSE worker is still running".to_string());
+        let joined =
+            self.native_join
+                .poll_join()
+                .map_err(|message| match self.cancellation_reason() {
+                    Some(reason) => format!("{message} (cancellation reason: {reason})"),
+                    None => message,
+                })?;
+        match joined {
+            true => Ok(()),
+            false => Err("SSE worker native join is pending (ownership retained)".into()),
         }
-        if self
-            .join_handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|handle| !handle.is_finished())
-        {
-            return Err("SSE worker thread has not exited".to_string());
-        }
-        let handle = self
-            .join_handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let Some(handle) = handle else {
-            return Ok(());
-        };
-        handle.join().map_err(|panic| {
-            let message = worker_panic_message(&panic);
-            match self.cancellation_reason() {
-                Some(reason) => format!("{message} (cancellation reason: {reason})"),
-                None => message,
-            }
-        })
     }
 
     fn try_join_finished(&self) -> ResourceResult<bool> {
-        if self.worker_lifecycle.load(Ordering::Acquire) != SseWorkerLifecycle::Finished as u8
-            || !self.done.load(Ordering::Acquire)
-            || !self.thread_finished.load(Ordering::Acquire)
-        {
-            return Ok(false);
-        }
-        let handle = {
-            let mut guard = self
-                .join_handle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.as_ref().is_some_and(|handle| !handle.is_finished()) {
-                return Ok(false);
-            }
-            guard.take()
-        };
-        let Some(handle) = handle else {
-            return Ok(true);
-        };
-        handle
-            .join()
-            .map(|_| true)
-            .map_err(|panic| resource_cleanup_error(&worker_panic_message(&panic)))
+        self.native_join
+            .poll_join()
+            .map_err(|message| resource_cleanup_error(&message))
     }
 
     fn cancellation_reason(&self) -> Option<OperationCancelReason> {
@@ -843,7 +794,7 @@ impl SseWorker {
             }
             sent = sender.send(item) => {
                 sent.map_err(|_| VmError::HostError("SSE stream closed".to_string()))?;
-                self.shared.waker.wake();
+                self.shared.native_join.wake_stream();
                 if self.shared.stopping.load(Ordering::Acquire) {
                     return Err(VmError::HostError("SSE stream cancelled".to_string()));
                 }
@@ -1035,6 +986,7 @@ impl HostStreamDriver for SseStreamDriver {
     }
 
     fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<VmResult<HostStreamPoll>> {
+        self.shared.native_join.register_stream(cx.waker());
         match self.receiver.poll_recv(cx) {
             Poll::Ready(Some(SseMessage::Open(status, headers, url))) => {
                 self.status = status;
@@ -1085,7 +1037,7 @@ impl HostStreamDriver for SseStreamDriver {
                         "eof"
                     });
                 }
-                self.shared.waker.register(cx.waker());
+                self.shared.native_join.register_stream(cx.waker());
                 if self.shared.done.load(Ordering::Acquire) {
                     self.poll_terminal(if self.shared.stopping.load(Ordering::Acquire) {
                         "stopped"
@@ -1242,7 +1194,7 @@ impl HostResource for SseStreamResource {
         match self.shared.try_join_finished() {
             Ok(true) => Poll::Ready(Ok(())),
             Ok(false) => {
-                self.shared.close_waker.register(cx.waker());
+                self.shared.native_join.close_waker.register(cx.waker());
                 match self.shared.try_join_finished() {
                     Ok(true) => Poll::Ready(Ok(())),
                     Ok(false) => Poll::Pending,
@@ -1299,16 +1251,20 @@ impl HostOperation for SseScopeOperation {
     }
 
     fn register_quiescence_waker(&mut self, cx: &Context<'_>) {
-        self.shared.quiescence_waker.register(cx.waker());
+        self.shared
+            .native_join
+            .quiescence_waker
+            .register(cx.waker());
     }
 
     fn poll_quiescent(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if self.shared.is_quiescent() {
             return Poll::Ready(());
         }
-        self.shared.waker.register(cx.waker());
-        self.shared.close_waker.register(cx.waker());
-        self.shared.quiescence_waker.register(cx.waker());
+        self.shared
+            .native_join
+            .quiescence_waker
+            .register(cx.waker());
         if self.shared.is_quiescent() {
             Poll::Ready(())
         } else {
@@ -1422,15 +1378,12 @@ fn builtin_sse_start(
         cancel: Notify::new(),
         cancellation_reason: std::sync::Mutex::new(None),
         item_ack: Notify::new(),
-        waker: AtomicWaker::new(),
+        native_join: Arc::new(SseNativeJoin::new("SSE", "rustscript-sse-join")),
         items,
         done: AtomicBool::new(false),
         thread_finished: AtomicBool::new(false),
         worker_lifecycle: std::sync::atomic::AtomicU8::new(SseWorkerLifecycle::NotStarted as u8),
         result: std::sync::Mutex::new(None),
-        join_handle: std::sync::Mutex::new(None),
-        close_waker: AtomicWaker::new(),
-        quiescence_waker: AtomicWaker::new(),
         _permit: permit,
         rollback_finished: AtomicBool::new(false),
     });
@@ -1491,7 +1444,7 @@ fn builtin_sse_start(
                 ))));
             }
             worker_shared.mark_worker_finished();
-            worker_shared.waker.wake();
+            worker_shared.native_join.wake_stream();
         }
     }) {
         Ok(handle) => handle,
@@ -1506,10 +1459,21 @@ fn builtin_sse_start(
         }
     };
     shared.mark_worker_running();
-    *shared
-        .join_handle
+    shared
+        .native_join
+        .state
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(join_handle);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .handle = Some(join_handle);
+    if let Err(error) = shared.try_join_finished() {
+        return Err(rollback_sse_admission(
+            vm,
+            &shared,
+            resource,
+            Some(scope_operation),
+            VmError::HostError(error.to_string()),
+        ));
+    }
 
     let driver = SseStreamDriver {
         shared: Arc::clone(&shared),
@@ -1617,11 +1581,14 @@ pub(super) fn builtin_http_client_sse_timeout(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use super::{
-        FAIL_NEXT_WORKER_SPAWN, REJECT_NEXT_OPERATION_ADMISSION, SseEvent, SseParser,
-        SseScopeOperation, SseShared, SseStreamResource, SseWorkerLifecycle,
+        FAIL_NEXT_WORKER_SPAWN, REJECT_NEXT_OPERATION_ADMISSION, SseEvent, SseNativeJoin,
+        SseParser, SseScopeOperation, SseShared, SseStreamResource, SseWorkerLifecycle,
         rollback_sse_admission, spawn_worker, start_operation,
     };
     use crate::vm::VmError;
@@ -1865,7 +1832,7 @@ mod tests {
             cancel: tokio::sync::Notify::new(),
             cancellation_reason: std::sync::Mutex::new(None),
             item_ack: tokio::sync::Notify::new(),
-            waker: futures_util::task::AtomicWaker::new(),
+            native_join: Arc::new(SseNativeJoin::new("SSE", "rustscript-sse-join")),
             items,
             done: AtomicBool::new(false),
             thread_finished: AtomicBool::new(false),
@@ -1873,9 +1840,6 @@ mod tests {
                 SseWorkerLifecycle::NotStarted as u8,
             ),
             result: std::sync::Mutex::new(None),
-            join_handle: std::sync::Mutex::new(None),
-            close_waker: futures_util::task::AtomicWaker::new(),
-            quiescence_waker: futures_util::task::AtomicWaker::new(),
             _permit: permit,
             rollback_finished: AtomicBool::new(false),
         });
@@ -1914,6 +1878,268 @@ mod tests {
             VmError::HostError("repeated rollback".to_string()),
         );
         assert!(repeated.to_string().contains("repeated rollback"));
+    }
+
+    #[test]
+    fn native_tail_completion_automatically_wakes_both_retirement_pollers() {
+        use crate::vm::operation::OperationSpec;
+        use crate::vm::resource::{CloseProgress, ResourceCloseReason};
+        use std::sync::{Arc, mpsc};
+        use std::task::{Context, Poll};
+        use std::time::Duration;
+
+        struct Wake(mpsc::Sender<()>);
+        impl futures_util::task::ArcWake for Wake {
+            fn wake_by_ref(this: &Arc<Self>) {
+                let _ = this.0.send(());
+            }
+        }
+        let admission = crate::builtins::runtime::http::policy::ConnectionAdmission::new(1);
+        let (items, mut receiver) = tokio::sync::mpsc::channel(1);
+        let shared = Arc::new(SseShared {
+            stopping: AtomicBool::new(false),
+            cancel: tokio::sync::Notify::new(),
+            cancellation_reason: std::sync::Mutex::new(None),
+            item_ack: tokio::sync::Notify::new(),
+            native_join: Arc::new(SseNativeJoin::new("SSE", "rustscript-sse-join")),
+            items,
+            done: AtomicBool::new(false),
+            thread_finished: AtomicBool::new(false),
+            worker_lifecycle: std::sync::atomic::AtomicU8::new(
+                SseWorkerLifecycle::NotStarted as u8,
+            ),
+            result: std::sync::Mutex::new(None),
+            _permit: admission.acquire().unwrap(),
+            rollback_finished: AtomicBool::new(false),
+        });
+        let (stream_tx, stream_rx) = mpsc::channel();
+        let stream_waker = futures_util::task::waker(Arc::new(Wake(stream_tx)));
+        shared.native_join.register_stream(&stream_waker);
+        let (body_tx, body_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture accept timeout"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("fixture accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 8192);
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let worker = Arc::new(super::SseWorker {
+            config: super::super::HttpConfig {
+                allow_private_ips: true,
+                allowed_schemes: vec!["http".into()],
+                allowed_hosts: vec!["127.0.0.1".into()],
+                allowed_ports: vec![address.port()],
+                ..Default::default()
+            },
+            request: super::HttpRequest {
+                method: hyper::Method::GET,
+                url: format!("http://{address}/events").parse().unwrap(),
+                headers: Vec::new(),
+                body: None,
+            },
+            deadline: std::time::Instant::now() + Duration::from_secs(2),
+            shared: shared.clone(),
+            items: Arc::new(super::AtomicUsize::new(0)),
+            bytes_received: Arc::new(super::AtomicUsize::new(0)),
+            bytes_sent: Arc::new(super::AtomicUsize::new(0)),
+            status: std::sync::Mutex::new(None),
+            headers: std::sync::Mutex::new(None),
+            url: std::sync::Mutex::new(None),
+        });
+        let producer = shared.clone();
+        let handle = std::thread::spawn(move || {
+            producer.mark_worker_running();
+            worker.run();
+            producer.mark_worker_finished();
+            producer.native_join.wake_stream();
+            body_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        shared.item_ack.notify_one();
+        body_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(super::SseMessage::Open(200, _, _))
+        ));
+        server.join().unwrap();
+        // The body wake was consumed while the VM is in its synchronous
+        // terminal handoff; no real stream waiter is re-registered afterward.
+        stream_rx.try_iter().for_each(drop);
+        assert!(
+            shared.result.lock().unwrap().as_ref().unwrap().is_ok(),
+            "real network body completed"
+        );
+        assert!(shared.done.load(Ordering::Acquire));
+        assert!(shared.thread_finished.load(Ordering::Acquire));
+        assert!(
+            !handle.is_finished(),
+            "tail must hold the actual native handle"
+        );
+        shared.native_join.state.lock().unwrap().handle = Some(handle);
+        let mut vm = crate::vm::Vm::new(crate::vm::Program::new(
+            Vec::new(),
+            vec![crate::vm::OpCode::Ret as u8],
+        ));
+        let scope = vm.execution_scope();
+        let resource = scope
+            .push_resource(SseStreamResource {
+                shared: shared.clone(),
+            })
+            .unwrap()
+            .handle();
+        let operation = scope
+            .start_operation(OperationSpec::new(SseScopeOperation {
+                shared: shared.clone(),
+            }))
+            .unwrap();
+        scope.complete_operation(operation).unwrap();
+        assert_eq!(
+            scope
+                .close_resource::<SseStreamResource>(resource, ResourceCloseReason::Requested)
+                .unwrap(),
+            CloseProgress::Pending
+        );
+        let (op_tx, op_rx) = mpsc::channel();
+        let (close_tx, close_rx) = mpsc::channel();
+        let op_waker = futures_util::task::waker(Arc::new(Wake(op_tx)));
+        let close_waker = futures_util::task::waker(Arc::new(Wake(close_tx)));
+        assert!(
+            scope
+                .poll_operation_quiescence(operation, &mut Context::from_waker(&op_waker))
+                .is_pending()
+        );
+        assert!(
+            scope
+                .poll_resource_close::<SseStreamResource>(
+                    resource,
+                    &mut Context::from_waker(&close_waker)
+                )
+                .is_pending()
+        );
+        assert!(
+            admission.acquire().is_err(),
+            "permit retained before native join"
+        );
+        assert!(shared.native_join.notifier_running.load(Ordering::Acquire));
+        release_tx.send(()).unwrap();
+        let op_wake = op_rx.recv_timeout(Duration::from_secs(2));
+        let close_wake = close_rx.recv_timeout(Duration::from_secs(2));
+        stream_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("native join must wake the stream after its earlier body wake was consumed");
+        assert!(
+            op_wake.is_ok(),
+            "native exit supplied no automatic quiescence wake"
+        );
+        assert!(
+            close_wake.is_ok(),
+            "native exit supplied no automatic close wake"
+        );
+        assert!(matches!(
+            scope.poll_resource_close::<SseStreamResource>(
+                resource,
+                &mut Context::from_waker(&close_waker)
+            ),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            scope.poll_operation_quiescence(operation, &mut Context::from_waker(&op_waker)),
+            Poll::Ready(Ok(_))
+        ));
+        assert_eq!(scope.resources().len(), 0);
+        assert_eq!(scope.operations().len(), 0);
+        assert!(shared.is_quiescent());
+        assert!(
+            shared
+                .native_join
+                .state
+                .lock()
+                .unwrap()
+                .stream_waker
+                .is_none()
+        );
+        assert!(
+            shared.native_join.state.lock().unwrap().handle.is_none(),
+            "original worker exclusively joined"
+        );
+        assert_eq!(
+            Arc::strong_count(&shared),
+            1,
+            "retired owners retain no producer roots"
+        );
+        drop(shared);
+        assert!(
+            admission.acquire().is_ok(),
+            "real retirement releases permit"
+        );
+    }
+
+    #[test]
+    fn native_join_spawn_failure_retains_original_handle_and_panic_result() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        struct Wake(mpsc::Sender<()>);
+        impl futures_util::task::ArcWake for Wake {
+            fn wake_by_ref(this: &Arc<Self>) {
+                let _ = this.0.send(());
+            }
+        }
+        let completion = Arc::new(SseNativeJoin::new("SSE", "rustscript-sse-join"));
+        let (release, held) = mpsc::channel();
+        completion.state.lock().unwrap().handle = Some(std::thread::spawn(move || {
+            held.recv().unwrap();
+            panic!("original producer panic");
+        }));
+        let error = completion
+            .poll_join_with(|_task| Err(std::io::Error::other("local injected notifier failure")))
+            .unwrap_err();
+        assert!(error.contains("ownership retained"));
+        assert!(completion.state.lock().unwrap().handle.is_some());
+        assert!(!completion.state.lock().unwrap().armed);
+        assert!(!completion.is_joined());
+        let (tx, rx) = mpsc::channel();
+        let wake = futures_util::task::waker(Arc::new(Wake(tx)));
+        completion.close_waker.register(&wake);
+        assert!(!completion.poll_join().unwrap());
+        release.send(()).unwrap();
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("automatic wake after panicking original joins");
+        assert!(completion.is_joined());
+        assert!(
+            completion
+                .poll_join()
+                .unwrap_err()
+                .contains("original producer panic")
+        );
+        assert!(completion.state.lock().unwrap().handle.is_none());
     }
 
     #[test]

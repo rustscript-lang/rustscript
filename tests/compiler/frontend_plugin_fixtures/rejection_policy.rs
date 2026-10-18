@@ -58,7 +58,10 @@ impl SourcePlugin for RejectionPolicy {
     }
     fn validate_typed_ir(&self, typed: &vm::FrontendTypedIr<'_>) -> Result<(), vm::CompileError> {
         let owner = typed.source_id.unwrap();
-        if typed.host_api_catalog.is_some() {
+        if typed
+            .host_api_catalog
+            .is_some_and(|catalog| catalog.function("neutral::probe").is_some())
+        {
             let checked = typed
                 .ir
                 .parsed_semantic_index

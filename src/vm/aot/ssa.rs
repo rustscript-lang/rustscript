@@ -1545,9 +1545,10 @@ impl<'a> Builder<'a> {
             } => {
                 let ip = block.terminal_ip.unwrap_or(block.end_ip);
                 let mut condition = frame.pop(ip, "brfalse")?;
-                if condition.value.repr == AotSsaValueRepr::Tagged
-                    && operand_types_at(self.program, ip).0 == ValueType::Bool
-                {
+                // Get and other generic value producers retain Tagged even
+                // when the logical source condition is Bool. Validate/unbox
+                // the real runtime tag, without trusting absent scalar hints.
+                if condition.value.repr == AotSsaValueRepr::Tagged {
                     condition.value = emitter.emit(
                         ip,
                         AotSsaInstKind::TaggedToBool {
@@ -2958,6 +2959,106 @@ fn promoted_numeric_result_repr(arg_reprs: &[AotSsaValueRepr]) -> Option<AotSsaV
 mod tests {
     use super::*;
     use crate::{BytecodeBuilder, HostImport, Value};
+
+    #[cfg(feature = "cranelift-jit")]
+    #[test]
+    fn r4_dynamic_result_aot_ssa_payload_checkpoints_and_host_root_execution() {
+        let vectors = [
+            ("fn(int) -> int", Value::Null),
+            ("int", Value::Int(-37)),
+            ("float", Value::Float(-0.0)),
+            ("float", Value::Float(f64::NAN)),
+            ("bool", Value::Bool(false)),
+            ("string", Value::string("ssa-runtime-input")),
+            ("int?", Value::Null),
+            ("int?", Value::Int(29)),
+            (
+                "Result<int, bool>",
+                crate::result::carrier(false, Value::Bool(false)),
+            ),
+        ];
+        for (ty, input) in vectors {
+            let source = format!(
+                "pub fn increment(n: int) -> int {{ n + 1 }} pub fn relay(flag: bool, payload: {ty}) -> Result<{ty}, {ty}> {{ let carrier: Result<{ty}, {ty}> = if flag => {{ Result::Ok(payload) }} else => {{ Result::Err(payload) }}; let selected = match carrier {{ Result::Ok(v) => v, Result::Err(e) => e, }}; if flag => {{ Result::Ok(selected) }} else => {{ Result::Err(selected) }} }} 0;"
+            );
+            let compiled = crate::compile_source(&source).unwrap();
+            let program = compiled.program.with_local_count(compiled.locals);
+            let ssa = build_aot_ssa(&program).unwrap();
+            ssa.verify().unwrap();
+            let text = ssa.text();
+            assert!(!text.contains("InterpreterBoundary"));
+            let mut getters = Vec::new();
+            let mut ip = 0;
+            while ip < program.code.len() {
+                let opcode = crate::OpCode::try_from(program.code[ip]).unwrap();
+                if opcode == crate::OpCode::Call
+                    && u16::from_le_bytes([program.code[ip + 1], program.code[ip + 2]])
+                        == crate::BuiltinFunction::Get.call_index()
+                {
+                    let resume = ip + 1 + opcode.operand_len();
+                    let checkpoint = ssa
+                        .checkpoint_for_ip(resume)
+                        .expect("real generic Get resume checkpoint");
+                    assert_eq!(checkpoint.stack.last(), Some(&AotSsaValueRepr::Tagged));
+                    getters.push((ip, resume, checkpoint.stack.clone()));
+                }
+                ip += 1 + opcode.operand_len();
+            }
+            assert!(
+                getters.len() >= 3,
+                "tag and both active-arm payload Get sites required"
+            );
+            println!("R4 AOT SSA ty={ty} getters={getters:?}\n{text}");
+            let mut machine = crate::Vm::new_with_jit_config(
+                program,
+                crate::JitConfig {
+                    enabled: false,
+                    hot_loop_threshold: 1,
+                    max_trace_len: 512,
+                },
+            );
+            machine.set_fuel(100_000);
+            machine.compile_aot().unwrap();
+            assert_eq!(machine.run().unwrap(), crate::VmStatus::Halted);
+            let callable = machine.resolve_exported_callable("relay").unwrap();
+            let input = if ty == "fn(int) -> int" {
+                machine.resolve_exported_callable("increment").unwrap()
+            } else {
+                input
+            };
+            for ok in [true, false] {
+                let before = machine.aot_exec_count();
+                let returned = machine
+                    .invoke_callable(callable.clone(), &[Value::Bool(ok), input.clone()])
+                    .unwrap();
+                let (tag, payload) = crate::result::payload(&returned).unwrap();
+                assert_eq!(tag, ok);
+                match (payload, &input) {
+                    (Value::Float(actual), Value::Float(expected)) if expected.is_nan() => {
+                        assert!(actual.is_nan())
+                    }
+                    (Value::Float(actual), Value::Float(expected)) => {
+                        assert_eq!(actual.to_bits(), expected.to_bits());
+                        assert_eq!(actual.is_sign_negative(), expected.is_sign_negative());
+                    }
+                    _ => assert_eq!(payload, &input),
+                }
+                assert!(machine.aot_exec_count() > before);
+                println!(
+                    "R4 AOT SSA runtime ty={ty} ok={ok} payload={payload:?} native_delta={}",
+                    machine.aot_exec_count() - before
+                );
+                if ty == "fn(int) -> int" {
+                    assert_eq!(
+                        machine
+                            .invoke_callable(payload.clone(), &[Value::Int(41)])
+                            .unwrap(),
+                        Value::Int(42)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn aotnull_exact_err_fallback_has_tagged_resume_and_native_execution() {

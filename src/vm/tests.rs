@@ -4920,18 +4920,16 @@ fn sol_try_trace_guard_exit_uses_interpreter_ret_cleanup_without_scope_abort() {
         VmStatus::Halted
     );
     assert!(vm.jit_native_exec_count() > 0);
-    // Resource carrier detachment exits at the move-helper call before Try's
-    // tag read. This proves Trace-enabled/interpreter-Ret parity, not native
-    // Try execution (the scalar-E test below retains the real tag SSA guard).
+    // The move helper still executes in the interpreter. Generic hot-loop
+    // call continuations now re-enter native tag/payload reads afterwards;
+    // Err's cleanup Ret can still finish through the interpreter continuation.
     assert!(snapshot.traces.iter().any(
         |trace| trace.executions > 0 && trace.op_names().last().is_some_and(|op| op == "call")
     ));
-    assert!(
-        snapshot
-            .traces
-            .iter()
-            .all(|trace| trace.executions == 0 || !trace.ssa_text().contains("String(\"tag\")"))
-    );
+    assert!(snapshot.traces.iter().any(|trace| trace.executions > 0
+        && trace.ssa_text().contains("String(\"tag\")")
+        && trace.ssa_text().contains("String(\"payload\")")
+        && trace.op_names().iter().any(|op| op == "map_get")));
     assert_eq!(stats.begins[0].load(Ordering::SeqCst), 1);
     assert_eq!(stats.begins[1].load(Ordering::SeqCst), 1);
     assert_eq!(stats.begins[2].load(Ordering::SeqCst), 0);

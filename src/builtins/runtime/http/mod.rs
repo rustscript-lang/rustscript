@@ -11,6 +11,7 @@ use crate::host_api::{
 use crate::vm::{HostFunctionRegistry, Vm, VmError, VmResult};
 
 mod config;
+mod native_join;
 pub(super) mod policy;
 pub(super) mod request;
 pub(super) mod resources;

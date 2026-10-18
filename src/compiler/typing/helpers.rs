@@ -7,7 +7,7 @@ use crate::host_api::{HostFunctionSchema, HostParamPassing};
 
 use super::super::CompileError;
 use super::super::TypingMode;
-use super::super::host_call_resolve::{ActualCallArg, resolve_candidate_slice_with_passing};
+use super::super::host_call_resolve::{ActualCallArg, resolve_candidate_slice_for_admission};
 use super::super::ir::{
     AssignmentKind, Expr, FunctionDecl, FunctionImpl, HostApiIrMetadata, LocalSlot, MatchPattern,
     ResolvedHostCall, SemanticNodeId, Stmt, StructDecl, TypeSchema,
@@ -42,6 +42,8 @@ pub(super) struct HostCallResolutionPass<'a> {
     changed: usize,
     unresolved: usize,
     first_error: Option<CompileError>,
+    pub(super) rejections: Vec<super::CanonicalHostRejection>,
+    argument_sites: &'a [super::super::ir::ParsedCallArguments],
     /// Exact callee span of the failing call site, recorded when the call
     /// carried parser provenance ([`SemanticNodeId`] -> callee span).
     call_site_spans: Option<&'a std::collections::HashMap<SemanticNodeId, Span>>,
@@ -59,6 +61,8 @@ impl<'a> HostCallResolutionPass<'a> {
             changed: 0,
             unresolved: 0,
             first_error: None,
+            rejections: Vec::new(),
+            argument_sites: &[],
             call_site_spans: None,
         }
     }
@@ -71,6 +75,14 @@ impl<'a> HostCallResolutionPass<'a> {
         spans: &'a std::collections::HashMap<SemanticNodeId, Span>,
     ) -> Self {
         self.call_site_spans = Some(spans);
+        self
+    }
+
+    pub(super) fn with_argument_sites(
+        mut self,
+        sites: &'a [super::super::ir::ParsedCallArguments],
+    ) -> Self {
+        self.argument_sites = sites;
         self
     }
 
@@ -103,7 +115,7 @@ impl<'a> HostCallResolutionPass<'a> {
         let Some(metadata) = self.metadata else {
             return;
         };
-        let Expr::Call(index, _, args, resolution, _) = expr else {
+        let Expr::Call(index, _, args, resolution, semantic_id) = expr else {
             return;
         };
         if resolution.is_some() {
@@ -153,8 +165,12 @@ impl<'a> HostCallResolutionPass<'a> {
             .zip(&schemas)
             .map(|(arg, schema)| ActualCallArg::new(schema, actual_passing(arg, schema)))
             .collect::<Vec<_>>();
-        let result =
-            resolve_candidate_slice_with_passing(&name, resolver_candidates, &actuals, fingerprint);
+        let (result, reason) = resolve_candidate_slice_for_admission(
+            &name,
+            resolver_candidates,
+            &actuals,
+            fingerprint,
+        );
         match result {
             Ok(resolved) => {
                 if let Err(error) =
@@ -168,6 +184,25 @@ impl<'a> HostCallResolutionPass<'a> {
             }
             Err(error) => {
                 self.unresolved += 1;
+                if self.phase == HostCallResolutionPhase::Final {
+                    let matching = self
+                        .argument_sites
+                        .iter()
+                        .filter(|site| Some(site.call_id) == *semantic_id)
+                        .collect::<Vec<_>>();
+                    if let [provenance] = matching.as_slice()
+                        && provenance.arguments.len() == args.len()
+                        && self
+                            .call_site_spans
+                            .and_then(|spans| spans.get(&provenance.call_id))
+                            == Some(&provenance.callee_span)
+                    {
+                        self.rejections.push(super::CanonicalHostRejection {
+                            provenance: (*provenance).clone(),
+                            reason,
+                        });
+                    }
+                }
                 if self.phase == HostCallResolutionPhase::Final && self.first_error.is_none() {
                     // Record the exact callee span of the failing call site
                     // when the call carried parser provenance; the semantic

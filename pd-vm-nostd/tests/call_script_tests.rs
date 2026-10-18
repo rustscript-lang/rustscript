@@ -96,12 +96,39 @@ fn nostd_executes_std_encoded_result_ok_and_err_without_source() {
             "let value: Result<int, int> = Result::Err(4); match value { Result::Ok(v) => v, Result::Err(e) => e };",
             EmbeddedValue::Int(4),
         ),
+        (
+            "let value: Result<Result<int?, bool>, string> = Result::Ok(Result::Err(false)); match value { Result::Ok(inner) => match inner { Result::Ok(n) => true, Result::Err(flag) => flag, }, Result::Err(e) => true, };",
+            EmbeddedValue::Bool(false),
+        ),
+        (
+            "let value: Result<string, int?> = Result::Err(null); match value { Result::Ok(s) => 9, Result::Err(n) => n, };",
+            EmbeddedValue::Null,
+        ),
     ];
     for (source, expected) in cases {
         let compiled = compile_source(source).expect("Result source should compile");
         let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
             .expect("Result program should encode");
         assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
+        let std_program = vm::decode_program(&bytes).expect("std current v13 decode");
+        assert_eq!(encode_program(&std_program).unwrap(), bytes);
+        let mut std_vm = vm::Vm::new_with_jit_config(
+            std_program,
+            vm::JitConfig {
+                enabled: false,
+                hot_loop_threshold: 1,
+                max_trace_len: 512,
+            },
+        );
+        std_vm.set_fuel(100_000);
+        assert_eq!(std_vm.run().unwrap(), vm::VmStatus::Halted);
+        let std_expected = match &expected {
+            EmbeddedValue::Int(n) => vm::Value::Int(*n),
+            EmbeddedValue::Bool(b) => vm::Value::Bool(*b),
+            EmbeddedValue::Null => vm::Value::Null,
+            _ => unreachable!(),
+        };
+        assert_eq!(std_vm.stack().last(), Some(&std_expected));
         let program = decode_program(&bytes).expect("no-std should decode v13 Result program");
         let mut vm = EmbeddedVm::new(program);
         assert_eq!(

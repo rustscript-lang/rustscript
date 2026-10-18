@@ -186,7 +186,7 @@ fn prepare_typed_units_with_entry(
         let runtime_availability = repl
             .map(|(locals, moved)| build_entry_local_availability(&runtime, locals, moved))
             .unwrap_or_default();
-        let (mut runtime, error) =
+        let (mut runtime, error, runtime_rejections) =
             typing::legalize_for_admission(runtime, TypingMode::DynamicHints, &runtime_types);
         if error.is_none() {
             super::result::resolve_result_types(&mut runtime, &runtime_types).map_err(|error| {
@@ -212,6 +212,7 @@ fn prepare_typed_units_with_entry(
             behavior,
             &sources,
             &runtime_availability,
+            &runtime_rejections,
         )
         .map_err(|error| SourcePathError::SourceWithMap {
             error: SourceError::Parse(error),
@@ -359,7 +360,7 @@ fn prepare_owned_typed_ir(
     }
     // Legalization and inference do not impose the root's language policy on
     // dependencies. Admission below uses each producer's own descriptor.
-    let (mut legalized, host_error) =
+    let (mut legalized, host_error, rejections) =
         typing::legalize_for_admission(parsed, TypingMode::DynamicHints, entry.types);
     // Host-call resolutions and merged module formals exist only after
     // legalize. Fill Result schemas from those owners before ownership.
@@ -386,15 +387,18 @@ fn prepare_owned_typed_ir(
                     entry.types,
                     source_name,
                     host_error.as_ref(),
+                    &rejections,
                 )
                 .map_err(SourceError::Compile)?,
             );
         } else {
-            typing::validate_source_type_consistency(
+            typing::validate_source_type_consistency_with_host_error(
                 &parsed,
                 owner.policy.typing_mode,
                 entry.types,
                 source_name,
+                host_error.as_ref(),
+                &rejections,
             )
             .map_err(SourceError::Compile)?;
         }
@@ -418,28 +422,16 @@ fn prepare_owned_typed_ir(
     }
     let logical_schemas = type_info.logical_schemas();
     parsed.semantic_index = Some(SemanticIndex::build(logical_schemas.clone(), &parsed));
-    let owned_ir = match enforce_owned_sources(
+    let owned_ir = enforce_owned_sources(
         parsed.clone(),
         &type_info,
         owners,
         behavior,
         sources,
         entry.availability,
-    ) {
-        Ok(owned) => owned,
-        Err(error)
-            if !behavior.recover_host_errors
-                && host_error.as_ref().is_some_and(|host| {
-                    resource_copy_duplicates_host_call(&parsed, host, &error)
-                }) =>
-        {
-            // The resolver already rejected this exact call's argument passing.
-            // Retain its primary diagnostic without bypassing source hooks. This
-            // admission-only IR cannot reach codegen: host_error is returned below.
-            parsed.clone()
-        }
-        Err(error) => return Err(SourceError::Parse(error)),
-    };
+        &rejections,
+    )
+    .map_err(SourceError::Parse)?;
     let mut owned_ir = owned_ir;
     let structs = owned_ir.struct_schemas.clone();
     super::try_anf::attach_err_cleanup_schemas(&mut owned_ir, &logical_schemas, &structs);
@@ -469,47 +461,6 @@ fn prepare_owned_typed_ir(
     Ok((parsed, type_info, owned_ir, analysis_errors))
 }
 
-fn resource_copy_duplicates_host_call(
-    ir: &FrontendIr,
-    host: &CompileError,
-    ownership: &ParseError,
-) -> bool {
-    let CompileError::HostCallResolve {
-        span: Some(callee), ..
-    } = host
-    else {
-        return false;
-    };
-    if ownership.code.as_deref() != Some("E_OWNERSHIP_COPY_RESOURCE") {
-        return false;
-    }
-    let Some(owned_span) = ownership.span else {
-        return false;
-    };
-    // Only a standalone failed call at the very same source site can duplicate
-    // the copy rejection. Line equality alone would alias independent calls,
-    // statements or module owners; missing provenance must remain fail-closed.
-    ir.parsed_semantic_index.as_ref().is_some_and(|index| {
-        // Availability can fall back to a statement span by source and line.
-        // Such a fallback is not exact enough to prioritize a call if more
-        // than one statement occupies that line.
-        index
-            .stmt_spans
-            .iter()
-            .filter(|site| {
-                site.span.source_id == owned_span.source_id && site.line as usize == ownership.line
-            })
-            .count()
-            == 1
-            && index.call_sites.iter().any(|site| {
-                site.callee_span == *callee
-                    && site.expr_span.source_id == owned_span.source_id
-                    && site.expr_span.lo == owned_span.lo
-                    && site.expr_span.hi <= owned_span.hi
-            })
-    })
-}
-
 fn enforce_owned_sources(
     ir: FrontendIr,
     facts: &typing::TypeInferenceResult,
@@ -517,6 +468,7 @@ fn enforce_owned_sources(
     behavior: CompileBehavior,
     sources: &SourceMap,
     entry_locals: &[lifetime::EntryLocalAvailability],
+    rejections: &[typing::CanonicalHostRejection],
 ) -> Result<FrontendIr, ParseError> {
     let owned_slots = facts
         .local_schemas
@@ -541,6 +493,7 @@ fn enforce_owned_sources(
             .first()
             .is_some_and(|owner| owner.policy.ownership_checking),
         sources,
+        rejections,
     )
 }
 
@@ -3337,6 +3290,7 @@ mod tests {
             &prepared.capture_source_policies,
             true,
             &prepared.sources,
+            &[],
         )
         .unwrap();
         assert_origins(&owned);
@@ -3503,6 +3457,160 @@ mod tests {
             panic!("record retained in REPL");
         };
         assert!(record.get(&crate::Value::string("note")).is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "http-client")]
+    fn ordered_argument_provenance_reaches_rejected_call_consumer() {
+        let source = "use http; let request = http::request::new(\"GET\", \"http://127.0.0.1:1/x\"); http::response::status(&request);";
+        let options = CompileSourceFileOptions::default()
+            .with_host_api_catalog(crate::standard_host_catalog());
+        let parsed =
+            crate::compiler::frontends::parse_source(source, SourceFlavor::RustScript, &options)
+                .unwrap();
+        let index = parsed.parsed_semantic_index.as_ref().unwrap();
+        let site = index
+            .call_sites
+            .iter()
+            .find(|site| site.name == "http::response::status")
+            .unwrap();
+        let arguments = index
+            .call_arguments
+            .iter()
+            .find(|args| args.call_id == site.id)
+            .expect("ordered parser argument provenance");
+        assert_eq!(
+            &source[arguments.arguments[0].span.lo..arguments.arguments[0].span.hi],
+            "&request"
+        );
+        assert_eq!(
+            arguments.arguments[0].shape,
+            super::super::ir::ParsedArgumentShape::Borrow
+        );
+        let (_, error, rejected) =
+            typing::legalize_for_admission(parsed, TypingMode::DynamicHints, &[]);
+        assert!(error.is_some());
+        assert_eq!(
+            rejected.len(),
+            1,
+            "one actual rejected host call: {rejected:?}; error={error:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "http-client")]
+    fn rejected_argument_missing_ambiguous_or_foreign_provenance_fails_closed() {
+        let source = "use http; let request = http::request::new(\"GET\", \"http://127.0.0.1:1/x\"); http::response::status(&request);";
+        let options = CompileSourceFileOptions::default()
+            .with_host_api_catalog(crate::standard_host_catalog());
+        for mode in 0..4 {
+            let mut ir = crate::compiler::frontends::parse_source(
+                source,
+                SourceFlavor::RustScript,
+                &options,
+            )
+            .unwrap();
+            ir.stmt_sources = vec![Some("main.rss".into()); ir.stmts.len()];
+            let (mut ir, error, rejections) =
+                typing::legalize_for_admission(ir, TypingMode::DynamicHints, &[]);
+            assert!(error.is_some());
+            let facts = typing::infer_types(&ir, TypingMode::DynamicHints, &[]);
+            let owned = facts
+                .local_schemas
+                .iter()
+                .map(|schema| schema.as_ref().is_some_and(TypeSchema::contains_resource))
+                .collect::<Vec<_>>();
+            let index = ir.parsed_semantic_index.as_mut().unwrap();
+            match mode {
+                0 => {}
+                1 => index.call_arguments.clear(),
+                2 => {
+                    let duplicate = index.call_arguments.last().unwrap().clone();
+                    index.call_arguments.push(duplicate);
+                }
+                _ => {
+                    for site in &mut index.call_arguments {
+                        site.callee_span.source_id = 42;
+                    }
+                }
+            }
+            let mut sources = SourceMap::new();
+            sources.add_source("main.rss", source);
+            let result = lifetime::enforce_source_availability_with_entry_locals(
+                ir,
+                &[],
+                false,
+                &owned,
+                &HashMap::new(),
+                true,
+                &sources,
+                &rejections,
+            );
+            if mode == 0 {
+                assert!(result.is_ok(), "exact provenance: {result:?}");
+            } else {
+                assert_eq!(
+                    result.unwrap_err().code.as_deref(),
+                    Some("E_OWNERSHIP_BORROW_ESCAPE"),
+                    "mode {mode}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "http-client")]
+    fn parser_argument_ordinals_wrappers_and_nested_ids_use_original_source_spans() {
+        let source = "use http; let mut request = http::request::new(\"GET\", \"http://127.0.0.1:1/x\"); http::request::set_header(&mut request, \"é\", http::response::status(&request));";
+        let options = CompileSourceFileOptions::default()
+            .with_host_api_catalog(crate::standard_host_catalog());
+        let parsed =
+            crate::compiler::frontends::parse_source(source, SourceFlavor::RustScript, &options)
+                .unwrap();
+        let index = parsed.parsed_semantic_index.unwrap();
+        let outer = index
+            .call_sites
+            .iter()
+            .find(|site| site.name == "http::request::set_header")
+            .unwrap();
+        let inner = index
+            .call_sites
+            .iter()
+            .find(|site| site.name == "http::response::status")
+            .unwrap();
+        assert_ne!(outer.id, inner.id);
+        let args = index
+            .call_arguments
+            .iter()
+            .find(|args| args.call_id == outer.id)
+            .unwrap();
+        assert_eq!(args.callee_span, outer.callee_span);
+        assert_eq!(args.expr_span, outer.expr_span);
+        assert_eq!(
+            args.arguments
+                .iter()
+                .map(|arg| &source[arg.span.lo..arg.span.hi])
+                .collect::<Vec<_>>(),
+            vec!["&mut request", "\"é\"", "http::response::status(&request)"]
+        );
+        assert!(
+            args.arguments
+                .iter()
+                .all(|arg| arg.span.source_id == outer.callee_span.source_id)
+        );
+        assert_eq!(
+            args.arguments[0].shape,
+            super::super::ir::ParsedArgumentShape::BorrowMut
+        );
+        let args = index
+            .call_arguments
+            .iter()
+            .find(|args| args.call_id == inner.id)
+            .unwrap();
+        assert_eq!(
+            &source[args.arguments[0].span.lo..args.arguments[0].span.hi],
+            "&request"
+        );
     }
 
     #[test]

@@ -19,6 +19,15 @@ pub fn render_source_error(source_map: &SourceMap, err: &ParseError, _styled: bo
 
 pub fn render_compile_error(source_map: &SourceMap, err: &CompileError, _styled: bool) -> String {
     let message = err.diagnostic_message();
+    // Result typing diagnostics retain an exact parser span. Its source id is
+    // authoritative even when no legacy line/source-name fields are present.
+    if let CompileError::StrictTypingRequired {
+        span: Some(span), ..
+    } = err
+        && let Some(rendered) = render_span_snippet(source_map, *span, &message)
+    {
+        return format!("compile error: {}", rendered.trim_end());
+    }
     let source_name = err.source_name();
 
     // Resolve the owning source id: by name when the error names its source,
