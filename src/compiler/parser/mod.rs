@@ -197,6 +197,7 @@ pub(super) struct Parser {
     catalog_function_decls: HashMap<(String, u8), FunctionDecl>,
     /// Parser-produced semantic provenance index tracked during parse.
     parsed_semantic_index: ParsedSemanticIndex,
+    call_args_by_end: HashMap<usize, Vec<super::ir::ParsedCallArgument>>,
     /// Parser scope stack for tracking current scope during parse.
     parser_scope_stack: Vec<ScopeId>,
 }
@@ -263,6 +264,7 @@ impl Parser {
             host_api_metadata: None,
             catalog_function_decls: HashMap::new(),
             parsed_semantic_index: ParsedSemanticIndex::default(),
+            call_args_by_end: HashMap::new(),
             parser_scope_stack: vec![0],
         })
     }
@@ -681,6 +683,22 @@ impl Parser {
     ) -> Option<SemanticNodeId> {
         let id = self.parsed_semantic_index.alloc_node_id();
         let scope_id = self.current_scope_id();
+        if let Some(arguments) = self.call_args_by_end.get(&expr_span.hi)
+            && arguments.iter().all(|arg| {
+                arg.span.source_id == expr_span.source_id
+                    && arg.span.lo >= callee_span.hi
+                    && arg.span.hi < expr_span.hi
+            })
+        {
+            self.parsed_semantic_index
+                .call_arguments
+                .push(super::ir::ParsedCallArguments {
+                    call_id: id,
+                    callee_span,
+                    expr_span,
+                    arguments: arguments.clone(),
+                });
+        }
         self.parsed_semantic_index.call_sites.push(ParsedCallSite {
             id,
             callee_span,

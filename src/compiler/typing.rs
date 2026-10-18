@@ -254,11 +254,19 @@ pub(super) fn legalize_builtins_and_bind_types(
     typing_mode: TypingMode,
     entry_local_types: &[EntryLocalType],
 ) -> Result<FrontendIr, CompileError> {
-    let (ir, error) = legalize_for_admission(ir, typing_mode, entry_local_types);
+    let (ir, error, _) = legalize_for_admission(ir, typing_mode, entry_local_types);
     match error {
         Some(error) => Err(error),
         None => Ok(ir),
     }
+}
+
+/// Admission-only identity of an actually rejected catalog call. It never
+/// supplies a successful host resolution or permits runtime transfer.
+#[derive(Clone, Debug)]
+pub(crate) struct CanonicalHostRejection {
+    pub provenance: super::ir::ParsedCallArguments,
+    pub reason: Option<super::host_call_resolve::ArgumentRejection>,
 }
 
 // Retain all successfully resolved facts even when another host call fails.
@@ -267,7 +275,11 @@ pub(super) fn legalize_for_admission(
     mut ir: FrontendIr,
     typing_mode: TypingMode,
     entry_local_types: &[EntryLocalType],
-) -> (FrontendIr, Option<CompileError>) {
+) -> (
+    FrontendIr,
+    Option<CompileError>,
+    Vec<CanonicalHostRejection>,
+) {
     // Exact callee spans for every parsed call site, keyed by the
     // [`SemanticNodeId`] carried on the typed [`Expr::Call`] nodes. The
     // host-call resolver attaches these to its failure diagnostic so the
@@ -284,11 +296,16 @@ pub(super) fn legalize_for_admission(
         })
         .unwrap_or_default();
 
+    let argument_sites = ir
+        .parsed_semantic_index
+        .as_ref()
+        .map(|index| index.call_arguments.clone())
+        .unwrap_or_default();
     let Some(metadata) = ir.host_api_metadata.clone() else {
         let mut pass = HostCallResolutionPass::new(None, HostCallResolutionPhase::Disabled)
             .with_call_site_spans(&call_site_spans);
         run_legalize_round(&mut ir, typing_mode, entry_local_types, &mut pass);
-        return (ir, None);
+        return (ir, None, Vec::new());
     };
 
     loop {
@@ -300,18 +317,19 @@ pub(super) fn legalize_for_admission(
             continue;
         }
         if refine.unresolved() == 0 {
-            return (ir, None);
+            return (ir, None, Vec::new());
         }
 
         let mut final_pass =
             HostCallResolutionPass::new(Some(&metadata), HostCallResolutionPhase::Final)
-                .with_call_site_spans(&call_site_spans);
+                .with_call_site_spans(&call_site_spans)
+                .with_argument_sites(&argument_sites);
         run_legalize_round(&mut ir, typing_mode, entry_local_types, &mut final_pass);
         if final_pass.changed() > 0 {
             continue;
         }
         if final_pass.unresolved() == 0 {
-            return (ir, None);
+            return (ir, None, Vec::new());
         }
         return (
             ir,
@@ -320,6 +338,7 @@ pub(super) fn legalize_for_admission(
                     .take_error()
                     .expect("a final unresolved catalog call must record a compile error"),
             ),
+            final_pass.rejections,
         );
     }
 }
@@ -592,8 +611,28 @@ pub(super) fn validate_source_type_consistency(
     entry_local_types: &[EntryLocalType],
     owner: Option<&str>,
 ) -> Result<(), CompileError> {
-    check_source_type_consistency(ir, typing_mode, entry_local_types, owner, false, None)
+    check_source_type_consistency(ir, typing_mode, entry_local_types, owner, false, None, &[])
         .map(|_| ())
+}
+
+pub(super) fn validate_source_type_consistency_with_host_error(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+    owner: Option<&str>,
+    host_error: Option<&CompileError>,
+    rejections: &[CanonicalHostRejection],
+) -> Result<(), CompileError> {
+    check_source_type_consistency(
+        ir,
+        typing_mode,
+        entry_local_types,
+        owner,
+        false,
+        host_error,
+        rejections,
+    )
+    .map(|_| ())
 }
 
 pub(super) fn analyze_source_type_consistency(
@@ -602,8 +641,17 @@ pub(super) fn analyze_source_type_consistency(
     entry_local_types: &[EntryLocalType],
     owner: Option<&str>,
     host_error: Option<&CompileError>,
+    rejections: &[CanonicalHostRejection],
 ) -> Result<Vec<CompileError>, CompileError> {
-    check_source_type_consistency(ir, typing_mode, entry_local_types, owner, true, host_error)
+    check_source_type_consistency(
+        ir,
+        typing_mode,
+        entry_local_types,
+        owner,
+        true,
+        host_error,
+        rejections,
+    )
 }
 
 fn check_source_type_consistency(
@@ -613,6 +661,7 @@ fn check_source_type_consistency(
     owner: Option<&str>,
     recover_typing_diagnostics: bool,
     host_error: Option<&CompileError>,
+    rejections: &[CanonicalHostRejection],
 ) -> Result<Vec<CompileError>, CompileError> {
     let mut diagnostics = Vec::new();
     let dependent_host_returns = host_error
@@ -635,6 +684,8 @@ fn check_source_type_consistency(
         typing_mode,
         ir.parsed_semantic_index.as_ref(),
     );
+    context.retain_catalog_rejection(host_error);
+    context.retain_catalog_rejection_contexts(rejections);
     for (index, stmt) in ir.stmts.iter().enumerate() {
         if owner.is_some_and(|owner| {
             ir.stmt_sources
@@ -1776,6 +1827,28 @@ mod catalog_call_resolution_tests {
 
         let configured =
             || CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog));
+        let model = crate::compiler::analyze_source_from_string_with_options(
+            "main.rss",
+            source,
+            configured(),
+        )
+        .expect("same-argument recovery retains the canonical catalog diagnostic");
+        assert_eq!(model.diagnostics().len(), 1);
+        assert!(
+            model.diagnostics()[0]
+                .message
+                .contains("expected passing take_owned, found passing value"),
+            "{:?}",
+            model.diagnostics()
+        );
+        let span = model.diagnostics()[0].span.unwrap();
+        assert_eq!(model.sources().span_text(span), Some("acme::consume"));
+        assert_eq!(model.sources().file_name(span.source_id), Some("main.rss"));
+        assert_eq!(
+            model.sources().line_col_for_offset(span.source_id, span.lo),
+            Some((3, 1))
+        );
+
         let valid = "use acme;\nlet file = acme::open(\"x\");\nacme::consume(file);\n";
         crate::compiler::compile_source_with_flavor_and_options(
             valid,
@@ -1801,7 +1874,6 @@ mod catalog_call_resolution_tests {
         // use-after-move is independent of an invalid catalog call, including
         // when the independent statement shares the same source line.
         for invalid in [
-            source,
             "use acme;\nlet file = acme::open(\"x\");\nfile.copy(); acme::consume(42);\n",
             "use acme;\nlet file = acme::open(\"x\");\nacme::consume(42); file.copy();\n",
             "use acme;\nlet file = acme::open(\"x\");\nacme::consume(file);\nfile;\nacme::consume(42);\n",
@@ -1814,25 +1886,23 @@ mod catalog_call_resolution_tests {
             .err()
             .expect("host recovery must retain ownership rejection");
             let mut errors = vec![analyzed];
-            if invalid != source {
-                errors.push(
-                    crate::compiler::compile_source_with_flavor_and_options(
-                        invalid,
-                        SourceFlavor::RustScript,
-                        configured(),
-                    )
-                    .err()
-                    .expect("independent ownership rejection in compile"),
-                );
-                errors.push(
-                    crate::compiler::collect_inferred_local_type_hints_with_options(
-                        invalid,
-                        SourceFlavor::RustScript,
-                        configured(),
-                    )
-                    .expect_err("independent ownership rejection in hints"),
-                );
-            }
+            errors.push(
+                crate::compiler::compile_source_with_flavor_and_options(
+                    invalid,
+                    SourceFlavor::RustScript,
+                    configured(),
+                )
+                .err()
+                .expect("independent ownership rejection in compile"),
+            );
+            errors.push(
+                crate::compiler::collect_inferred_local_type_hints_with_options(
+                    invalid,
+                    SourceFlavor::RustScript,
+                    configured(),
+                )
+                .expect_err("independent ownership rejection in hints"),
+            );
             for error in errors {
                 let crate::compiler::SourcePathError::SourceWithMap {
                     error: crate::compiler::SourceError::Parse(error),

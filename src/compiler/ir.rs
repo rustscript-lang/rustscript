@@ -1527,6 +1527,31 @@ pub struct ParsedCallSite {
     pub is_namespace_call: bool,
 }
 
+/// Exact source-level shape at one direct argument boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParsedArgumentShape {
+    Other,
+    Borrow,
+    BorrowMut,
+    Copy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedCallArgument {
+    pub span: Span,
+    pub shape: ParsedArgumentShape,
+    /// Direct wrapper operand only; never inferred from nearby references.
+    pub local: Option<LocalSlot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedCallArguments {
+    pub call_id: SemanticNodeId,
+    pub callee_span: Span,
+    pub expr_span: Span,
+    pub arguments: Vec<ParsedCallArgument>,
+}
+
 /// A parsed local variable declaration site.
 #[derive(Clone, Debug)]
 pub struct LocalDeclSite {
@@ -1703,6 +1728,8 @@ pub struct ParsedSemanticIndex {
     pub type_provenance: Vec<GuestTypeProvenance>,
     /// All parsed call sites, in allocation order.
     pub call_sites: Vec<ParsedCallSite>,
+    /// Source-only ordered argument provenance; absent for synthetic calls.
+    pub call_arguments: Vec<ParsedCallArguments>,
     /// All parsed local declarations, in allocation order.
     pub local_decls: Vec<LocalDeclSite>,
     /// All parsed local variable references, in allocation order.

@@ -1249,6 +1249,8 @@ fn to_nyi(err: TraceRecordError) -> JitNyiReason {
 fn scan_loop_headers(program: &Program) -> Vec<bool> {
     let code = &program.code;
     let mut headers = vec![false; code.len()];
+    let mut loop_ranges = Vec::new();
+    let mut move_continuations = Vec::new();
     let mut ip = 0usize;
 
     while ip < code.len() {
@@ -1267,13 +1269,37 @@ fn scan_loop_headers(program: &Program) -> Vec<bool> {
             let target = target_u32 as usize;
             if target <= instr_ip && target < headers.len() {
                 headers[target] = true;
+                loop_ranges.push(target..=instr_ip);
             }
+        } else if opcode == OpCode::Call && code.get(instr_ip + 1..instr_ip + 4).is_some() {
+            move_continuations.push(instr_ip + 4);
         }
         // Advance by the full instruction length (opcode plus operands) so
         // operand bytes are never interpreted as opcodes.
         ip = instr_ip.saturating_add(1 + opcode.operand_len());
     }
 
+    // Calls (including owned-move helpers) may finish in the interpreter.
+    // Their post-call state is nevertheless a valid hot-loop entry: without
+    // it, the first helper permanently hides all later useful computation.
+    // Do not admit straight-line successors or execute/replay the call natively.
+    // Sweep sorted loop intervals rather than scanning every loop per call.
+    if !move_continuations.is_empty() {
+        loop_ranges.sort_unstable_by_key(|range| *range.start());
+        let mut ranges = loop_ranges.iter().peekable();
+        let mut covered_end = None;
+        for next in move_continuations {
+            while let Some(range) = ranges.peek()
+                && *range.start() <= next
+            {
+                covered_end = Some(covered_end.unwrap_or(0).max(*range.end()));
+                ranges.next();
+            }
+            if next < headers.len() && covered_end.is_some_and(|end| next <= end) {
+                headers[next] = true;
+            }
+        }
+    }
     headers
 }
 
@@ -1980,6 +2006,29 @@ mod tests {
                 .iter()
                 .any(|name| name == "inline_call:0")
         );
+    }
+
+    #[test]
+    fn scan_loop_headers_keeps_detach_continuations_inside_loops() {
+        let detach = crate::BuiltinFunction::DetachLocal.call_index();
+        let mut bc = BytecodeBuilder::new();
+        bc.call(detach, 1);
+        let outside = bc.position();
+        bc.nop();
+        let root = bc.position();
+        bc.ldc(0);
+        bc.call(detach, 1);
+        let inside = bc.position();
+        bc.nop();
+        bc.br(root);
+        let program = Program::new(vec![Value::Int(0)], bc.finish());
+        let entries = scan_loop_headers(&program);
+        assert!(entries[root as usize]);
+        assert!(
+            entries[inside as usize],
+            "hot owned-move continuation must remain eligible"
+        );
+        assert!(!entries[outside as usize], "no new straight-line admission");
     }
 
     #[test]

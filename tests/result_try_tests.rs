@@ -55,8 +55,8 @@ fn assert_question_span(source: &str, error: &vm::SourceError) {
         panic!("expected a spanned try diagnostic, got {error:?}");
     };
     let span = span.expect("try diagnostic should keep the ? span");
-    let lo = span.lo as usize;
-    let hi = span.hi as usize;
+    let lo = span.lo;
+    let hi = span.hi;
     assert_eq!(
         hi,
         lo + 1,

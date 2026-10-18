@@ -130,6 +130,9 @@ pub(super) struct TypeContext<'a> {
     /// Result payload checks reuse this context but must not treat
     /// `GenericParam` or `Unknown` as compatible with every concrete schema.
     pub(super) result_payload_strict: bool,
+    /// A catalog rejection already owns this exact parser-proven call site.
+    /// Skip only its flat legacy signature check, never child/body validation.
+    rejected_host_calls: Vec<(Span, Span)>,
 }
 
 struct CallableBody<'a> {
@@ -177,6 +180,59 @@ impl<'a> TypeContext<'a> {
             active_optional_returns: Vec::new(),
             parsed,
             result_payload_strict: false,
+            rejected_host_calls: Vec::new(),
+        }
+    }
+
+    pub(super) fn retain_catalog_rejection(&mut self, error: Option<&CompileError>) {
+        let Some(CompileError::HostCallResolve {
+            span: Some(callee), ..
+        }) = error
+        else {
+            return;
+        };
+        if let Some(site) = self.parsed.and_then(|index| {
+            index
+                .call_sites
+                .iter()
+                .find(|site| site.callee_span == *callee)
+                .map(|site| (site.callee_span, site.expr_span))
+        }) {
+            self.rejected_host_calls.push(site);
+        }
+    }
+
+    pub(super) fn retain_catalog_rejection_contexts(
+        &mut self,
+        rejections: &[super::CanonicalHostRejection],
+    ) {
+        let Some(parsed) = self.parsed else {
+            return;
+        };
+        for rejection in rejections {
+            let site = &rejection.provenance;
+            // Same span-exact flat-signature deferral, restricted to actual
+            // parser-proven resolver failures. No child/body check is skipped.
+            if parsed
+                .call_arguments
+                .iter()
+                .filter(|args| *args == site)
+                .count()
+                == 1
+                && parsed
+                    .call_sites
+                    .iter()
+                    .filter(|call| {
+                        call.id == site.call_id
+                            && call.callee_span == site.callee_span
+                            && call.expr_span == site.expr_span
+                    })
+                    .count()
+                    == 1
+            {
+                self.rejected_host_calls
+                    .push((site.callee_span, site.expr_span));
+            }
         }
     }
 
@@ -2625,6 +2681,15 @@ impl<'a> TypeContext<'a> {
         source_name: Option<&str>,
         span: Option<Span>,
     ) -> Result<(), CompileError> {
+        if self
+            .rejected_host_calls
+            .iter()
+            .any(|(callee, expression)| span == Some(*callee) || span == Some(*expression))
+        {
+            // The full schema/passing resolver will return its canonical error.
+            // This does not resolve the call or permit this IR to reach codegen.
+            return Ok(());
+        }
         for (index, param) in signature.params.iter().enumerate() {
             let crate::builtins::CallableParamType::Callable(callable) = param.ty else {
                 continue;

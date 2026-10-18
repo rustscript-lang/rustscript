@@ -149,6 +149,16 @@ fn roundtrip(name: &str, source: &str, result: i64) {
 }
 
 #[test]
+fn fresh_process_result_ok_err_try_artifacts_execute_without_source() {
+    for (flag, expected) in [("true", 8), ("false", 7)] {
+        let source = format!(
+            "fn choose(flag: bool, n: int) -> Result<int, int> {{ if flag => {{ Result::Ok(n) }} else => {{ Result::Err(n) }} }} fn relay(flag: bool, n: int) -> Result<int, int> {{ let v = choose(flag, n)?; Result::Ok(v + 1) }} let output = match relay({flag}, 7) {{ Result::Ok(n) => n, Result::Err(e) => e, }}; output;"
+        );
+        roundtrip(&format!("result-{flag}"), &source, expected);
+    }
+}
+
+#[test]
 fn fresh_process_number_factorial_artifact_is_native_with_and_without_source() {
     roundtrip(
         "number-factorial",

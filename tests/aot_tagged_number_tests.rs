@@ -348,23 +348,25 @@ fn the_same_number_factorial_frame_accepts_multiple_runtime_representations() {
 }
 
 #[test]
-fn host_callable_invocation_retains_its_existing_interpreter_policy() {
-    let mut machine = exported_vm("pub fn below(n: number) -> bool { n < 2 }", true);
-    let callable = machine.resolve_exported_callable("below").unwrap();
-    let before = machine.aot_exec_count();
-    assert_eq!(
-        machine.invoke_callable(callable, &[Value::Int(1)]).unwrap(),
-        Value::Bool(true)
-    );
-    assert_eq!(
-        machine.aot_exec_count(),
-        before,
-        "host invocation currently disables native execution"
-    );
-    eprintln!(
-        "host invoke_callable boundary: native returns before={before} after={}",
-        machine.aot_exec_count()
-    );
+fn host_callable_invocation_respects_its_configured_native_backend() {
+    for native in [false, true] {
+        let mut machine = exported_vm("pub fn below(n: number) -> bool { n < 2 }", native);
+        let callable = machine.resolve_exported_callable("below").unwrap();
+        let before = machine.aot_exec_count();
+        assert_eq!(
+            machine.invoke_callable(callable, &[Value::Int(1)]).unwrap(),
+            Value::Bool(true)
+        );
+        if native {
+            assert!(machine.aot_exec_count() > before);
+        } else {
+            assert_eq!(machine.aot_exec_count(), before);
+        }
+        eprintln!(
+            "host invoke_callable native={native}: before={before} after={}",
+            machine.aot_exec_count()
+        );
+    }
 }
 
 #[test]

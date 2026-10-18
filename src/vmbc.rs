@@ -2864,9 +2864,7 @@ mod ret_cleanup_wire_tests {
         let key = b"pr24.closure";
         let schema_len = 1 + 4 + key.len();
         deep.truncate(deep.len() - schema_len);
-        for _ in 0..64 {
-            deep.push(16);
-        }
+        deep.extend(std::iter::repeat_n(16, 64));
         deep.push(17);
         deep.extend_from_slice(&(key.len() as u32).to_le_bytes());
         deep.extend_from_slice(key);
