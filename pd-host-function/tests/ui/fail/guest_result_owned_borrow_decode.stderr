@@ -1,19 +1,17 @@
-error[E0599]: the variant or associated item `from_vm_value` exists for enum `GuestResult<ResourceOwned<Counter>, i64>`, but its trait bounds were not satisfied
- --> tests/ui/fail/guest_result_owned_borrow_decode.rs:4:57
+error[E0277]: the trait bound `ResourceOwned<Counter>: FromVmValue<'_>` is not satisfied
+ --> tests/ui/fail/guest_result_owned_borrow_decode.rs:4:14
   |
-4 |     let _ = GuestResult::<ResourceOwned<Counter>, i64>::from_vm_value(&Value::Null, "owned");
-  |                                                         ^^^^^^^^^^^^^ variant or associated item cannot be called on `GuestResult<ResourceOwned<Counter>, i64>` due to unsatisfied trait bounds
+4 |     let _ = <GuestResult<ResourceOwned<Counter>, i64> as FromVmValue<'_>>::from_vm_value(
+  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `FromVmValue<'_>` is not implemented for `ResourceOwned<Counter>`
   |
- ::: $WORKSPACE/src/result.rs
-  |
-  | pub enum GuestResult<T, E> {
-  | -------------------------- doesn't satisfy `_: FromVmValue<'_>`
-  |
- ::: $WORKSPACE/src/vm/resource/handle.rs
-  |
-  | pub struct ResourceOwned<T>(T);
-  | --------------------------- doesn't satisfy `ResourceOwned<Counter>: FromVmValue<'_>`
-  |
-  = note: the following trait bounds were not satisfied:
-          `ResourceOwned<Counter>: FromVmValue<'_>`
-          which is required by `GuestResult<ResourceOwned<Counter>, i64>: FromVmValue<'_>`
+  = help: the following other types implement trait `FromVmValue<'a>`:
+            `&'a VmMap` implements `FromVmValue<'a>`
+            `&'a [u8]` implements `FromVmValue<'a>`
+            `&'a [vm::Value]` implements `FromVmValue<'a>`
+            `&'a str` implements `FromVmValue<'a>`
+            `&'a vm::Value` implements `FromVmValue<'a>`
+            `()` implements `FromVmValue<'_>`
+            `Arc<Vec<u8>>` implements `FromVmValue<'_>`
+            `Arc<Vec<vm::Value>>` implements `FromVmValue<'_>`
+          and $N others
+  = note: required for `GuestResult<ResourceOwned<Counter>, i64>` to implement `FromVmValue<'_>`
