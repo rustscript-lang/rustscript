@@ -21,6 +21,7 @@
 //! transaction statement count, and transaction deadline, plus SQL-safety
 //! rejection and read-only enforcement.
 
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -547,6 +548,9 @@ fn current_policy(vm: &Vm) -> &SqlitePolicy {
 }
 
 fn sqlite_error(error: rusqlite::Error) -> VmError {
+    if matches!(error, rusqlite::Error::MultipleStatement) {
+        return VmError::HostError("multiple SQLite statements are not allowed".to_string());
+    }
     let code = error
         .sqlite_error()
         .map(|value| value.extended_code.to_string())
@@ -860,6 +864,15 @@ fn install_authorizer(connection: &Connection, allow_unsafe_sql: bool) {
             return Authorization::Allow;
         }
         match context.action {
+            // Regular triggers and their ordinary DML/RAISE guards use the
+            // same permissions as top-level writes. All accesses in a trigger
+            // body still pass through this authorizer when SQLite compiles it.
+            AuthAction::CreateTrigger { .. }
+            | AuthAction::Insert { .. }
+            | AuthAction::Update { .. }
+            | AuthAction::Delete { .. }
+            | AuthAction::Read { .. }
+            | AuthAction::Select => Authorization::Allow,
             AuthAction::Attach { .. }
             | AuthAction::Detach { .. }
             | AuthAction::Pragma { .. }
@@ -871,7 +884,32 @@ fn install_authorizer(connection: &Connection, allow_unsafe_sql: bool) {
             {
                 Authorization::Deny
             }
-            _ => Authorization::Allow,
+            // Preserve the other known actions already allowed by this
+            // adapter, including existing schema/drop/temp permissions. Future
+            // rusqlite action variants must not acquire permission implicitly.
+            AuthAction::CreateIndex { .. }
+            | AuthAction::CreateTable { .. }
+            | AuthAction::CreateTempIndex { .. }
+            | AuthAction::CreateTempTable { .. }
+            | AuthAction::CreateTempTrigger { .. }
+            | AuthAction::CreateTempView { .. }
+            | AuthAction::CreateView { .. }
+            | AuthAction::DropIndex { .. }
+            | AuthAction::DropTable { .. }
+            | AuthAction::DropTempIndex { .. }
+            | AuthAction::DropTempTable { .. }
+            | AuthAction::DropTempTrigger { .. }
+            | AuthAction::DropTempView { .. }
+            | AuthAction::DropTrigger { .. }
+            | AuthAction::DropView { .. }
+            | AuthAction::Transaction { .. }
+            | AuthAction::AlterTable { .. }
+            | AuthAction::Reindex { .. }
+            | AuthAction::Analyze { .. }
+            | AuthAction::Function { .. }
+            | AuthAction::Savepoint { .. }
+            | AuthAction::Recursive => Authorization::Allow,
+            _ => Authorization::Deny,
         }
     }));
 }
@@ -899,12 +937,14 @@ fn open_connection(options: &OpenOptions) -> VmResult<Connection> {
     Ok(connection)
 }
 
+// Lexical policy checks only: statement boundaries are decided by SQLite in
+// check_single_statement, never by counting semicolons or BEGIN/END tokens.
 fn normalized_sql(sql: &str) -> VmResult<String> {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
     let mut index = 0;
     let mut quote = None;
-    let mut statement_ended = false;
+
     while index < bytes.len() {
         let byte = bytes[index];
         if let Some(active_quote) = quote {
@@ -918,8 +958,8 @@ fn normalized_sql(sql: &str) -> VmResult<String> {
             index += 1;
             continue;
         }
-        if matches!(byte, b'\'' | b'"' | b'`') {
-            quote = Some(byte);
+        if matches!(byte, b'\'' | b'"' | b'`' | b'[') {
+            quote = Some(if byte == b'[' { b']' } else { byte });
             out.push(' ');
             index += 1;
             continue;
@@ -947,14 +987,9 @@ fn normalized_sql(sql: &str) -> VmResult<String> {
             continue;
         }
         if byte == b';' {
-            statement_ended = true;
+            out.push(' ');
             index += 1;
             continue;
-        }
-        if statement_ended && !byte.is_ascii_whitespace() {
-            return Err(VmError::HostError(
-                "multiple SQLite statements are not allowed".to_string(),
-            ));
         }
         out.push((byte as char).to_ascii_lowercase());
         index += 1;
@@ -1261,12 +1296,89 @@ fn value_from_row(
     }
 }
 
+/// Probe exactly one statement on the executing connection, under its current
+/// authorizer, limits and progress handler. Never step the probe. In particular,
+/// a trigger's body semicolons belong to SQLite's grammar, not a host SQL lexer.
+fn check_single_statement(connection: &Connection, sql: &str) -> Result<(), rusqlite::Error> {
+    let text = CString::new(sql).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let length = i32::try_from(sql.len()).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let mut statement = std::ptr::null_mut();
+    let mut tail = std::ptr::null();
+    // SAFETY: the worker exclusively owns this live connection while holding
+    // its connection lock. `text` is NUL-terminated, contains `length` SQL bytes,
+    // and outlives prepare. SQLite writes only our two output pointers. No
+    // statement escapes this block: finalize (also valid for NULL) runs on both
+    // success and error, before any Rust error return or tail validation. No
+    // callback can access the connection; the installed hooks only inspect
+    // authorization context / atomic cancellation state.
+    let (has_statement, consumed) = unsafe {
+        let handle = connection.handle();
+        let rc = rusqlite::ffi::sqlite3_prepare_v2(
+            handle,
+            text.as_ptr(),
+            length,
+            &mut statement,
+            &mut tail,
+        );
+        let has_statement = !statement.is_null();
+        rusqlite::ffi::sqlite3_finalize(statement);
+        if rc != rusqlite::ffi::SQLITE_OK {
+            // SQLite owns a non-null, NUL-terminated error string for the
+            // lifetime of this live handle; copy it before the next API call.
+            let message = CStr::from_ptr(rusqlite::ffi::sqlite3_errmsg(handle))
+                .to_string_lossy()
+                .into_owned();
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rc),
+                Some(message),
+            ));
+        }
+        (
+            has_statement,
+            (tail as usize).checked_sub(text.as_ptr() as usize),
+        )
+    };
+    let consumed = consumed
+        .filter(|offset| *offset <= sql.len())
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    if !has_statement {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    // Only whitespace and complete comments may follow the parsed statement.
+    // This linear tail scan is deliberately not a second SQL grammar/parser.
+    let bytes = sql.as_bytes();
+    let mut index = consumed;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+        } else if bytes[index..].starts_with(b"--") {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+        } else if bytes[index..].starts_with(b"/*") {
+            index += 2;
+            while index + 1 < bytes.len() && !bytes[index..].starts_with(b"*/") {
+                index += 1;
+            }
+            if index + 1 >= bytes.len() {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            index += 2;
+        } else {
+            return Err(rusqlite::Error::MultipleStatement);
+        }
+    }
+    Ok(())
+}
+
 fn query_with_connection(
     connection: &Connection,
     sql: &str,
     params: &[SqlValue],
     limits: SqliteLimits,
 ) -> Result<VmMap, rusqlite::Error> {
+    check_single_statement(connection, sql)?;
     let mut statement = connection.prepare(sql)?;
     let columns = statement
         .column_names()
@@ -1331,6 +1443,7 @@ fn execute_with_connection(
     sql: &str,
     params: &[SqlValue],
 ) -> Result<VmMap, rusqlite::Error> {
+    check_single_statement(connection, sql)?;
     let mut statement = connection.prepare(sql)?;
     let rows_affected = statement.execute(params_from_iter(params.iter()))?;
     drop(statement);

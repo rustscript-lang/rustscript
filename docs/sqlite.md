@@ -208,6 +208,39 @@ An execute statement produces `{ kind: "execute", execute: ... }`; a query state
 `kind` before using `execute` or `query`. The transaction remains atomic: statement order,
 rollback on failure, cancellation, deadlines, and result limits are preserved.
 
+## Single-statement SQL and triggers
+
+`execute`, `query`, and each transaction entry accept exactly one SQLite statement. The
+worker uses SQLite's parser on the executing connection, with its current authorizer and
+limits, before stepping the statement. An optional outer terminator may be followed only by
+whitespace or complete comments. A second statement is rejected before the first statement
+is stepped, including when the embedding policy permits unsafe SQL. Empty/comment-only SQL,
+NUL bytes, unterminated quotes/comments, and oversized statements are rejected.
+
+Regular `CREATE TRIGGER ... BEGIN ...; END` statements are supported without unsafe SQL.
+Internal trigger-body semicolons, quoted identifiers, strings, comments, and `CASE ... END`
+are interpreted by SQLite. For example, after creating `messages` and `revisions`:
+
+```rust
+sqlite::execute(
+    &db,
+    "CREATE TRIGGER revision_insert AFTER INSERT ON messages BEGIN UPDATE revisions SET revision=revision+1; END",
+    [],
+);
+```
+
+Trigger bodies remain subject to the connection's SQL authorization policy when SQLite
+compiles them. Safe policy continues to reject attach/detach, pragmas, virtual-table actions,
+unknown authorization actions, and extension loading. Trigger support does not enable foreign
+keys or provide a tamper-proof schema: existing permissions such as `DROP TRIGGER` remain
+unchanged. Applications that require checked revision counters must enforce integer type and
+range in their schema or guards; SQLite may promote overflowing integer arithmetic to REAL.
+
+Transaction entries are checked immediately before their own step, so later entries can use
+tables, indexes, or triggers created by earlier entries. A later parse/authorization error
+rolls back the transaction, including earlier DDL and writes; no successful result envelope is
+returned for a rolled-back prefix. Query uses the same gate; it is not a read-only permission.
+
 ## Resource lifecycle
 
 `sqlite::close(db)` consumes the connection, cancels pending operations on it, and waits for
