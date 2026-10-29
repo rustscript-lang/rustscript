@@ -25,6 +25,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use super::{IoPolicy, io_policy};
+use crate::host_api::ResourceTypeKey;
 use crate::vm::resource::close::{CloseProgress, HostResource};
 use crate::vm::resource::error::{ResourceError, ResourceErrorCode, ResourceResult};
 use crate::vm::resource::{ResourceCloseReason, ResourceHandle};
@@ -292,6 +293,10 @@ impl Drop for IoResource {
 }
 
 impl HostResource for IoResource {
+    fn resource_type_key() -> Option<ResourceTypeKey> {
+        ResourceTypeKey::new(super::IO_FILE_KEY).ok()
+    }
+
     fn begin_close(&mut self, reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.closed.store(true, Ordering::Release);
         let pid = self.process_id.load(Ordering::Acquire);
@@ -617,7 +622,7 @@ pub(crate) async fn builtin_io_read_line(
 }
 
 /// Writes text to an I/O handle.
-#[pd_host_function(name = "io::write")]
+#[pd_host_function(name = "io::write", contract = super::io_write_contract)]
 pub(crate) async fn builtin_io_write(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
@@ -657,7 +662,7 @@ pub(crate) async fn builtin_io_write(
 }
 
 /// Flushes buffered output for an I/O handle.
-#[pd_host_function(name = "io::flush")]
+#[pd_host_function(name = "io::flush", contract = super::io_flush_contract)]
 pub(crate) async fn builtin_io_flush(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,

@@ -16,7 +16,11 @@ use crate::vm::{Vm, VmError, VmResult};
 /// this build binds the canonical declaration to a marker handle type.
 pub(crate) struct WasmIoFileHandle;
 
-impl crate::vm::resource::HostResource for WasmIoFileHandle {}
+impl crate::vm::resource::HostResource for WasmIoFileHandle {
+    fn resource_type_key() -> Option<crate::host_api::ResourceTypeKey> {
+        crate::host_api::ResourceTypeKey::new(IO_FILE_KEY).ok()
+    }
+}
 
 impl crate::host_extension::HostResourceType for WasmIoFileHandle {
     const KEY: &'static str = IO_FILE_KEY;
@@ -75,7 +79,7 @@ pub(super) fn builtin_io_read_line(
 }
 
 /// Writes text to an I/O handle.
-#[pd_host_function(name = "io::write")]
+#[pd_host_function(name = "io::write", contract = super::io_write_contract)]
 pub(super) fn builtin_io_write(
     _vm: &mut Vm,
     _handle_id: i64,
@@ -87,7 +91,7 @@ pub(super) fn builtin_io_write(
 }
 
 /// Flushes buffered output for an I/O handle.
-#[pd_host_function(name = "io::flush")]
+#[pd_host_function(name = "io::flush", contract = super::io_flush_contract)]
 pub(super) fn builtin_io_flush(_vm: &mut Vm, _handle_id: i64) -> VmResult<HostCallResult<bool>> {
     Err(VmError::HostError(
         "io::flush is unsupported on wasm32 runtime".to_string(),

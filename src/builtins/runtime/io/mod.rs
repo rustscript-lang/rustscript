@@ -180,15 +180,48 @@ fn io_close_contract() -> HostFunctionSchema {
     )
 }
 
+/// Guest contract for `io::write`.
+///
+/// The runtime signature still carries the raw scope-token `i64`. The guest
+/// contract borrows the typed `io.file` resource, matching `io::read_all`.
+fn io_write_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        "io::write",
+        vec![
+            HostParamSchema::with_passing(
+                "handle",
+                HostTypeSchema::Resource(io_file_key()),
+                HostParamPassing::Borrow,
+            ),
+            HostParamSchema::value("text", HostTypeSchema::String),
+        ],
+        HostTypeSchema::Int,
+    )
+}
+
+/// Guest contract for `io::flush`.
+fn io_flush_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        "io::flush",
+        vec![HostParamSchema::with_passing(
+            "handle",
+            HostTypeSchema::Resource(io_file_key()),
+            HostParamPassing::Borrow,
+        )],
+        HostTypeSchema::Bool,
+    )
+}
+
 /// The functions this module publishes as the `io` guest catalog surface.
 ///
-/// The compatibility surface is exactly the resource-bearing set; the
-/// remaining `io::*` members stay dispatched through the generated
-/// namespaced-builtin path and are owned by this module without a catalog
-/// entry.
+/// The surface is the resource-bearing set: `open` creates `io.file`,
+/// `read_all` / `write` / `flush` borrow it, and `close` takes it. The
+/// remaining `io::*` members stay on the namespaced-builtin path.
 const IO_CATALOG_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
     builtin_io_open_descriptor,
     builtin_io_read_all_descriptor,
+    builtin_io_write_descriptor,
+    builtin_io_flush_descriptor,
     builtin_io_close_descriptor,
 ];
 

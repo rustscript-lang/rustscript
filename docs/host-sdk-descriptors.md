@@ -308,9 +308,10 @@ Each module declares two things:
 standard `#[pd_host_function]` has exactly one descriptor owner, every ownership
 list is declared by a file that belongs to a module `standard_host_modules()`
 composes (a module this build's gates turn off is the only exemption, and it is
-stated in the guard), no gated module leaks into the derived catalog, and the
-published catalog fingerprints are byte-for-byte unchanged for the composed
-module set.
+stated in the guard), no gated module leaks into the derived catalog, and each
+published catalog fingerprint equals the composed module set. `io::write` and
+`io::flush` are on that surface as borrowed `io.file` operations, so the io
+and standard catalog fingerprints moved with that contract.
 
 ## 7. Compatibility window
 

@@ -210,8 +210,14 @@ fn io_module_descriptors_carry_coherent_schema_binding_and_effects() {
         .collect();
     assert_eq!(
         published,
-        ["io::open", "io::read_all", "io::close"],
-        "the io catalog surface must stay the compatibility surface"
+        [
+            "io::open",
+            "io::read_all",
+            "io::write",
+            "io::flush",
+            "io::close"
+        ],
+        "the io catalog surface is the resource-bearing set: open, borrowed read/write/flush, and consuming close"
     );
     let resources: Vec<(&str, &str)> = catalog
         .resources()
@@ -636,4 +642,321 @@ fn installed_io_descriptors_enforce_the_configured_restrictions() {
 
     let _ = fs::remove_dir_all(&allowed);
     let _ = fs::remove_dir_all(&other);
+}
+
+// ---------------------------------------------------- standard catalog contract
+
+/// Installs the standard `io` catalog surface the way an embedder does.
+///
+/// Guest calls on that surface compile to host imports. The builtins are
+/// granted as well so a namespaced fallback cannot hide a missing catalog
+/// entry. `io::write` / `io::flush` are reached only after the catalog
+/// publishes their borrowed `io.file` contracts.
+fn installed_standard_catalog_registry() -> HostFunctionRegistry {
+    let module = io_module()
+        .catalog_module()
+        .expect("the io module publishes a catalog surface");
+    let catalog = vm::standard_host_catalog();
+    let surface = module
+        .catalog()
+        .expect("the io catalog surface must be valid");
+    let mut registry = HostFunctionRegistry::empty();
+    registry.set_standard_composition(vm::standard_composition());
+    for function in surface.functions() {
+        registry
+            .allow_builtin(&function.name)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "`{}` is on the io catalog surface and must be a grantable builtin: {error}",
+                    function.name
+                )
+            });
+    }
+    module
+        .install_from_catalog(&mut registry, catalog.as_ref())
+        .expect("the io catalog surface must install from the standard catalog");
+    registry
+}
+
+fn vm_with_standard_catalog_io(source: &str) -> (Vm, SubmittedOps) {
+    let catalog = vm::standard_host_catalog();
+    let compiled = vm::compile_source_with_flavor_and_options(
+        &format!("use io;\n{source}"),
+        vm::SourceFlavor::RustScript,
+        vm::CompileSourceFileOptions::new().with_host_api_catalog(std::sync::Arc::clone(&catalog)),
+    )
+    .unwrap_or_else(|error| panic!("standard-catalog io source failed to compile: {error}"));
+    let mut vm = Vm::new(compiled.program);
+    vm.set_default_host_fallback_enabled(false);
+    vm.set_standard_composition(vm::standard_composition());
+    let registry = installed_standard_catalog_registry();
+    let surface = io_module()
+        .catalog_module()
+        .expect("the io module publishes a catalog surface");
+    surface
+        .install_state_requirements(&mut vm)
+        .expect("io catalog state requirements must install");
+    registry
+        .bind_vm_cached(&mut vm)
+        .unwrap_or_else(|error| panic!("standard-catalog io registry failed to bind: {error}"));
+    let submitted = install_async_driver(&mut vm);
+    (vm, submitted)
+}
+
+fn writable_policy(root: &std::path::Path) -> IoPolicy {
+    IoPolicy {
+        allowed_roots: vec![root.display().to_string()],
+        allow_write: true,
+        allow_process: false,
+        ..IoPolicy::default()
+    }
+}
+
+/// `io::write` and `io::flush` are part of the published standard catalog.
+///
+/// Both borrow `io.file`. They are not a second int-handle builtin schema.
+#[test]
+fn standard_catalog_publishes_borrowed_write_and_flush() {
+    let catalog = vm::standard_host_catalog();
+    let key = io_file_key();
+    for name in ["io::write", "io::flush"] {
+        let function = catalog.function(name).unwrap_or_else(|| {
+            let owned = owned_descriptors()
+                .get(name)
+                .map(|descriptor| format!("{:?}", descriptor.schema.params));
+            panic!(
+                "standard catalog must publish typed `{name}`; owned descriptor params are {owned:?}"
+            )
+        });
+        assert_eq!(
+            function.params.first().map(|param| &param.ty),
+            Some(&HostTypeSchema::Resource(key.clone())),
+            "`{name}` must take the typed io.file resource, got {function:?}"
+        );
+        assert_eq!(
+            function.params.first().map(|param| param.passing),
+            Some(vm::HostParamPassing::Borrow),
+            "`{name}` must borrow the handle, got {function:?}"
+        );
+    }
+    let write = catalog
+        .function("io::write")
+        .expect("io::write is published");
+    assert_eq!(
+        write.params.len(),
+        2,
+        "io::write takes the handle and the text"
+    );
+    assert_eq!(write.params[1].ty, HostTypeSchema::String);
+    assert_eq!(write.return_type, HostTypeSchema::Int);
+    let flush = catalog
+        .function("io::flush")
+        .expect("io::flush is published");
+    assert_eq!(flush.params.len(), 1, "io::flush takes only the handle");
+    assert_eq!(flush.return_type, HostTypeSchema::Bool);
+}
+
+/// `io::open` through the standard catalog must return a live `io.file`.
+#[test]
+fn standard_catalog_open_returns_a_stamped_io_file() {
+    let dir = scratch_dir("catalog-open");
+    let inside = dir.join("opened.txt");
+    let (mut vm, _) = vm_with_standard_catalog_io(&format!(
+        r#"
+        let handle = io::open("{inside}", "w");
+        handle;
+        "#,
+        inside = inside.display()
+    ));
+    vm.configure_io(writable_policy(&dir));
+
+    let run = run_driven(&mut vm)
+        .unwrap_or_else(|error| panic!("standard-catalog io::open failed: {error}"));
+    assert!(inside.exists(), "open writable must create the file");
+    assert_eq!(
+        vm.host_context().resource_count(),
+        1,
+        "the opened io.file must stay live until close"
+    );
+    assert!(matches!(run.stack.last(), Some(Value::Int(_))));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Real file bytes through the standard catalog: open writable, borrowed
+/// write, flush, consuming close, reopen, read_all, close.
+#[test]
+fn standard_catalog_round_trips_file_bytes() {
+    let dir = scratch_dir("catalog-roundtrip");
+    let inside = dir.join("rss.txt");
+    let (mut vm, submitted) = vm_with_standard_catalog_io(&format!(
+        r#"
+        let written = io::open("{inside}", "w");
+        io::write(written, "xehentai-rss-roundtrip");
+        io::flush(written);
+        let closed = io::close(written);
+        let read_back = io::open("{inside}", "r");
+        let contents = io::read_all(read_back);
+        let closed_again = io::close(read_back);
+        contents;
+        "#,
+        inside = inside.display()
+    ));
+    vm.configure_io(writable_policy(&dir));
+
+    let run = run_driven(&mut vm)
+        .unwrap_or_else(|error| panic!("standard-catalog io.file round trip failed: {error}"));
+    assert_eq!(
+        run.stack.last(),
+        Some(&Value::String(std::sync::Arc::new(
+            "xehentai-rss-roundtrip".to_string()
+        )))
+    );
+    assert_eq!(
+        fs::read_to_string(&inside).expect("the written file must exist"),
+        "xehentai-rss-roundtrip"
+    );
+    assert_pending_ops_resolved_by_backend(&submitted, run.driven_ops);
+    assert_eq!(
+        vm.host_context().resource_count(),
+        0,
+        "close must release every io.file resource"
+    );
+    assert!(vm.execution_scope().operations().is_empty());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn standard_catalog_rejects_write_outside_policy() {
+    let allowed = scratch_dir("catalog-allowed");
+    let other = scratch_dir("catalog-other");
+    let outside = other.join("outside.txt");
+    fs::write(&outside, "outside").expect("fixture file should be writable");
+    let inside = allowed.join("payload.txt");
+
+    let (mut no_write, submitted) = vm_with_standard_catalog_io(&format!(
+        r#"
+        io::open("{inside}", "w");
+        "#,
+        inside = inside.display()
+    ));
+    no_write.configure_io(IoPolicy {
+        allowed_roots: vec![allowed.display().to_string()],
+        allow_write: false,
+        allow_process: false,
+        ..IoPolicy::default()
+    });
+    let error = host_error(
+        run_driven(&mut no_write).expect_err("a write without the write capability must fail"),
+    );
+    assert!(
+        error.contains("write capability"),
+        "write policy must reject the open: {error}"
+    );
+    assert!(
+        !inside.exists(),
+        "a rejected write must not create the file"
+    );
+    assert_rejected_call_left_no_io_state(&mut no_write, &submitted);
+
+    let (mut wrong_root, submitted) = vm_with_standard_catalog_io(&format!(
+        r#"
+        io::open("{outside}", "r");
+        "#,
+        outside = outside.display()
+    ));
+    wrong_root.configure_io(IoPolicy {
+        allowed_roots: vec![allowed.display().to_string()],
+        allow_write: true,
+        allow_process: false,
+        ..IoPolicy::default()
+    });
+    let error = host_error(
+        run_driven(&mut wrong_root).expect_err("a path outside the allowed roots must fail"),
+    );
+    assert!(
+        error.contains("outside the allowed roots"),
+        "roots must bound the catalog adapter: {error}"
+    );
+    assert_rejected_call_left_no_io_state(&mut wrong_root, &submitted);
+
+    let _ = fs::remove_dir_all(&allowed);
+    let _ = fs::remove_dir_all(&other);
+}
+
+#[test]
+fn standard_catalog_rejects_a_stale_handle_and_a_second_close() {
+    let dir = scratch_dir("catalog-stale");
+    let inside = dir.join("payload.txt");
+    fs::write(&inside, "ownership").expect("fixture file should be writable");
+
+    for source in [
+        format!(
+            "let handle = io::open(\"{}\", \"r\"); io::close(handle); io::read_all(handle);",
+            inside.display()
+        ),
+        format!(
+            "let handle = io::open(\"{}\", \"r\"); io::close(handle); io::close(handle);",
+            inside.display()
+        ),
+    ] {
+        let compiled = vm::compile_source_with_flavor_and_options(
+            &format!("use io;\n{source}"),
+            vm::SourceFlavor::RustScript,
+            vm::CompileSourceFileOptions::new().with_host_api_catalog(vm::standard_host_catalog()),
+        );
+        let Err(error) = compiled else {
+            panic!("a consumed io.file must not be usable again");
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains("moved"),
+            "consuming close must make a second use ill-typed: {error}"
+        );
+    }
+
+    let (mut closed, _submitted) = vm_with_standard_catalog_io(&format!(
+        r#"
+        let handle = io::open("{inside}", "r");
+        io::close(handle);
+        "#,
+        inside = inside.display()
+    ));
+    closed.configure_io(writable_policy(&dir));
+    run_driven(&mut closed).expect("consuming close must succeed");
+    assert_eq!(closed.host_context().resource_count(), 0);
+    assert!(closed.execution_scope().operations().is_empty());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn standard_catalog_registry_keeps_process_off() {
+    let compiled = compile_source(
+        r#"
+        use io;
+        io::popen("exit 0", "r");
+        "#,
+    )
+    .expect("popen source should compile");
+    let mut registry = installed_standard_catalog_registry();
+    registry
+        .allow_builtin("io::popen")
+        .expect("io::popen remains a namespaced builtin");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_default_host_fallback_enabled(false);
+    vm.configure_io(IoPolicy {
+        allow_process: false,
+        ..IoPolicy::default()
+    });
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("catalog registry plus the popen builtin should bind");
+    let _submitted = install_async_driver(&mut vm);
+
+    let error = host_error(run_driven(&mut vm).expect_err("process launch must stay denied"));
+    assert!(
+        error.contains("process capability") || error.contains("command capability"),
+        "process stays off unless the policy grants it: {error}"
+    );
+    assert_eq!(vm.host_context().resource_count(), 0);
 }

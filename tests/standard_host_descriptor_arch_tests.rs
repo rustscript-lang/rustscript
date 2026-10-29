@@ -25,20 +25,16 @@ const HTTP_SURFACE_ENABLED: bool = cfg!(all(feature = "http-client", not(target_
 /// Fingerprint of the published standard host catalog **with** the HTTP
 /// surface.
 ///
-/// Both fingerprints are exact goldens of the descriptor migration: the whole
-/// point of the change is that guest contracts did not move. The standard
-/// catalog is the merge of the composed module surfaces, so the golden depends
-/// on the composed set — the default build (no `http-client`) composes one
+/// The io surface now publishes borrowed `io::write` and `io::flush` on
+/// `io.file`, so the composed goldens moved with that public contract. They
+/// are still exact equality checks of `HostApiCatalog::fingerprint()` for the
+/// composed module set. The default build (no `http-client`) composes one
 /// module fewer and must reproduce [`STANDARD_CATALOG_FINGERPRINT_NO_HTTP`].
-///
-/// The HTTP surface moved from named-struct request/response/event types to
-/// resources, so its guest contract intentionally changed: the composed
-/// goldens below are the resource-API values.
-const STANDARD_CATALOG_FINGERPRINT: &str = "df4072aba04d62fa";
+const STANDARD_CATALOG_FINGERPRINT: &str = "273f14600c4b4139";
 /// Fingerprint of the published standard host catalog **without** the HTTP
 /// surface: the `--workspace` default build and every wasm build.
-const STANDARD_CATALOG_FINGERPRINT_NO_HTTP: &str = "a6b4b2dcadc5df14";
-const IO_CATALOG_FINGERPRINT: &str = "234a7fdc3aaa3f95";
+const STANDARD_CATALOG_FINGERPRINT_NO_HTTP: &str = "ec9017833c39ab05";
+const IO_CATALOG_FINGERPRINT: &str = "bd84a28c7bc42ae4";
 const SQLITE_CATALOG_FINGERPRINT: &str = "b6d4c278145edacf";
 const JIT_CATALOG_FINGERPRINT: &str = "d0a3efbca2d0923c";
 const TIMER_CATALOG_FINGERPRINT: &str = "4af2dfa2aee1f42e";
@@ -1130,7 +1126,7 @@ fn standard_catalog_is_derived_from_one_descriptor_per_module() {
     assert_eq!(
         catalog.fingerprint().to_string(),
         standard_catalog_fingerprint(),
-        "the standard catalog fingerprint must be byte-for-byte unchanged for the composed module set"
+        "the standard catalog fingerprint must equal the composed module set after io::write and io::flush joined the io.file surface"
     );
 }
 
@@ -1178,7 +1174,7 @@ fn module_catalogs_keep_their_published_fingerprints() {
         assert_eq!(
             fingerprint.to_string(),
             golden,
-            "the `{name}` host catalog fingerprint must be byte-for-byte unchanged"
+            "the `{name}` host catalog fingerprint must equal the published contract"
         );
     }
 }

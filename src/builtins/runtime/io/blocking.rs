@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 use pd_host_function::pd_host_function;
 
 use super::HostCallResult;
+use crate::host_api::ResourceTypeKey;
 use crate::vm::operation::driver::HostOperation;
 use crate::vm::operation::error::{OperationError, OperationErrorCode, OperationResult};
 use crate::vm::operation::reason::OperationCancelReason;
@@ -262,6 +263,10 @@ pub(crate) fn io_file_resource() -> crate::host_extension::HostResourceTypeMeta 
 }
 
 impl HostResource for IoResource {
+    fn resource_type_key() -> Option<ResourceTypeKey> {
+        ResourceTypeKey::new(super::IO_FILE_KEY).ok()
+    }
+
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         // Marking closed while holding the same admission lock used by worker
         // leases makes the close boundary linearizable: a worker either
@@ -985,7 +990,7 @@ pub(super) fn builtin_io_read_line(
 }
 
 /// Writes text to an I/O handle.
-#[pd_host_function(name = "io::write")]
+#[pd_host_function(name = "io::write", contract = super::io_write_contract)]
 pub(super) fn builtin_io_write(
     vm: &mut Vm,
     handle_id: i64,
@@ -1035,7 +1040,7 @@ pub(super) fn builtin_io_write(
 }
 
 /// Flushes buffered output for an I/O handle.
-#[pd_host_function(name = "io::flush")]
+#[pd_host_function(name = "io::flush", contract = super::io_flush_contract)]
 pub(super) fn builtin_io_flush(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<bool>> {
     let (_handle, resource) = io_resource_for_handle(vm, handle_id)?;
     let op_id = schedule_io_task(vm, "io::flush", move |shared| {
