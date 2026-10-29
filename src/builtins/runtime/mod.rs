@@ -24,6 +24,7 @@ pub(crate) mod http;
 mod io;
 mod jit;
 mod json;
+mod json_ordered;
 mod map_iter;
 mod math;
 pub(crate) mod print;
@@ -39,6 +40,7 @@ pub use host_modules::StandardHostModule;
 pub use jit::{
     jit_host_catalog, register_jit_builtin_module, register_jit_builtin_module_from_catalog,
 };
+pub use json::{register_json_builtin_module, register_json_builtin_module_from_catalog};
 pub use regex::{DEFAULT_REGEX_CACHE_CAPACITY, RegexCache, RegexCacheVmExt};
 #[cfg(all(feature = "sqlite", not(target_arch = "wasm32")))]
 pub use sqlite::{register_sqlite_builtin_module, register_sqlite_builtin_module_from_catalog};

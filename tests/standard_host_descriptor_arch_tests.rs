@@ -30,10 +30,10 @@ const HTTP_SURFACE_ENABLED: bool = cfg!(all(feature = "http-client", not(target_
 /// are still exact equality checks of `HostApiCatalog::fingerprint()` for the
 /// composed module set. The default build (no `http-client`) composes one
 /// module fewer and must reproduce [`STANDARD_CATALOG_FINGERPRINT_NO_HTTP`].
-const STANDARD_CATALOG_FINGERPRINT: &str = "273f14600c4b4139";
+const STANDARD_CATALOG_FINGERPRINT: &str = "bd3126dce12140f8";
 /// Fingerprint of the published standard host catalog **without** the HTTP
 /// surface: the `--workspace` default build and every wasm build.
-const STANDARD_CATALOG_FINGERPRINT_NO_HTTP: &str = "ec9017833c39ab05";
+const STANDARD_CATALOG_FINGERPRINT_NO_HTTP: &str = "73d0f90bea80e57a";
 const IO_CATALOG_FINGERPRINT: &str = "bd84a28c7bc42ae4";
 const SQLITE_CATALOG_FINGERPRINT: &str = "b6d4c278145edacf";
 const JIT_CATALOG_FINGERPRINT: &str = "d0a3efbca2d0923c";
@@ -69,6 +69,7 @@ const HTTP_RESOURCE_KEYS: &[&str] = &[
 
 /// Named structs the standard catalog always declares.
 const STANDARD_NAMED_STRUCTS: &[&str] = &[
+    "JsonObjectEntry",
     "JitConfig",
     "SqliteValue",
     "SqliteQueryResult",

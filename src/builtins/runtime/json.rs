@@ -20,9 +20,17 @@ pub(super) fn builtin_json_encode(value: &AnyValue) -> VmResult<String> {
 /// If the JSON string contains duplicate keys, it will return an error instead of letting the last key win.
 #[pd_host_function(name = "json::decode")]
 pub(super) fn builtin_json_decode(text: &str) -> VmResult<UnknownValue> {
-    let json_value = serde_json::from_str::<DecodedJsonValue>(text)
-        .map_err(|err| VmError::HostError(format!("json_decode failed: {err}")))?;
-    Ok(json_value.0)
+    decode_strict_value(text)
+        .map_err(|err| VmError::HostError(format!("json_decode failed: {err}")))
+}
+
+/// Parses `text` as exactly one JSON value under the strict unique-key contract.
+///
+/// The ordered object-entry codec reuses this so both directions reject the
+/// same inputs `json::decode` rejects: duplicate keys at any depth, unsupported
+/// numbers, bad escapes, and trailing input.
+pub(super) fn decode_strict_value(text: &str) -> Result<Value, serde_json::Error> {
+    serde_json::from_str::<DecodedJsonValue>(text).map(|decoded| decoded.0)
 }
 
 fn vm_to_json_value(value: &Value) -> VmResult<JsonValue> {
@@ -167,12 +175,57 @@ impl<'de> Visitor<'de> for JsonValueVisitor {
 
 // ---- standard host module ownership ---------------------------------------
 
+/// The ordered-entry descriptors this module publishes as a guest surface.
+const JSON_ENTRY_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+    super::json_ordered::builtin_json_decode_object_entries_descriptor,
+    super::json_ordered::builtin_json_encode_object_entries_descriptor,
+];
+
 /// The standard `json` host module: one descriptor owner per host
 /// function.
+///
+/// `json::encode` / `json::decode` stay on the generated namespaced-builtin
+/// path, so their static call indices are untouched. Only the ordered
+/// object-entry codec publishes a guest catalog surface: it is compiled and
+/// bound as a typed host import, which keeps the frozen static ID table and the
+/// VMBC wire format unchanged.
 pub(super) fn json_host_module() -> super::host_modules::StandardHostModule {
+    use super::host_modules::StandardHostModule;
+
     const OWNED: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
         builtin_json_encode_descriptor,
         builtin_json_decode_descriptor,
+        super::json_ordered::builtin_json_decode_object_entries_descriptor,
+        super::json_ordered::builtin_json_encode_object_entries_descriptor,
     ];
-    super::host_modules::descriptor_only_module("json", OWNED)
+
+    StandardHostModule {
+        name: "json",
+        catalog: || super::host_modules::catalog_module("json", JSON_ENTRY_FUNCTIONS, &[]),
+        owned: OWNED,
+        named_structs: super::json_ordered::JSON_NAMED_STRUCTS,
+    }
+}
+
+/// Registers the ordered object-entry codec from the standard host catalog.
+pub fn register_json_builtin_module(registry: &mut crate::HostFunctionRegistry) -> VmResult<()> {
+    let catalog = crate::builtins::runtime::standard_host_catalog();
+    register_json_builtin_module_from_catalog(registry, catalog.as_ref())
+}
+
+/// Registers the ordered object-entry codec using schemas from `catalog`.
+///
+/// `catalog` must be the snapshot the guest code was compiled against; the
+/// installed adapters are the module's own descriptors, so a compile/bind pair
+/// always agrees on import identity. A restricted registry keeps its
+/// deny-by-default policy for every import this module does not declare.
+pub fn register_json_builtin_module_from_catalog(
+    registry: &mut crate::HostFunctionRegistry,
+    catalog: &crate::host_api::HostApiCatalog,
+) -> VmResult<()> {
+    json_host_module()
+        .catalog_module()
+        .expect("the json module publishes a catalog surface")
+        .install_from_catalog(registry, catalog)
+        .map(|_| ())
 }

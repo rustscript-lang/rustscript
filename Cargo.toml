@@ -95,7 +95,7 @@ futures-channel = "0.3"
 paste = "1"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 rt-format = "0.3.1"
 self_cell = "1"
 rustyline = { version = "14", optional = true }

@@ -387,3 +387,62 @@ demo_module().install(registry)?; // validates and installs transactionally
 
 The wrapper, the schema, the resource declaration, the binding class, the
 effects, and the exact registry entry all come from the single declaration.
+
+## 9. Case study: ordered JSON object entries
+
+`Value::Map` is a hash map, so a decoded JSON object's member order is not
+representable: `json::decode` keeps the values but drops the order, and
+`json::encode` can only emit hash-bucket (or sorted) order. Applications that
+must reproduce a document's member order — a session file's `tasks` object
+deciding a restore queue, its `cookies` object deciding a `Cookie` header — need
+the order as data.
+
+`json::decode_object_entries` / `json::encode_object_entries` are that data, as a
+JSON wire codec rather than a new container:
+
+```rss
+use json;
+
+let entries = json::decode_object_entries(text);   // [JsonObjectEntry]
+let first = entries[0].key;                        // document order
+let tasks = json::decode(json::decode_object_entries(text)[0].value_json);
+let text = json::encode_object_entries([
+    { key: "nw", value_json: "\"1\"" },
+    { key: "ipb_member_id", value_json: "\"17\"" },
+]);
+```
+
+- The published body is one named struct, `JsonObjectEntry { key: string,
+  value_json: string }`. Both fields are required and resource-free, and both
+  directions pass values (`HostParamPassing::Value`).
+- `key` is the member name after standard unescaping; `value_json` is that
+  member's value as one complete, validated JSON value. A caller that needs the
+  value decodes `value_json` with the ordinary codec, or recurses into this one
+  when a nested object's own order matters.
+- `{}` decodes to `[]` (never `null`), a `null` member stays an entry, and
+  `null`/`true`/numbers/arrays/nested objects keep their values.
+- Both directions reuse the strict unique-key contract of `json::decode`:
+  root and nested duplicate keys, unsupported numbers, bad escapes, trailing
+  input, and non-object roots are rejected, and the encoder additionally rejects
+  duplicate entry keys and any `value_json` that is not exactly one valid JSON
+  value. Errors name the operation and entry index and never echo the payload.
+- No hand-written parser, escape table, or ordering sidecar is involved: the
+  decoder validates with the shared strict visitor and extracts members with
+  `serde_json::value::RawValue`, and the encoder writes through a standard
+  `SerializeMap` in entry order.
+
+The capability allocates **no** static builtin index. The ordinary call-index
+block is full (every frozen ID from `src/builtins/catalog.rs` is assigned), so
+these functions publish a guest catalog surface on the standard `json` host
+module and are compiled and bound as typed host imports, exactly like
+`timer`/`jit`/`sqlite` catalog functions. `json::encode`/`json::decode` keep
+their generated namespaced-builtin path and frozen indices, and the VMBC wire
+format is untouched. An embedder installs the surface from the same catalog
+snapshot the guest compiled against:
+
+```rust
+let catalog = vm::standard_host_catalog();
+let mut registry = vm::HostFunctionRegistry::restricted();
+vm::register_json_builtin_module_from_catalog(&mut registry, catalog.as_ref())?;
+registry.bind_vm_cached(&mut vm)?;
+```

@@ -69,7 +69,8 @@ pub use builtins::runtime::{
 pub use builtins::runtime::{
     DEFAULT_REGEX_CACHE_CAPACITY, RegexCache, RegexCacheVmExt, StandardHostModule, io_host_catalog,
     jit_host_catalog, register_jit_builtin_module, register_jit_builtin_module_from_catalog,
-    sqlite_host_catalog, standard_catalog_modules, standard_composition, standard_host_catalog,
+    register_json_builtin_module, register_json_builtin_module_from_catalog, sqlite_host_catalog,
+    standard_catalog_modules, standard_composition, standard_host_catalog,
     standard_host_catalog_fingerprint, standard_host_modules,
 };
 #[cfg(all(feature = "runtime", not(target_arch = "wasm32")))]

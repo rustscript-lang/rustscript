@@ -251,6 +251,172 @@ fn static_builtin_ids_are_frozen() {
     }
 }
 
+/// The frozen static call-index table, hard-coded from the accepted base
+/// `99890b6`.
+///
+/// This is the wire contract the ordered JSON object-entry work must not
+/// disturb: every entry keeps its explicit `u16` operand, and the generated
+/// reverse lookup resolves each index back to the same guest name. The
+/// SQLite namespace is optional, so its five frozen IDs are pinned only when
+/// that feature generates them.
+const LEGACY_STATIC_CALL_INDICES: &[(&str, u16)] = &[
+    ("__bind_callable", 0xFF94),
+    ("__detach_local", 0xFF93),
+    ("__format_template", 0xFF9E),
+    ("__map_iter_close", 0xFF95),
+    ("__map_iter_init", 0xFF99),
+    ("__map_iter_next", 0xFF98),
+    ("__map_iter_take_key", 0xFF97),
+    ("__map_iter_take_value", 0xFF96),
+    ("__to_string", 0xFF9F),
+    ("array_new", 0xFFA5),
+    ("array_push", 0xFFA6),
+    ("assert", 0xFFA1),
+    ("bytes::from_array_u8", 0xFFB3),
+    ("bytes::from_base64", 0xFFB1),
+    ("bytes::from_hex", 0xFFAF),
+    ("bytes::from_utf8", 0xFFAC),
+    ("bytes::to_array_u8", 0xFFB4),
+    ("bytes::to_base64", 0xFFB2),
+    ("bytes::to_hex", 0xFFB0),
+    ("bytes::to_utf8", 0xFFAD),
+    ("bytes::to_utf8_lossy", 0xFFAE),
+    ("concat", 0xFFA4),
+    ("count", 0xFFFB),
+    ("get", 0xFFA8),
+    ("has", 0xFFA9),
+    ("io::close", 0xFFBB),
+    ("io::exists", 0xFFBC),
+    ("io::flush", 0xFFBA),
+    ("io::open", 0xFFB5),
+    ("io::popen", 0xFFB6),
+    ("io::read_all", 0xFFB7),
+    ("io::read_line", 0xFFB8),
+    ("io::write", 0xFFB9),
+    ("jit::get_config", 0xFFC6),
+    ("jit::get_enabled", 0xFFC8),
+    ("jit::get_hot_loop_threshold", 0xFFCA),
+    ("jit::get_max_trace_len", 0xFFCC),
+    ("jit::set_config", 0xFFC5),
+    ("jit::set_enabled", 0xFFC7),
+    ("jit::set_hot_loop_threshold", 0xFFC9),
+    ("jit::set_max_trace_len", 0xFFCB),
+    ("json::decode", 0xFFC4),
+    ("json::encode", 0xFFC2),
+    ("keys", 0xFFAB),
+    ("len", 0xFFA2),
+    ("map_new", 0xFFA7),
+    ("math::abs", 0xFFD4),
+    ("math::acos", 0xFFE1),
+    ("math::asin", 0xFFE0),
+    ("math::atan", 0xFFE2),
+    ("math::atan2", 0xFFF1),
+    ("math::cbrt", 0xFFD6),
+    ("math::ceil", 0xFFE7),
+    ("math::clamp", 0xFFF9),
+    ("math::copysign", 0xFFF8),
+    ("math::cos", 0xFFDE),
+    ("math::cosh", 0xFFE4),
+    ("math::e", 0xFFCF),
+    ("math::epsilon", 0xFFD0),
+    ("math::exp", 0xFFD7),
+    ("math::exp2", 0xFFD8),
+    ("math::floor", 0xFFE6),
+    ("math::fract", 0xFFEA),
+    ("math::hypot", 0xFFF4),
+    ("math::inf", 0xFFD1),
+    ("math::is_finite", 0xFFF0),
+    ("math::is_infinite", 0xFFEF),
+    ("math::is_nan", 0xFFEE),
+    ("math::ln", 0xFFD9),
+    ("math::ln_1p", 0xFFDA),
+    ("math::log", 0xFFF5),
+    ("math::log10", 0xFFDC),
+    ("math::log2", 0xFFDB),
+    ("math::max", 0xFFF7),
+    ("math::min", 0xFFF6),
+    ("math::mul_add", 0xFFFA),
+    ("math::nan", 0xFFD3),
+    ("math::neg_inf", 0xFFD2),
+    ("math::pi", 0xFFCD),
+    ("math::powf", 0xFFF2),
+    ("math::powi", 0xFFF3),
+    ("math::round", 0xFFE8),
+    ("math::signum", 0xFFEB),
+    ("math::sin", 0xFFDD),
+    ("math::sinh", 0xFFE3),
+    ("math::sqrt", 0xFFD5),
+    ("math::tan", 0xFFDF),
+    ("math::tanh", 0xFFE5),
+    ("math::tau", 0xFFCE),
+    ("math::to_degrees", 0xFFEC),
+    ("math::to_radians", 0xFFED),
+    ("math::trunc", 0xFFE9),
+    ("re::captures", 0xFFC1),
+    ("re::find", 0xFFBE),
+    ("re::match", 0xFFBD),
+    ("re::replace", 0xFFBF),
+    ("re::split", 0xFFC0),
+    ("set", 0xFFAA),
+    ("slice", 0xFFA3),
+    ("string_contains", 0xFF9B),
+    ("string_lower_ascii", 0xFF9D),
+    ("string_replace_literal", 0xFF9C),
+    ("string_split_literal", 0xFF9A),
+    ("type", 0xFFA0),
+];
+
+/// The frozen IDs of the optional SQLite namespace.
+#[cfg(feature = "sqlite")]
+const LEGACY_SQLITE_CALL_INDICES: &[(&str, u16)] = &[
+    ("sqlite::close", 0xFFFF),
+    ("sqlite::execute", 0xFFFC),
+    ("sqlite::open", 0xFFC3),
+    ("sqlite::query", 0xFFFD),
+    ("sqlite::transaction", 0xFFFE),
+];
+
+/// The generated runtime name of a catalog source name: namespace separators
+/// become `_` and the language `type` builtin is exposed as `type_of`.
+fn runtime_name(source_name: &str) -> String {
+    match source_name {
+        "type" => "type_of".to_string(),
+        other => other.replace("::", "_"),
+    }
+}
+
+/// Every frozen static call index is unchanged in both directions, so no
+/// existing VMBC `call` operand can be renumbered by a new capability that
+/// allocates no static index at all.
+#[test]
+fn legacy_static_call_indices_and_reverse_lookup_are_unchanged() {
+    #[cfg(feature = "sqlite")]
+    let expected: Vec<(&str, u16)> = LEGACY_STATIC_CALL_INDICES
+        .iter()
+        .chain(LEGACY_SQLITE_CALL_INDICES)
+        .copied()
+        .collect();
+    #[cfg(not(feature = "sqlite"))]
+    let expected: Vec<(&str, u16)> = LEGACY_STATIC_CALL_INDICES.to_vec();
+
+    let reverse: HashMap<u16, &str> = BUILTIN_CATALOG
+        .iter()
+        .map(|builtin| (builtin.call_index(), builtin.name()))
+        .collect();
+    for (source_name, id) in expected {
+        assert_eq!(
+            builtin_call_index(source_name),
+            Some(id),
+            "forward resolution for '{source_name}'"
+        );
+        assert_eq!(
+            reverse.get(&id).copied(),
+            Some(runtime_name(source_name).as_str()),
+            "reverse resolution for 0x{id:04X}"
+        );
+    }
+}
+
 /// The checked-in no-std mirror (`pd-vm-nostd/src/generated_builtin_ids.rs`)
 /// dispatches on exactly the same static IDs as the std catalog. This is the
 /// sync guard referenced by both files; drift fails here.
