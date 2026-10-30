@@ -25,16 +25,15 @@ const HTTP_SURFACE_ENABLED: bool = cfg!(all(feature = "http-client", not(target_
 /// Fingerprint of the published standard host catalog **with** the HTTP
 /// surface.
 ///
-/// The io surface now publishes borrowed `io::write` and `io::flush` on
-/// `io.file`, so the composed goldens moved with that public contract. They
-/// are still exact equality checks of `HostApiCatalog::fingerprint()` for the
-/// composed module set. The default build (no `http-client`) composes one
-/// module fewer and must reproduce [`STANDARD_CATALOG_FINGERPRINT_NO_HTTP`].
-const STANDARD_CATALOG_FINGERPRINT: &str = "bd3126dce12140f8";
+/// The io surface includes the resource-free `io::try_write_text` result API,
+/// and json publishes `json::is_valid`; the composed goldens match those
+/// public contracts. The default build (no `http-client`) composes one module
+/// fewer and must reproduce [`STANDARD_CATALOG_FINGERPRINT_NO_HTTP`].
+const STANDARD_CATALOG_FINGERPRINT: &str = "ee63d83f097e1ada";
 /// Fingerprint of the published standard host catalog **without** the HTTP
 /// surface: the `--workspace` default build and every wasm build.
-const STANDARD_CATALOG_FINGERPRINT_NO_HTTP: &str = "73d0f90bea80e57a";
-const IO_CATALOG_FINGERPRINT: &str = "bd84a28c7bc42ae4";
+const STANDARD_CATALOG_FINGERPRINT_NO_HTTP: &str = "acd5c613415e0ff2";
+const IO_CATALOG_FINGERPRINT: &str = "7e7e9de55694a67d";
 const SQLITE_CATALOG_FINGERPRINT: &str = "b6d4c278145edacf";
 const JIT_CATALOG_FINGERPRINT: &str = "d0a3efbca2d0923c";
 const TIMER_CATALOG_FINGERPRINT: &str = "4af2dfa2aee1f42e";

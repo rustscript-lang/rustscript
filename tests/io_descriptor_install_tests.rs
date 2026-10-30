@@ -68,13 +68,14 @@ fn installed_restricted_registry() -> HostFunctionRegistry {
         .catalog()
         .expect("the io descriptor catalog must be valid");
     let mut registry = HostFunctionRegistry::restricted();
-    // A restricted registry grants each privileged namespaced builtin
-    // explicitly; the grants are made before the install so the install's own
-    // host-import authorizations extend the same capability profile.
+    // A restricted registry grants its legacy namespaced builtins explicitly.
+    // Catalog-only imports are authorized by descriptor installation itself.
     for name in owned_descriptors().keys() {
-        registry
-            .allow_builtin(name)
-            .unwrap_or_else(|error| panic!("`{name}` must be a known namespaced builtin: {error}"));
+        if vm::builtin_call_index(name).is_some() {
+            registry.allow_builtin(name).unwrap_or_else(|error| {
+                panic!("`{name}` must be a known namespaced builtin: {error}")
+            });
+        }
     }
     module
         .install_from_catalog(&mut registry, &contract)
@@ -123,6 +124,7 @@ fn io_module_descriptors_carry_coherent_schema_binding_and_effects() {
         "io::read_all",
         "io::read_line",
         "io::write",
+        "io::try_write_text",
         "io::flush",
         "io::close",
         "io::exists",
@@ -196,8 +198,9 @@ fn io_module_descriptors_carry_coherent_schema_binding_and_effects() {
         );
     }
 
-    // The published catalog surface is the resource-bearing subset, and it
-    // declares exactly the resource the contracts refer to.
+    // The published catalog includes the resource lifecycle and the
+    // resource-free whole-file writer, and declares the resource those
+    // lifecycle contracts refer to.
     let catalog = io_module()
         .catalog_module()
         .expect("the io module publishes a catalog surface")
@@ -214,10 +217,11 @@ fn io_module_descriptors_carry_coherent_schema_binding_and_effects() {
             "io::open",
             "io::read_all",
             "io::write",
+            "io::try_write_text",
             "io::flush",
             "io::close"
         ],
-        "the io catalog surface is the resource-bearing set: open, borrowed read/write/flush, and consuming close"
+        "the io catalog surface includes open, borrowed read/write/flush, consuming close, and resource-free try_write_text"
     );
     let resources: Vec<(&str, &str)> = catalog
         .resources()
@@ -648,10 +652,9 @@ fn installed_io_descriptors_enforce_the_configured_restrictions() {
 
 /// Installs the standard `io` catalog surface the way an embedder does.
 ///
-/// Guest calls on that surface compile to host imports. The builtins are
+/// Guest calls on that surface compile to host imports. Legacy builtins are
 /// granted as well so a namespaced fallback cannot hide a missing catalog
-/// entry. `io::write` / `io::flush` are reached only after the catalog
-/// publishes their borrowed `io.file` contracts.
+/// entry. Catalog-only APIs are authorized by their registered descriptors.
 fn installed_standard_catalog_registry() -> HostFunctionRegistry {
     let module = io_module()
         .catalog_module()
@@ -663,14 +666,16 @@ fn installed_standard_catalog_registry() -> HostFunctionRegistry {
     let mut registry = HostFunctionRegistry::empty();
     registry.set_standard_composition(vm::standard_composition());
     for function in surface.functions() {
-        registry
-            .allow_builtin(&function.name)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "`{}` is on the io catalog surface and must be a grantable builtin: {error}",
-                    function.name
-                )
-            });
+        if vm::builtin_call_index(&function.name).is_some() {
+            registry
+                .allow_builtin(&function.name)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "`{}` is a legacy io builtin and must be grantable: {error}",
+                        function.name
+                    )
+                });
+        }
     }
     module
         .install_from_catalog(&mut registry, catalog.as_ref())

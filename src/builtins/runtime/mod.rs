@@ -25,6 +25,7 @@ mod io;
 mod jit;
 mod json;
 mod json_ordered;
+mod json_validation;
 mod map_iter;
 mod math;
 pub(crate) mod print;
@@ -113,6 +114,7 @@ pub(crate) use context::{RuntimeContext, RuntimeContextConfig, STREAM_EMIT_NAME}
 pub use error::{RuntimeError, RuntimeErrorCode, RuntimeResult};
 #[allow(unused_imports)]
 pub(crate) use event::{EventLimits, EventPayload};
+pub use io::IoWriteTextResult;
 #[cfg(not(target_arch = "wasm32"))]
 pub use io::{IoHostExt, IoPolicy};
 pub use standard_composition::standard_composition;

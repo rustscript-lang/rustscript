@@ -906,6 +906,11 @@ fn custom_catalog_exact_binding_runs_the_codec() {
     let entry_type = body.as_type();
     builder.named_struct(body);
     builder.function(HostFunctionSchema::with_return(
+        "json::is_valid",
+        vec![HostParamSchema::value("text", HostTypeSchema::String)],
+        HostTypeSchema::Bool,
+    ));
+    builder.function(HostFunctionSchema::with_return(
         DECODE,
         vec![HostParamSchema::value("text", HostTypeSchema::String)],
         HostTypeSchema::Array(Box::new(entry_type.clone())),

@@ -8,8 +8,13 @@
 
 use pd_host_function::pd_host_function;
 
+use super::borrow_arg;
 use super::{HostCallResult, IO_FILE_DESCRIPTION, IO_FILE_KEY};
 use crate::vm::{Vm, VmError, VmResult};
+
+#[path = "io_wasm/try_write_text.rs"]
+mod try_write_text;
+pub(super) use try_write_text::*;
 
 /// The wasm32 IO backend keeps no scope resource, but the guest-visible
 /// `io.file` resource type is part of the standard catalog on every target, so

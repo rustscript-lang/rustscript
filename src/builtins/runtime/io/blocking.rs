@@ -10,7 +10,8 @@ use std::thread::JoinHandle;
 
 use pd_host_function::pd_host_function;
 
-use super::HostCallResult;
+use super::borrow_arg;
+use super::{HostCallResult, IoPathAuthorizationError, IoPolicy};
 use crate::host_api::ResourceTypeKey;
 use crate::vm::operation::driver::HostOperation;
 use crate::vm::operation::error::{OperationError, OperationErrorCode, OperationResult};
@@ -20,6 +21,9 @@ use crate::vm::resource::close::{CloseProgress, HostResource};
 use crate::vm::resource::error::{ResourceError, ResourceErrorCode, ResourceResult};
 use crate::vm::resource::{ResourceCloseReason, ResourceHandle};
 use crate::vm::{CallReturn, HostOpId, Value, Vm, VmError, VmResult};
+
+mod try_write_text;
+pub(super) use try_write_text::*;
 
 /// A file / child-process backed IO handle.
 pub(super) enum IoHandle {
@@ -1364,26 +1368,36 @@ fn io_parse_handle(handle_id: i64) -> VmResult<ResourceHandle> {
 /// Authorizes one IO path against the configured policy, mirroring the
 /// async path: a policy with no matching allowed root denies the path.
 fn authorize_blocking_io_path(vm: &Vm, path: &str, writes: bool) -> VmResult<PathBuf> {
+    let policy = super::io_policy(vm);
+    authorize_blocking_io_path_with_policy(policy.as_ref(), path, writes)
+        .map_err(IoPathAuthorizationError::into_vm_error)
+}
+
+fn authorize_blocking_io_path_with_policy(
+    policy: Option<&IoPolicy>,
+    path: &str,
+    writes: bool,
+) -> Result<PathBuf, IoPathAuthorizationError> {
     let requested = PathBuf::from(path);
-    let Some(policy) = super::io_policy(vm) else {
+    let Some(policy) = policy else {
         return Ok(requested);
     };
     if writes && !policy.allow_write {
-        return Err(VmError::HostError(
-            "io path write requires the write capability".to_string(),
-        ));
+        return Err(IoPathAuthorizationError::WriteDenied);
     }
     let absolute = if requested.is_absolute() {
         requested
     } else {
         std::env::current_dir()
-            .map_err(|error| VmError::HostError(format!("io path resolution failed: {error}")))?
+            .map_err(|error| {
+                IoPathAuthorizationError::Resolution(format!("io path resolution failed: {error}"))
+            })?
             .join(requested)
     };
     let canonical = canonicalize_blocking_target(&absolute)?;
     for root in &policy.allowed_roots {
         let root = std::fs::canonicalize(Path::new(root)).map_err(|error| {
-            VmError::HostError(format!(
+            IoPathAuthorizationError::Resolution(format!(
                 "io allowed root '{root}' cannot be resolved: {error}"
             ))
         })?;
@@ -1391,23 +1405,22 @@ fn authorize_blocking_io_path(vm: &Vm, path: &str, writes: bool) -> VmResult<Pat
             return Ok(canonical);
         }
     }
-    Err(VmError::HostError(format!(
-        "io path '{}' is outside the allowed roots",
-        canonical.display()
-    )))
+    Err(IoPathAuthorizationError::OutsideAllowedRoots(canonical))
 }
 
-fn canonicalize_blocking_target(path: &Path) -> VmResult<PathBuf> {
+fn canonicalize_blocking_target(path: &Path) -> Result<PathBuf, IoPathAuthorizationError> {
     if path.exists() {
-        return std::fs::canonicalize(path)
-            .map_err(|error| VmError::HostError(format!("io path resolution failed: {error}")));
+        return std::fs::canonicalize(path).map_err(|error| {
+            IoPathAuthorizationError::Resolution(format!("io path resolution failed: {error}"))
+        });
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let canonical_parent = std::fs::canonicalize(parent)
-        .map_err(|error| VmError::HostError(format!("io path resolution failed: {error}")))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| VmError::HostError("io path has no file name".to_string()))?;
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+        IoPathAuthorizationError::Resolution(format!("io path resolution failed: {error}"))
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        IoPathAuthorizationError::Resolution("io path has no file name".to_string())
+    })?;
     Ok(canonical_parent.join(name))
 }
 

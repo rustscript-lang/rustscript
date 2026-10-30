@@ -23,8 +23,14 @@
 use super::borrow_arg;
 #[cfg(all(feature = "async", not(target_arch = "wasm32")))]
 use super::{CallOutcome, CaptureAsyncHostContext, return_one};
+use crate::host_extension::HostNamedStruct;
+use crate::vm::Value;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::vm::{Vm, VmError, VmResult};
+#[cfg(target_arch = "wasm32")]
+use crate::vm::{Vm, VmResult};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::PathBuf;
 
 /// The synchronous host-call channel that hands a pending operation id back to
 /// the VM. The blocking and wasm backends schedule a concrete operation driver;
@@ -71,6 +77,129 @@ impl Default for IoPolicy {
             max_write_bytes: 1024 * 1024,
         }
     }
+}
+
+/// Typed result returned by `io::try_write_text`.
+///
+/// `error_code` is empty on success, and otherwise is one of `policy_denied`,
+/// `write_limit`, `io_error`, or `unsupported`. The result never carries the
+/// path or text. Native writes are non-atomic: an OS failure after opening may
+/// leave an empty or partial file; success means write and flush completed and
+/// the handle was closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IoWriteTextResult {
+    /// Whether the complete text write and flush succeeded.
+    pub ok: bool,
+    /// A stable, non-sensitive failure code, or the empty string on success.
+    pub error_code: String,
+}
+
+impl HostNamedStruct for IoWriteTextResult {
+    const NAME: &'static str = "IoWriteTextResult";
+
+    fn host_struct_fields() -> Vec<HostStructField> {
+        vec![
+            HostStructField::new("ok", HostTypeSchema::Bool),
+            HostStructField::new("error_code", HostTypeSchema::String),
+        ]
+    }
+}
+
+impl IoWriteTextResult {
+    pub(super) fn success() -> Self {
+        Self {
+            ok: true,
+            error_code: String::new(),
+        }
+    }
+
+    pub(super) fn failure(error_code: &str) -> Self {
+        Self {
+            ok: false,
+            error_code: error_code.to_string(),
+        }
+    }
+
+    pub(super) fn into_value(self) -> Value {
+        Value::map(vec![
+            (Value::string("ok"), Value::Bool(self.ok)),
+            (Value::string("error_code"), Value::string(self.error_code)),
+        ])
+    }
+}
+
+fn io_write_text_result_schema() -> crate::host_api::HostStructSchema {
+    crate::host_api::HostStructSchema::new(
+        IoWriteTextResult::NAME,
+        IoWriteTextResult::host_struct_fields(),
+    )
+    .with_description("Result of io::try_write_text; error_code is empty on success.")
+}
+
+/// Guest contract for `io::try_write_text`.
+fn io_try_write_text_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        "io::try_write_text",
+        vec![
+            HostParamSchema::value("path", HostTypeSchema::String),
+            HostParamSchema::value("text", HostTypeSchema::String),
+        ],
+        io_write_text_result_schema().as_type(),
+    )
+    .with_description(
+        "Creates or truncates a UTF-8 text file. Ordinary policy, size, and OS failures return IoWriteTextResult; later OS errors may leave partial bytes.",
+    )
+}
+
+const IO_NAMED_STRUCTS: &[(&str, &str)] = &[(
+    "IoWriteTextResult",
+    "Typed result of a whole-file UTF-8 text write; error_code is empty on success.",
+)];
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+pub(super) enum IoPathAuthorizationError {
+    WriteDenied,
+    OutsideAllowedRoots(PathBuf),
+    Resolution(String),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl IoPathAuthorizationError {
+    pub(super) fn into_vm_error(self) -> VmError {
+        match self {
+            Self::WriteDenied => {
+                VmError::HostError("io path write requires the write capability".to_string())
+            }
+            Self::OutsideAllowedRoots(path) => VmError::HostError(format!(
+                "io path '{}' is outside the allowed roots",
+                path.display()
+            )),
+            Self::Resolution(message) => VmError::HostError(message),
+        }
+    }
+
+    pub(super) fn result_code(&self) -> &'static str {
+        match self {
+            Self::WriteDenied | Self::OutsideAllowedRoots(_) => "policy_denied",
+            Self::Resolution(_) => "io_error",
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn io_write_text_precheck(
+    policy: Option<&IoPolicy>,
+    text: &str,
+) -> Option<IoWriteTextResult> {
+    let policy = policy?;
+    if !policy.allow_write {
+        return Some(IoWriteTextResult::failure("policy_denied"));
+    }
+    if text.len() > policy.max_write_bytes {
+        return Some(IoWriteTextResult::failure("write_limit"));
+    }
+    None
 }
 
 /// I/O host configuration owned by the I/O host implementation.
@@ -162,7 +291,8 @@ pub(crate) use wasm::*;
 // ---- guest contracts -------------------------------------------------------
 
 use crate::host_api::{
-    HostFunctionSchema, HostParamPassing, HostParamSchema, HostTypeSchema, ResourceTypeKey,
+    HostFunctionSchema, HostParamPassing, HostParamSchema, HostStructField, HostTypeSchema,
+    ResourceTypeKey,
 };
 
 /// The `io.file` resource key, derived from its single canonical declaration.
@@ -248,13 +378,14 @@ fn io_flush_contract() -> HostFunctionSchema {
 
 /// The functions this module publishes as the `io` guest catalog surface.
 ///
-/// The surface is the resource-bearing set: `open` creates `io.file`,
-/// `read_all` / `write` / `flush` borrow it, and `close` takes it. The
-/// remaining `io::*` members stay on the namespaced-builtin path.
+/// The surface includes the `io.file` resource operations and the typed,
+/// resource-free whole-file writer. Remaining `io::*` members stay on the
+/// namespaced-builtin path.
 const IO_CATALOG_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
     builtin_io_open_descriptor,
     builtin_io_read_all_descriptor,
     builtin_io_write_descriptor,
+    builtin_io_try_write_text_descriptor,
     builtin_io_flush_descriptor,
     builtin_io_close_descriptor,
 ];
@@ -323,6 +454,7 @@ pub(super) fn io_host_module() -> super::host_modules::StandardHostModule {
         builtin_io_read_all_descriptor,
         builtin_io_read_line_descriptor,
         builtin_io_write_descriptor,
+        builtin_io_try_write_text_descriptor,
         builtin_io_flush_descriptor,
         builtin_io_close_descriptor,
         builtin_io_exists_descriptor,
@@ -332,6 +464,6 @@ pub(super) fn io_host_module() -> super::host_modules::StandardHostModule {
         name: "io",
         catalog: io_catalog_module,
         owned: OWNED,
-        named_structs: &[],
+        named_structs: IO_NAMED_STRUCTS,
     }
 }

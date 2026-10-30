@@ -177,6 +177,7 @@ impl<'de> Visitor<'de> for JsonValueVisitor {
 
 /// The ordered-entry descriptors this module publishes as a guest surface.
 const JSON_ENTRY_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
+    super::json_validation::builtin_json_is_valid_descriptor,
     super::json_ordered::builtin_json_decode_object_entries_descriptor,
     super::json_ordered::builtin_json_encode_object_entries_descriptor,
 ];
@@ -195,6 +196,7 @@ pub(super) fn json_host_module() -> super::host_modules::StandardHostModule {
     const OWNED: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
         builtin_json_encode_descriptor,
         builtin_json_decode_descriptor,
+        super::json_validation::builtin_json_is_valid_descriptor,
         super::json_ordered::builtin_json_decode_object_entries_descriptor,
         super::json_ordered::builtin_json_encode_object_entries_descriptor,
     ];

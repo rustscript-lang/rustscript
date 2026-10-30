@@ -24,12 +24,17 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-use super::{IoPolicy, io_policy};
+use super::borrow_arg;
+use super::{CallOutcome, return_one};
+use super::{IoPathAuthorizationError, IoPolicy, io_policy};
 use crate::host_api::ResourceTypeKey;
 use crate::vm::resource::close::{CloseProgress, HostResource};
 use crate::vm::resource::error::{ResourceError, ResourceErrorCode, ResourceResult};
 use crate::vm::resource::{ResourceCloseReason, ResourceHandle};
 use crate::vm::{CaptureAsyncHostContext, HostFutureOutput, Value, Vm, VmError, VmResult};
+
+mod try_write_text;
+pub(super) use try_write_text::*;
 
 /// A file / child-process backed IO handle.
 #[derive(Debug)]
@@ -465,7 +470,9 @@ pub(crate) async fn builtin_io_open(
             )));
         }
     };
-    let path = authorize_io_path(context.policy.as_ref(), &path, writes).await?;
+    let path = authorize_io_path(context.policy.as_ref(), &path, writes)
+        .await
+        .map_err(IoPathAuthorizationError::into_vm_error)?;
     let mut options = OpenOptions::new();
     match mode.as_str() {
         "r" => {
@@ -741,7 +748,9 @@ pub(crate) async fn builtin_io_exists(
     #[pd_host_context] context: IoPolicyContext,
     path: String,
 ) -> VmResult<HostFutureOutput<bool>> {
-    let path = authorize_io_path(context.policy.as_ref(), &path, false).await?;
+    let path = authorize_io_path(context.policy.as_ref(), &path, false)
+        .await
+        .map_err(IoPathAuthorizationError::into_vm_error)?;
     let exists = tokio::fs::try_exists(path)
         .await
         .map_err(|error| VmError::HostError(format!("io_exists failed: {error}")))?;
@@ -752,21 +761,21 @@ async fn authorize_io_path(
     policy: Option<&IoPolicy>,
     path: &str,
     writes: bool,
-) -> VmResult<PathBuf> {
+) -> Result<PathBuf, IoPathAuthorizationError> {
     let requested = PathBuf::from(path);
     let Some(policy) = policy else {
         return Ok(requested);
     };
     if writes && !policy.allow_write {
-        return Err(VmError::HostError(
-            "io path write requires the write capability".to_string(),
-        ));
+        return Err(IoPathAuthorizationError::WriteDenied);
     }
     let absolute = if requested.is_absolute() {
         requested
     } else {
         std::env::current_dir()
-            .map_err(|error| VmError::HostError(format!("io path resolution failed: {error}")))?
+            .map_err(|error| {
+                IoPathAuthorizationError::Resolution(format!("io path resolution failed: {error}"))
+            })?
             .join(requested)
     };
     let canonical = canonicalize_io_target(&absolute).await?;
@@ -774,7 +783,7 @@ async fn authorize_io_path(
         let root = tokio::fs::canonicalize(Path::new(root))
             .await
             .map_err(|error| {
-                VmError::HostError(format!(
+                IoPathAuthorizationError::Resolution(format!(
                     "io allowed root '{root}' cannot be resolved: {error}"
                 ))
             })?;
@@ -782,30 +791,26 @@ async fn authorize_io_path(
             return Ok(canonical);
         }
     }
-    Err(VmError::HostError(format!(
-        "io path '{}' is outside the allowed roots",
-        canonical.display()
-    )))
+    Err(IoPathAuthorizationError::OutsideAllowedRoots(canonical))
 }
 
-async fn canonicalize_io_target(path: &Path) -> VmResult<PathBuf> {
-    if tokio::fs::try_exists(path)
-        .await
-        .map_err(|error| VmError::HostError(format!("io path resolution failed: {error}")))?
-    {
-        return tokio::fs::canonicalize(path)
-            .await
-            .map_err(|error| VmError::HostError(format!("io path resolution failed: {error}")));
+async fn canonicalize_io_target(path: &Path) -> Result<PathBuf, IoPathAuthorizationError> {
+    if tokio::fs::try_exists(path).await.map_err(|error| {
+        IoPathAuthorizationError::Resolution(format!("io path resolution failed: {error}"))
+    })? {
+        return tokio::fs::canonicalize(path).await.map_err(|error| {
+            IoPathAuthorizationError::Resolution(format!("io path resolution failed: {error}"))
+        });
     }
     // The target does not exist yet (e.g. a create-mode open): canonicalize
     // the parent and append the final component.
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let canonical_parent = tokio::fs::canonicalize(parent)
-        .await
-        .map_err(|error| VmError::HostError(format!("io path resolution failed: {error}")))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| VmError::HostError("io path has no file name".to_string()))?;
+    let canonical_parent = tokio::fs::canonicalize(parent).await.map_err(|error| {
+        IoPathAuthorizationError::Resolution(format!("io path resolution failed: {error}"))
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        IoPathAuthorizationError::Resolution("io path has no file name".to_string())
+    })?;
     Ok(canonical_parent.join(name))
 }
 
