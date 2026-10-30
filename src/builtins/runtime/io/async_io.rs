@@ -20,7 +20,7 @@ use std::task::{Context, Poll, Waker};
 
 use pd_host_function::pd_host_function;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
@@ -549,10 +549,11 @@ pub(crate) async fn builtin_io_read_all(
     let handle = guard
         .as_mut()
         .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
-    let mut out = String::new();
-    match handle {
-        IoHandle::File(file) => file.read_to_string(&mut out).await,
-        IoHandle::PopenRead { stdout, .. } => stdout.read_to_string(&mut out).await,
+    let limit = context.max_read_bytes;
+    let bound = limit.and_then(super::read_all_probe_bound);
+    let bytes = match handle {
+        IoHandle::File(file) => read_all_bytes(file, bound).await,
+        IoHandle::PopenRead { stdout, .. } => read_all_bytes(stdout, bound).await,
         IoHandle::PopenWrite { .. } => {
             return Err(VmError::HostError(
                 "io_read_all cannot read from a write handle".to_string(),
@@ -565,16 +566,30 @@ pub(crate) async fn builtin_io_read_all(
             "io_read_all handle is closed".to_string(),
         ));
     }
-    if context
-        .max_read_bytes
-        .is_some_and(|limit| out.len() > limit)
-    {
-        return Err(VmError::HostError(
-            "io_read_all exceeded read limit".to_string(),
-        ));
-    }
+    let out = super::decode_read_all(bytes, limit)?;
     lease.complete();
     Ok(HostFutureOutput::returning(out))
+}
+
+/// Reads at most one byte past the accepted limit from an async Reader.
+///
+/// The standard `Take` adapter applies the budget at the Reader boundary, so
+/// the outstanding bytes are never buffered in full and the read stops as soon
+/// as the probe budget is exhausted instead of waiting for EOF.
+async fn read_all_bytes<R>(reader: &mut R, bound: Option<u64>) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    match bound {
+        Some(bound) => {
+            reader.take(bound).read_to_end(&mut bytes).await?;
+        }
+        None => {
+            reader.read_to_end(&mut bytes).await?;
+        }
+    }
+    Ok(bytes)
 }
 
 /// Reads a single line of text from an I/O handle.

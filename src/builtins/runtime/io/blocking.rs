@@ -917,6 +917,7 @@ pub(super) fn builtin_io_popen(
 #[pd_host_function(name = "io::read_all", contract = super::io_read_all_contract)]
 pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostCallResult<String>> {
     let (_handle, resource) = io_resource_for_handle(vm, handle_id)?;
+    let max_read_bytes = super::io_policy(vm).map(|policy| policy.max_read_bytes);
     let op_id = schedule_io_task(vm, "io::read_all", move |shared| {
         let mut handle = match resource.take_handle() {
             Some(handle) => handle,
@@ -927,17 +928,10 @@ pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostC
             }
         };
         install_process_cancel_hook(shared, &handle, &resource.state);
-        let mut out = String::new();
         let result = match &mut *handle {
-            IoHandle::File(file) => file
-                .read_to_string(&mut out)
-                .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))
-                .map(|_| CallReturn::one(Value::string(out))),
+            IoHandle::File(file) => read_all_from_reader(file, max_read_bytes),
             IoHandle::PopenRead { child } => match child.stdout.as_mut() {
-                Some(stdout) => stdout
-                    .read_to_string(&mut out)
-                    .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))
-                    .map(|_| CallReturn::one(Value::string(out))),
+                Some(stdout) => read_all_from_reader(stdout, max_read_bytes),
                 None => Err(VmError::HostError(
                     "io_read_all popen handle missing stdout".to_string(),
                 )),
@@ -949,6 +943,25 @@ pub(super) fn builtin_io_read_all(vm: &mut Vm, handle_id: i64) -> VmResult<HostC
         finish_io_worker(shared, handle, result);
     })?;
     Ok(HostCallResult::Pending(op_id))
+}
+
+/// Reads at most one byte past the accepted limit from a blocking Reader.
+///
+/// The standard `Take` adapter applies the budget at the Reader boundary, so
+/// the rest of the stream is never buffered and the read stops as soon as the
+/// probe budget is exhausted instead of waiting for EOF.
+fn read_all_from_reader(
+    reader: &mut impl Read,
+    max_read_bytes: Option<usize>,
+) -> VmResult<CallReturn> {
+    let bound = max_read_bytes.and_then(super::read_all_probe_bound);
+    let mut bytes = Vec::new();
+    match bound {
+        Some(bound) => reader.take(bound).read_to_end(&mut bytes),
+        None => reader.read_to_end(&mut bytes),
+    }
+    .map_err(|err| VmError::HostError(format!("io_read_all failed: {err}")))?;
+    super::decode_read_all(bytes, max_read_bytes).map(|out| CallReturn::one(Value::string(out)))
 }
 
 /// Reads a single line of text from an I/O handle.

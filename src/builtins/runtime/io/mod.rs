@@ -24,7 +24,7 @@ use super::borrow_arg;
 #[cfg(all(feature = "async", not(target_arch = "wasm32")))]
 use super::{CallOutcome, CaptureAsyncHostContext, return_one};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::vm::Vm;
+use crate::vm::{Vm, VmError, VmResult};
 
 /// The synchronous host-call channel that hands a pending operation id back to
 /// the VM. The blocking and wasm backends schedule a concrete operation driver;
@@ -103,6 +103,40 @@ pub(super) fn io_policy(vm: &Vm) -> Option<IoPolicy> {
         .get_module_state::<IoPolicy>()
         .cloned()
         .or_else(|| (!vm.host.default_builtin_capabilities_enabled()).then(IoPolicy::default))
+}
+
+/// The Reader-layer bound used to enforce `max_read_bytes` in `io::read_all`.
+///
+/// Collecting `limit + 1` bytes is enough to prove that the stream exceeds the
+/// limit, so the read can stop at the boundary instead of waiting for EOF.
+/// `None` means `limit + 1` cannot be represented in the reader's `u64` budget
+/// (the limit is effectively unbounded at this address width).
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn read_all_probe_bound(limit: usize) -> Option<u64> {
+    u64::try_from(limit)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+}
+
+/// Turns the bytes collected under a `limit + 1` probe into the guest string.
+///
+/// The contract is checked before decoding so an over-limit stream reports the
+/// limit even when its probe ends mid-character; only a payload within the
+/// limit is validated as UTF-8, with the message the previous implementation
+/// produced for invalid text.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn decode_read_all(bytes: Vec<u8>, limit: Option<usize>) -> VmResult<String> {
+    if let Some(limit) = limit
+        && let Some(bound) = read_all_probe_bound(limit)
+        && u64::try_from(bytes.len()).is_ok_and(|len| len >= bound)
+    {
+        return Err(VmError::HostError(
+            "io_read_all exceeded read limit".to_string(),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        VmError::HostError("io_read_all failed: stream did not contain valid UTF-8".to_string())
+    })
 }
 
 // ---- cfg-selected implementations -----------------------------------------
@@ -227,6 +261,55 @@ const IO_CATALOG_FUNCTIONS: &[fn() -> crate::host_extension::HostFunctionDescrip
 
 fn io_catalog_module() -> crate::host_extension::HostModuleDescriptor {
     super::host_modules::catalog_module("io", IO_CATALOG_FUNCTIONS, &[io_file_resource])
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::{decode_read_all, read_all_probe_bound};
+
+    #[test]
+    fn read_all_probe_bound_saturates_instead_of_overflowing() {
+        assert_eq!(read_all_probe_bound(0), Some(1));
+        assert_eq!(
+            read_all_probe_bound(usize::MAX - 1),
+            Some(usize::MAX as u64)
+        );
+        assert_eq!(read_all_probe_bound(usize::MAX), None);
+    }
+
+    #[test]
+    fn decode_read_all_checks_the_limit_before_decoding() {
+        // The probe ends one byte past the limit and mid-way through invalid
+        // UTF-8: the limit must win over the decode error.
+        let error = decode_read_all(vec![0xFF; 5], Some(4))
+            .expect_err("the probe over the limit must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("io_read_all exceeded read limit"),
+            "unexpected error: {error}"
+        );
+
+        // Invalid UTF-8 within the limit keeps the published decode message.
+        let error =
+            decode_read_all(vec![0xFF, 0xFE], Some(4)).expect_err("invalid UTF-8 must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("io_read_all failed: stream did not contain valid UTF-8"),
+            "unexpected error: {error}"
+        );
+
+        // A valid payload exactly at the limit decodes; no limit reads all.
+        assert_eq!(
+            decode_read_all("éé".as_bytes().to_vec(), Some(4)).expect("exact limit decodes"),
+            "éé"
+        );
+        assert_eq!(
+            decode_read_all("payload".as_bytes().to_vec(), None).expect("no limit decodes"),
+            "payload"
+        );
+    }
 }
 
 /// The standard `io` host module: the catalog surface plus every owned

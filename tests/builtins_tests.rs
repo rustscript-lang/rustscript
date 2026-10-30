@@ -19,6 +19,9 @@ mod io_scope_lifecycle_tests;
 #[path = "builtins/io_async_tests.rs"]
 mod io_async_tests;
 
+#[path = "builtins/io_read_bound_tests.rs"]
+mod io_read_bound_tests;
+
 #[cfg(feature = "sqlite")]
 #[path = "builtins/sqlite_scope_lifecycle_tests.rs"]
 mod sqlite_scope_lifecycle_tests;
