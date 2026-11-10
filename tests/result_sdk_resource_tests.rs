@@ -2356,3 +2356,144 @@ fn owned_result_combinator_writer_volatility_only_covers_its_shared_source() {
     compile_with_fixture_catalog(source)
         .expect("writing an unrelated private callable must not poison the safe factory");
 }
+
+// ---------------------------------------------------------------------------
+// Scope B address5: volatile facts must survive the diagnostic walk and the
+// caller-to-callee captured-slot mapping.
+// ---------------------------------------------------------------------------
+
+fn assert_address5_rejection(probe: &str, source: &str, detail: &str) {
+    let text = match compile_with_fixture_catalog(source) {
+        Ok(()) => panic!(
+            "{probe}: {detail}: source was accepted, expected a temporary-callable capture rejection"
+        ),
+        Err(text) => text,
+    };
+    assert!(
+        text.contains("temporary callable")
+            && text.contains("capture ownership")
+            && text.contains("bind the callable before the method"),
+        "{probe}: unexpected rejection: {text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_expression_if_argument_rebind_after_shared_writer() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn make_free(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            let mut factory = make_free;
+            let writer = || if true => {
+                factory = make_callback;
+                0
+            } else => {
+                factory = make_free;
+                0
+            };
+            value.map(if true => {
+                factory = make_free;
+                writer();
+                factory(token)
+            } else => {
+                factory = make_free;
+                writer();
+                factory(token)
+            })
+        }
+    "#;
+    assert_address5_rejection(
+        "expression-if-argument",
+        source,
+        "the diagnostic walk must keep the same-frame shared factory volatile across an argument rebind",
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_nested_named_produce_rebind_after_shared_writer() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn make_free(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn make(token: resource<result.success>) -> fn(int) -> int {
+            let mut factory = make_free;
+            let writer = || if true => {
+                factory = make_callback;
+                0
+            } else => {
+                factory = make_free;
+                0
+            };
+            fn produce(token: resource<result.success>) -> fn(int) -> int {
+                factory = make_free;
+                writer();
+                factory(token)
+            }
+            produce(token)
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make(token))
+        }
+    "#;
+    assert_address5_rejection(
+        "nested-named-produce",
+        source,
+        "a callee frame must inherit the caller's volatile source through its capture pair",
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_nested_closure_produce_rebind_after_shared_writer() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn make_free(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn make(token: resource<result.success>) -> fn(int) -> int {
+            let mut factory = make_free;
+            let writer = || if true => {
+                factory = make_callback;
+                0
+            } else => {
+                factory = make_free;
+                0
+            };
+            let callback: fn(resource<result.success>) -> fn(int) -> int = |token| if true => {
+                factory = make_free;
+                writer();
+                factory(token)
+            } else => {
+                factory = make_free;
+                writer();
+                factory(token)
+            };
+            callback(token)
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make(token))
+        }
+    "#;
+    assert_address5_rejection(
+        "nested-closure-produce",
+        source,
+        "a closure body frame must inherit the caller's volatile source through its capture pair",
+    );
+}

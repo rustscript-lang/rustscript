@@ -1486,7 +1486,7 @@ fn find_temporary_callable_capture(expr: &Expr, env: &Env) -> TemporaryCallableC
         defs: env.local_defs.clone(),
         owned_locals: HashSet::new(),
         param_facts: HashMap::new(),
-        volatile_sources: HashSet::new(),
+        volatile_sources: env.volatile_sources.clone(),
         env,
     };
     let mut visiting_slots = HashSet::new();
@@ -1816,12 +1816,17 @@ fn closure_body_walk<'a>(
     }
     let mut owned_locals: HashSet<LocalSlot> = closure.param_slots.iter().copied().collect();
     owned_locals.extend(closure.capture_copies.iter().map(|(_, captured)| *captured));
+    let volatile_sources = captured_volatile_slots(
+        &closure.capture_copies,
+        &caller.volatile_sources,
+        &nested_slots,
+    );
     CaptureWalk {
         slots: nested_slots,
         defs: HashMap::new(),
         owned_locals,
         param_facts,
-        volatile_sources: HashSet::new(),
+        volatile_sources,
         env: caller.env,
     }
 }
@@ -2047,12 +2052,17 @@ fn function_capture_walk<'a>(
             );
         }
     }
+    let volatile_sources = captured_volatile_slots(
+        &implementation.capture_copies,
+        &caller.volatile_sources,
+        &slots,
+    );
     let mut walk = CaptureWalk {
         slots,
         defs: HashMap::new(),
         owned_locals,
         param_facts,
-        volatile_sources: HashSet::new(),
+        volatile_sources,
         env: caller.env,
     };
     bind_stmts(&implementation.body_stmts, &mut walk);
@@ -2311,6 +2321,24 @@ fn mark_walk_volatile_sources(walk: &mut CaptureWalk<'_>, sources: HashSet<Local
         .collect();
     walk.volatile_sources.extend(sources.iter().copied());
     invalidate_possible_writes(walk, &sources);
+}
+
+/// Volatile facts for a fresh callee frame, derived only from the actual
+/// `(source, captured)` capture pairs. A caller volatile source poisons the
+/// callee slot that captures it; the caller's numeric slot set is never
+/// copied across the lexical frame, so an unrelated private/parameter slot
+/// that happens to reuse the same integer id keeps its own trust.
+fn captured_volatile_slots(
+    capture_copies: &[(LocalSlot, LocalSlot)],
+    caller_volatile_sources: &HashSet<LocalSlot>,
+    callee_slots: &HashMap<LocalSlot, TypeSchema>,
+) -> HashSet<LocalSlot> {
+    capture_copies
+        .iter()
+        .filter(|(source, _)| caller_volatile_sources.contains(source))
+        .map(|(_, captured)| *captured)
+        .filter(|captured| is_callable_slot(callee_slots, *captured))
+        .collect()
 }
 
 /// Slots in the frame enclosing `closure` whose values its body may write
@@ -3813,5 +3841,196 @@ mod tests {
             ),
             HashSet::from([source])
         );
+    }
+
+    fn free_factory_decl(index: u16, arity: u8) -> FunctionDecl {
+        FunctionDecl {
+            name: format!("free_factory_{index}"),
+            arity,
+            index,
+            args: (0..arity).map(|offset| format!("arg{offset}")).collect(),
+            arg_schemas: (0..arity).map(|_| Some(callable_int_schema())).collect(),
+            return_schema: Some(callable_int_schema()),
+            type_params: Vec::new(),
+            exported: false,
+            return_type: ValueType::Callable,
+            symbol: None,
+        }
+    }
+
+    fn free_factory_impl() -> FunctionImpl {
+        FunctionImpl {
+            param_slots: Vec::new(),
+            capture_copies: Vec::new(),
+            body_stmts: Vec::new(),
+            body_expr: Expr::Closure(ClosureExpr {
+                param_slots: Vec::new(),
+                capture_copies: Vec::new(),
+                body: Box::new(Expr::Int(0)),
+            }),
+            body_expr_line: 1,
+        }
+    }
+
+    #[test]
+    fn diagnostic_walk_inherits_same_frame_volatile_sources() {
+        let source = 1;
+        let mut env = callable_source_env(source, 2);
+        env.functions.insert(0, free_factory_decl(0, 0));
+        env.function_list.push(free_factory_decl(0, 0));
+        env.function_impls.insert(0, free_factory_impl());
+        env.volatile_sources.insert(source);
+        env.local_defs
+            .insert(source, volatile_definition(&env.slots));
+        let expr = Expr::Block {
+            stmts: vec![Stmt::Assign {
+                kind: AssignmentKind::Set,
+                index: source,
+                expr: Expr::FunctionRef(0, Vec::new()),
+                line: 1,
+            }],
+            expr: Box::new(Expr::LocalCall(source, Vec::new(), Vec::new(), None)),
+        };
+        let capture = find_temporary_callable_capture(&expr, &env);
+        assert!(
+            matches!(capture, TemporaryCallableCapture::Unknown),
+            "the diagnostic walk must keep the same-frame volatile source untrusted, got {capture:?}"
+        );
+    }
+
+    #[test]
+    fn named_callee_maps_caller_volatile_source_and_keeps_equal_id_param_fresh() {
+        let source = 7;
+        let captured = 20;
+        let unrelated = 9;
+        let mut env = callable_source_env(source, 2);
+        env.slots.insert(unrelated, callable_int_schema());
+        env.functions.insert(1, free_factory_decl(1, 0));
+        env.function_list.push(free_factory_decl(1, 0));
+        env.function_impls.insert(1, free_factory_impl());
+        let mut caller = capture_walk(&env, source);
+        caller.volatile_sources.insert(source);
+        caller.volatile_sources.insert(unrelated);
+        let function = free_factory_decl(0, 1);
+        let implementation = FunctionImpl {
+            param_slots: vec![unrelated],
+            capture_copies: vec![(source, captured)],
+            body_stmts: vec![
+                Stmt::Assign {
+                    kind: AssignmentKind::Set,
+                    index: captured,
+                    expr: Expr::FunctionRef(1, Vec::new()),
+                    line: 1,
+                },
+                Stmt::Assign {
+                    kind: AssignmentKind::Set,
+                    index: unrelated,
+                    expr: Expr::FunctionRef(1, Vec::new()),
+                    line: 1,
+                },
+            ],
+            body_expr: Expr::Int(0),
+            body_expr_line: 1,
+        };
+        let callee = function_capture_walk(
+            &function,
+            &implementation,
+            &[],
+            &caller,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            0,
+        );
+        assert_eq!(
+            callee.volatile_sources,
+            HashSet::from([captured]),
+            "only the actual capture pair may seed the callee frame"
+        );
+        assert!(matches!(
+            callee
+                .defs
+                .get(&captured)
+                .map(|definition| &definition.capture),
+            Some(TemporaryCallableCapture::Unknown)
+        ));
+        assert!(callee.defs[&captured].target.is_none());
+        assert!(matches!(
+            callee
+                .defs
+                .get(&unrelated)
+                .map(|definition| &definition.capture),
+            Some(TemporaryCallableCapture::Free)
+        ));
+        assert!(matches!(
+            callee.defs[&unrelated].target.as_deref(),
+            Some(CallableTarget::Function(1))
+        ));
+    }
+
+    #[test]
+    fn closure_body_maps_caller_volatile_source_and_keeps_equal_id_param_fresh() {
+        let source = 30;
+        let captured = 31;
+        let unrelated = 9;
+        let mut env = callable_source_env(source, 2);
+        env.slots.insert(unrelated, callable_int_schema());
+        env.functions.insert(1, free_factory_decl(1, 0));
+        env.function_list.push(free_factory_decl(1, 0));
+        env.function_impls.insert(1, free_factory_impl());
+        let mut caller = capture_walk(&env, source);
+        caller.volatile_sources.insert(source);
+        caller.volatile_sources.insert(unrelated);
+        let stmts = vec![
+            Stmt::Assign {
+                kind: AssignmentKind::Set,
+                index: captured,
+                expr: Expr::FunctionRef(1, Vec::new()),
+                line: 1,
+            },
+            Stmt::Assign {
+                kind: AssignmentKind::Set,
+                index: unrelated,
+                expr: Expr::FunctionRef(1, Vec::new()),
+                line: 1,
+            },
+        ];
+        let closure = ClosureExpr {
+            param_slots: vec![unrelated],
+            capture_copies: vec![(source, captured)],
+            body: Box::new(Expr::Block {
+                stmts: stmts.clone(),
+                expr: Box::new(Expr::Int(0)),
+            }),
+        };
+        let mut nested = closure_body_walk(
+            &closure,
+            &caller.slots,
+            &[],
+            &caller,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            0,
+        );
+        assert_eq!(
+            nested.volatile_sources,
+            HashSet::from([captured]),
+            "only the actual capture pair may seed the closure body frame"
+        );
+        bind_stmts(&stmts, &mut nested);
+        assert!(matches!(
+            nested
+                .defs
+                .get(&captured)
+                .map(|definition| &definition.capture),
+            Some(TemporaryCallableCapture::Unknown)
+        ));
+        assert!(nested.defs[&captured].target.is_none());
+        assert!(matches!(
+            nested
+                .defs
+                .get(&unrelated)
+                .map(|definition| &definition.capture),
+            Some(TemporaryCallableCapture::Free)
+        ));
     }
 }
