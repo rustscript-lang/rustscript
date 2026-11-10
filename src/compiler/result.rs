@@ -28,6 +28,11 @@ struct Env {
     /// Only callable-typed locals are recorded so ordinary value flow does not
     /// retain expression clones in this pass.
     local_defs: HashMap<LocalSlot, LocalDefinition>,
+    /// Callable source slots in the current producer lexical scope that may be
+    /// written through a shared capture cell. This is a persistent scope fact:
+    /// later assignments and branch joins must not re-establish a trusted
+    /// `Free` definition or target for those slots.
+    volatile_sources: HashSet<LocalSlot>,
     /// Return schema of the function or closure currently being resolved.
     /// `None` at root and inside a callable that does not return `Result`.
     lexical_return: Option<TypeSchema>,
@@ -77,6 +82,7 @@ pub(crate) fn resolve_result_types(
         function_impls: ir.function_impls.clone(),
         struct_schemas: ir.struct_schemas.clone(),
         local_defs: HashMap::new(),
+        volatile_sources: HashSet::new(),
         lexical_return: None,
     };
     resolve_stmts(&mut ir.stmts, None, &mut env)?;
@@ -95,6 +101,7 @@ fn resolve_function(
 ) -> Result<(), CompileError> {
     let saved = env.slots.clone();
     let saved_defs = env.local_defs.clone();
+    let saved_volatile = std::mem::take(&mut env.volatile_sources);
     let saved_return = env.lexical_return.clone();
     if let Some(function) = env.functions.get(&index).cloned() {
         env.lexical_return = function.return_schema.clone();
@@ -123,6 +130,7 @@ fn resolve_function(
     }
     env.slots = saved;
     env.local_defs = saved_defs;
+    env.volatile_sources = saved_volatile;
     env.lexical_return = saved_return;
     Ok(())
 }
@@ -144,7 +152,14 @@ fn resolve_stmt(
     env: &mut Env,
 ) -> Result<(), CompileError> {
     match stmt {
-        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {
+        Stmt::Noop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
+        Stmt::FuncDecl {
+            index, has_impl, ..
+        } => {
+            if *has_impl {
+                let sources = function_capture_targets(*index, env);
+                mark_env_volatile_sources(env, sources);
+            }
             Ok(())
         }
         Stmt::Let {
@@ -175,8 +190,12 @@ fn resolve_stmt(
                 .get(index)
                 .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }));
             if is_callable {
-                env.local_defs
-                    .insert(*index, callable_env_definition(expr, env));
+                let definition = if env.volatile_sources.contains(index) {
+                    volatile_definition(&env.slots)
+                } else {
+                    callable_env_definition(expr, env)
+                };
+                env.local_defs.insert(*index, definition);
             } else {
                 env.local_defs.remove(index);
             }
@@ -201,8 +220,12 @@ fn resolve_stmt(
                 .get(index)
                 .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }));
             if is_callable {
-                env.local_defs
-                    .insert(*index, callable_env_definition(expr, env));
+                let definition = if env.volatile_sources.contains(index) {
+                    volatile_definition(&env.slots)
+                } else {
+                    callable_env_definition(expr, env)
+                };
+                env.local_defs.insert(*index, definition);
             } else {
                 env.local_defs.remove(index);
             }
@@ -231,12 +254,16 @@ fn resolve_stmt(
             collect_expr_writes(condition, &mut condition_writes);
             invalidate_local_definitions(&mut env.local_defs, &condition_writes);
             let before_defs = env.local_defs.clone();
+            invalidate_local_definitions(&mut env.local_defs, &env.volatile_sources);
             resolve_stmts(then_branch, expected_tail.cloned(), env)?;
             let then_defs = env.local_defs.clone();
             env.local_defs = before_defs.clone();
+            invalidate_local_definitions(&mut env.local_defs, &env.volatile_sources);
             resolve_stmts(else_branch, expected_tail.cloned(), env)?;
             let else_defs = env.local_defs.clone();
-            env.local_defs = join_definitions(&before_defs, &then_defs, &else_defs);
+            let mut joined = join_definitions(&before_defs, &then_defs, &else_defs);
+            invalidate_local_definitions(&mut joined, &env.volatile_sources);
+            env.local_defs = joined;
             Ok(())
         }
         Stmt::For {
@@ -474,13 +501,17 @@ fn resolve_expr(
         | Expr::ToOwned(inner)
         | Expr::Borrow(inner)
         | Expr::BorrowMut(inner) => resolve_expr(inner, None, env),
+        Expr::FunctionRef(index, _) => {
+            let sources = function_capture_targets(*index, env);
+            mark_env_volatile_sources(env, sources);
+            Ok(())
+        }
         Expr::Null
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
         | Expr::String(_)
         | Expr::Bytes(_)
-        | Expr::FunctionRef(_, _)
         | Expr::ModuleFunctionRef(_, _)
         | Expr::UnresolvedFunctionRef { .. }
         | Expr::Var(_)
@@ -1442,6 +1473,10 @@ struct CaptureWalk<'a> {
     /// Capture facts for callable-typed parameters, derived from the actual
     /// argument expressions at the call site.
     param_facts: HashMap<LocalSlot, TemporaryCallableCapture>,
+    /// Callable source slots in this producer scope that may be written
+    /// through a shared capture cell. Persisted across assignments, branch
+    /// joins, blocks and loops; a later binding must not restore `Free`.
+    volatile_sources: HashSet<LocalSlot>,
     env: &'a Env,
 }
 
@@ -1451,6 +1486,7 @@ fn find_temporary_callable_capture(expr: &Expr, env: &Env) -> TemporaryCallableC
         defs: env.local_defs.clone(),
         owned_locals: HashSet::new(),
         param_facts: HashMap::new(),
+        volatile_sources: HashSet::new(),
         env,
     };
     let mut visiting_slots = HashSet::new();
@@ -1497,6 +1533,7 @@ fn temporary_callable_capture(
                 defs: walk.defs.clone(),
                 owned_locals: walk.owned_locals.clone(),
                 param_facts: walk.param_facts.clone(),
+                volatile_sources: walk.volatile_sources.clone(),
                 env: walk.env,
             };
             bind_stmts(stmts, &mut nested);
@@ -1661,6 +1698,7 @@ fn local_callable_return_capture(
                     defs: walk.defs.clone(),
                     owned_locals: walk.owned_locals.clone(),
                     param_facts: walk.param_facts.clone(),
+                    volatile_sources: walk.volatile_sources.clone(),
                     env: walk.env,
                 };
                 call_return_capture(
@@ -1783,6 +1821,7 @@ fn closure_body_walk<'a>(
         defs: HashMap::new(),
         owned_locals,
         param_facts,
+        volatile_sources: HashSet::new(),
         env: caller.env,
     }
 }
@@ -1877,6 +1916,7 @@ fn callable_env_definition(expr: &Expr, env: &Env) -> LocalDefinition {
         defs: env.local_defs.clone(),
         owned_locals: HashSet::new(),
         param_facts: HashMap::new(),
+        volatile_sources: env.volatile_sources.clone(),
         env,
     };
     LocalDefinition {
@@ -2012,6 +2052,7 @@ fn function_capture_walk<'a>(
         defs: HashMap::new(),
         owned_locals,
         param_facts,
+        volatile_sources: HashSet::new(),
         env: caller.env,
     };
     bind_stmts(&implementation.body_stmts, &mut walk);
@@ -2026,11 +2067,19 @@ fn bind_stmts(stmts: &[Stmt], walk: &mut CaptureWalk<'_>) {
 
 fn bind_stmt(stmt: &Stmt, walk: &mut CaptureWalk<'_>) {
     match stmt {
-        Stmt::Noop { .. }
-        | Stmt::FuncDecl { .. }
-        | Stmt::Break { .. }
-        | Stmt::Continue { .. }
-        | Stmt::ClosureLet { .. } => {}
+        Stmt::Noop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::FuncDecl {
+            index, has_impl, ..
+        } => {
+            if *has_impl {
+                let sources = function_capture_targets(*index, walk.env);
+                mark_walk_volatile_sources(walk, sources);
+            }
+        }
+        Stmt::ClosureLet { closure, .. } => {
+            let sources = closure_capture_targets(closure, walk.env);
+            mark_walk_volatile_sources(walk, sources);
+        }
         Stmt::Let {
             index,
             declared_schema,
@@ -2117,6 +2166,14 @@ fn record_callable_binding(
         walk.owned_locals.insert(index);
     }
     walk.param_facts.remove(&index);
+    if walk.volatile_sources.contains(&index) {
+        if is_callable_slot(&walk.slots, index) {
+            walk.defs.insert(index, volatile_definition(&walk.slots));
+        } else {
+            walk.defs.remove(&index);
+        }
+        return;
+    }
     let is_callable = walk
         .slots
         .get(&index)
@@ -2135,6 +2192,12 @@ fn record_callable_binding(
     } else {
         walk.defs.remove(&index);
     }
+}
+
+fn is_callable_slot(slots: &HashMap<LocalSlot, TypeSchema>, slot: LocalSlot) -> bool {
+    slots
+        .get(&slot)
+        .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }))
 }
 
 fn callable_outer_slots(walk: &CaptureWalk<'_>) -> HashSet<LocalSlot> {
@@ -2201,6 +2264,12 @@ fn join_branch_walks(
     }
     walk.defs = merged_defs;
     walk.param_facts = merged_params;
+    walk.volatile_sources
+        .extend(then_walk.volatile_sources.iter().copied());
+    walk.volatile_sources
+        .extend(else_walk.volatile_sources.iter().copied());
+    let volatile = walk.volatile_sources.clone();
+    invalidate_possible_writes(walk, &volatile);
 }
 
 fn invalidate_possible_writes(walk: &mut CaptureWalk<'_>, written: &HashSet<LocalSlot>) {
@@ -2214,14 +2283,311 @@ fn invalidate_possible_writes(walk: &mut CaptureWalk<'_>, written: &HashSet<Loca
             continue;
         }
         walk.param_facts.remove(slot);
-        walk.defs.insert(
-            *slot,
-            LocalDefinition {
-                capture: TemporaryCallableCapture::Unknown,
-                target: None,
-                slots: walk.slots.clone(),
-            },
-        );
+        walk.defs.insert(*slot, volatile_definition(&walk.slots));
+    }
+}
+
+fn volatile_definition(slots: &HashMap<LocalSlot, TypeSchema>) -> LocalDefinition {
+    LocalDefinition {
+        capture: TemporaryCallableCapture::Unknown,
+        target: None,
+        slots: slots.clone(),
+    }
+}
+
+fn mark_env_volatile_sources(env: &mut Env, sources: HashSet<LocalSlot>) {
+    let sources: HashSet<LocalSlot> = sources
+        .into_iter()
+        .filter(|slot| is_callable_slot(&env.slots, *slot))
+        .collect();
+    env.volatile_sources.extend(sources.iter().copied());
+    invalidate_local_definitions(&mut env.local_defs, &sources);
+}
+
+fn mark_walk_volatile_sources(walk: &mut CaptureWalk<'_>, sources: HashSet<LocalSlot>) {
+    let sources: HashSet<LocalSlot> = sources
+        .into_iter()
+        .filter(|slot| is_callable_slot(&walk.slots, *slot))
+        .collect();
+    walk.volatile_sources.extend(sources.iter().copied());
+    invalidate_possible_writes(walk, &sources);
+}
+
+/// Slots in the frame enclosing `closure` whose values its body may write
+/// through the closure's shared capture cells. Nested capture producers are
+/// mapped through their own `capture_copies`; the closure is conservatively
+/// treated as possibly invoked.
+fn closure_capture_targets(closure: &ClosureExpr, env: &Env) -> HashSet<LocalSlot> {
+    closure_capture_targets_inner(closure, env, &mut HashSet::new())
+}
+
+fn closure_capture_targets_inner(
+    closure: &ClosureExpr,
+    env: &Env,
+    visiting_functions: &mut HashSet<u16>,
+) -> HashSet<LocalSlot> {
+    let mut written = HashSet::new();
+    collect_capture_body_writes(&closure.body, env, &mut written, visiting_functions);
+    closure
+        .capture_copies
+        .iter()
+        .filter(|(_, captured)| written.contains(captured))
+        .map(|(source, _)| *source)
+        .collect()
+}
+
+fn function_capture_targets(index: u16, env: &Env) -> HashSet<LocalSlot> {
+    function_capture_targets_inner(index, env, &mut HashSet::new())
+}
+
+fn function_capture_targets_inner(
+    index: u16,
+    env: &Env,
+    visiting_functions: &mut HashSet<u16>,
+) -> HashSet<LocalSlot> {
+    let Some(implementation) = env.function_impls.get(&index) else {
+        return HashSet::new();
+    };
+    if !visiting_functions.insert(index) {
+        return HashSet::new();
+    }
+    let mut written = HashSet::new();
+    for stmt in &implementation.body_stmts {
+        collect_capture_stmt_writes(stmt, env, &mut written, visiting_functions);
+    }
+    collect_capture_body_writes(
+        &implementation.body_expr,
+        env,
+        &mut written,
+        visiting_functions,
+    );
+    let targets = implementation
+        .capture_copies
+        .iter()
+        .filter(|(_, captured)| written.contains(captured))
+        .map(|(source, _)| *source)
+        .collect();
+    visiting_functions.remove(&index);
+    targets
+}
+
+fn collect_capture_body_writes(
+    expr: &Expr,
+    env: &Env,
+    written: &mut HashSet<LocalSlot>,
+    visiting_functions: &mut HashSet<u16>,
+) {
+    collect_expr_writes(expr, written);
+    collect_capture_expr_producers(expr, env, written, visiting_functions);
+}
+
+fn collect_capture_stmt_writes(
+    stmt: &Stmt,
+    env: &Env,
+    written: &mut HashSet<LocalSlot>,
+    visiting_functions: &mut HashSet<u16>,
+) {
+    match stmt {
+        Stmt::Noop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
+            written.insert(*index);
+            collect_capture_body_writes(expr, env, written, visiting_functions);
+        }
+        Stmt::ClosureLet { closure, .. } => {
+            written.extend(closure_capture_targets_inner(
+                closure,
+                env,
+                visiting_functions,
+            ));
+        }
+        Stmt::FuncDecl {
+            index, has_impl, ..
+        } => {
+            if *has_impl {
+                written.extend(function_capture_targets_inner(
+                    *index,
+                    env,
+                    visiting_functions,
+                ));
+            }
+        }
+        Stmt::Expr { expr, .. } => {
+            collect_capture_body_writes(expr, env, written, visiting_functions);
+        }
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_capture_body_writes(condition, env, written, visiting_functions);
+            for nested in then_branch {
+                collect_capture_stmt_writes(nested, env, written, visiting_functions);
+            }
+            for nested in else_branch {
+                collect_capture_stmt_writes(nested, env, written, visiting_functions);
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            collect_capture_stmt_writes(init, env, written, visiting_functions);
+            collect_capture_body_writes(condition, env, written, visiting_functions);
+            collect_capture_stmt_writes(post, env, written, visiting_functions);
+            for nested in body {
+                collect_capture_stmt_writes(nested, env, written, visiting_functions);
+            }
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            collect_capture_body_writes(condition, env, written, visiting_functions);
+            for nested in body {
+                collect_capture_stmt_writes(nested, env, written, visiting_functions);
+            }
+        }
+        Stmt::Drop { index, .. } => {
+            written.insert(*index);
+        }
+    }
+}
+
+fn collect_capture_expr_producers(
+    expr: &Expr,
+    env: &Env,
+    written: &mut HashSet<LocalSlot>,
+    visiting_functions: &mut HashSet<u16>,
+) {
+    match expr {
+        Expr::Closure(closure) => {
+            written.extend(closure_capture_targets_inner(
+                closure,
+                env,
+                visiting_functions,
+            ));
+        }
+        Expr::ClosureCall(closure, args) => {
+            written.extend(closure_capture_targets_inner(
+                closure,
+                env,
+                visiting_functions,
+            ));
+            for argument in args {
+                collect_capture_expr_producers(argument, env, written, visiting_functions);
+            }
+        }
+        Expr::FunctionRef(index, _) => {
+            written.extend(function_capture_targets_inner(
+                *index,
+                env,
+                visiting_functions,
+            ));
+        }
+        Expr::Block { stmts, expr } => {
+            for stmt in stmts {
+                collect_capture_stmt_writes(stmt, env, written, visiting_functions);
+            }
+            collect_capture_expr_producers(expr, env, written, visiting_functions);
+        }
+        Expr::OptionalGet { container, key, .. } => {
+            collect_capture_expr_producers(container, env, written, visiting_functions);
+            collect_capture_expr_producers(key, env, written, visiting_functions);
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            collect_capture_expr_producers(value, env, written, visiting_functions);
+            collect_capture_expr_producers(fallback, env, written, visiting_functions);
+        }
+        Expr::Call(_, _, args, _, _)
+        | Expr::ModuleCall(_, _, args, _)
+        | Expr::LocalCall(_, _, args, _) => {
+            for argument in args {
+                collect_capture_expr_producers(argument, env, written, visiting_functions);
+            }
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            collect_capture_expr_producers(lhs, env, written, visiting_functions);
+            collect_capture_expr_producers(rhs, env, written, visiting_functions);
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => {
+            collect_capture_expr_producers(inner, env, written, visiting_functions);
+        }
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_capture_expr_producers(condition, env, written, visiting_functions);
+            collect_capture_expr_producers(then_expr, env, written, visiting_functions);
+            collect_capture_expr_producers(else_expr, env, written, visiting_functions);
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            collect_capture_expr_producers(value, env, written, visiting_functions);
+            for (_, arm) in arms {
+                collect_capture_expr_producers(arm, env, written, visiting_functions);
+            }
+            collect_capture_expr_producers(default, env, written, visiting_functions);
+        }
+        Expr::ResultConstruct { payload, .. } => {
+            collect_capture_expr_producers(payload, env, written, visiting_functions);
+        }
+        Expr::ResultQuery { value, .. } => {
+            collect_capture_expr_producers(value, env, written, visiting_functions);
+        }
+        Expr::ResultTry { value, .. } => {
+            collect_capture_expr_producers(value, env, written, visiting_functions);
+        }
+        Expr::ResultMatch {
+            value,
+            ok_expr,
+            err_expr,
+            ..
+        } => {
+            collect_capture_expr_producers(value, env, written, visiting_functions);
+            collect_capture_expr_producers(ok_expr, env, written, visiting_functions);
+            collect_capture_expr_producers(err_expr, env, written, visiting_functions);
+        }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            collect_capture_expr_producers(receiver, env, written, visiting_functions);
+            collect_capture_expr_producers(argument, env, written, visiting_functions);
+        }
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::Bytes(_)
+        | Expr::ModuleFunctionRef(_, _)
+        | Expr::UnresolvedFunctionRef { .. }
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. } => {}
     }
 }
 
@@ -2250,6 +2616,10 @@ fn copy_outer_callable_state(walk: &mut CaptureWalk<'_>, nested: &CaptureWalk<'_
     }
     walk.defs = defs;
     walk.param_facts = param_facts;
+    walk.volatile_sources
+        .extend(nested.volatile_sources.iter().copied());
+    let volatile = walk.volatile_sources.clone();
+    invalidate_possible_writes(walk, &volatile);
 }
 
 /// Apply the writes that evaluating `expr` can perform on callable slots in
@@ -2264,14 +2634,20 @@ fn apply_expr_effects(expr: &Expr, walk: &mut CaptureWalk<'_>) {
         | Expr::Bool(_)
         | Expr::String(_)
         | Expr::Bytes(_)
-        | Expr::FunctionRef(_, _)
         | Expr::ModuleFunctionRef(_, _)
         | Expr::UnresolvedFunctionRef { .. }
         | Expr::Var(_)
         | Expr::MoveVar(_)
         | Expr::MoveField { .. }
-        | Expr::MoveIndex { .. }
-        | Expr::Closure(_) => {}
+        | Expr::MoveIndex { .. } => {}
+        Expr::Closure(closure) => {
+            let sources = closure_capture_targets(closure, walk.env);
+            mark_walk_volatile_sources(walk, sources);
+        }
+        Expr::FunctionRef(index, _) => {
+            let sources = function_capture_targets(*index, walk.env);
+            mark_walk_volatile_sources(walk, sources);
+        }
         Expr::OptionalGet { container, key, .. } => {
             apply_expr_effects(container, walk);
             apply_expr_effects(key, walk);
@@ -2289,7 +2665,9 @@ fn apply_expr_effects(expr: &Expr, walk: &mut CaptureWalk<'_>) {
                 apply_expr_effects(argument, walk);
             }
         }
-        Expr::ClosureCall(_, args) => {
+        Expr::ClosureCall(closure, args) => {
+            let sources = closure_capture_targets(closure, walk.env);
+            mark_walk_volatile_sources(walk, sources);
             for argument in args {
                 apply_expr_effects(argument, walk);
             }
@@ -3071,15 +3449,29 @@ fn resolve_closure(
     );
     let saved = std::mem::replace(&mut env.slots, nested);
     let saved_defs = env.local_defs.clone();
+    let saved_volatile = std::mem::take(&mut env.volatile_sources);
     let saved_return = env.lexical_return.clone();
     env.lexical_return = match expected_return {
         Some(schema @ TypeSchema::Result { .. }) => Some(schema.clone()),
         _ => None,
     };
     let resolved = resolve_expr(&mut closure.body, expected_return, env);
+    let body_volatile = std::mem::replace(&mut env.volatile_sources, saved_volatile);
     env.slots = saved;
     env.local_defs = saved_defs;
     env.lexical_return = saved_return;
+    if resolved.is_ok() {
+        let mut written = HashSet::new();
+        collect_expr_writes(&closure.body, &mut written);
+        written.extend(body_volatile);
+        let sources: HashSet<LocalSlot> = closure
+            .capture_copies
+            .iter()
+            .filter(|(_, captured)| written.contains(captured))
+            .map(|(source, _)| *source)
+            .collect();
+        mark_env_volatile_sources(env, sources);
+    }
     resolved
 }
 
@@ -3275,6 +3667,151 @@ mod tests {
             (detail.contains("schema") || detail.contains("assigned") || detail.contains("string"))
                 && !detail.contains("inactive branch"),
             "{detail}"
+        );
+    }
+
+    fn callable_int_schema() -> TypeSchema {
+        TypeSchema::Callable {
+            params: vec![TypeSchema::Int],
+            result: Box::new(TypeSchema::Int),
+        }
+    }
+
+    fn callable_source_env(source: LocalSlot, captured: LocalSlot) -> Env {
+        let mut slots = HashMap::new();
+        slots.insert(source, callable_int_schema());
+        slots.insert(captured, callable_int_schema());
+        let mut local_defs = HashMap::new();
+        local_defs.insert(
+            source,
+            LocalDefinition {
+                capture: TemporaryCallableCapture::Free,
+                target: None,
+                slots: slots.clone(),
+            },
+        );
+        Env {
+            slots,
+            functions: HashMap::new(),
+            function_list: Vec::new(),
+            function_impls: HashMap::new(),
+            struct_schemas: HashMap::new(),
+            local_defs,
+            volatile_sources: HashSet::new(),
+            lexical_return: None,
+        }
+    }
+
+    fn shared_writer_closure(source: LocalSlot, captured: LocalSlot) -> ClosureExpr {
+        ClosureExpr {
+            param_slots: Vec::new(),
+            capture_copies: vec![(source, captured)],
+            body: Box::new(Expr::Block {
+                stmts: vec![Stmt::Assign {
+                    kind: AssignmentKind::Set,
+                    index: captured,
+                    expr: Expr::FunctionRef(0, Vec::new()),
+                    line: 1,
+                }],
+                expr: Box::new(Expr::Int(0)),
+            }),
+        }
+    }
+
+    fn capture_walk<'a>(env: &'a Env, source: LocalSlot) -> CaptureWalk<'a> {
+        CaptureWalk {
+            slots: env.slots.clone(),
+            defs: env.local_defs.clone(),
+            owned_locals: HashSet::from([source]),
+            param_facts: HashMap::new(),
+            volatile_sources: HashSet::new(),
+            env,
+        }
+    }
+
+    #[test]
+    fn closure_call_entry_marks_shared_callable_source_volatile() {
+        let source = 1;
+        let captured = 2;
+        let env = callable_source_env(source, captured);
+        let mut walk = capture_walk(&env, source);
+        let closure = shared_writer_closure(source, captured);
+        apply_expr_effects(&Expr::ClosureCall(closure, Vec::new()), &mut walk);
+        assert!(walk.volatile_sources.contains(&source));
+        assert!(matches!(
+            walk.defs.get(&source).map(|definition| &definition.capture),
+            Some(TemporaryCallableCapture::Unknown)
+        ));
+        assert!(walk.defs[&source].target.is_none());
+    }
+
+    #[test]
+    fn closure_let_entry_marks_shared_callable_source_volatile() {
+        let source = 1;
+        let captured = 2;
+        let env = callable_source_env(source, captured);
+        let mut walk = capture_walk(&env, source);
+        let closure = shared_writer_closure(source, captured);
+        bind_stmt(
+            &Stmt::ClosureLet {
+                line: 1,
+                closure,
+                expected_schema: None,
+            },
+            &mut walk,
+        );
+        assert!(walk.volatile_sources.contains(&source));
+        assert!(matches!(
+            walk.defs.get(&source).map(|definition| &definition.capture),
+            Some(TemporaryCallableCapture::Unknown)
+        ));
+        assert!(walk.defs[&source].target.is_none());
+    }
+
+    #[test]
+    fn nested_closure_capture_write_maps_back_to_outer_source() {
+        let outer_source = 1;
+        let outer_captured = 2;
+        let inner_captured = 3;
+        let env = callable_source_env(outer_source, outer_captured);
+        let inner = shared_writer_closure(outer_captured, inner_captured);
+        let outer = ClosureExpr {
+            param_slots: Vec::new(),
+            capture_copies: vec![(outer_source, outer_captured)],
+            body: Box::new(Expr::Closure(inner)),
+        };
+        assert_eq!(
+            closure_capture_targets(&outer, &env),
+            HashSet::from([outer_source])
+        );
+    }
+
+    #[test]
+    fn named_function_capture_write_maps_back_to_source() {
+        let source = 1;
+        let captured = 2;
+        let env = callable_source_env(source, captured);
+        let implementation = FunctionImpl {
+            param_slots: Vec::new(),
+            capture_copies: vec![(source, captured)],
+            body_stmts: vec![Stmt::Assign {
+                kind: AssignmentKind::Set,
+                index: captured,
+                expr: Expr::FunctionRef(0, Vec::new()),
+                line: 1,
+            }],
+            body_expr: Expr::Int(0),
+            body_expr_line: 1,
+        };
+        assert_eq!(
+            function_capture_targets(
+                7,
+                &Env {
+                    function_impls: HashMap::from([(7, implementation)]),
+                    ..env
+                }
+            ),
+            HashSet::from([source])
         );
     }
 }

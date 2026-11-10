@@ -835,6 +835,50 @@ fn resource_free_statement_if_and_alias_reassignment_stay_executable() {
 }
 
 #[test]
+fn resource_free_frozen_alias_before_shared_writer_stays_executable() {
+    let _guard = PROBE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use probe;
+        fn make_free(tag: int) -> fn(int) -> int {
+            |item| item
+        }
+        fn make_writing(tag: int) -> fn(int) -> int {
+            |item| item + probe::mark(tag)
+        }
+        fn make(tag: int) -> fn(int) -> int {
+            let mut factory = make_free;
+            let alias = factory;
+            let writer = || if true => {
+                factory = make_writing;
+                0
+            } else => {
+                factory = make_free;
+                0
+            };
+            writer();
+            alias(tag)
+        }
+        fn relay(value: Result<int, int>, tag: int) -> int {
+            let mapped = value.map(make(tag));
+            match mapped {
+                Result::Ok(item) => item,
+                Result::Err(error) => error,
+            }
+        }
+        let ok_out = relay(probe::ok(1), 20);
+        let err_out = relay(probe::err(2), 30);
+        ok_out + err_out;
+    "#;
+    let (value, events) = run_probe(source);
+    // The alias keeps the target frozen before the writer barrier. make_writing
+    // must not run, and map still passes both payloads through.
+    assert_eq!(value, Value::Int(3));
+    assert_eq!(events, vec![1, 2]);
+}
+
+#[test]
 fn resource_free_scalar_loop_in_temporary_factory_stays_executable() {
     let _guard = PROBE_LOCK
         .lock()

@@ -1951,3 +1951,408 @@ fn owned_result_combinator_unwrap_or_rejects_discarded_named_err_resource() {
         "{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scope B address4: shared-callable producer volatility regressions
+// ---------------------------------------------------------------------------
+
+fn assert_temporary_capture_rejection(method: &str, source: &str, detail: &str) {
+    let error = compile_with_fixture_catalog(source).expect_err(detail);
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary callable")
+            && text.contains("capture ownership")
+            && text.contains("bind the callable before the method"),
+        "{method}: {text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_writer_reassigned_local_return_factory_capture() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn make_free(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            let mut factory = make_free;
+            let writer = || if true => {
+                factory = make_callback;
+                0
+            } else => {
+                factory = make_free;
+                0
+            };
+            writer();
+            value.map(factory(token))
+        }
+    "#;
+    assert_temporary_capture_rejection(
+        "writer",
+        source,
+        "a called writer must not leave the shared factory definition trusted",
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_branched_writer_shared_factory_capture() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn make_free(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn make(token: resource<result.success>, flag: bool) -> fn(int) -> int {
+            let mut factory = make_free;
+            let writer = if flag => {
+                || if true => {
+                    factory = make_callback;
+                    0
+                } else => {
+                    factory = make_free;
+                    0
+                }
+            } else => {
+                || 0
+            };
+            writer();
+            factory(token)
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make(token, true))
+        }
+    "#;
+    assert_temporary_capture_rejection(
+        "branched-writer",
+        source,
+        "a branch-wrapped writer has no frozen target but still writes the shared factory",
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_named_higher_order_run_of_writer() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn make_free(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn run(action: fn() -> int) -> int {
+            action()
+        }
+        pub fn make(token: resource<result.success>) -> fn(int) -> int {
+            let mut factory = make_free;
+            let writer = || if true => {
+                factory = make_callback;
+                0
+            } else => {
+                factory = make_free;
+                0
+            };
+            run(writer);
+            factory(token)
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make(token))
+        }
+    "#;
+    assert_temporary_capture_rejection(
+        "named-higher-order",
+        source,
+        "a capture-free named callee must not hide the invoked writer's shared write",
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_writer_reassignment_after_barrier() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn make_free(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn make(token: resource<result.success>) -> fn(int) -> int {
+            let mut factory = make_free;
+            let writer = || if true => {
+                factory = make_callback;
+                0
+            } else => {
+                factory = make_free;
+                0
+            };
+            factory = make_free;
+            writer();
+            factory(token)
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make(token))
+        }
+    "#;
+    assert_temporary_capture_rejection(
+        "reassignment-after-barrier",
+        source,
+        "a later assignment to the shared source must not restore a trusted Free target",
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_branch_join_after_barrier() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn make_free(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn make(token: resource<result.success>, flag: bool) -> fn(int) -> int {
+            let mut factory = make_free;
+            let writer = || if true => {
+                factory = make_callback;
+                0
+            } else => {
+                factory = make_free;
+                0
+            };
+            if flag {
+                factory = make_free;
+            } else {
+                factory = make_free;
+            }
+            writer();
+            factory(token)
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make(token, true))
+        }
+    "#;
+    assert_temporary_capture_rejection(
+        "branch-join-after-barrier",
+        source,
+        "a branch join must not re-trust a volatile shared source",
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_alias_created_after_barrier() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn make_free(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            let mut factory = make_free;
+            let writer = || if true => {
+                factory = make_callback;
+                0
+            } else => {
+                factory = make_free;
+                0
+            };
+            writer();
+            let alias = factory;
+            value.map(alias(token))
+        }
+    "#;
+    assert_temporary_capture_rejection(
+        "alias-after-barrier",
+        source,
+        "an alias created after the barrier cannot recover a trusted shared target",
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_nested_closure_writer_capture() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn make_free(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn make(token: resource<result.success>) -> fn(int) -> int {
+            let mut factory = make_free;
+            let writer = || if true => {
+                let nested = || if true => {
+                    factory = make_callback;
+                    0
+                } else => {
+                    factory = make_free;
+                    0
+                };
+                nested();
+                0
+            } else => {
+                factory = make_free;
+                0
+            };
+            writer();
+            factory(token)
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make(token))
+        }
+    "#;
+    assert_temporary_capture_rejection(
+        "nested-closure-writer",
+        source,
+        "a nested writer must map its captured slot back to the caller factory source",
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_named_capture_writer_after_barrier() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn make_free(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn make(token: resource<result.success>) -> fn(int) -> int {
+            let mut factory = make_free;
+            fn install() {
+                factory = make_callback;
+                0
+            }
+            install();
+            factory(token)
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make(token))
+        }
+    "#;
+    assert_temporary_capture_rejection(
+        "named-capture-writer",
+        source,
+        "a capture-bearing named function must poison its shared callable source",
+    );
+}
+
+#[test]
+fn owned_result_combinator_conservatively_rejects_uncalled_shared_writer() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn make_free(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn make(token: resource<result.success>) -> fn(int) -> int {
+            let mut factory = make_free;
+            let writer = || if true => {
+                factory = make_callback;
+                0
+            } else => {
+                factory = make_free;
+                0
+            };
+            factory(token)
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make(token))
+        }
+    "#;
+    assert_temporary_capture_rejection(
+        "uncalled-writer",
+        source,
+        "a potential shared writer is conservatively volatile even before invocation",
+    );
+}
+
+#[test]
+fn owned_result_combinator_keeps_frozen_alias_before_shared_source_write() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn make_free(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn make(token: resource<result.success>) -> fn(int) -> int {
+            let mut factory = make_free;
+            let alias = factory;
+            let writer = || if true => {
+                factory = make_callback;
+                0
+            } else => {
+                factory = make_free;
+                0
+            };
+            writer();
+            alias(token)
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make(token))
+        }
+    "#;
+    compile_with_fixture_catalog(source)
+        .expect("an alias frozen before the barrier keeps its independent Free target");
+}
+
+#[test]
+fn owned_result_combinator_writer_volatility_only_covers_its_shared_source() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        pub fn make_free(tag: int) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn make_writing(tag: int) -> fn(int) -> int {
+            |value| value + 1
+        }
+        pub fn make(tag: int) -> fn(int) -> int {
+            let mut other = make_free;
+            let factory = make_free;
+            let writer = || if true => {
+                other = make_writing;
+                0
+            } else => {
+                other = make_free;
+                0
+            };
+            writer();
+            factory(tag)
+        }
+        pub fn leak(value: Result<int, int>) -> Result<int, int> {
+            value.map(make(7))
+        }
+    "#;
+    compile_with_fixture_catalog(source)
+        .expect("writing an unrelated private callable must not poison the safe factory");
+}
