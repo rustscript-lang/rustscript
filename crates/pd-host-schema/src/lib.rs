@@ -727,7 +727,7 @@ pub fn guest_type_shape(ty: &Type) -> Result<GuestTypeShape<'_>, String> {
                     params.push(walk(&input.ty, depth + 1)?);
                 }
                 let result = match &function.output {
-                    syn::ReturnType::Default => GuestTypeShape::Scalar("null"),
+                    syn::ReturnType::Default => GuestTypeShape::Unit,
                     syn::ReturnType::Type(_, ty) => walk(ty, depth + 1)?,
                 };
                 return Ok(GuestTypeShape::Callable {
@@ -850,7 +850,7 @@ fn callable_type_label(segment: &syn::PathSegment) -> Result<String, String> {
         .map(|input| type_label(&input.ty))
         .collect::<Result<Vec<_>, _>>()?;
     let result = match &function.output {
-        syn::ReturnType::Default => "null".to_string(),
+        syn::ReturnType::Default => "()".to_string(),
         syn::ReturnType::Type(_, ty) => type_label(ty)?,
     };
     Ok(format!("fn({}) -> {result}", params.join(", ")))

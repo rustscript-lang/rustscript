@@ -89,9 +89,11 @@ The wrapper recursively supports scalar, Named-struct, array, logical Unit,
 `GuestResult`, nested `GuestOption`, typed callable payloads, and legal
 owned-resource payloads. A callable payload keeps its full function signature
 (parameter and result schemas) under `GuestOption`/`GuestResult`; the callable
-value itself owns no resource. A resource array is not supported by the host
-handle ABI and is rejected with a capability error; dynamic map/unknown payloads
-and transport results such as `VmResult` inside the payload are also rejected.
+value itself owns no resource. `fn()` and `fn() -> ()` are the same Rust
+function type, so an omitted return publishes the logical Unit result rather
+than Null. A resource array is not supported by the host handle ABI and is
+rejected with a capability error; dynamic map/unknown payloads and transport
+results such as `VmResult` inside the payload are also rejected.
 
 A host function that returns no value has the logical Unit return schema, while
 the call still supplies an internal Null payload. `VmResult<()>` keeps fatal

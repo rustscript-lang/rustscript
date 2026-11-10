@@ -101,13 +101,36 @@ fn guest_option_callable_payload_uses_the_typed_callable_schema() {
 
     let unit: syn::Type = parse_quote!(GuestOption<VmCallable<fn() -> ()>>);
     assert_eq!(shape(&unit).label(), "Option<fn() -> ()>");
-    // A bare `fn()` keeps the existing shared label spelling for its default
-    // return, so macro and build descriptors cannot drift.
+    // `fn()` and `fn() -> ()` are the same Rust function type: an omitted
+    // return publishes logical Unit, not the low-level Null spelling.
     let defaulted: syn::Type = parse_quote!(GuestOption<VmCallable<fn()>>);
-    assert_eq!(shape(&defaulted).label(), "Option<fn() -> null>");
+    let defaulted_shape = shape(&defaulted);
+    assert_eq!(defaulted_shape.label(), "Option<fn() -> ()>");
+    let GuestTypeShape::Option(inner) = &defaulted_shape else {
+        panic!("bare callable Option must keep the Option wrapper");
+    };
+    let GuestTypeShape::Callable { params, result } = inner.as_ref() else {
+        panic!("bare callable payload must use the Callable shape");
+    };
+    assert!(params.is_empty());
+    assert!(matches!(result.as_ref(), GuestTypeShape::Unit));
+
+    let defaulted_typed: syn::Type = parse_quote!(GuestOption<VmCallable<fn(i64)>>);
+    let explicit_typed: syn::Type = parse_quote!(GuestOption<VmCallable<fn(i64) -> ()>>);
+    assert_eq!(shape(&defaulted_typed).label(), "Option<fn(int) -> ()>");
+    assert_eq!(
+        shape(&defaulted_typed).label(),
+        shape(&explicit_typed).label()
+    );
 
     let nested: syn::Type = parse_quote!(GuestResult<GuestOption<VmCallable<fn() -> ()>>, String>);
     assert_eq!(shape(&nested).label(), "Result<Option<fn() -> ()>, string>");
+    let nested_defaulted: syn::Type =
+        parse_quote!(GuestResult<GuestOption<VmCallable<fn()>>, String>);
+    assert_eq!(
+        shape(&nested_defaulted).label(),
+        "Result<Option<fn() -> ()>, string>"
+    );
 
     let malformed: syn::Type = parse_quote!(GuestOption<VmCallable<i64>>);
     let error = guest_type_shape(&malformed).unwrap_err();
@@ -139,6 +162,8 @@ fn guest_option_shape_detection_and_arity_are_strict() {
 fn callable_unit_labels_use_the_unit_spelling() {
     let callable: syn::Type = parse_quote!(VmCallable<fn(i64) -> ()>);
     assert_eq!(type_label(&callable).unwrap(), "fn(int) -> ()");
+    let bare: syn::Type = parse_quote!(VmCallable<fn()>);
+    assert_eq!(type_label(&bare).unwrap(), "fn() -> ()");
     let optional_callable: syn::Type = parse_quote!(Option<VmCallable<fn() -> ()>>);
     assert_eq!(type_label(&optional_callable).unwrap(), "fn() -> () | null");
 }

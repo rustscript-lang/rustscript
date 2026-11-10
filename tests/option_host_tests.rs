@@ -84,6 +84,7 @@ fn descriptors() -> Vec<vm::HostFunctionDescriptor> {
         generated::functions::callable_pick_descriptor(),
         generated::functions::callable_count_descriptor(),
         generated::functions::callable_unit_echo_descriptor(),
+        generated::functions::callable_unit_default_echo_descriptor(),
         generated::functions::callable_pair_echo_descriptor(),
         generated::functions::resource_make_descriptor(),
         generated::functions::resource_take_descriptor(),
@@ -171,6 +172,10 @@ fn build_fixture_and_proc_macro_descriptors_are_identical() {
             result_sdk_build_callable_unit_echo(),
         ),
         (
+            generated::functions::callable_unit_default_echo_descriptor(),
+            result_sdk_build_callable_unit_default_echo(),
+        ),
+        (
             generated::functions::callable_pair_echo_descriptor(),
             result_sdk_build_callable_pair_echo(),
         ),
@@ -245,6 +250,22 @@ fn build_fixture_and_proc_macro_descriptors_are_identical() {
     };
     assert!(params.is_empty());
     assert!(matches!(result.as_ref(), vm::HostTypeSchema::Unit));
+
+    let defaulted_unit_schema = &generated::functions::callable_unit_default_echo_descriptor()
+        .schema
+        .params[0]
+        .ty;
+    assert_eq!(
+        defaulted_unit_schema, unit_schema,
+        "omitted and explicit Unit callable spellings must publish the same schema"
+    );
+    assert_eq!(
+        generated::functions::callable_unit_default_echo_descriptor()
+            .schema
+            .params[0]
+            .passing,
+        vm::HostParamPassing::Value
+    );
 
     let pair_schema = &generated::functions::callable_pair_echo_descriptor()
         .schema
@@ -395,6 +416,28 @@ fn generated_host_roundtrips_callable_option_payloads() {
 }
 
 #[test]
+fn generated_host_admits_and_invokes_bare_rust_callable_unit() {
+    let source = r#"
+        use option_sdk;
+        fn tick() { let total: int = option_sdk::inspect(Option::Some([2, 3])); }
+        fn invoke_unit(f: fn() -> ()) -> int { f(); 5 }
+        let selected: Option<fn() -> ()> = option_sdk::callable_unit_default_echo(Option::Some(tick));
+        let called = match selected { Option::Some(f) => invoke_unit(f), Option::None => -1 };
+        let absent: Option<fn() -> ()> = option_sdk::callable_unit_default_echo(Option::None);
+        let skipped = match absent { Option::Some(f) => invoke_unit(f), Option::None => -6 };
+        called + skipped;
+    "#;
+    let mut runtime = machine(source);
+    assert_eq!(runtime.run().unwrap(), VmStatus::Halted);
+    assert_eq!(runtime.stack().last(), Some(&Value::Int(-1)));
+    assert_eq!(
+        runtime.host_context().module_state::<usize>().copied(),
+        Some(1),
+        "Some must invoke the no-tail callable body once; None must stay uncalled"
+    );
+}
+
+#[test]
 fn typed_rust_callback_accepts_returns_and_invokes_guest_option_callable() {
     let compiled = vm::compile_source(
         "fn double(value: int) -> int { value + value }\n\
@@ -456,6 +499,24 @@ fn typed_rust_callback_accepts_returns_and_invokes_guest_option_callable() {
     assert_eq!(unit_invoke.call(&mut store, ()).unwrap(), ());
     assert!(matches!(
         make_unit.call(&mut store, (false,)).unwrap(),
+        GuestOption::None
+    ));
+
+    // The omitted Rust spelling is the same public callable type and must
+    // admit the no-tail RSS function through the typed Store path too.
+    let make_unit_bare = store
+        .script_callback_by_name::<(bool,), GuestOption<VmCallable<fn()>>>("make_unit")
+        .unwrap();
+    let bare_selected = match make_unit_bare.call(&mut store, (true,)).unwrap() {
+        GuestOption::Some(value) => value,
+        GuestOption::None => panic!("bare Unit selection must carry a callable"),
+    };
+    let bare_invoke = store
+        .script_callback::<(), ()>(bare_selected.into_value())
+        .unwrap();
+    assert_eq!(bare_invoke.call(&mut store, ()).unwrap(), ());
+    assert!(matches!(
+        make_unit_bare.call(&mut store, (false,)).unwrap(),
         GuestOption::None
     ));
 
