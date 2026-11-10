@@ -1987,7 +1987,7 @@ fn result_try_aot_artifact_closes_live_local_before_vm_drop() {
     bind_result_hosts(&mut producer);
     let artifact = producer
         .encode_aot_artifact()
-        .expect("AOT artifact should embed the current v13 cleanup section");
+        .expect("AOT artifact should embed the current v14 cleanup section");
     drop(producer);
     reset_exit_observers();
     let mut vm = Vm::new_from_aot_artifact_with_jit_config(&artifact, jit)

@@ -29,6 +29,10 @@ impl ParserDialect for RustScriptDialect {
         true
     }
 
+    fn allow_option_syntax(&self) -> bool {
+        true
+    }
+
     fn allow_result_try(&self) -> bool {
         true
     }

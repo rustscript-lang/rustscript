@@ -21,6 +21,7 @@ mod lifetime;
 mod linker;
 mod materialization;
 mod modules;
+mod option;
 mod parser;
 mod pipeline;
 mod result;

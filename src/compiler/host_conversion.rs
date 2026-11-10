@@ -44,6 +44,7 @@ impl HostTypeSchema {
         match self {
             HostTypeSchema::Unknown => TypeSchema::Unknown,
             HostTypeSchema::Null => TypeSchema::Null,
+            HostTypeSchema::Unit => TypeSchema::Unit,
             HostTypeSchema::Int => TypeSchema::Int,
             HostTypeSchema::Float => TypeSchema::Float,
             HostTypeSchema::Number => TypeSchema::Number,
@@ -54,6 +55,9 @@ impl HostTypeSchema {
             HostTypeSchema::Map(inner) => TypeSchema::Map(Box::new(inner.to_compiler_schema())),
             HostTypeSchema::Optional(inner) => {
                 TypeSchema::Optional(Box::new(inner.to_compiler_schema()))
+            }
+            HostTypeSchema::Option(inner) => {
+                TypeSchema::Option(Box::new(inner.to_compiler_schema()))
             }
             HostTypeSchema::Callable { params, result } => TypeSchema::Callable {
                 params: params.iter().map(Self::to_compiler_schema).collect(),
@@ -82,6 +86,9 @@ impl HostTypeSchema {
             }
             HostTypeSchema::Optional(inner) => {
                 TypeSchema::Optional(Box::new(inner.to_compiler_object_schema()))
+            }
+            HostTypeSchema::Option(inner) => {
+                TypeSchema::Option(Box::new(inner.to_compiler_object_schema()))
             }
             HostTypeSchema::Callable { params, result } => TypeSchema::Callable {
                 params: params.iter().map(Self::to_compiler_object_schema).collect(),
@@ -138,6 +145,7 @@ pub(crate) fn to_host_schema(schema: &TypeSchema) -> HostTypeSchema {
     match schema {
         TypeSchema::Unknown | TypeSchema::GenericParam(_) => HostTypeSchema::Unknown,
         TypeSchema::Null => HostTypeSchema::Null,
+        TypeSchema::Unit => HostTypeSchema::Unit,
         TypeSchema::Int => HostTypeSchema::Int,
         TypeSchema::Float => HostTypeSchema::Float,
         TypeSchema::Number => HostTypeSchema::Number,
@@ -145,6 +153,7 @@ pub(crate) fn to_host_schema(schema: &TypeSchema) -> HostTypeSchema {
         TypeSchema::String => HostTypeSchema::String,
         TypeSchema::Bytes => HostTypeSchema::Bytes,
         TypeSchema::Optional(inner) => HostTypeSchema::Optional(Box::new(to_host_schema(inner))),
+        TypeSchema::Option(inner) => HostTypeSchema::Option(Box::new(to_host_schema(inner))),
         TypeSchema::Array(inner) => HostTypeSchema::Array(Box::new(to_host_schema(inner))),
         TypeSchema::ArrayTuple(items) => HostTypeSchema::Array(Box::new(
             items

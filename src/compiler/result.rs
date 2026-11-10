@@ -414,24 +414,34 @@ fn resolve_expr(
             resolve_expr(value, None, env)?;
             resolve_expr(fallback, expected, env)
         }
-        Expr::Call(index, type_args, args, _, _) => {
-            let expected_args = super::typing::argument_schemas_for_call(
-                &env.function_list,
-                &env.function_impls,
-                &env.struct_schemas,
-                *index,
-                type_args,
-            )
-            .or_else(|| {
-                super::typing::expected_container_argument_schemas(
-                    &env.function_list,
-                    &env.function_impls,
-                    &env.struct_schemas,
-                    *index,
-                    args,
-                    expected,
-                )
+        Expr::Call(index, type_args, args, resolution, _) => {
+            let expected_args = resolution.as_ref().map(|resolved| {
+                resolved
+                    .params
+                    .iter()
+                    .map(|param| Some(param.schema.clone()))
+                    .collect::<Vec<_>>()
             });
+            let expected_args = expected_args
+                .or_else(|| {
+                    super::typing::argument_schemas_for_call(
+                        &env.function_list,
+                        &env.function_impls,
+                        &env.struct_schemas,
+                        *index,
+                        type_args,
+                    )
+                })
+                .or_else(|| {
+                    super::typing::expected_container_argument_schemas(
+                        &env.function_list,
+                        &env.function_impls,
+                        &env.struct_schemas,
+                        *index,
+                        args,
+                        expected,
+                    )
+                });
             for (offset, arg) in args.iter_mut().enumerate() {
                 let expected_arg = expected_args
                     .as_ref()
@@ -506,7 +516,56 @@ fn resolve_expr(
             mark_env_volatile_sources(env, sources);
             Ok(())
         }
+        Expr::OptionConstruct {
+            some,
+            payload,
+            option_schema,
+            ..
+        } => {
+            let declared = match expected {
+                Some(schema @ TypeSchema::Option(inner)) => Some((schema.clone(), inner.as_ref())),
+                _ => None,
+            };
+            if let Some(payload) = payload {
+                let inner = declared.as_ref().and_then(|(_, inner)| {
+                    (!matches!(inner, TypeSchema::Unknown)).then_some(*inner)
+                });
+                resolve_expr(payload, if *some { inner } else { None }, env)?;
+            }
+            if let Some((schema, inner)) = declared
+                && !matches!(inner, TypeSchema::Unknown)
+                && matches!(option_schema, TypeSchema::Unknown)
+            {
+                // Seed the logical Option schema from the surrounding Result
+                // payload expectation so payload validation can compare it
+                // before the standalone Option resolver runs.
+                *option_schema = schema;
+            }
+            Ok(())
+        }
+        Expr::OptionMatch {
+            value,
+            some_binding,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            resolve_expr(value, None, env)?;
+            let schema = authoritative_schema(value, env);
+            let inner = match &schema {
+                Some(TypeSchema::Option(inner)) => Some(inner.as_ref().clone()),
+                _ => None,
+            };
+            let saved = env.slots.clone();
+            if let (Some(slot), Some(inner)) = (*some_binding, inner) {
+                env.slots.insert(slot, inner);
+            }
+            resolve_expr(some_expr, expected, env)?;
+            env.slots = saved;
+            resolve_expr(none_expr, expected, env)
+        }
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -553,6 +612,15 @@ fn resolve_method(
     let receiver_schema = authoritative_schema(&receiver, env);
     let result_schema = match receiver_schema {
         Some(schema @ TypeSchema::Result { .. }) => schema,
+        Some(TypeSchema::Option(_)) => {
+            return Err(result_error(
+                span,
+                format!(
+                    "logical Option<T> does not support .{}(); Option operations are outside the current contract",
+                    method.name()
+                ),
+            ));
+        }
         other => {
             // `.unwrap_or(...)` keeps the pre-existing nullable lowering for
             // every non-Result receiver; the Result methods are new syntax and
@@ -1588,6 +1656,7 @@ fn temporary_callable_capture(
         // Scalar leaves cannot produce a callable value; every other
         // unmodeled callable-producing expression is unproven, not Free.
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -2604,7 +2673,23 @@ fn collect_capture_expr_producers(
             collect_capture_expr_producers(receiver, env, written, visiting_functions);
             collect_capture_expr_producers(argument, env, written, visiting_functions);
         }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                collect_capture_expr_producers(payload, env, written, visiting_functions);
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            collect_capture_expr_producers(value, env, written, visiting_functions);
+            collect_capture_expr_producers(some_expr, env, written, visiting_functions);
+            collect_capture_expr_producers(none_expr, env, written, visiting_functions);
+        }
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -2657,6 +2742,7 @@ fn copy_outer_callable_state(walk: &mut CaptureWalk<'_>, nested: &CaptureWalk<'_
 fn apply_expr_effects(expr: &Expr, walk: &mut CaptureWalk<'_>) {
     match expr {
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -2786,6 +2872,24 @@ fn apply_expr_effects(expr: &Expr, walk: &mut CaptureWalk<'_>) {
             apply_expr_effects(receiver, walk);
             apply_expr_effects(argument, walk);
         }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                apply_expr_effects(payload, walk);
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            apply_expr_effects(value, walk);
+            let mut some_walk = walk.clone();
+            apply_expr_effects(some_expr, &mut some_walk);
+            let mut none_walk = walk.clone();
+            apply_expr_effects(none_expr, &mut none_walk);
+            join_branch_walks(walk, &some_walk, &none_walk);
+        }
     }
 }
 
@@ -2848,6 +2952,7 @@ fn collect_stmt_writes(stmt: &Stmt, written: &mut HashSet<LocalSlot>) {
 fn collect_expr_writes(expr: &Expr, written: &mut HashSet<LocalSlot>) {
     match expr {
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -2945,6 +3050,21 @@ fn collect_expr_writes(expr: &Expr, written: &mut HashSet<LocalSlot>) {
             collect_expr_writes(receiver, written);
             collect_expr_writes(argument, written);
         }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                collect_expr_writes(payload, written);
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            collect_expr_writes(value, written);
+            collect_expr_writes(some_expr, written);
+            collect_expr_writes(none_expr, written);
+        }
     }
 }
 
@@ -3020,6 +3140,17 @@ fn find_resource_capturing_closure(expr: &Expr, env: &Env) -> Option<TypeSchema>
             receiver, argument, ..
         } => find_resource_capturing_closure(receiver, env)
             .or_else(|| find_resource_capturing_closure(argument, env)),
+        Expr::OptionConstruct { payload, .. } => payload
+            .as_deref()
+            .and_then(|payload| find_resource_capturing_closure(payload, env)),
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => find_resource_capturing_closure(value, env)
+            .or_else(|| find_resource_capturing_closure(some_expr, env))
+            .or_else(|| find_resource_capturing_closure(none_expr, env)),
         Expr::OptionalGet { container, key, .. } => find_resource_capturing_closure(container, env)
             .or_else(|| find_resource_capturing_closure(key, env)),
         Expr::OptionUnwrapOr {
@@ -3027,6 +3158,7 @@ fn find_resource_capturing_closure(expr: &Expr, env: &Env) -> Option<TypeSchema>
         } => find_resource_capturing_closure(value, env)
             .or_else(|| find_resource_capturing_closure(fallback, env)),
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)

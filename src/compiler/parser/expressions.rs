@@ -367,6 +367,11 @@ impl Parser {
                 let expr = self.parse_result_constructor(name_span)?;
                 return self.parse_postfix_access(expr, name_span);
             }
+            if self.dialect.allow_option_syntax() && name == "Option" && self.check_path_separator()
+            {
+                let expr = self.parse_option_constructor(name_span)?;
+                return self.parse_postfix_access(expr, name_span);
+            }
             if self.dialect.allow_dotted_call()
                 && let Some(expr) = self.try_parse_js_dotted_call(&name, name_span)?
             {
@@ -701,6 +706,9 @@ impl Parser {
                 .get(self.pos.saturating_sub(1))
                 .map(|t| t.span)
                 .unwrap_or_else(|| self.current_span());
+            if self.dialect.allow_option_syntax() && self.match_kind(&TokenKind::RParen) {
+                return Ok(Expr::Unit);
+            }
             let mut expr = self.parse_expr()?;
             self.expect(&TokenKind::RParen, "expected ')' after expression")?;
             expr = self.parse_postfix_access(expr, open_span)?;
@@ -804,23 +812,24 @@ impl Parser {
             let expr = if let Some(expr) = trailing_expr {
                 expr
             } else {
-                let Some(last_stmt) = stmts.pop() else {
-                    return Err(ParseError {
-                        span: None,
-                        code: None,
-                        line: parser.current_line(),
-                        message: "if expression branch must end with an expression".to_string(),
-                    });
-                };
-                if let Stmt::Expr { expr, .. } = last_stmt {
-                    expr
-                } else {
-                    return Err(ParseError {
-                        span: None,
-                        code: None,
-                        line: parser.current_line(),
-                        message: "if expression branch must end with an expression".to_string(),
-                    });
+                match stmts.last() {
+                    Some(Stmt::Expr { .. }) => {
+                        let last_stmt = stmts.pop().expect("checked last statement");
+                        let Stmt::Expr { expr, .. } = last_stmt else {
+                            unreachable!("checked expression statement");
+                        };
+                        expr
+                    }
+                    Some(_) if parser.dialect.allow_option_syntax() => Expr::Unit,
+                    None if parser.dialect.allow_option_syntax() => Expr::Unit,
+                    _ => {
+                        return Err(ParseError {
+                            span: None,
+                            code: None,
+                            line: parser.current_line(),
+                            message: "if expression branch must end with an expression".to_string(),
+                        });
+                    }
                 }
             };
 
@@ -885,6 +894,117 @@ impl Parser {
             && self.check_kind_at(self.pos + 2, &TokenKind::Colon)
     }
 
+    pub(super) fn parse_option_constructor(&mut self, start: Span) -> Result<Expr, ParseError> {
+        if !self.match_path_separator() {
+            return Err(ParseError {
+                span: Some(start),
+                code: None,
+                line: self.current_line(),
+                message: "expected '::' after Option".to_string(),
+            });
+        }
+        let ctor = self.expect_ident("expected Option constructor 'Some' or 'None'")?;
+        let (some, payload) = match ctor.as_str() {
+            "Some" => {
+                self.expect(&TokenKind::LParen, "expected '(' after Option::Some")?;
+                let payload = self.parse_expr()?;
+                self.expect(
+                    &TokenKind::RParen,
+                    "expected ')' after Option::Some payload",
+                )?;
+                (true, Some(Box::new(payload)))
+            }
+            "None" => {
+                if self.check(&TokenKind::LParen) {
+                    return Err(ParseError {
+                        span: Some(start),
+                        code: None,
+                        line: self.current_line(),
+                        message: "Option::None has no payload".to_string(),
+                    });
+                }
+                (false, None)
+            }
+            other => {
+                return Err(ParseError {
+                    span: Some(start),
+                    code: None,
+                    line: self.current_line(),
+                    message: format!("unknown Option constructor '{other}'"),
+                });
+            }
+        };
+        let hi = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span.hi)
+            .unwrap_or(start.hi);
+        Ok(Expr::OptionConstruct {
+            some,
+            payload,
+            option_schema: TypeSchema::Unknown,
+            span: Span::new(start.source_id, start.lo, hi),
+            semantic_id: None,
+        })
+    }
+
+    fn peek_option_constructor_pattern(&self) -> bool {
+        self.dialect.allow_option_syntax()
+            && self.check_ident_literal("Option")
+            && self.check_kind_at(self.pos + 1, &TokenKind::Colon)
+            && self.check_kind_at(self.pos + 2, &TokenKind::Colon)
+    }
+
+    fn parse_option_constructor_pattern(&mut self) -> Result<ResultConstructorPattern, ParseError> {
+        let start = self.current_span();
+        let name = self.expect_ident("expected Option")?;
+        if name != "Option" || !self.match_path_separator() {
+            return Err(ParseError {
+                span: Some(start),
+                code: None,
+                line: self.current_line(),
+                message: "expected Option::Some or Option::None match pattern".to_string(),
+            });
+        }
+        let ctor = self.expect_ident("expected Option constructor in match pattern")?;
+        match ctor.as_str() {
+            "None" => {
+                if self.check(&TokenKind::LParen) {
+                    return Err(ParseError {
+                        span: Some(start),
+                        code: None,
+                        line: self.current_line(),
+                        message: "Option::None match pattern has no payload".to_string(),
+                    });
+                }
+                Ok((false, None))
+            }
+            "Some" => {
+                self.expect(&TokenKind::LParen, "expected '(' in Option match pattern")?;
+                let binding = if self.match_ident_literal("_") {
+                    None
+                } else {
+                    let (binding_name, binding_span) = self
+                        .expect_ident_with_span("expected binding name in Option match pattern")?;
+                    let slot = self.allocate_hidden_local()?;
+                    self.set_local_slot_mutable(slot, false);
+                    Some((binding_name, binding_span, slot))
+                };
+                self.expect(
+                    &TokenKind::RParen,
+                    "expected ')' after Option match pattern",
+                )?;
+                Ok((true, binding))
+            }
+            other => Err(ParseError {
+                span: Some(start),
+                code: None,
+                line: self.current_line(),
+                message: format!("unknown Option match constructor '{other}'"),
+            }),
+        }
+    }
+
     fn parse_result_constructor_pattern(&mut self) -> Result<ResultConstructorPattern, ParseError> {
         let start = self.current_span();
         let name = self.expect_ident("expected Result")?;
@@ -937,6 +1057,9 @@ impl Parser {
         let mut result_ok: Option<(Option<LocalSlot>, Expr)> = None;
         let mut result_err: Option<(Option<LocalSlot>, Expr)> = None;
         let mut saw_result_arm = false;
+        let mut option_some: Option<(Option<LocalSlot>, Expr)> = None;
+        let mut option_none: Option<Expr> = None;
+        let mut saw_option_arm = false;
 
         while !self.check(&TokenKind::RBrace) {
             if self.check(&TokenKind::Eof) {
@@ -949,7 +1072,47 @@ impl Parser {
             }
 
             let pattern_token_line = self.current_line();
-            if self.peek_result_constructor_pattern() {
+            if self.peek_option_constructor_pattern() {
+                let (some, binding) = self.parse_option_constructor_pattern()?;
+                self.expect(&TokenKind::FatArrow, "expected '=>' in match arm")?;
+                let arm_expr = if let Some((name, ident_span, slot)) = binding.clone() {
+                    let mut scope = HashMap::new();
+                    scope.insert(name.clone(), slot);
+                    self.closure_scopes.push(scope);
+                    let arm_open = self.current_span();
+                    let arm_result = self.with_scope(arm_open, |parser| {
+                        parser.record_local_decl(ident_span, ident_span, slot, name);
+                        parser.parse_expr()
+                    });
+                    self.closure_scopes.pop();
+                    arm_result?
+                } else {
+                    let arm_open = self.current_span();
+                    self.with_scope(arm_open, |parser| parser.parse_expr())?
+                };
+                saw_option_arm = true;
+                if some {
+                    if option_some.is_some() {
+                        return Err(ParseError {
+                            span: None,
+                            code: None,
+                            line: pattern_token_line,
+                            message: "duplicate Option::Some match arm".to_string(),
+                        });
+                    }
+                    option_some = Some((binding.map(|(_, _, slot)| slot), arm_expr));
+                } else {
+                    if option_none.is_some() {
+                        return Err(ParseError {
+                            span: None,
+                            code: None,
+                            line: pattern_token_line,
+                            message: "duplicate Option::None match arm".to_string(),
+                        });
+                    }
+                    option_none = Some(arm_expr);
+                }
+            } else if self.peek_result_constructor_pattern() {
                 let (ok, binding) = self.parse_result_constructor_pattern()?;
                 self.expect(&TokenKind::FatArrow, "expected '=>' in match arm")?;
                 let arm_expr = if let Some((name, ident_span, slot)) = binding.clone() {
@@ -1052,6 +1215,72 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RBrace, "expected '}' after match expression")?;
+
+        if saw_option_arm {
+            if saw_result_arm {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: "Option match cannot mix constructor arms with Result arms"
+                        .to_string(),
+                });
+            }
+            if !arms.is_empty() {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: "Option match cannot mix constructor arms with value patterns"
+                        .to_string(),
+                });
+            }
+            let (some_binding, some_expr) = if let Some((slot, expr)) = option_some {
+                if option_none.is_some() && default.is_some() {
+                    return Err(ParseError {
+                        span: None,
+                        code: None,
+                        line: self.current_line(),
+                        message:
+                            "Option match with both constructor arms cannot also have a wildcard"
+                                .to_string(),
+                    });
+                }
+                (slot, expr)
+            } else if let Some(expr) = default.clone() {
+                (None, expr)
+            } else {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: "Option match is missing Option::Some arm".to_string(),
+                });
+            };
+            let none_expr = if let Some(expr) = option_none {
+                expr
+            } else if let Some(expr) = default {
+                expr
+            } else {
+                return Err(ParseError {
+                    span: None,
+                    code: None,
+                    line: self.current_line(),
+                    message: "Option match is missing Option::None arm".to_string(),
+                });
+            };
+            let span = self.current_span();
+            return Ok(Expr::OptionMatch {
+                value: Box::new(value),
+                value_slot,
+                some_binding,
+                some_expr: Box::new(some_expr),
+                none_expr: Box::new(none_expr),
+                scrutinee_schema: TypeSchema::Unknown,
+                span,
+                semantic_id: None,
+            });
+        }
 
         if saw_result_arm {
             if !arms.is_empty() {

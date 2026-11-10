@@ -83,6 +83,7 @@ impl Graph<'_> {
         for _ in 0..MAX_DEPTH {
             owned_schema = match owned_schema {
                 Some(TypeSchema::Optional(inner)) => Some(*inner),
+                Some(TypeSchema::Option(inner)) => Some(*inner),
                 Some(TypeSchema::Named(ref name, ref args)) => super::super::NamedStructLookup {
                     host: &self.vm.host.named_struct_schemas,
                     guest: &self.vm.program.named_struct_decls,
@@ -157,6 +158,14 @@ impl Graph<'_> {
                             match values.get(&Value::string("tag")) {
                                 Some(Value::Bool(true)) => Some(ok.as_ref()),
                                 Some(Value::Bool(false)) => Some(err.as_ref()),
+                                _ => None,
+                            }
+                        }
+                        (Some(TypeSchema::Option(inner)), Value::String(name))
+                            if name.as_str() == "payload" =>
+                        {
+                            match values.get(&Value::string("tag")) {
+                                Some(Value::Bool(true)) => Some(inner.as_ref()),
                                 _ => None,
                             }
                         }

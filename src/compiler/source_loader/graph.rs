@@ -448,7 +448,10 @@ fn collect_named_schema_names(schema: &TypeSchema, names: &mut HashSet<String>) 
                 collect_named_schema_names(argument, names);
             }
         }
-        TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
+        TypeSchema::Optional(inner)
+        | TypeSchema::Option(inner)
+        | TypeSchema::Array(inner)
+        | TypeSchema::Map(inner) => {
             collect_named_schema_names(inner, names);
         }
         TypeSchema::ArrayTuple(items) => {
@@ -479,6 +482,7 @@ fn collect_named_schema_names(schema: &TypeSchema, names: &mut HashSet<String>) 
         }
         TypeSchema::Unknown
         | TypeSchema::Null
+        | TypeSchema::Unit
         | TypeSchema::Int
         | TypeSchema::Float
         | TypeSchema::Number
@@ -1795,6 +1799,7 @@ fn resolve_expr_imported_calls(
             }
         }
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -1899,6 +1904,36 @@ fn resolve_expr_imported_calls(
             resolve_expr_imported_calls(ctx, value, line, parsed_semantic_index.as_deref_mut())?;
             resolve_expr_imported_calls(ctx, ok_expr, line, parsed_semantic_index.as_deref_mut())?;
             resolve_expr_imported_calls(ctx, err_expr, line, parsed_semantic_index.as_deref_mut())?;
+        }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                resolve_expr_imported_calls(
+                    ctx,
+                    payload,
+                    line,
+                    parsed_semantic_index.as_deref_mut(),
+                )?;
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            resolve_expr_imported_calls(ctx, value, line, parsed_semantic_index.as_deref_mut())?;
+            resolve_expr_imported_calls(
+                ctx,
+                some_expr,
+                line,
+                parsed_semantic_index.as_deref_mut(),
+            )?;
+            resolve_expr_imported_calls(
+                ctx,
+                none_expr,
+                line,
+                parsed_semantic_index.as_deref_mut(),
+            )?;
         }
         Expr::IfElse {
             condition,

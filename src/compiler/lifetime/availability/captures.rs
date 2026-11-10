@@ -430,6 +430,7 @@ impl AvailabilityAnalyzer {
     ) {
         match expr {
             Expr::Null
+            | Expr::Unit
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
@@ -630,6 +631,32 @@ impl AvailabilityAnalyzer {
                 other.visit_result_children(|child| {
                     self.capture_mode_for_expr(child, captured_slot, context, implicit, scan);
                 });
+            }
+            Expr::OptionConstruct { payload, .. } => {
+                if let Some(payload) = payload {
+                    self.capture_mode_for_expr(payload, captured_slot, context, implicit, scan);
+                }
+            }
+            Expr::OptionMatch {
+                value,
+                value_slot,
+                some_binding,
+                some_expr,
+                none_expr,
+                ..
+            } => {
+                if *value_slot == captured_slot
+                    || some_binding.is_some_and(|binding| binding == captured_slot)
+                {
+                    scan.seen = true;
+                    scan.mode = scan.mode.max(context);
+                    if implicit && context == CaptureBindingMode::Copy {
+                        scan.implicit_read = true;
+                    }
+                }
+                self.capture_mode_for_expr(value, captured_slot, context, implicit, scan);
+                self.capture_mode_for_expr(some_expr, captured_slot, context, implicit, scan);
+                self.capture_mode_for_expr(none_expr, captured_slot, context, implicit, scan);
             }
             Expr::Block { stmts, expr } => {
                 self.capture_mode_for_stmts(stmts, captured_slot, context, implicit, scan);

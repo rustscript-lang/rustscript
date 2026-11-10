@@ -472,6 +472,8 @@ fn inline_schema_guard_type(schema: &TypeSchema) -> Option<Option<ValueType>> {
             Some(Some(ValueType::Array))
         }
         TypeSchema::Null => Some(Some(ValueType::Null)),
+        TypeSchema::Unit => Some(Some(ValueType::Null)),
+        TypeSchema::Option(_) => Some(Some(ValueType::Map)),
         TypeSchema::Number | TypeSchema::Optional(_) | TypeSchema::Callable { .. } => None,
         TypeSchema::Resource(_) => None,
     }

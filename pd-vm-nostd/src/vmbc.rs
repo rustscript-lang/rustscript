@@ -9,7 +9,7 @@ use super::{
 };
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V13: u16 = 13;
+const VERSION_V14: u16 = 14;
 const FLAGS: u16 = 0;
 const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;
@@ -72,7 +72,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V13 {
+    if version != VERSION_V14 {
         return Err(WireError::UnsupportedVersion(version));
     }
     let flags = cursor.read_u16()?;
@@ -221,7 +221,8 @@ fn skip_host_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireErr
     }
     match cursor.read_u8()? {
         0..=7 => Ok(()),
-        8..=10 => skip_host_schema(cursor, depth + 1),
+        8..=10 | 15 => skip_host_schema(cursor, depth + 1),
+        16 => Ok(()),
         11 => {
             let parameter_count =
                 cursor.read_count_with_overhead("host callable parameters", 1, 1)?;
@@ -265,7 +266,8 @@ fn skip_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<(), WireError> {
             }
             Ok(())
         }
-        10 | 13 | 16 => skip_schema(cursor, nested_depth),
+        10 | 13 | 16 | 19 => skip_schema(cursor, nested_depth),
+        20 => Ok(()),
         11 => {
             let count = cursor.read_count("schema tuple items", 1)?;
             for _ in 0..count {
@@ -488,6 +490,7 @@ enum WireSchema {
         result: Box<WireSchema>,
     },
     Optional(Box<WireSchema>),
+    Option(Box<WireSchema>),
     Resource,
     Result {
         ok: Box<WireSchema>,
@@ -567,6 +570,8 @@ fn read_cleanup_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<WireSche
             ok: Box::new(read_cleanup_schema(cursor, nested)?),
             err: Box::new(read_cleanup_schema(cursor, nested)?),
         },
+        19 => WireSchema::Option(Box::new(read_cleanup_schema(cursor, nested)?)),
+        20 => WireSchema::Scalar,
         value => return Err(WireError::InvalidValueType(value)),
     })
 }
@@ -599,7 +604,10 @@ fn cleanup_schema_owns(
             cleanup_schema_owns(&param_args[index], decls, &[], &[], next, nodes, active)
         }
         WireSchema::Resource => Ok(true),
-        WireSchema::Array(inner) | WireSchema::Map(inner) | WireSchema::Optional(inner) => {
+        WireSchema::Array(inner)
+        | WireSchema::Map(inner)
+        | WireSchema::Optional(inner)
+        | WireSchema::Option(inner) => {
             cleanup_schema_owns(inner, decls, param_names, param_args, next, nodes, active)
         }
         WireSchema::Tuple(items) => {
@@ -710,6 +718,9 @@ fn substitute_schema(
         }
         WireSchema::Optional(inner) => {
             WireSchema::Optional(Box::new(substitute_schema(inner, param_names, param_args)))
+        }
+        WireSchema::Option(inner) => {
+            WireSchema::Option(Box::new(substitute_schema(inner, param_names, param_args)))
         }
         WireSchema::Map(inner) => {
             WireSchema::Map(Box::new(substitute_schema(inner, param_names, param_args)))

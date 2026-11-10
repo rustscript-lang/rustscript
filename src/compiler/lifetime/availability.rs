@@ -1015,6 +1015,7 @@ impl AvailabilityAnalyzer {
         }
         match expr {
             Expr::Null
+            | Expr::Unit
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
@@ -1339,6 +1340,34 @@ impl AvailabilityAnalyzer {
                 self.mark_owned_value_reads_moved(err_expr, &mut out);
                 Ok(out)
             }
+            Expr::OptionConstruct { payload, .. } => {
+                let mut out = if let Some(payload) = payload {
+                    self.analyze_expr(payload, state, line)?
+                } else {
+                    state.clone()
+                };
+                if let Some(payload) = payload {
+                    self.mark_owned_value_reads_moved(payload, &mut out);
+                }
+                Ok(out)
+            }
+            Expr::OptionMatch {
+                value,
+                value_slot,
+                some_binding,
+                some_expr,
+                none_expr,
+                ..
+            } => {
+                let (some_in, none_in) =
+                    self.option_match_arm_states(value, *value_slot, *some_binding, state, line)?;
+                let some_state = self.analyze_expr(some_expr, &some_in, line)?;
+                let none_state = self.analyze_expr(none_expr, &none_in, line)?;
+                let mut out = self.merge_states(some_state, none_state);
+                self.mark_owned_value_reads_moved(some_expr, &mut out);
+                self.mark_owned_value_reads_moved(none_expr, &mut out);
+                Ok(out)
+            }
             Expr::ToOwned(inner) => {
                 // `.copy()` on a resource-containing value would duplicate the
                 // underlying handle; the core has no generic resource copy, so
@@ -1510,6 +1539,27 @@ impl AvailabilityAnalyzer {
             self.note_result_payload_owner(&mut err_in, slot, value);
         }
         Ok((ok_in, err_in))
+    }
+
+    fn option_match_arm_states(
+        &self,
+        value: &Expr,
+        value_slot: LocalSlot,
+        some_binding: Option<LocalSlot>,
+        state: &FlowState,
+        line: u32,
+    ) -> Result<(FlowState, FlowState), ParseError> {
+        let mut value_state = self.analyze_expr(value, state, line)?;
+        self.mark_owned_value_reads_moved(value, &mut value_state);
+        self.mark_available(&mut value_state, value_slot, line)?;
+        let mut some_in = value_state.clone();
+        if let Some(slot) = some_binding {
+            self.mark_available(&mut some_in, slot, line)?;
+            self.clear_local_moved_state(&mut some_in, slot);
+            self.note_result_payload_owner(&mut some_in, slot, value);
+        }
+        let none_in = value_state;
+        Ok((some_in, none_in))
     }
 
     fn note_result_payload_owner(
@@ -1864,6 +1914,11 @@ impl AvailabilityAnalyzer {
                 other.visit_result_children(|child| found |= self.expr_contains_owned_local(child));
                 found
             }
+            other @ (Expr::OptionConstruct { .. } | Expr::OptionMatch { .. }) => {
+                let mut found = false;
+                other.visit_option_children(|child| found |= self.expr_contains_owned_local(child));
+                found
+            }
             Expr::Block { stmts, expr } => {
                 stmts
                     .iter()
@@ -1871,6 +1926,7 @@ impl AvailabilityAnalyzer {
                     || self.expr_contains_owned_local(expr)
             }
             Expr::Null
+            | Expr::Unit
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
@@ -2472,8 +2528,56 @@ impl AvailabilityAnalyzer {
                     semantic_id: *semantic_id,
                 })
             }
+            Expr::OptionConstruct {
+                some,
+                payload,
+                option_schema,
+                span,
+                semantic_id,
+            } => Ok(Expr::OptionConstruct {
+                some: *some,
+                payload: match payload {
+                    Some(payload) => Some(Box::new(
+                        self.rewrite_expr_ownership_inner(payload, false, state)?,
+                    )),
+                    None => None,
+                },
+                option_schema: option_schema.clone(),
+                span: *span,
+                semantic_id: *semantic_id,
+            }),
+            Expr::OptionMatch {
+                value,
+                value_slot,
+                some_binding,
+                some_expr,
+                none_expr,
+                scrutinee_schema,
+                span,
+                semantic_id,
+            } => {
+                let line = 1u32;
+                let value = self.rewrite_expr_ownership_inner(value, false, state)?;
+                let (some_in, none_in) =
+                    self.option_match_arm_states(&value, *value_slot, *some_binding, state, line)?;
+                Ok(Expr::OptionMatch {
+                    value: Box::new(value),
+                    value_slot: *value_slot,
+                    some_binding: *some_binding,
+                    some_expr: Box::new(
+                        self.rewrite_expr_ownership_inner(some_expr, false, &some_in)?,
+                    ),
+                    none_expr: Box::new(
+                        self.rewrite_expr_ownership_inner(none_expr, false, &none_in)?,
+                    ),
+                    scrutinee_schema: scrutinee_schema.clone(),
+                    span: *span,
+                    semantic_id: *semantic_id,
+                })
+            }
             Expr::Block { .. } => self.rewrite_expr_for_ownership_with_state(expr, state, 0),
             Expr::Null
+            | Expr::Unit
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)

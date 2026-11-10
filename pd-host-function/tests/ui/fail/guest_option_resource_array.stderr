@@ -1,0 +1,5 @@
+error: resource arrays are not supported by the host handle ABI
+ --> tests/ui/fail/guest_option_resource_array.rs:7:17
+  |
+7 | fn invalid() -> VmResult<GuestOption<Vec<ResourceOwned<Counter>>>> {
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

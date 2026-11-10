@@ -619,6 +619,7 @@ impl SemanticModel {
         match schema {
             TypeSchema::Unknown => crate::host_api::HostTypeSchema::Unknown,
             TypeSchema::Null => HostTypeSchema::Null,
+            TypeSchema::Unit => HostTypeSchema::Unit,
             TypeSchema::Int => HostTypeSchema::Int,
             TypeSchema::Float => HostTypeSchema::Float,
             TypeSchema::Number => HostTypeSchema::Number,
@@ -633,6 +634,9 @@ impl SemanticModel {
             }
             TypeSchema::Optional(inner) => {
                 HostTypeSchema::Optional(Box::new(self.compiler_schema_to_host_schema(inner)))
+            }
+            TypeSchema::Option(inner) => {
+                HostTypeSchema::Option(Box::new(self.compiler_schema_to_host_schema(inner)))
             }
             TypeSchema::Callable { params, result } => HostTypeSchema::Callable {
                 params: params
@@ -1639,6 +1643,7 @@ impl std::fmt::Display for TypeSchema {
         match self {
             TypeSchema::Unknown => write!(f, "unknown"),
             TypeSchema::Null => write!(f, "null"),
+            TypeSchema::Unit => write!(f, "()"),
             TypeSchema::Int => write!(f, "int"),
             TypeSchema::Float => write!(f, "float"),
             TypeSchema::Number => write!(f, "number"),
@@ -1646,6 +1651,7 @@ impl std::fmt::Display for TypeSchema {
             TypeSchema::String => write!(f, "string"),
             TypeSchema::Bytes => write!(f, "bytes"),
             TypeSchema::Optional(inner) => write!(f, "optional<{inner}>"),
+            TypeSchema::Option(inner) => write!(f, "Option<{inner}>"),
             TypeSchema::GenericParam(name) => write!(f, "{name}"),
             TypeSchema::Named(name, args) => {
                 if args.is_empty() {

@@ -390,7 +390,8 @@ fn host_schema_contains_resource(schema: &HostTypeSchema) -> Result<bool, String
             HostTypeSchema::Resource(_) => return Ok(true),
             HostTypeSchema::Array(inner)
             | HostTypeSchema::Map(inner)
-            | HostTypeSchema::Optional(inner) => pending.push((inner, depth + 1)),
+            | HostTypeSchema::Optional(inner)
+            | HostTypeSchema::Option(inner) => pending.push((inner, depth + 1)),
             HostTypeSchema::Callable { params, result } => {
                 pending.push((result, depth + 1));
                 for param in params {
@@ -408,6 +409,7 @@ fn host_schema_contains_resource(schema: &HostTypeSchema) -> Result<bool, String
             }
             HostTypeSchema::Unknown
             | HostTypeSchema::Null
+            | HostTypeSchema::Unit
             | HostTypeSchema::Int
             | HostTypeSchema::Float
             | HostTypeSchema::Number
@@ -437,8 +439,9 @@ fn addressable_host_resource_key(schema: &HostTypeSchema) -> Option<(ResourceTyp
     }
 }
 
-/// Precisely supported union resource paths: Result/Optional nodes leading to
-/// a direct resource or a resource-free leaf. Other aggregates remain refused.
+/// Precisely supported union resource paths: Result, Option and Optional
+/// nodes leading to a direct resource or a resource-free leaf. Other
+/// aggregates remain refused.
 fn addressable_result_resources(schema: &HostTypeSchema) -> bool {
     fn branch(schema: &HostTypeSchema, depth: u8) -> bool {
         if depth > MAX_REGISTRATION_SCHEMA_DEPTH {
@@ -446,13 +449,14 @@ fn addressable_result_resources(schema: &HostTypeSchema) -> bool {
         }
         match schema {
             HostTypeSchema::Result { ok, err } => branch(ok, depth + 1) && branch(err, depth + 1),
+            HostTypeSchema::Option(inner) => branch(inner, depth + 1),
             HostTypeSchema::Optional(inner) => branch(inner, depth + 1),
             HostTypeSchema::Resource(_) => true,
             _ => host_schema_contains_resource(schema) == Ok(false),
         }
     }
     match schema {
-        HostTypeSchema::Result { .. } => branch(schema, 0),
+        HostTypeSchema::Result { .. } | HostTypeSchema::Option(_) => branch(schema, 0),
         HostTypeSchema::Optional(inner) => addressable_result_resources(inner),
         _ => false,
     }
@@ -466,6 +470,18 @@ fn active_result_resource<'a>(
         HostTypeSchema::Result { ok, err } => {
             let (tag, payload) = crate::result::payload(value)?;
             active_result_resource(if tag { ok } else { err }, payload)
+        }
+        HostTypeSchema::Option(inner) => {
+            let (some, payload) = crate::option::payload(value)?;
+            if !some {
+                return Ok(None);
+            }
+            let Some(payload) = payload else {
+                return Err(VmError::HostError(
+                    "Option Some resource payload is missing".into(),
+                ));
+            };
+            active_result_resource(inner, payload)
         }
         HostTypeSchema::Optional(_) if matches!(value, Value::Null) => Ok(None),
         HostTypeSchema::Optional(inner) => active_result_resource(inner, value),
@@ -2107,7 +2123,12 @@ pub(crate) fn validate_host_call_return(
         if matches!(schema.return_type, HostTypeSchema::Unknown) {
             return Ok(());
         }
-        if value_slice.is_empty() && matches!(schema.return_type, HostTypeSchema::Null) {
+        if value_slice.is_empty()
+            && matches!(
+                schema.return_type,
+                HostTypeSchema::Null | HostTypeSchema::Unit
+            )
+        {
             return Ok(());
         }
         if value_slice.len() != 1 {
@@ -2144,6 +2165,7 @@ fn callable_schema_matches(
     match (expected, actual) {
         (HostTypeSchema::Unknown, _) => true,
         (HostTypeSchema::Null, TypeSchema::Null)
+        | (HostTypeSchema::Unit, TypeSchema::Unit)
         | (HostTypeSchema::Int, TypeSchema::Int)
         | (HostTypeSchema::Float, TypeSchema::Float)
         | (HostTypeSchema::Bool, TypeSchema::Bool)
@@ -2171,6 +2193,16 @@ fn callable_schema_matches(
         (HostTypeSchema::Optional(expected), TypeSchema::Optional(actual)) => {
             callable_schema_matches(expected, actual)
         }
+        (HostTypeSchema::Option(expected), TypeSchema::Option(actual)) => {
+            callable_schema_matches(expected, actual)
+        }
+        (
+            HostTypeSchema::Result { ok, err },
+            TypeSchema::Result {
+                ok: actual_ok,
+                err: actual_err,
+            },
+        ) => callable_schema_matches(ok, actual_ok) && callable_schema_matches(err, actual_err),
         (
             HostTypeSchema::Callable {
                 params: expected_params,
@@ -2227,6 +2259,7 @@ fn host_callable_schema_matches(expected: &HostTypeSchema, actual: &HostTypeSche
     match (expected, actual) {
         (HostTypeSchema::Unknown, _) => true,
         (HostTypeSchema::Null, HostTypeSchema::Null)
+        | (HostTypeSchema::Unit, HostTypeSchema::Unit)
         | (HostTypeSchema::Int, HostTypeSchema::Int)
         | (HostTypeSchema::Float, HostTypeSchema::Float)
         | (HostTypeSchema::Bool, HostTypeSchema::Bool)
@@ -2235,8 +2268,22 @@ fn host_callable_schema_matches(expected: &HostTypeSchema, actual: &HostTypeSche
         | (HostTypeSchema::Number, HostTypeSchema::Number) => true,
         (HostTypeSchema::Array(expected), HostTypeSchema::Array(actual))
         | (HostTypeSchema::Map(expected), HostTypeSchema::Map(actual))
-        | (HostTypeSchema::Optional(expected), HostTypeSchema::Optional(actual)) => {
+        | (HostTypeSchema::Optional(expected), HostTypeSchema::Optional(actual))
+        | (HostTypeSchema::Option(expected), HostTypeSchema::Option(actual)) => {
             host_callable_schema_matches(expected, actual)
+        }
+        (
+            HostTypeSchema::Result {
+                ok: expected_ok,
+                err: expected_err,
+            },
+            HostTypeSchema::Result {
+                ok: actual_ok,
+                err: actual_err,
+            },
+        ) => {
+            host_callable_schema_matches(expected_ok, actual_ok)
+                && host_callable_schema_matches(expected_err, actual_err)
         }
         (
             HostTypeSchema::Callable {
@@ -2361,6 +2408,13 @@ fn validate_host_value(
                 Err(VmError::TypeMismatch("null"))
             }
         }
+        HostTypeSchema::Unit => {
+            if matches!(value, Value::Null) {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch("()"))
+            }
+        }
         HostTypeSchema::Int => {
             if matches!(value, Value::Int(_)) {
                 Ok(())
@@ -2426,6 +2480,21 @@ fn validate_host_value(
                 Ok(())
             } else {
                 validate_host_value(value, inner, program, resources)
+            }
+        }
+        HostTypeSchema::Option(inner) => {
+            let (some, payload) = crate::option::payload(value)?;
+            if !some {
+                return Ok(());
+            }
+            match payload {
+                Some(payload) => validate_host_value(payload, inner, program, resources),
+                // Only a proven logical Unit payload may be restored from a
+                // missing physical entry; every other Some must carry one.
+                None if matches!(inner.as_ref(), HostTypeSchema::Unit) => {
+                    validate_host_value(&Value::Null, inner, program, resources)
+                }
+                None => Err(VmError::TypeMismatch("Option Some payload")),
             }
         }
         HostTypeSchema::Callable { params, result } => {

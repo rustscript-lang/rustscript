@@ -43,6 +43,7 @@ fn visit(path: &str, schema: &HostTypeSchema, seen: &mut BTreeSet<String>, polic
         }
         HostTypeSchema::Array(inner) => visit(&format!("{path}[]"), inner, seen, policy),
         HostTypeSchema::Optional(inner) => visit(&format!("{path}?"), inner, seen, policy),
+        HostTypeSchema::Option(inner) => visit(&format!("{path}.option"), inner, seen, policy),
         HostTypeSchema::Result { ok, err } => {
             visit(&format!("{path}.ok"), ok, seen, policy);
             visit(&format!("{path}.err"), err, seen, policy);
@@ -79,6 +80,7 @@ fn visit(path: &str, schema: &HostTypeSchema, seen: &mut BTreeSet<String>, polic
             visit(&format!("{path}.callback_result"), result, seen, policy);
         }
         HostTypeSchema::Null
+        | HostTypeSchema::Unit
         | HostTypeSchema::Bool
         | HostTypeSchema::Int
         | HostTypeSchema::Float

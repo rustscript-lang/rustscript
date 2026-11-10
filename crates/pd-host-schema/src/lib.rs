@@ -544,7 +544,7 @@ pub fn type_label(ty: &Type) -> Result<String, String> {
             }
             _ => Err("unsupported callable type".to_string()),
         },
-        Type::Tuple(tuple) if tuple.elems.is_empty() => Ok("null".to_string()),
+        Type::Tuple(tuple) if tuple.elems.is_empty() => Ok("()".to_string()),
         Type::Path(path) => {
             let Some(segment) = path.path.segments.last() else {
                 return Err("unsupported callable type".to_string());
@@ -567,7 +567,7 @@ pub fn type_label(ty: &Type) -> Result<String, String> {
                 "ResourceOwned" => Err(
                     "ResourceOwned is input-only; it cannot be used as a return schema".to_string(),
                 ),
-                "GuestResult" => Ok(guest_type_shape(ty)?.label()),
+                "GuestResult" | "GuestOption" => Ok(guest_type_shape(ty)?.label()),
                 "VmCallable" => callable_type_label(segment),
                 "Unknown" | "UnknownValue" => Ok("unknown".to_string()),
                 "CallOutcome" => Ok("unknown".to_string()),
@@ -614,6 +614,9 @@ fn parameter_type_label_inner(ty: &Type) -> Result<(String, bool), String> {
 #[derive(Clone, Debug)]
 pub enum GuestTypeShape<'a> {
     Result(Box<Self>, Box<Self>),
+    Option(Box<Self>),
+    /// Logical guest `()`, physically carried by the internal Null value.
+    Unit,
     Optional(Box<Self>),
     Array(Box<Self>),
     Resource(Box<ResourceSpec>),
@@ -625,6 +628,8 @@ impl GuestTypeShape<'_> {
     pub fn label(&self) -> String {
         match self {
             Self::Result(ok, err) => format!("Result<{}, {}>", ok.label(), err.label()),
+            Self::Option(inner) => format!("Option<{}>", inner.label()),
+            Self::Unit => "()".into(),
             Self::Optional(inner) => format!("{} | null", inner.label()),
             Self::Array(inner) => format!("array<{}>", inner.label()),
             Self::Resource(_) => "resource".into(),
@@ -641,7 +646,7 @@ impl GuestTypeShape<'_> {
                 out.extend(err.resources());
                 out
             }
-            Self::Optional(inner) | Self::Array(inner) => inner.resources(),
+            Self::Option(inner) | Self::Optional(inner) | Self::Array(inner) => inner.resources(),
             Self::Resource(spec) => vec![spec],
             _ => Vec::new(),
         }
@@ -668,6 +673,9 @@ pub fn guest_type_shape(ty: &Type) -> Result<GuestTypeShape<'_>, String> {
             return Err("GuestResult schema exceeds nesting limit".into());
         }
         let ty = unwrap_surface(ty);
+        if matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty()) {
+            return Ok(GuestTypeShape::Unit);
+        }
         if let Some((ok, err)) = guest_result_arguments(ty)? {
             return Ok(GuestTypeShape::Result(
                 Box::new(walk(ok, depth + 1)?),
@@ -680,6 +688,11 @@ pub fn guest_type_shape(ty: &Type) -> Result<GuestTypeShape<'_>, String> {
         if let Type::Path(path) = ty {
             let segment = path.path.segments.last().ok_or("empty type path")?;
             let ident = segment.ident.to_string();
+            if ident == "GuestOption" {
+                let argument = one_type_argument(segment, &ident)?;
+                let inner = walk(argument, depth + 1)?;
+                return Ok(GuestTypeShape::Option(Box::new(inner)));
+            }
             if ident == "Option" || ident == "Vec" {
                 let argument = one_type_argument(segment, &ident)?;
                 if ident == "Vec" && path_last_ident(argument).as_deref() == Some("u8") {
@@ -727,6 +740,7 @@ pub fn guest_result_shape(ty: &Type) -> Result<Option<GuestTypeShape<'_>>, Strin
         match unwrap_surface(ty) {
             Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
                 segment.ident == "GuestResult"
+                    || segment.ident == "GuestOption"
                     || matches!(segment.ident.to_string().as_str(), "Option" | "Vec")
                         && one_type_argument(segment, &segment.ident.to_string())
                             .is_ok_and(contains)

@@ -74,6 +74,10 @@ pub(super) fn collect_direct_return_consumed_positions(
             Expr::Var(slot) | Expr::MoveVar(slot) => vec![*slot],
             _ => Vec::new(),
         },
+        Expr::OptionConstruct { payload, .. } => match payload.as_deref() {
+            Some(Expr::Var(slot) | Expr::MoveVar(slot)) => vec![*slot],
+            _ => Vec::new(),
+        },
         _ => Vec::new(),
     };
     for slot in slots {
@@ -191,6 +195,7 @@ pub(super) fn stmt_uses_slot(stmt: &Stmt, slot: LocalSlot) -> bool {
 pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
     match expr {
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -201,6 +206,23 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
         | Expr::UnresolvedFunctionRef { .. } => false,
         Expr::Var(index) | Expr::MoveVar(index) => *index == slot,
         Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => *root == slot,
+        Expr::OptionConstruct { payload, .. } => payload
+            .as_deref()
+            .is_some_and(|payload| expr_uses_slot(payload, slot)),
+        Expr::OptionMatch {
+            value,
+            value_slot,
+            some_binding,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            *value_slot == slot
+                || some_binding.is_some_and(|binding| binding == slot)
+                || expr_uses_slot(value, slot)
+                || expr_uses_slot(some_expr, slot)
+                || expr_uses_slot(none_expr, slot)
+        }
         Expr::OptionalGet {
             field_projection: _,
             container,
@@ -420,6 +442,7 @@ pub(super) fn collect_consumed_positions_from_expr(
 ) {
     match expr {
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -446,6 +469,41 @@ pub(super) fn collect_consumed_positions_from_expr(
             {
                 out.insert(position);
             }
+        }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                collect_consumed_positions_from_expr(
+                    payload,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            collect_consumed_positions_from_expr(
+                value,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+            collect_consumed_positions_from_expr(
+                some_expr,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
+            collect_consumed_positions_from_expr(
+                none_expr,
+                function_impl,
+                known_consumed_positions,
+                out,
+            );
         }
         Expr::OptionalGet { container, key, .. } => {
             collect_consumed_positions_from_expr(

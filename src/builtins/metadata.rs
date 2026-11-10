@@ -2,6 +2,8 @@
 pub enum CallableParamType {
     Any,
     Null,
+    /// Logical guest `()`; the physical carrier is the internal Null value.
+    Unit,
     Int,
     Float,
     Bool,
@@ -25,6 +27,7 @@ impl CallableParamType {
         match self {
             Self::Any => "any",
             Self::Null => "null",
+            Self::Unit => "()",
             Self::Int => "int",
             Self::Float => "float",
             Self::Bool => "bool",

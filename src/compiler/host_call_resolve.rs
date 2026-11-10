@@ -635,13 +635,14 @@ fn score_pair(expected: &TypeSchema, actual: &TypeSchema) -> MatchScore {
         Mismatch,
     }
     // Classify the pair, then apply the recursive rule unless it's structural.
-    fn classify(e: &TypeSchema, a: &TypeSchema) -> Option<Kind> {
+    fn classify(e: &TypeSchema, a: &TypeSchema) -> std::option::Option<Kind> {
         match (e, a) {
             // Unknown branch first: deferred/dynamic, never a concrete match.
             (Unknown, _) | (_, Unknown) => Some(Kind::Deferred),
             // Numeric compatibility second.
             (Number, Int | Float) | (Int | Float, Number) => Some(Kind::Numeric),
             (Null, Null)
+            | (Unit, Unit)
             | (Int, Int)
             | (Float, Float)
             | (Number, Number)
@@ -680,6 +681,9 @@ fn score_pair(expected: &TypeSchema, actual: &TypeSchema) -> MatchScore {
             .combined(score_pair(e_ok, a_ok))
             .combined(score_pair(e_err, a_err)),
         (Optional(e), Optional(a)) => MatchScore::default()
+            .plus_exact()
+            .combined(score_pair(e, a)),
+        (Option(e), Option(a)) => MatchScore::default()
             .plus_exact()
             .combined(score_pair(e, a)),
         (Optional(_), Null) => MatchScore::default().plus_exact(),
@@ -907,6 +911,7 @@ fn tf_schema_label(schema: &TypeSchema) -> String {
     match schema {
         TypeSchema::Unknown => "unknown".to_string(),
         TypeSchema::Null => "null".to_string(),
+        TypeSchema::Unit => "()".to_string(),
         TypeSchema::Int => "int".to_string(),
         TypeSchema::Float => "float".to_string(),
         TypeSchema::Number => "number".to_string(),
@@ -914,6 +919,7 @@ fn tf_schema_label(schema: &TypeSchema) -> String {
         TypeSchema::String => "string".to_string(),
         TypeSchema::Bytes => "bytes".to_string(),
         TypeSchema::Optional(inner) => format!("optional<{}>", tf_schema_label(inner)),
+        TypeSchema::Option(inner) => format!("Option<{}>", tf_schema_label(inner)),
         TypeSchema::Array(inner) => format!("array<{}>", tf_schema_label(inner)),
         TypeSchema::ArrayTuple(items) => format!(
             "({})",
@@ -1022,6 +1028,7 @@ fn schema_label(schema: &crate::host_api::HostTypeSchema) -> String {
     match schema {
         HostTypeSchema::Unknown => "unknown".to_string(),
         HostTypeSchema::Null => "null".to_string(),
+        HostTypeSchema::Unit => "()".to_string(),
         HostTypeSchema::Int => "int".to_string(),
         HostTypeSchema::Float => "float".to_string(),
         HostTypeSchema::Number => "number".to_string(),
@@ -1031,6 +1038,7 @@ fn schema_label(schema: &crate::host_api::HostTypeSchema) -> String {
         HostTypeSchema::Array(inner) => format!("array<{}>", schema_label(inner)),
         HostTypeSchema::Map(inner) => format!("map<{}>", schema_label(inner)),
         HostTypeSchema::Optional(inner) => format!("optional<{}>", schema_label(inner)),
+        HostTypeSchema::Option(inner) => format!("Option<{}>", schema_label(inner)),
         HostTypeSchema::Callable { params, result } => {
             let params = params
                 .iter()
@@ -1060,6 +1068,9 @@ fn expand_actual_named(
         }
         (TypeSchema::Optional(inner), HostTypeSchema::Optional(expected_inner)) => {
             TypeSchema::Optional(Box::new(expand_actual_named(inner, expected_inner)))
+        }
+        (TypeSchema::Option(inner), HostTypeSchema::Option(expected_inner)) => {
+            TypeSchema::Option(Box::new(expand_actual_named(inner, expected_inner)))
         }
         (TypeSchema::Array(inner), HostTypeSchema::Array(expected_inner)) => {
             TypeSchema::Array(Box::new(expand_actual_named(inner, expected_inner)))

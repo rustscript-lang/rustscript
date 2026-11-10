@@ -700,6 +700,7 @@ fn expected_guest_resource_effects(schema: &HostFunctionSchema) -> Vec<ResourceE
                 visit(err, effect, out);
             }
             HostTypeSchema::Optional(inner) => visit(inner, effect, out),
+            HostTypeSchema::Option(inner) => visit(inner, effect, out),
             _ => {}
         }
     }
@@ -774,7 +775,8 @@ fn collect_named_structs_from_type(
         }
         HostTypeSchema::Array(inner)
         | HostTypeSchema::Map(inner)
-        | HostTypeSchema::Optional(inner) => {
+        | HostTypeSchema::Optional(inner)
+        | HostTypeSchema::Option(inner) => {
             collect_named_structs_from_type(inner, seen, builder)?;
         }
         HostTypeSchema::Callable { params, result } => {

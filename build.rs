@@ -1724,6 +1724,7 @@ pub(crate) fn callable_param_expr(label: &str) -> String {
     match label {
         "any" => "CallableParamType::Any".to_string(),
         "null" => "CallableParamType::Null".to_string(),
+        "()" => "CallableParamType::Unit".to_string(),
         "int" => "CallableParamType::Int".to_string(),
         "float" => "CallableParamType::Float".to_string(),
         "bool" => "CallableParamType::Bool".to_string(),
@@ -2162,6 +2163,7 @@ fn callable_docs(name: &str, attrs: &[Attribute]) -> String {
 fn emit_guest_result_schema_fixture(manifest: &Path, out: &Path) {
     for (input, output) in [
         ("result_sdk_signature.rs", "result_sdk_build_schemas.rs"),
+        ("option_sdk_signature.rs", "option_sdk_build_schemas.rs"),
         (
             "result_sdk_resource_signature.rs",
             "result_sdk_resource_build_schemas.rs",
@@ -2216,6 +2218,11 @@ fn guest_schema_expr(shape: &pd_host_schema::GuestTypeShape<'_>) -> String {
             guest_schema_expr(ok),
             guest_schema_expr(err)
         ),
+        S::Option(inner) => format!(
+            "vm::HostTypeSchema::Option(Box::new({}))",
+            guest_schema_expr(inner)
+        ),
+        S::Unit => "vm::HostTypeSchema::Unit".to_string(),
         S::Optional(inner) => format!(
             "vm::HostTypeSchema::Optional(Box::new({}))",
             guest_schema_expr(inner)
@@ -2329,7 +2336,7 @@ pub(crate) fn render_guest_descriptor_model(function: &ItemFn) -> String {
 
 fn return_type_label(output: &ReturnType) -> String {
     match output {
-        ReturnType::Default => "null".to_string(),
+        ReturnType::Default => "()".to_string(),
         ReturnType::Type(_, ty) => pd_host_schema::type_label(ty)
             .unwrap_or_else(|message| panic!("unsupported callable return type: {message}")),
     }
@@ -2342,6 +2349,7 @@ fn static_return_type_label(output: &ReturnType) -> String {
 fn value_type_from_label(label: &str) -> &'static str {
     match label {
         "null" => "Null",
+        "()" => "Null",
         "int" => "Int",
         "float" => "Float",
         "bool" => "Bool",

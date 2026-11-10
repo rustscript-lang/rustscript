@@ -195,6 +195,12 @@ fn prepare_typed_units_with_entry(
                     sources: sources.clone(),
                 }
             })?;
+            super::option::resolve_option_types(&mut runtime, &runtime_types).map_err(|error| {
+                SourcePathError::SourceWithMap {
+                    error: SourceError::Compile(error),
+                    sources: sources.clone(),
+                }
+            })?;
         }
         if !behavior.recover_host_errors
             && let Some(error) = error
@@ -367,6 +373,8 @@ fn prepare_owned_typed_ir(
     // A failed host resolution keeps its own diagnostic.
     if host_error.is_none() {
         super::result::resolve_result_types(&mut legalized, entry.types)
+            .map_err(SourceError::Compile)?;
+        super::option::resolve_option_types(&mut legalized, entry.types)
             .map_err(SourceError::Compile)?;
     }
     super::try_anf::lower_partial_resource_args(&mut legalized).map_err(SourceError::Parse)?;
@@ -614,6 +622,7 @@ fn record_expr_local_debug_ranges(
 ) {
     match expr {
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -740,6 +749,27 @@ fn record_expr_local_debug_ranges(
             }
             record_expr_local_debug_ranges(receiver, line, ranges);
             record_expr_local_debug_ranges(argument, line, ranges);
+        }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                record_expr_local_debug_ranges(payload, line, ranges);
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            value_slot,
+            some_binding,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            note_local_use(ranges, *value_slot, line);
+            if let Some(slot) = some_binding {
+                note_local_use(ranges, *slot, line);
+            }
+            record_expr_local_debug_ranges(value, line, ranges);
+            record_expr_local_debug_ranges(some_expr, line, ranges);
+            record_expr_local_debug_ranges(none_expr, line, ranges);
         }
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
@@ -882,6 +912,8 @@ fn compile_parsed_output_with_capture_output(
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
     let mut parsed = parsed;
     super::result::resolve_result_types(&mut parsed, entry_local_types)
+        .map_err(SourceError::Compile)?;
+    super::option::resolve_option_types(&mut parsed, entry_local_types)
         .map_err(SourceError::Compile)?;
     let mut parsed =
         typing::legalize_builtins_and_bind_types(parsed, typing_mode, entry_local_types)
@@ -1375,6 +1407,7 @@ fn schema_is_fully_known(schema: &TypeSchema) -> bool {
     match schema {
         TypeSchema::Unknown => false,
         TypeSchema::Null
+        | TypeSchema::Unit
         | TypeSchema::Int
         | TypeSchema::Float
         | TypeSchema::Number
@@ -1390,6 +1423,9 @@ fn schema_is_fully_known(schema: &TypeSchema) -> bool {
             // treat unknown payloads as fully known.
             matches!(inner.as_ref(), TypeSchema::Unknown) || schema_is_fully_known(inner)
         }
+        // A logical Option must have a resolved payload schema; `Unknown`
+        // inside is exactly the missing type argument this pass rejects.
+        TypeSchema::Option(inner) => schema_is_fully_known(inner),
         TypeSchema::Named(_, type_args) => type_args.iter().all(schema_is_fully_known),
         TypeSchema::Array(item) | TypeSchema::Map(item) => {
             matches!(item.as_ref(), TypeSchema::Unknown) || schema_is_fully_known(item)

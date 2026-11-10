@@ -59,7 +59,7 @@ fn wire_roundtrip_preserves_constants_and_code() {
     });
 
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
     let decoded = decode_program(&encoded).expect("decode should succeed");
 
     assert_eq!(decoded.constants, program.constants);
@@ -82,7 +82,7 @@ fn wire_v11_legacy_imports_decode_without_schema_metadata() {
         vec![import.clone()],
         None,
     );
-    let encoded = encode_program(&program).expect("v13 encoding should succeed");
+    let encoded = encode_program(&program).expect("v14 encoding should succeed");
     let marker_offset = 8 + 4 + 4 + program.code.len() + 4 + 4 + import.name.len() + 2;
     assert_eq!(encoded[marker_offset], 0);
     let mut legacy = encoded;
@@ -102,7 +102,7 @@ fn wire_v11_legacy_imports_decode_without_schema_metadata() {
 #[test]
 fn wire_v11_zero_import_program_decodes_by_version() {
     let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
-    let mut encoded = encode_program(&program).expect("v13 encoding should succeed");
+    let mut encoded = encode_program(&program).expect("v14 encoding should succeed");
     strip_empty_named_struct_section(&mut encoded);
     encoded[4..6].copy_from_slice(&11u16.to_le_bytes());
 
@@ -128,7 +128,7 @@ fn strip_empty_named_struct_section(encoded: &mut Vec<u8>) {
 fn minimal_vmbc_prefix(constant_count: u32, code: &[u8], import_count: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"VMBC");
-    bytes.extend_from_slice(&13u16.to_le_bytes());
+    bytes.extend_from_slice(&14u16.to_le_bytes());
     bytes.extend_from_slice(&0u16.to_le_bytes());
     bytes.extend_from_slice(&constant_count.to_le_bytes());
     bytes.extend_from_slice(&(code.len() as u32).to_le_bytes());
@@ -1060,10 +1060,10 @@ fn validate_rejects_call_script_targeting_host_import_prototype() {
 }
 
 #[test]
-fn call_script_wire_version_is_v13() {
+fn call_script_wire_version_is_v14() {
     let program = Program::new(vec![], vec![vm::OpCode::Ret as u8]);
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
 
     let mut old = encoded;
     strip_empty_named_struct_section(&mut old);
@@ -1083,7 +1083,7 @@ fn current_vmbc_preserves_code_bytes_without_script_calls() {
     bc.ret();
     let program = Program::new(vec![Value::Int(1), Value::Int(2)], bc.finish());
     let encoded = encode_program(&program).expect("encode should succeed");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
     let decoded = decode_program(&encoded).expect("decode should succeed");
     assert_eq!(decoded.code, program.code);
     assert_eq!(decoded.constants, program.constants);
@@ -1092,7 +1092,7 @@ fn current_vmbc_preserves_code_bytes_without_script_calls() {
 #[test]
 fn v12_trailing_zero_count_is_not_a_named_struct_table() {
     let program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
-    let mut encoded = encode_program(&program).expect("v13 encoding should succeed");
+    let mut encoded = encode_program(&program).expect("v14 encoding should succeed");
     strip_empty_named_struct_section(&mut encoded);
     encoded[4..6].copy_from_slice(&12u16.to_le_bytes());
     assert!(matches!(
@@ -1112,7 +1112,7 @@ fn v12_trailing_zero_count_is_not_a_named_struct_table() {
 }
 
 #[test]
-fn v13_roundtrip_preserves_guest_named_struct_payload() {
+fn v14_roundtrip_preserves_guest_named_struct_payload() {
     let compiled = compile_source(
         r#"
         struct Point { x: int, y: int }
@@ -1126,25 +1126,25 @@ fn v13_roundtrip_preserves_guest_named_struct_payload() {
         "codegen should attach guest struct decls"
     );
     let encoded = encode_program(&compiled.program).expect("struct-bearing program should encode");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
-    assert_eq!(vm::bytecode::BYTECODE_ABI_VERSION, 13);
-    let decoded = decode_program(&encoded).expect("v13 named-struct section should decode");
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
+    assert_eq!(vm::bytecode::BYTECODE_ABI_VERSION, 14);
+    let decoded = decode_program(&encoded).expect("v14 named-struct section should decode");
     assert!(
         decoded.named_struct_decls().contains_key("Point"),
-        "VMBC v13 should preserve guest struct decls"
+        "VMBC v14 should preserve guest struct decls"
     );
 }
 
 #[test]
-fn result_schema_roundtrip_rejects_non_v13_unknown_tags_and_excess_depth() {
+fn result_schema_roundtrip_rejects_non_current_unknown_tags_and_excess_depth() {
     let compiled = compile_source(
         "let value: Result<int, string> = Result::Ok(7); match value { Result::Ok(v) => v, Result::Err(e) => -1 };",
     )
     .expect("Result source should compile");
     let encoded = encode_program(&compiled.program.with_local_count(compiled.locals))
         .expect("Result program should encode");
-    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 13);
-    let decoded = decode_program(&encoded).expect("v13 Result program should decode");
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
+    let decoded = decode_program(&encoded).expect("v14 Result program should decode");
     let has_result = decoded.type_map.as_ref().is_some_and(|map| {
         map.local_schemas
             .iter()
@@ -1192,4 +1192,106 @@ fn result_schema_roundtrip_rejects_non_v13_unknown_tags_and_excess_depth() {
         decode_program(&deep_bytes),
         Err(WireError::LengthTooLarge("schema nesting depth", _))
     ));
+}
+
+#[test]
+fn option_and_unit_compiler_schemas_roundtrip_on_the_current_wire() {
+    let compiled = compile_source(
+        "let nested: Option<Option<int>> = Option::Some(Option::None);\n\
+         let unit: () = ();\n\
+         let value = match nested { Option::Some(inner) => match inner { Option::Some(v) => v, Option::None => 0 }, Option::None => -1 };\n\
+         value;",
+    )
+    .expect("Option source should compile");
+    let encoded = encode_program(&compiled.program.with_local_count(compiled.locals))
+        .expect("Option program should encode");
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
+    let decoded = decode_program(&encoded).expect("current Option program should decode");
+    let maps = decoded
+        .type_map
+        .as_ref()
+        .map(|map| &map.local_schemas)
+        .expect("Option program should keep local schemas");
+    assert!(
+        maps.iter()
+            .any(|schema| matches!(schema, Some(TypeSchema::Option(_))))
+    );
+    assert!(
+        maps.iter()
+            .any(|schema| matches!(schema, Some(TypeSchema::Unit)))
+    );
+    let mut machine = vm::Vm::new(decoded.with_local_count(compiled.locals));
+    machine.set_fuel(100_000);
+    assert_eq!(machine.run().unwrap(), vm::VmStatus::Halted);
+    assert_eq!(machine.stack().last(), Some(&Value::Int(0)));
+}
+
+#[test]
+fn nested_option_result_schemas_roundtrip_on_the_current_wire() {
+    let compiled = compile_source(
+        "let option_result: Option<Result<int, string>> = Option::Some(Result::Ok(1));\n\
+         let result_option: Result<Option<int>, string> = Result::Ok(Option::Some(2));\n\
+         let first = match option_result { Option::Some(result) => match result { Result::Ok(value) => value, Result::Err(error) => -1 }, Option::None => -2 };\n\
+         let second = match result_option { Result::Ok(option) => match option { Option::Some(value) => value, Option::None => -4 }, Result::Err(error) => -8 };\n\
+         first + second;",
+    )
+    .expect("nested Option/Result source should compile");
+    let encoded = encode_program(&compiled.program.with_local_count(compiled.locals))
+        .expect("nested Option/Result program should encode");
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
+    let decoded = decode_program(&encoded).expect("nested Option/Result program should decode");
+    let schemas = decoded
+        .type_map
+        .as_ref()
+        .map(|map| &map.local_schemas)
+        .expect("nested program should keep local schemas");
+    assert!(schemas.iter().any(|schema| {
+        matches!(
+            schema,
+            Some(TypeSchema::Option(inner))
+                if matches!(inner.as_ref(), TypeSchema::Result { .. })
+        )
+    }));
+    assert!(schemas.iter().any(|schema| {
+        matches!(
+            schema,
+            Some(TypeSchema::Result { ok, .. })
+                if matches!(ok.as_ref(), TypeSchema::Option(_))
+        )
+    }));
+    let mut machine = vm::Vm::new(decoded.with_local_count(compiled.locals));
+    machine.set_fuel(100_000);
+    assert_eq!(machine.run().unwrap(), vm::VmStatus::Halted);
+    assert_eq!(machine.stack().last(), Some(&Value::Int(3)));
+}
+
+#[test]
+fn host_option_and_unit_schemas_roundtrip_on_the_current_wire() {
+    let function = HostFunctionSchema::with_return(
+        "wire::option_unit",
+        vec![HostParamSchema::value(
+            "value",
+            HostTypeSchema::Option(Box::new(HostTypeSchema::Array(Box::new(
+                HostTypeSchema::Int,
+            )))),
+        )],
+        HostTypeSchema::Unit,
+    );
+    let mut builder = HostApiBuilder::new();
+    builder.function(function.clone());
+    let catalog = builder.build().expect("catalog");
+    let schema = HostImportSchema::from_function(&catalog, &function);
+    let mut program = Program::new(Vec::new(), vec![vm::OpCode::Ret as u8]);
+    program.imports.push(HostImport {
+        name: "wire::option_unit".to_string(),
+        arity: 1,
+        return_type: ValueType::Unknown,
+    });
+    let program = program
+        .with_host_import_schemas(vec![schema.clone()])
+        .expect("schema alignment");
+    let encoded = encode_program(&program).expect("Option/Unit host schema should encode");
+    assert_eq!(u16::from_le_bytes([encoded[4], encoded[5]]), 14);
+    let decoded = decode_program(&encoded).expect("Option/Unit host schema should decode");
+    assert_eq!(decoded.host_import_schemas()[0], Some(schema));
 }

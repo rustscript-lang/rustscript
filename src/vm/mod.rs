@@ -566,6 +566,9 @@ fn substitute_named_struct_schema(
         TypeSchema::Optional(inner) => {
             TypeSchema::Optional(Box::new(substitute_named_struct_schema(inner, bindings)))
         }
+        TypeSchema::Option(inner) => {
+            TypeSchema::Option(Box::new(substitute_named_struct_schema(inner, bindings)))
+        }
         TypeSchema::Named(name, args) => TypeSchema::Named(
             name.clone(),
             args.iter()
@@ -642,6 +645,7 @@ fn result_schema_accepts_missing_payload(schema: &crate::compiler::TypeSchema) -
     matches!(
         schema,
         crate::compiler::TypeSchema::Null
+            | crate::compiler::TypeSchema::Unit
             | crate::compiler::TypeSchema::Optional(_)
             | crate::compiler::TypeSchema::Unknown
     )
@@ -704,6 +708,13 @@ fn validate_value_against_type_schema_walk(
                 Err(VmError::TypeMismatch("null"))
             }
         }
+        TypeSchema::Unit => {
+            if !validate_scalars || matches!(value, Value::Null) {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch("()"))
+            }
+        }
         TypeSchema::Int => {
             if !validate_scalars || matches!(value, Value::Int(_)) {
                 Ok(())
@@ -759,6 +770,37 @@ fn validate_value_against_type_schema_walk(
                     depth + 1,
                     nodes,
                 )
+            }
+        }
+        TypeSchema::Option(inner) => {
+            let (some, payload) = crate::option::payload(value)?;
+            if !some {
+                return Ok(());
+            }
+            match payload {
+                Some(payload) => validate_value_against_type_schema_walk(
+                    payload,
+                    inner,
+                    resources,
+                    validate_scalars,
+                    named_struct_schemas,
+                    depth + 1,
+                    nodes,
+                ),
+                // Only a proven logical Unit payload may be restored from a
+                // missing physical entry.
+                None if matches!(inner.as_ref(), TypeSchema::Unit) => {
+                    validate_value_against_type_schema_walk(
+                        &Value::Null,
+                        inner,
+                        resources,
+                        validate_scalars,
+                        named_struct_schemas,
+                        depth + 1,
+                        nodes,
+                    )
+                }
+                None => Err(VmError::TypeMismatch("Option Some payload")),
             }
         }
         TypeSchema::Named(name, args) => {
@@ -1030,7 +1072,10 @@ fn schema_contains_resource_walk(
                     nodes,
                 )
         }
-        TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
+        TypeSchema::Optional(inner)
+        | TypeSchema::Option(inner)
+        | TypeSchema::Array(inner)
+        | TypeSchema::Map(inner) => {
             schema_contains_resource_walk(inner, named_struct_schemas, depth + 1, active, nodes)
         }
         TypeSchema::Object(fields) => fields.values().any(|field| {
@@ -1076,6 +1121,7 @@ fn schema_contains_resource_walk(
         | TypeSchema::Callable { .. }
         | TypeSchema::Unknown
         | TypeSchema::Null
+        | TypeSchema::Unit
         | TypeSchema::Int
         | TypeSchema::Float
         | TypeSchema::Number
@@ -1098,6 +1144,7 @@ fn hash_type_schema(schema: &crate::compiler::TypeSchema, state: &mut impl Hashe
     match schema {
         TypeSchema::Unknown => 0u8.hash(state),
         TypeSchema::Null => 1u8.hash(state),
+        TypeSchema::Unit => 20u8.hash(state),
         TypeSchema::Int => 2u8.hash(state),
         TypeSchema::Float => 3u8.hash(state),
         TypeSchema::Number => 4u8.hash(state),
@@ -1106,6 +1153,10 @@ fn hash_type_schema(schema: &crate::compiler::TypeSchema, state: &mut impl Hashe
         TypeSchema::Bytes => 7u8.hash(state),
         TypeSchema::Optional(inner) => {
             16u8.hash(state);
+            hash_type_schema(inner, state);
+        }
+        TypeSchema::Option(inner) => {
+            19u8.hash(state);
             hash_type_schema(inner, state);
         }
         TypeSchema::GenericParam(name) => {
@@ -4354,9 +4405,10 @@ impl RetCleanupWalk<'_> {
         let next = depth + 1;
         match schema {
             TypeSchema::Resource(_) => Ok(true),
-            TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
-                self.schema_owns(inner, next)
-            }
+            TypeSchema::Optional(inner)
+            | TypeSchema::Option(inner)
+            | TypeSchema::Array(inner)
+            | TypeSchema::Map(inner) => self.schema_owns(inner, next),
             TypeSchema::ArrayTuple(items) => {
                 let mut owned = false;
                 for item in items {
@@ -4409,6 +4461,7 @@ impl RetCleanupWalk<'_> {
             }
             TypeSchema::Unknown
             | TypeSchema::Null
+            | TypeSchema::Unit
             | TypeSchema::Int
             | TypeSchema::Float
             | TypeSchema::Number
@@ -4460,6 +4513,21 @@ impl RetCleanupWalk<'_> {
                     return Ok(());
                 }
                 self.walk(value, inner, next)
+            }
+            TypeSchema::Option(inner) => {
+                let (some, payload) = crate::option::payload(value)?;
+                if !some {
+                    return Ok(());
+                }
+                let Some(payload) = payload else {
+                    if matches!(inner.as_ref(), TypeSchema::Unit) {
+                        return Ok(());
+                    }
+                    return Err(VmError::HostError(
+                        "Err cleanup expected an Option Some payload".to_string(),
+                    ));
+                };
+                self.walk(payload, inner, next)
             }
             TypeSchema::Array(inner) => {
                 let Value::Array(items) = value else {
@@ -4572,6 +4640,7 @@ impl RetCleanupWalk<'_> {
             TypeSchema::Callable { .. }
             | TypeSchema::Unknown
             | TypeSchema::Null
+            | TypeSchema::Unit
             | TypeSchema::Int
             | TypeSchema::Float
             | TypeSchema::Number

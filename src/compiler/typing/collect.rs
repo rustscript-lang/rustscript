@@ -377,6 +377,7 @@ fn collect_root_expr(
             }
         }
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -402,6 +403,21 @@ fn collect_root_expr(
             operand(value, false);
             operand(ok_expr, true);
             operand(err_expr, true);
+        }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                operand(payload, false);
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            operand(value, false);
+            operand(some_expr, true);
+            operand(none_expr, true);
         }
         Expr::IfElse { .. } | Expr::Match { .. } | Expr::Block { .. } => unreachable!(),
     }
@@ -983,6 +999,7 @@ fn collect_expr_types(
 ) {
     match expr {
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -1243,6 +1260,21 @@ fn collect_expr_types(
             );
             let _ = context.infer_expr_type(expr, state);
         }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                collect_expr_types(
+                    payload,
+                    state,
+                    local_types,
+                    local_schemas,
+                    local_schema_labels,
+                    callable_slots,
+                    optional_slots,
+                    context,
+                );
+            }
+            let _ = context.infer_expr_type(expr, state);
+        }
         Expr::ResultQuery { value, .. } => {
             collect_expr_types(
                 value,
@@ -1352,6 +1384,81 @@ fn collect_expr_types(
             collect_expr_types(
                 err_expr,
                 &err_state,
+                local_types,
+                local_schemas,
+                local_schema_labels,
+                callable_slots,
+                optional_slots,
+                context,
+            );
+            let _ = context.infer_expr_type(expr, state);
+        }
+        Expr::OptionMatch {
+            value,
+            value_slot,
+            some_binding,
+            some_expr,
+            none_expr,
+            scrutinee_schema,
+            ..
+        } => {
+            collect_expr_types(
+                value,
+                state,
+                local_types,
+                local_schemas,
+                local_schema_labels,
+                callable_slots,
+                optional_slots,
+                context,
+            );
+            let value_ty = context.infer_expr_type(value, state);
+            let mut nested = state.clone();
+            bind_expr_result_to_slot(
+                &mut nested,
+                *value_slot,
+                None,
+                value,
+                state,
+                value_ty,
+                context,
+            );
+            record_local_type(local_types, *value_slot, nested.get(*value_slot));
+            record_local_schema(local_schemas, *value_slot, nested.schema(*value_slot));
+            record_local_schema_label(local_schema_labels, *value_slot, nested.schema(*value_slot));
+            let inner = match scrutinee_schema {
+                TypeSchema::Option(inner) => inner.as_ref().clone(),
+                _ => TypeSchema::Unknown,
+            };
+            let mut some_state = nested.clone();
+            if let Some(slot) = *some_binding {
+                some_state.set_with_optional_schema_origin(
+                    slot,
+                    context.bound_type_for_schema(&inner),
+                    Some(inner.clone()),
+                    true,
+                    matches!(inner, TypeSchema::Optional(_)),
+                );
+                record_local_type(local_types, slot, some_state.get(slot));
+                record_local_schema(local_schemas, slot, some_state.schema(slot));
+                record_local_schema_label(local_schema_labels, slot, some_state.schema(slot));
+                if some_state.is_optional(slot) {
+                    record_optional_slot(optional_slots, slot);
+                }
+            }
+            collect_expr_types(
+                some_expr,
+                &some_state,
+                local_types,
+                local_schemas,
+                local_schema_labels,
+                callable_slots,
+                optional_slots,
+                context,
+            );
+            collect_expr_types(
+                none_expr,
+                &nested,
                 local_types,
                 local_schemas,
                 local_schema_labels,

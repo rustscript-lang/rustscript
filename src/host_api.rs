@@ -915,6 +915,9 @@ impl HostStructSchema {
 pub enum HostTypeSchema {
     Unknown,
     Null,
+    /// Guest `()`. Distinct from [`Self::Null`]; the physical carrier is the
+    /// internal Null value.
+    Unit,
     Int,
     Float,
     Number,
@@ -924,6 +927,9 @@ pub enum HostTypeSchema {
     Array(Box<HostTypeSchema>),
     Map(Box<HostTypeSchema>),
     Optional(Box<HostTypeSchema>),
+    /// Guest `Option<T>`. Runtime values are maps with a Boolean `tag`
+    /// (`true` = Some) and the active `payload`. Distinct from [`Self::Optional`].
+    Option(Box<HostTypeSchema>),
     Callable {
         params: Vec<HostTypeSchema>,
         result: Box<HostTypeSchema>,
@@ -1038,6 +1044,10 @@ impl Serialize for HostTypeSchema {
                 state.serialize_field("err", err)?;
                 state.end()
             }
+            Self::Option(inner) => {
+                serializer.serialize_newtype_variant("HostTypeSchema", 15, "Option", inner)
+            }
+            Self::Unit => serializer.serialize_unit_variant("HostTypeSchema", 16, "Unit"),
         }
     }
 }
@@ -1059,6 +1069,8 @@ enum HostTypeSchemaVariant {
     Resource,
     Named,
     Result,
+    Option,
+    Unit,
 }
 
 struct HostTypeSchemaSeed<'a> {
@@ -1091,7 +1103,7 @@ impl<'de> DeserializeSeed<'de> for HostTypeSchemaSeed<'_> {
             "HostTypeSchema",
             &[
                 "Unknown", "Null", "Int", "Float", "Number", "Bool", "String", "Bytes", "Array",
-                "Map", "Optional", "Callable", "Resource", "Named", "Result",
+                "Map", "Optional", "Callable", "Resource", "Named", "Result", "Option", "Unit",
             ],
             HostTypeSchemaVisitor {
                 budget: self.budget,
@@ -1180,6 +1192,17 @@ impl<'de> Visitor<'de> for HostTypeSchemaVisitor<'_> {
                     depth: self.depth,
                 })
                 .map(|(ok, err)| HostTypeSchema::Result { ok, err }),
+            HostTypeSchemaVariant::Option => {
+                let depth = next_schema_depth::<A::Error>(self.depth)?;
+                access
+                    .newtype_variant_seed(HostTypeSchemaSeed {
+                        budget: self.budget,
+                        depth,
+                        property: false,
+                    })
+                    .map(|inner| HostTypeSchema::Option(Box::new(inner)))
+            }
+            HostTypeSchemaVariant::Unit => access.unit_variant().map(|()| HostTypeSchema::Unit),
         }
     }
 }
@@ -1685,6 +1708,7 @@ impl fmt::Display for HostTypeSchema {
         match self {
             Self::Unknown => write!(f, "unknown"),
             Self::Null => write!(f, "null"),
+            Self::Unit => write!(f, "()"),
             Self::Int => write!(f, "int"),
             Self::Float => write!(f, "float"),
             Self::Number => write!(f, "number"),
@@ -1694,6 +1718,7 @@ impl fmt::Display for HostTypeSchema {
             Self::Array(inner) => write!(f, "array<{inner}>"),
             Self::Map(inner) => write!(f, "map<{inner}>"),
             Self::Optional(inner) => write!(f, "optional<{inner}>"),
+            Self::Option(inner) => write!(f, "Option<{inner}>"),
             Self::Callable { params, result } => {
                 write!(f, "fn(")?;
                 for (index, param) in params.iter().enumerate() {
@@ -2998,7 +3023,8 @@ where
             }
             HostTypeSchema::Array(inner)
             | HostTypeSchema::Map(inner)
-            | HostTypeSchema::Optional(inner) => {
+            | HostTypeSchema::Optional(inner)
+            | HostTypeSchema::Option(inner) => {
                 let child_depth =
                     depth
                         .checked_add(1)
@@ -3069,6 +3095,7 @@ where
             }
             HostTypeSchema::Unknown
             | HostTypeSchema::Null
+            | HostTypeSchema::Unit
             | HostTypeSchema::Int
             | HostTypeSchema::Float
             | HostTypeSchema::Number
@@ -4196,6 +4223,7 @@ fn try_push_type(
         match current {
             HostTypeSchema::Unknown => push_tag(bytes, b'U'),
             HostTypeSchema::Null => push_tag(bytes, b'N'),
+            HostTypeSchema::Unit => push_tag(bytes, b'.'),
             HostTypeSchema::Int => push_tag(bytes, b'I'),
             HostTypeSchema::Float => push_tag(bytes, b'F'),
             HostTypeSchema::Number => push_tag(bytes, b'#'),
@@ -4265,6 +4293,15 @@ fn try_push_type(
                 })?;
                 pending.push(err);
                 pending.push(ok);
+            }
+            HostTypeSchema::Option(inner) => {
+                push_tag(bytes, b'O');
+                pending.try_reserve(1).map_err(|_| {
+                    HostSchemaValidationError::AllocationFailed {
+                        field: "schema encoding",
+                    }
+                })?;
+                pending.push(inner);
             }
         }
     }
@@ -4400,7 +4437,8 @@ fn validate_named_struct_refs(
         }
         HostTypeSchema::Array(inner)
         | HostTypeSchema::Map(inner)
-        | HostTypeSchema::Optional(inner) => validate_named_struct_refs(function, inner, structs),
+        | HostTypeSchema::Optional(inner)
+        | HostTypeSchema::Option(inner) => validate_named_struct_refs(function, inner, structs),
         HostTypeSchema::Callable { params, result } => {
             for param in params {
                 validate_named_struct_refs(function, param, structs)?;
