@@ -23,14 +23,14 @@ pub(super) type VmMapHandle = SharedMap;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub(super) struct VmCallable<Signature> {
+pub struct VmCallable<Signature> {
     value: Value,
     marker: PhantomData<fn() -> Signature>,
 }
 
 impl<Signature> VmCallable<Signature> {
     #[allow(dead_code)]
-    pub(super) fn into_value(self) -> Value {
+    pub fn into_value(self) -> Value {
         self.value
     }
 }
@@ -56,6 +56,12 @@ impl<Signature> TakeVmValue for VmCallable<Signature> {
             value: std::mem::replace(slot, Value::Null),
             marker: PhantomData,
         })
+    }
+}
+
+impl<Signature> IntoVmValue for VmCallable<Signature> {
+    fn into_vm_value(self) -> Value {
+        self.value
     }
 }
 

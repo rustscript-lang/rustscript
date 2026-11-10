@@ -80,13 +80,38 @@ fn guest_option_resources_keep_their_access_mode() {
 }
 
 #[test]
-fn guest_option_callable_payload_is_rejected_with_the_existing_capability() {
-    let callable: syn::Type = parse_quote!(GuestOption<VmCallable<fn() -> ()>>);
-    let error = guest_type_shape(&callable).unwrap_err();
+fn guest_option_callable_payload_uses_the_typed_callable_schema() {
+    let callable: syn::Type = parse_quote!(GuestOption<VmCallable<fn(i64, String) -> bool>>);
+    let option_shape = shape(&callable);
+    assert_eq!(option_shape.label(), "Option<fn(int, string) -> bool>");
+    let GuestTypeShape::Option(inner) = &option_shape else {
+        panic!("callable Option must keep the Option wrapper");
+    };
+    let GuestTypeShape::Callable { params, result } = inner.as_ref() else {
+        panic!("callable payload must use the Callable shape");
+    };
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[1].label(), "string");
+    assert_eq!(result.label(), "bool");
     assert!(
-        error.contains("fully typed public schema"),
-        "callable GuestOption should keep the precise unsupported-payload error, got {error}"
+        option_shape.resources().is_empty(),
+        "a callable value owns no resource"
     );
+    assert_eq!(option_shape.resource_mode().unwrap(), None);
+
+    let unit: syn::Type = parse_quote!(GuestOption<VmCallable<fn() -> ()>>);
+    assert_eq!(shape(&unit).label(), "Option<fn() -> ()>");
+    // A bare `fn()` keeps the existing shared label spelling for its default
+    // return, so macro and build descriptors cannot drift.
+    let defaulted: syn::Type = parse_quote!(GuestOption<VmCallable<fn()>>);
+    assert_eq!(shape(&defaulted).label(), "Option<fn() -> null>");
+
+    let nested: syn::Type = parse_quote!(GuestResult<GuestOption<VmCallable<fn() -> ()>>, String>);
+    assert_eq!(shape(&nested).label(), "Result<Option<fn() -> ()>, string>");
+
+    let malformed: syn::Type = parse_quote!(GuestOption<VmCallable<i64>>);
+    let error = guest_type_shape(&malformed).unwrap_err();
+    assert!(error.contains("fn(...) ->"), "{error}");
 }
 
 #[test]

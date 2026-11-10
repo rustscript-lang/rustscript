@@ -7,8 +7,8 @@ use std::sync::{
 };
 use vm::resource::{CloseProgress, HostResource, ResourceCloseReason, ResourceResult};
 use vm::{
-    GuestOption, GuestResult, HostNamedStruct, HostResourceType, ResourceOwned, ResourceTypeKey,
-    Value, Vm, VmResult, VmStatus,
+    FromVmValue, GuestOption, GuestResult, HostNamedStruct, HostResourceType, ResourceOwned,
+    ResourceTypeKey, Value, Vm, VmCallable, VmResult, VmStatus,
 };
 
 static CREATED: AtomicUsize = AtomicUsize::new(0);
@@ -80,6 +80,11 @@ fn descriptors() -> Vec<vm::HostFunctionDescriptor> {
         generated::functions::inspect_descriptor(),
         generated::functions::option_result_descriptor(),
         generated::functions::result_option_descriptor(),
+        generated::functions::callable_echo_descriptor(),
+        generated::functions::callable_pick_descriptor(),
+        generated::functions::callable_count_descriptor(),
+        generated::functions::callable_unit_echo_descriptor(),
+        generated::functions::callable_pair_echo_descriptor(),
         generated::functions::resource_make_descriptor(),
         generated::functions::resource_take_descriptor(),
         generated::functions::resource_observe_descriptor(),
@@ -150,6 +155,26 @@ fn build_fixture_and_proc_macro_descriptors_are_identical() {
             result_sdk_build_result_option(),
         ),
         (
+            generated::functions::callable_echo_descriptor(),
+            result_sdk_build_callable_echo(),
+        ),
+        (
+            generated::functions::callable_pick_descriptor(),
+            result_sdk_build_callable_pick(),
+        ),
+        (
+            generated::functions::callable_count_descriptor(),
+            result_sdk_build_callable_count(),
+        ),
+        (
+            generated::functions::callable_unit_echo_descriptor(),
+            result_sdk_build_callable_unit_echo(),
+        ),
+        (
+            generated::functions::callable_pair_echo_descriptor(),
+            result_sdk_build_callable_pair_echo(),
+        ),
+        (
             generated::functions::resource_make_descriptor(),
             result_sdk_build_resource_make(),
         ),
@@ -187,6 +212,55 @@ fn build_fixture_and_proc_macro_descriptors_are_identical() {
             .return_type,
         vm::HostTypeSchema::Option(_)
     ));
+    let callable_schema = &generated::functions::callable_echo_descriptor()
+        .schema
+        .params[0]
+        .ty;
+    assert_eq!(
+        generated::functions::callable_echo_descriptor()
+            .schema
+            .params[0]
+            .passing,
+        vm::HostParamPassing::Value,
+        "a callable payload owns no resource and uses value passing"
+    );
+    let vm::HostTypeSchema::Option(callable) = callable_schema else {
+        panic!("callable Option parameter schema: {callable_schema:?}");
+    };
+    let vm::HostTypeSchema::Callable { params, result } = callable.as_ref() else {
+        panic!("callable Option payload must carry the Callable schema");
+    };
+    assert_eq!(params, &vec![vm::HostTypeSchema::Int]);
+    assert!(matches!(result.as_ref(), vm::HostTypeSchema::Int));
+
+    let unit_schema = &generated::functions::callable_unit_echo_descriptor()
+        .schema
+        .params[0]
+        .ty;
+    let vm::HostTypeSchema::Option(unit) = unit_schema else {
+        panic!("Unit callable Option parameter schema: {unit_schema:?}");
+    };
+    let vm::HostTypeSchema::Callable { params, result } = unit.as_ref() else {
+        panic!("Unit callable payload must carry the Callable schema");
+    };
+    assert!(params.is_empty());
+    assert!(matches!(result.as_ref(), vm::HostTypeSchema::Unit));
+
+    let pair_schema = &generated::functions::callable_pair_echo_descriptor()
+        .schema
+        .params[0]
+        .ty;
+    let vm::HostTypeSchema::Option(pair) = pair_schema else {
+        panic!("pair callable Option parameter schema: {pair_schema:?}");
+    };
+    let vm::HostTypeSchema::Callable { params, result } = pair.as_ref() else {
+        panic!("pair callable payload must carry the Callable schema");
+    };
+    assert_eq!(
+        params,
+        &vec![vm::HostTypeSchema::Int, vm::HostTypeSchema::Bool]
+    );
+    assert!(matches!(result.as_ref(), vm::HostTypeSchema::Int));
 }
 
 #[test]
@@ -280,6 +354,192 @@ fn unit_host_returns_carry_logical_unit_to_rss() {
         generated::functions::unit_descriptor().schema.return_type,
         vm::HostTypeSchema::Unit
     );
+}
+
+#[test]
+fn generated_host_roundtrips_callable_option_payloads() {
+    let source = r#"
+        use option_sdk;
+        pub fn double(value: int) -> int { value + value }
+        fn announce() { }
+        fn invoke_unit(f: fn() -> ()) -> int { f(); 5 }
+        fn pick(value: int, scale: bool) -> int { if scale => { value * 2 } else => { value } }
+        let echoed: Option<fn(int) -> int> = option_sdk::callable_echo(Option::Some(double));
+        let doubled = match echoed { Option::Some(f) => f(4), Option::None => -1 };
+        let absent: Option<fn(int) -> int> = option_sdk::callable_echo(Option::None);
+        let skipped = match absent { Option::Some(f) => f(4), Option::None => -2 };
+        let picked: Option<fn(int) -> int> = option_sdk::callable_pick(true);
+        let from_host = match picked { Option::Some(f) => f(5), Option::None => -3 };
+        let empty: Option<fn(int) -> int> = option_sdk::callable_pick(false);
+        let missing = match empty { Option::Some(f) => f(5), Option::None => -4 };
+        let offset = 10;
+        let add: fn(int) -> int = |value| value + offset;
+        let carried: Option<fn(int) -> int> = option_sdk::callable_echo(Option::Some(add));
+        let captured = match carried { Option::Some(f) => f(6) + f(7), Option::None => -5 };
+        let unit_some: Option<fn() -> ()> = option_sdk::callable_unit_echo(Option::Some(announce));
+        let unit_result = match unit_some { Option::Some(f) => invoke_unit(f), Option::None => -6 };
+        let unit_none: Option<fn() -> ()> = option_sdk::callable_unit_echo(Option::None);
+        let unit_skipped = match unit_none { Option::Some(f) => invoke_unit(f), Option::None => -7 };
+        let pair: Option<fn(int, bool) -> int> = option_sdk::callable_pair_echo(Option::Some(pick));
+        let pair_result = match pair { Option::Some(f) => f(9, true), Option::None => -8 };
+        doubled + skipped + from_host + missing + captured + unit_result + unit_skipped + pair_result;
+    "#;
+    assert_eq!(eval(source), Value::Int(61));
+
+    let none = eval("use option_sdk; option_sdk::callable_count(Option::None);");
+    assert_eq!(none, Value::Int(0));
+    let some = eval(
+        "use option_sdk; fn double(value: int) -> int { value + value } option_sdk::callable_count(Option::Some(double));",
+    );
+    assert_eq!(some, Value::Int(1));
+}
+
+#[test]
+fn typed_rust_callback_accepts_returns_and_invokes_guest_option_callable() {
+    let compiled = vm::compile_source(
+        "fn double(value: int) -> int { value + value }\n\
+         fn announce() { }\n\
+         fn pick(value: int, scale: bool) -> int { if scale => { value * 2 } else => { value } }\n\
+         pub fn make(present: bool) -> Option<fn(int) -> int> { let offset = 1; let add: fn(int) -> int = |value| value + offset; if present => { Option::Some(add) } else => { Option::None } }\n\
+         pub fn make_unit(present: bool) -> Option<fn() -> ()> { if present => { Option::Some(announce) } else => { Option::None } }\n\
+         pub fn make_pair(present: bool) -> Option<fn(int, bool) -> int> { if present => { Option::Some(pick) } else => { Option::None } }\n\
+         pub fn apply(value: Option<fn(int) -> int>) -> int { match value { Option::Some(f) => f(3), Option::None => -1 } }",
+    )
+    .unwrap();
+    let mut store = vm::Store::new(
+        Vm::new(compiled.program.with_local_count(compiled.locals)),
+        (),
+    );
+    store.vm_mut().set_fuel(100_000);
+    assert_eq!(store.run().unwrap(), VmStatus::Halted);
+
+    let make = store
+        .script_callback_by_name::<(bool,), GuestOption<VmCallable<fn(i64) -> i64>>>("make")
+        .unwrap();
+    let present = make.call(&mut store, (true,)).unwrap();
+    let GuestOption::Some(callable) = present else {
+        panic!("present selection must carry a typed callable");
+    };
+    let invoke = store
+        .script_callback::<(i64,), i64>(callable.into_value())
+        .unwrap();
+    assert_eq!(invoke.call(&mut store, (7,)).unwrap(), 8);
+    assert_eq!(invoke.call(&mut store, (8,)).unwrap(), 9);
+    assert!(matches!(
+        make.call(&mut store, (false,)).unwrap(),
+        GuestOption::None
+    ));
+
+    let apply = store
+        .script_callback_by_name::<(GuestOption<VmCallable<fn(i64) -> i64>>,), i64>("apply")
+        .unwrap();
+    let held = match make.call(&mut store, (true,)).unwrap() {
+        GuestOption::Some(value) => value,
+        GuestOption::None => panic!("second present selection must carry a callable"),
+    };
+    assert_eq!(
+        apply.call(&mut store, (GuestOption::Some(held),)).unwrap(),
+        4
+    );
+    assert_eq!(apply.call(&mut store, (GuestOption::None,)).unwrap(), -1);
+
+    let make_unit = store
+        .script_callback_by_name::<(bool,), GuestOption<VmCallable<fn() -> ()>>>("make_unit")
+        .unwrap();
+    let unit_selected = match make_unit.call(&mut store, (true,)).unwrap() {
+        GuestOption::Some(value) => value,
+        GuestOption::None => panic!("present Unit selection must carry a callable"),
+    };
+    let unit_invoke = store
+        .script_callback::<(), ()>(unit_selected.into_value())
+        .unwrap();
+    assert_eq!(unit_invoke.call(&mut store, ()).unwrap(), ());
+    assert!(matches!(
+        make_unit.call(&mut store, (false,)).unwrap(),
+        GuestOption::None
+    ));
+
+    let make_pair = store
+        .script_callback_by_name::<(bool,), GuestOption<VmCallable<fn(i64, bool) -> i64>>>(
+            "make_pair",
+        )
+        .unwrap();
+    let pair_selected = match make_pair.call(&mut store, (true,)).unwrap() {
+        GuestOption::Some(value) => value,
+        GuestOption::None => panic!("present pair selection must carry a callable"),
+    };
+    let pair_invoke = store
+        .script_callback::<(i64, bool), i64>(pair_selected.into_value())
+        .unwrap();
+    assert_eq!(pair_invoke.call(&mut store, (4, true)).unwrap(), 8);
+    assert_eq!(pair_invoke.call(&mut store, (4, false)).unwrap(), 4);
+
+    let cross = match make.call(&mut store, (true,)).unwrap() {
+        GuestOption::Some(value) => value.into_value(),
+        GuestOption::None => panic!("third present selection must carry a callable"),
+    };
+    let mut other = vm::Store::new(
+        Vm::new(vm::Program::new(Vec::new(), vec![vm::OpCode::Ret as u8])),
+        (),
+    );
+    assert!(
+        other.script_callback::<(i64,), i64>(cross.clone()).is_err(),
+        "callable from another store must be rejected"
+    );
+
+    store.vm_mut().reset_for_reuse().unwrap();
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        store.vm_mut().poll_reset_for_reuse(&mut context),
+        std::task::Poll::Ready(Ok(()))
+    ));
+    assert!(
+        store.script_callback::<(i64,), i64>(cross).is_err(),
+        "reset must invalidate a previously returned callable"
+    );
+}
+
+#[test]
+fn callable_option_signature_mismatch_rejects_before_guest_side_effects() {
+    let descriptors = descriptors();
+    let catalog = Arc::new(vm::HostFunctionDescriptor::collect_catalog(&descriptors).unwrap());
+    let error = match vm::compile_source_with_flavor_and_options(
+        "use option_sdk;\n\
+         fn text(value: string) -> string { value }\n\
+         option_sdk::callable_echo(Option::Some(text));",
+        vm::SourceFlavor::RustScript,
+        vm::CompileSourceFileOptions::default().with_host_api_catalog(catalog),
+    ) {
+        Ok(_) => panic!("a string callable must not satisfy the int callable schema"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("callable") || message.contains("Option"),
+        "callable signature mismatch was {message}"
+    );
+
+    let compiled = vm::compile_source(
+        "fn text(value: string) -> string { value }\n\
+             pub fn text_fn() -> fn(string) -> string { text }",
+    )
+    .unwrap();
+    let mut machine = Vm::new(compiled.program.with_local_count(compiled.locals));
+    assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+    let text_fn = machine.resolve_exported_callable("text_fn").unwrap();
+    let returned = machine.invoke_callable(text_fn, &[]).unwrap();
+    let wrapped =
+        <VmCallable<fn(i64) -> i64> as FromVmValue>::from_vm_value(&returned, "callable").unwrap();
+    let carrier = vm::option::some_carrier(wrapped.into_value());
+    let schema = generated::functions::callable_echo_descriptor()
+        .schema
+        .params[0]
+        .ty
+        .clone();
+    let error = machine
+        .validate_guest_result_value(&carrier, &schema)
+        .expect_err("runtime admission must reject the mismatched callable signature");
+    assert!(error.to_string().contains("callable"), "{error}");
 }
 
 #[test]
@@ -634,7 +894,7 @@ fn option_roundtrip_executes_in_native_aot() {
 
 #[test]
 fn option_roundtrip_executes_from_loaded_vmbc() {
-    let source = "use option_sdk; let value: Option<int[]> = option_sdk::fixture(Option::Some([3, 4])); match value { Option::Some(items) => items[0] + items[1], Option::None => -1 };";
+    let source = "use option_sdk; fn double(value: int) -> int { value + value } let value: Option<int[]> = option_sdk::fixture(Option::Some([3, 4])); let callable: Option<fn(int) -> int> = option_sdk::callable_echo(Option::Some(double)); let applied = match callable { Option::Some(f) => f(4), Option::None => -1 }; match value { Option::Some(items) => items[0] + items[1] + applied, Option::None => -1 };";
     let descriptors = descriptors();
     let catalog = Arc::new(vm::HostFunctionDescriptor::collect_catalog(&descriptors).unwrap());
     let compiled = vm::compile_source_with_flavor_and_options(
@@ -649,7 +909,7 @@ fn option_roundtrip_executes_from_loaded_vmbc() {
     bind_registry(&mut loaded);
     loaded.set_fuel(100_000);
     assert_eq!(loaded.run().unwrap(), VmStatus::Halted);
-    assert_eq!(loaded.stack().last(), Some(&Value::Int(7)));
+    assert_eq!(loaded.stack().last(), Some(&Value::Int(15)));
 }
 
 #[cfg(feature = "cranelift-jit")]

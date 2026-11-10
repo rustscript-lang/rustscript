@@ -51,6 +51,53 @@ fn result_option(
     Ok(value)
 }
 
+/// Echoes a typed callable payload nested inside a logical guest Option.
+#[pd_host_function(name = "option_sdk::callable_echo")]
+fn callable_echo(
+    value: GuestOption<VmCallable<fn(i64) -> i64>>,
+) -> VmResult<GuestOption<VmCallable<fn(i64) -> i64>>> {
+    Ok(value)
+}
+
+/// Returns an exported callable as `Some`, or `None` without resolving it.
+#[pd_host_function(name = "option_sdk::callable_pick")]
+fn callable_pick(
+    vm: &mut Vm,
+    present: bool,
+) -> VmResult<GuestOption<VmCallable<fn(i64) -> i64>>> {
+    if !present {
+        return Ok(GuestOption::None);
+    }
+    let value = vm.resolve_exported_callable("double")?;
+    let callable = <VmCallable<fn(i64) -> i64> as FromVmValue>::from_vm_value(&value, "callable")?;
+    Ok(GuestOption::Some(callable))
+}
+
+/// Reports whether the Option carries a callable without invoking it.
+#[pd_host_function(name = "option_sdk::callable_count")]
+fn callable_count(value: GuestOption<VmCallable<fn(i64) -> i64>>) -> i64 {
+    match value {
+        GuestOption::Some(_) => 1,
+        GuestOption::None => 0,
+    }
+}
+
+/// Echoes a Unit-returning callable payload nested in a logical Option.
+#[pd_host_function(name = "option_sdk::callable_unit_echo")]
+fn callable_unit_echo(
+    value: GuestOption<VmCallable<fn() -> ()>>,
+) -> VmResult<GuestOption<VmCallable<fn() -> ()>>> {
+    Ok(value)
+}
+
+/// Echoes a multi-argument callable payload with a Boolean parameter.
+#[pd_host_function(name = "option_sdk::callable_pair_echo")]
+fn callable_pair_echo(
+    value: GuestOption<VmCallable<fn(i64, bool) -> i64>>,
+) -> VmResult<GuestOption<VmCallable<fn(i64, bool) -> i64>>> {
+    Ok(value)
+}
+
 /// Publishes only the selected owned resource.
 #[pd_host_function(name = "option_sdk::resource_make")]
 fn resource_make(present: bool) -> VmResult<GuestOption<ResourceOwned<OptionSuccess>>> {
