@@ -90,6 +90,14 @@ fn callable_unit_echo(
     Ok(value)
 }
 
+/// Echoes a Unit callable declared with the omitted Rust return spelling.
+#[pd_host_function(name = "option_sdk::callable_unit_default_echo")]
+fn callable_unit_default_echo(
+    value: GuestOption<VmCallable<fn()>>,
+) -> VmResult<GuestOption<VmCallable<fn()>>> {
+    Ok(value)
+}
+
 /// Echoes a multi-argument callable payload with a Boolean parameter.
 #[pd_host_function(name = "option_sdk::callable_pair_echo")]
 fn callable_pair_echo(
