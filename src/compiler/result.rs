@@ -518,21 +518,31 @@ fn resolve_method(
         }
     };
     let (ok_schema, err_schema) = branch_schemas(&result_schema).expect("driver matched Result");
-    let annotated_result = match &annotated {
-        Some(schema @ TypeSchema::Result { .. }) if !schema_contains_unknown(schema) => {
-            Some(schema.clone())
+    // Only the methods that keep an outer `Result` return enforce the
+    // surrounding annotation as a `Result`. `unwrap_or(T) -> T` and
+    // `unwrap_or_else((E) -> T) -> T` use the annotation as the payload type;
+    // their fallback/callback results are checked against the receiver's
+    // payload below instead.
+    let annotated_result = match method {
+        ResultMethod::Map | ResultMethod::MapErr | ResultMethod::AndThen | ResultMethod::OrElse => {
+            match &annotated {
+                Some(schema @ TypeSchema::Result { .. }) if !schema_contains_unknown(schema) => {
+                    Some(schema.clone())
+                }
+                Some(TypeSchema::Result { .. }) | None => None,
+                Some(other) => {
+                    return Err(result_error(
+                        span,
+                        format!(
+                            ".{} produces a Result value, not {}",
+                            method.name(),
+                            render_schema(other)
+                        ),
+                    ));
+                }
+            }
         }
-        Some(TypeSchema::Result { .. }) | None => None,
-        Some(other) => {
-            return Err(result_error(
-                span,
-                format!(
-                    ".{} produces a Result value, not {}",
-                    method.name(),
-                    render_schema(other)
-                ),
-            ));
-        }
+        ResultMethod::UnwrapOr | ResultMethod::UnwrapOrElse => None,
     };
 
     match method {
@@ -1391,6 +1401,14 @@ impl TemporaryCallableCapture {
 struct CaptureWalk<'a> {
     slots: HashMap<LocalSlot, TypeSchema>,
     defs: HashMap<LocalSlot, LocalDefinition>,
+    /// Slots whose storage belongs to the producer scope currently being
+    /// walked. A returned `Var` of one of these dies with the producer; a
+    /// `Var` of any other slot is a caller-owned binding and keeps its
+    /// existing owner rule. The root walk starts with an empty set.
+    owned_locals: HashSet<LocalSlot>,
+    /// Capture facts for callable-typed parameters, derived from the actual
+    /// argument expressions at the call site.
+    param_facts: HashMap<LocalSlot, TemporaryCallableCapture>,
     env: &'a Env,
 }
 
@@ -1398,6 +1416,8 @@ fn find_temporary_callable_capture(expr: &Expr, env: &Env) -> TemporaryCallableC
     let walk = CaptureWalk {
         slots: env.slots.clone(),
         defs: env.local_defs.clone(),
+        owned_locals: HashSet::new(),
+        param_facts: HashMap::new(),
         env,
     };
     let mut visiting_slots = HashSet::new();
@@ -1419,11 +1439,16 @@ fn temporary_callable_capture(
         return TemporaryCallableCapture::Unknown;
     }
     match expr {
-        Expr::Call(index, _, _, _, _) => {
-            call_return_capture(*index, walk, visiting_slots, visiting_functions, depth)
-        }
-        Expr::LocalCall(slot, _, _, _) => {
-            local_call_capture(*slot, walk, visiting_slots, visiting_functions, depth)
+        Expr::Call(index, _, args, _, _) => call_return_capture(
+            *index,
+            args,
+            walk,
+            visiting_slots,
+            visiting_functions,
+            depth,
+        ),
+        Expr::LocalCall(slot, _, args, _) => {
+            local_call_capture(*slot, args, walk, visiting_slots, visiting_functions, depth)
         }
         Expr::ClosureCall(closure, args) => closure_call_return_capture(
             closure,
@@ -1437,6 +1462,8 @@ fn temporary_callable_capture(
             let mut nested = CaptureWalk {
                 slots: walk.slots.clone(),
                 defs: walk.defs.clone(),
+                owned_locals: walk.owned_locals.clone(),
+                param_facts: walk.param_facts.clone(),
                 env: walk.env,
             };
             bind_stmts(stmts, &mut nested);
@@ -1486,14 +1513,50 @@ fn temporary_callable_capture(
             closure_capture(closure, walk, visiting_slots, visiting_functions, depth)
         }
         Expr::FunctionRef(index, _) => function_value_capture(*index, walk, visiting_functions),
-        // A persistent user binding (or any non-execution expression) keeps
-        // its existing owner; this check adds nothing for those shapes.
-        _ => TemporaryCallableCapture::Free,
+        // A returned producer-local resolves through the definition/capture
+        // facts recorded for that scope. A caller-owned binding (the root
+        // prebound local, or a captured user local) keeps its existing owner.
+        Expr::Var(slot) | Expr::MoveVar(slot) => {
+            local_value_capture(*slot, walk, visiting_slots, visiting_functions, depth)
+        }
+        // Scalar leaves cannot produce a callable value; every other
+        // unmodeled callable-producing expression is unproven, not Free.
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::Bytes(_) => TemporaryCallableCapture::Free,
+        _ => TemporaryCallableCapture::Unknown,
+    }
+}
+
+/// Capture provenance of the callable value read from `slot` at runtime.
+fn local_value_capture(
+    slot: LocalSlot,
+    walk: &CaptureWalk<'_>,
+    visiting_slots: &mut HashSet<LocalSlot>,
+    visiting_functions: &mut HashSet<u16>,
+    depth: usize,
+) -> TemporaryCallableCapture {
+    if let Some(fact) = walk.param_facts.get(&slot) {
+        return fact.clone();
+    }
+    if !walk.owned_locals.contains(&slot) {
+        // A persistent caller binding is not a temporary producer owner.
+        return TemporaryCallableCapture::Free;
+    }
+    match walk.defs.get(&slot) {
+        Some(definition) => {
+            definition_value_capture(definition, walk, visiting_slots, visiting_functions, depth)
+        }
+        None => TemporaryCallableCapture::Unknown,
     }
 }
 
 fn call_return_capture(
     index: u16,
+    args: &[Expr],
     walk: &CaptureWalk<'_>,
     visiting_slots: &mut HashSet<LocalSlot>,
     visiting_functions: &mut HashSet<u16>,
@@ -1507,11 +1570,22 @@ fn call_return_capture(
         walk.env.function_impls.get(&index),
     ) {
         (Some(function), Some(implementation)) => {
-            let nested = function_capture_walk(function, implementation, walk.env);
+            let nested = function_capture_walk(
+                function,
+                implementation,
+                args,
+                walk,
+                visiting_slots,
+                visiting_functions,
+                depth,
+            );
+            // The callee's own local slots are a distinct lexical scope even
+            // when a sibling function reuses the same numeric LocalSlot.
+            let mut callee_slots = HashSet::new();
             temporary_callable_capture(
                 &implementation.body_expr,
                 &nested,
-                visiting_slots,
+                &mut callee_slots,
                 visiting_functions,
                 depth + 1,
             )
@@ -1526,16 +1600,26 @@ fn call_return_capture(
 
 fn local_call_capture(
     slot: LocalSlot,
+    args: &[Expr],
     walk: &CaptureWalk<'_>,
     visiting_slots: &mut HashSet<LocalSlot>,
     visiting_functions: &mut HashSet<u16>,
     depth: usize,
 ) -> TemporaryCallableCapture {
-    local_callable_return_capture(slot, walk, visiting_slots, visiting_functions, depth, 0)
+    local_callable_return_capture(
+        slot,
+        args,
+        walk,
+        visiting_slots,
+        visiting_functions,
+        depth,
+        0,
+    )
 }
 
 fn local_callable_return_capture(
     slot: LocalSlot,
+    args: &[Expr],
     walk: &CaptureWalk<'_>,
     visiting_slots: &mut HashSet<LocalSlot>,
     visiting_functions: &mut HashSet<u16>,
@@ -1549,21 +1633,36 @@ fn local_callable_return_capture(
         Some(definition) => match &definition.expr {
             Expr::Var(next) | Expr::MoveVar(next) => local_callable_return_capture(
                 *next,
+                args,
                 walk,
                 visiting_slots,
                 visiting_functions,
                 depth,
                 hops + 1,
             ),
-            Expr::FunctionRef(index, _) => {
-                call_return_capture(*index, walk, visiting_slots, visiting_functions, depth)
-            }
+            Expr::FunctionRef(index, _) => call_return_capture(
+                *index,
+                args,
+                walk,
+                visiting_slots,
+                visiting_functions,
+                depth,
+            ),
             Expr::Closure(closure) => {
-                let nested = closure_body_walk(closure, &definition.slots, walk.env);
+                let mut callee_slots = HashSet::new();
+                let nested = closure_body_walk(
+                    closure,
+                    &definition.slots,
+                    args,
+                    walk,
+                    visiting_slots,
+                    visiting_functions,
+                    depth,
+                );
                 temporary_callable_capture(
                     &closure.body,
                     &nested,
-                    visiting_slots,
+                    &mut callee_slots,
                     visiting_functions,
                     depth + 1,
                 )
@@ -1584,14 +1683,20 @@ fn closure_call_return_capture(
     visiting_functions: &mut HashSet<u16>,
     depth: usize,
 ) -> TemporaryCallableCapture {
-    let mut nested = closure_body_walk(closure, &walk.slots, walk.env);
-    if let Some(arg_schemas) = argument_schemas(&closure.param_slots, args, walk) {
-        nested.slots.extend(arg_schemas);
-    }
+    let mut callee_slots = HashSet::new();
+    let nested = closure_body_walk(
+        closure,
+        &walk.slots,
+        args,
+        walk,
+        visiting_slots,
+        visiting_functions,
+        depth,
+    );
     temporary_callable_capture(
         &closure.body,
         &nested,
-        visiting_slots,
+        &mut callee_slots,
         visiting_functions,
         depth + 1,
     )
@@ -1619,7 +1724,11 @@ fn argument_schemas(
 fn closure_body_walk<'a>(
     closure: &ClosureExpr,
     slots: &HashMap<LocalSlot, TypeSchema>,
-    env: &'a Env,
+    args: &[Expr],
+    caller: &CaptureWalk<'a>,
+    visiting_slots: &mut HashSet<LocalSlot>,
+    visiting_functions: &mut HashSet<u16>,
+    depth: usize,
 ) -> CaptureWalk<'a> {
     let mut nested_slots = slots.clone();
     for (source, captured) in &closure.capture_copies {
@@ -1627,10 +1736,30 @@ fn closure_body_walk<'a>(
             nested_slots.insert(*captured, schema.clone());
         }
     }
+    if let Some(arg_schemas) = argument_schemas(&closure.param_slots, args, caller) {
+        nested_slots.extend(arg_schemas);
+    }
+    let mut param_facts = HashMap::new();
+    for (slot, argument) in closure.param_slots.iter().zip(args.iter()) {
+        param_facts.insert(
+            *slot,
+            temporary_callable_capture(
+                argument,
+                caller,
+                visiting_slots,
+                visiting_functions,
+                depth + 1,
+            ),
+        );
+    }
+    let mut owned_locals: HashSet<LocalSlot> = closure.param_slots.iter().copied().collect();
+    owned_locals.extend(closure.capture_copies.iter().map(|(_, captured)| *captured));
     CaptureWalk {
         slots: nested_slots,
         defs: HashMap::new(),
-        env,
+        owned_locals,
+        param_facts,
+        env: caller.env,
     }
 }
 
@@ -1679,15 +1808,19 @@ fn closure_capture(
                 return TemporaryCallableCapture::Resource(schema.clone());
             }
             Some(TypeSchema::Callable { .. }) => {
-                let nested = match walk.defs.get(source) {
-                    Some(definition) => definition_value_capture(
-                        definition,
-                        walk,
-                        visiting_slots,
-                        visiting_functions,
-                        depth + 1,
-                    ),
-                    None => TemporaryCallableCapture::Unknown,
+                let nested = if let Some(fact) = walk.param_facts.get(source) {
+                    fact.clone()
+                } else {
+                    match walk.defs.get(source) {
+                        Some(definition) => definition_value_capture(
+                            definition,
+                            walk,
+                            visiting_slots,
+                            visiting_functions,
+                            depth + 1,
+                        ),
+                        None => TemporaryCallableCapture::Unknown,
+                    }
                 };
                 verdict = verdict.merge(nested);
             }
@@ -1711,26 +1844,35 @@ fn definition_value_capture(
     let nested = CaptureWalk {
         slots: definition.slots.clone(),
         defs: walk.defs.clone(),
+        owned_locals: walk.owned_locals.clone(),
+        param_facts: walk.param_facts.clone(),
         env: walk.env,
     };
     match &definition.expr {
         Expr::Closure(closure) => {
             closure_capture(closure, &nested, visiting_slots, visiting_functions, depth)
         }
-        Expr::Var(slot) | Expr::MoveVar(slot) => match nested.defs.get(slot) {
-            Some(next) => definition_value_capture(
-                next,
-                &CaptureWalk {
-                    slots: next.slots.clone(),
-                    defs: nested.defs.clone(),
-                    env: nested.env,
-                },
-                visiting_slots,
-                visiting_functions,
-                depth + 1,
-            ),
-            None => TemporaryCallableCapture::Unknown,
-        },
+        Expr::Var(slot) | Expr::MoveVar(slot) => {
+            if let Some(fact) = nested.param_facts.get(slot) {
+                return fact.clone();
+            }
+            match nested.defs.get(slot) {
+                Some(next) => definition_value_capture(
+                    next,
+                    &CaptureWalk {
+                        slots: next.slots.clone(),
+                        defs: nested.defs.clone(),
+                        owned_locals: nested.owned_locals.clone(),
+                        param_facts: nested.param_facts.clone(),
+                        env: nested.env,
+                    },
+                    visiting_slots,
+                    visiting_functions,
+                    depth + 1,
+                ),
+                None => TemporaryCallableCapture::Unknown,
+            }
+        }
         _ => temporary_callable_capture(
             &definition.expr,
             &nested,
@@ -1744,9 +1886,14 @@ fn definition_value_capture(
 fn function_capture_walk<'a>(
     function: &FunctionDecl,
     implementation: &FunctionImpl,
-    env: &'a Env,
+    args: &[Expr],
+    caller: &CaptureWalk<'a>,
+    visiting_slots: &mut HashSet<LocalSlot>,
+    visiting_functions: &mut HashSet<u16>,
+    depth: usize,
 ) -> CaptureWalk<'a> {
     let mut slots = HashMap::new();
+    let mut owned_locals = HashSet::new();
     for (slot, schema) in implementation
         .param_slots
         .iter()
@@ -1755,16 +1902,47 @@ fn function_capture_walk<'a>(
         if let Some(schema) = schema {
             slots.insert(*slot, schema.clone());
         }
+        owned_locals.insert(*slot);
     }
     for (source, captured) in &implementation.capture_copies {
-        if let Some(schema) = env.slots.get(source) {
+        if let Some(schema) = caller
+            .slots
+            .get(source)
+            .or_else(|| caller.env.slots.get(source))
+        {
             slots.insert(*captured, schema.clone());
+        }
+        owned_locals.insert(*captured);
+    }
+    let mut param_facts = HashMap::new();
+    for ((slot, schema), argument) in implementation
+        .param_slots
+        .iter()
+        .zip(function.arg_schemas.iter())
+        .zip(args.iter())
+    {
+        if schema
+            .as_ref()
+            .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }))
+        {
+            param_facts.insert(
+                *slot,
+                temporary_callable_capture(
+                    argument,
+                    caller,
+                    visiting_slots,
+                    visiting_functions,
+                    depth + 1,
+                ),
+            );
         }
     }
     let mut walk = CaptureWalk {
         slots,
         defs: HashMap::new(),
-        env,
+        owned_locals,
+        param_facts,
+        env: caller.env,
     };
     bind_stmts(&implementation.body_stmts, &mut walk);
     walk
@@ -1794,6 +1972,7 @@ fn bind_stmts(stmts: &[Stmt], walk: &mut CaptureWalk<'_>) {
                 if let Some(schema) = schema {
                     walk.slots.insert(*index, schema);
                 }
+                walk.owned_locals.insert(*index);
                 let is_callable = walk
                     .slots
                     .get(index)
@@ -1839,6 +2018,7 @@ fn bind_stmts(stmts: &[Stmt], walk: &mut CaptureWalk<'_>) {
             Stmt::Drop { index, .. } => {
                 walk.slots.remove(index);
                 walk.defs.remove(index);
+                walk.owned_locals.remove(index);
             }
             _ => {}
         }

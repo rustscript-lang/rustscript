@@ -751,3 +751,176 @@ fn resource_free_temporary_factory_callback_keeps_construction_and_selected_body
     assert_eq!(value, Value::Int(24));
     assert_eq!(events, vec![1, 20, 21, 2, 30]);
 }
+
+#[test]
+fn resource_free_local_return_factory_and_forwarding_stay_executable() {
+    let _guard = PROBE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use probe;
+        fn make_callback(tag: int) -> fn(int) -> int {
+            let callback = |item| item + tag;
+            probe::mark(tag);
+            callback
+        }
+        fn id(callback: fn(int) -> int) -> fn(int) -> int {
+            callback
+        }
+        fn relay(value: Result<int, int>, tag: int) -> int {
+            let mapped = value.map(id(make_callback(tag)));
+            match mapped {
+                Result::Ok(item) => item,
+                Result::Err(error) => error,
+            }
+        }
+        let ok_out = relay(probe::ok(1), 20);
+        let err_out = relay(probe::err(2), 30);
+        ok_out + err_out;
+    "#;
+    let (value, events) = run_probe(source);
+    // Ok: 1 -> factory 20 -> selected body 1 + 20 => 21. Err: 2 -> factory 30,
+    // the unselected body never runs and the error payload passes through.
+    assert_eq!(value, Value::Int(23));
+    assert_eq!(events, vec![1, 20, 2, 30]);
+}
+
+#[test]
+fn typed_unwrap_payload_in_function_tail_and_annotated_let() {
+    let _guard = PROBE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use probe;
+        fn pick_tail(value: Result<int, int>) -> int {
+            value.unwrap_or(probe::mark(10))
+        }
+        fn pick_let(value: Result<int, int>) -> int {
+            let out: int = value.unwrap_or(probe::mark(11));
+            out
+        }
+        fn pick_else_tail(value: Result<int, int>) -> int {
+            value.unwrap_or_else(|error| probe::mark(12) + error)
+        }
+        fn pick_else_let(value: Result<int, int>) -> int {
+            let out: int = value.unwrap_or_else(|error| probe::mark(13) + error);
+            out
+        }
+        let ok_out = pick_tail(probe::ok(1));
+        let err_let = pick_let(probe::err(2));
+        let ok_else = pick_else_tail(probe::ok(3));
+        let err_else_let = pick_else_let(probe::err(4));
+        ok_out + err_let + ok_else + err_else_let;
+    "#;
+    let (value, events) = run_probe(source);
+    // Ok(1) selects 1 after the eager fallback mark 10; Err(2) selects the
+    // eager fallback 11; Ok(3) leaves the lazy callback body unrun; Err(4)
+    // runs the lazy body (13 + 4 = 17). 1 + 11 + 3 + 17 = 32.
+    assert_eq!(value, Value::Int(32));
+    assert_eq!(events, vec![1, 10, 2, 11, 3, 4, 13]);
+}
+
+#[test]
+fn typed_unwrap_payload_supports_non_int_and_nested_result() {
+    let source = r#"
+        fn pick_text(value: Result<string, string>) -> string {
+            value.unwrap_or("fallback")
+        }
+        fn pick_text_else(value: Result<string, string>) -> string {
+            value.unwrap_or_else(|error| error)
+        }
+        fn pick_nested(value: Result<Result<int, int>, int>) -> Result<int, int> {
+            value.unwrap_or(Result::Ok(7))
+        }
+        fn pick_nested_else(value: Result<Result<int, int>, int>) -> Result<int, int> {
+            value.unwrap_or_else(|error| Result::Ok(error + 1))
+        }
+        let ok_text: Result<string, string> = Result::Ok("ok");
+        let err_text: Result<string, string> = Result::Err("bad");
+        let text_out = pick_text(ok_text);
+        let text_else_out = pick_text_else(err_text);
+        let inner: Result<int, int> = Result::Ok(5);
+        let outer_ok: Result<Result<int, int>, int> = Result::Ok(inner);
+        let outer_err: Result<Result<int, int>, int> = Result::Err(6);
+        let nested_ok = pick_nested(outer_ok);
+        let nested_fallback = pick_nested(outer_err);
+        let nested_else_ok = pick_nested_else(outer_ok);
+        let nested_else_err = pick_nested_else(outer_err);
+        let nested_ok_payload = match nested_ok {
+            Result::Ok(item) => item,
+            Result::Err(error) => -error,
+        };
+        let nested_fallback_payload = match nested_fallback {
+            Result::Ok(item) => item,
+            Result::Err(error) => -error,
+        };
+        let nested_else_ok_payload = match nested_else_ok {
+            Result::Ok(item) => item,
+            Result::Err(error) => -error,
+        };
+        let nested_else_err_payload = match nested_else_err {
+            Result::Ok(item) => item,
+            Result::Err(error) => -error,
+        };
+        let text_flag = if text_out == "ok" && text_else_out == "bad" => { 1 } else => { 0 };
+        text_flag + nested_ok_payload + nested_fallback_payload + nested_else_ok_payload
+            + nested_else_err_payload;
+    "#;
+    assert_eq!(eval(source), Value::Int(1 + 5 + 7 + 5 + 7));
+}
+
+#[test]
+fn result_returning_combinators_still_reject_non_result_annotations() {
+    for (label, source) in [
+        (
+            "map",
+            r#"
+        fn bad(value: Result<int, int>) -> int {
+            value.map(|item| item + 1)
+        }
+        "#,
+        ),
+        (
+            "and_then",
+            r#"
+        fn bad(value: Result<int, int>) -> int {
+            value.and_then(|item| Result::Ok(item + 1))
+        }
+        "#,
+        ),
+    ] {
+        let diagnostic = reject(source);
+        assert!(
+            diagnostic.contains("produces a Result value, not int"),
+            "{label}: {diagnostic}"
+        );
+    }
+}
+
+#[test]
+fn typed_unwrap_payload_still_requires_the_payload_type() {
+    for (label, source) in [
+        (
+            "unwrap_or",
+            r#"
+        fn bad(value: Result<int, int>) -> string {
+            value.unwrap_or(0)
+        }
+        "#,
+        ),
+        (
+            "unwrap_or_else",
+            r#"
+        fn bad(value: Result<int, int>) -> string {
+            value.unwrap_or_else(|error| error)
+        }
+        "#,
+        ),
+    ] {
+        let diagnostic = reject(source);
+        assert!(
+            diagnostic.contains(label) && diagnostic.contains("expects string"),
+            "{label}: {diagnostic}"
+        );
+    }
+}

@@ -813,6 +813,12 @@ fn compile_with_fixture_catalog(source: &str) -> Result<(), String> {
     }
 }
 
+fn resource_store(source: &str) -> vm::Store {
+    let mut store = vm::Store::from_vm(machine(source));
+    store.run().unwrap();
+    store
+}
+
 fn assert_combinator_both_branches(name: &str) {
     let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut store = callback_store();
@@ -1130,6 +1136,89 @@ fn owned_result_combinator_rejects_unproven_factory_alias_capture() {
 }
 
 #[test]
+fn owned_result_combinator_local_return_rejection_covers_callable_sites() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cases = [
+        (
+            "map",
+            r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn leak(value: Result<int, resource<result.failure>>, token: resource<result.success>) -> Result<int, resource<result.failure>> {
+            value.map(make_callback(token))
+        }
+        "#,
+        ),
+        (
+            "map_err",
+            r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map_err(make_callback(token))
+        }
+        "#,
+        ),
+        (
+            "and_then",
+            r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> Result<int, resource<result.failure>> {
+            let callback: fn(int) -> Result<int, resource<result.failure>> =
+                |value| Result::Ok(result_resource::consume_token(token) + value);
+            callback
+        }
+        pub fn leak(value: Result<int, resource<result.failure>>, token: resource<result.success>) -> Result<int, resource<result.failure>> {
+            value.and_then(make_callback(token))
+        }
+        "#,
+        ),
+        (
+            "or_else",
+            r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(resource<result.failure>) -> Result<int, resource<result.failure>> {
+            let callback: fn(resource<result.failure>) -> Result<int, resource<result.failure>> =
+                |error| Result::Ok(result_resource::consume_token(token));
+            callback
+        }
+        pub fn leak(value: Result<int, resource<result.failure>>, token: resource<result.success>) -> Result<int, resource<result.failure>> {
+            value.or_else(make_callback(token))
+        }
+        "#,
+        ),
+        (
+            "unwrap_or_else",
+            r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> int {
+            let out = value.unwrap_or_else(make_callback(token));
+            out
+        }
+        "#,
+        ),
+    ];
+    for (method, source) in cases {
+        let error = compile_with_fixture_catalog(source).expect_err(method);
+        let text = error.to_string();
+        assert!(
+            text.contains("temporary") && text.contains("resource") && text.contains("captur"),
+            "{method}: {text}"
+        );
+    }
+}
+
+#[test]
 fn owned_result_combinator_allows_prebound_resource_capture_callback() {
     let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = r#"
@@ -1163,6 +1252,189 @@ fn owned_result_combinator_unwrap_or_rejects_discarded_err_resource() {
         text.contains("unwrap_or") && text.contains("Err") && text.contains("resource"),
         "{text}"
     );
+}
+
+#[test]
+fn owned_result_combinator_unwrap_or_rejects_discarded_err_resource_in_typed_tail() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn leak(value: Result<int, resource<result.failure>>) -> int {
+            value.unwrap_or(0)
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("a typed tail must reach the selected Err resource rejection");
+    let text = error.to_string();
+    assert!(
+        text.contains("unwrap_or") && text.contains("Err") && text.contains("resource"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("produces a Result value"),
+        "typed unwrap must not be rejected by the outer Result annotation rule: {text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_local_return_factory_resource_capture() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make_callback(token))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("a factory that returns a resource-capturing local callable is temporary");
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary") && text.contains("resource") && text.contains("captur"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_forwarded_factory_resource_capture() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            |value| result_resource::consume_token(token)
+        }
+        pub fn id(callback: fn(int) -> int) -> fn(int) -> int {
+            callback
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(id(make_callback(token)))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("callable argument capture facts must flow into the forwarding parameter");
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary") && text.contains("resource") && text.contains("captur"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_block_local_factory_resource_capture() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>, flag: bool) -> fn(int) -> int {
+            if flag => {
+                let callback = |value| result_resource::consume_token(token);
+                callback
+            } else => {
+                |value| value
+            }
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make_callback(token, true))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("a block that returns a resource-capturing local callable is temporary");
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary") && text.contains("resource") && text.contains("captur"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_aliased_local_return_factory_resource_capture() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            let factory = make_callback;
+            value.map(factory(token))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("a callable alias still resolves the local-return factory capture");
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary") && text.contains("resource") && text.contains("captur"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_allows_prebound_forwarded_resource_capture_callback() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            |value| result_resource::consume_token(token)
+        }
+        pub fn id(callback: fn(int) -> int) -> fn(int) -> int {
+            callback
+        }
+        pub fn keep(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            let callback = make_callback(token);
+            value.map(id(callback))
+        }
+    "#;
+    compile_with_fixture_catalog(source)
+        .expect("a caller-owned prebound callable forwarded through a helper keeps its owner");
+}
+
+#[test]
+fn owned_result_combinator_keeps_prebound_callback_usable_before_teardown() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            let callback = |value| result_resource::consume_token(token);
+            callback
+        }
+        pub fn keep(value: Result<int, int>, token: resource<result.success>) -> int {
+            let callback = make_callback(token);
+            let mapped = value.map(callback);
+            let selected = match mapped {
+                Result::Ok(item) => item,
+                Result::Err(error) => error,
+            };
+            callback(0) + selected
+        }
+    "#;
+    let mut store = resource_store(source);
+    let callback = store
+        .vm_script_callback_by_name::<(vm::GuestResult<i64, i64>, ResourceOwned<Success>), i64>(
+            "keep",
+        )
+        .unwrap();
+    let handler_calls = HANDLER_CALLS.load(Ordering::SeqCst);
+    let closed = CLOSED.load(Ordering::SeqCst);
+    let dropped_ok = DROPPED_OK.load(Ordering::SeqCst);
+    let returned = callback
+        .call_with_vm(
+            &mut store,
+            (vm::GuestResult::Err(5), ResourceOwned::new(Success(61))),
+        )
+        .unwrap();
+    // The unselected Err branch does not call the callback body, and the
+    // surviving user binding is still callable afterwards: it consumes the
+    // captured token exactly once before VM teardown.
+    assert_eq!(returned, 5 + 61);
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), handler_calls + 1);
+    assert_eq!(DROPPED_OK.load(Ordering::SeqCst), dropped_ok + 1);
+    assert_eq!(store.vm_mut().host_context().resource_count(), 0);
+    // A TakeOwned consumption vacates the resource slot; it does not route
+    // through HostResource::begin_close, so CLOSED stays at its baseline.
+    assert_eq!(CLOSED.load(Ordering::SeqCst), closed);
 }
 
 #[test]
