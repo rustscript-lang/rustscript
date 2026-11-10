@@ -563,3 +563,56 @@ fn owned_callback_try_ret_and_publication_reclaim_preserve_return_and_unrelated_
         }
     }
 }
+
+#[test]
+fn owned_combinator_map_before_try_keeps_selected_owner_across_v13() {
+    let _lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    for decoded in [false, true] {
+        for ok in [true, false] {
+            EVENTS.lock().unwrap().clear();
+            let tick = if ok { 0 } else { 2 };
+            let source = format!(
+                r#"
+                use joined;
+                fn relay(flag: bool) -> Result<resource<joined.token>, resource<joined.token>> {{
+                    let produced = joined::make(flag, 301);
+                    let mapped = produced.map(|item| item);
+                    let selected = mapped?;
+                    joined::tick(3);
+                    let local = joined::make(true, 101);
+                    joined::close(local);
+                    Result::Ok(selected)
+                }}
+                relay(joined::tick({tick}) == 0);"#
+            );
+            let mut machine = machine(&source, decoded);
+            machine.set_fuel(100_000);
+            assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+            let (tag, payload) = vm::result::payload(machine.stack().last().unwrap()).unwrap();
+            assert_eq!(tag, ok);
+            let handle = vm::result::resource_handle(payload).expect("active owner handle");
+            assert_eq!(machine.host_context().resource_count(), 1);
+            let events = EVENTS.lock().unwrap().clone();
+            assert!(events.contains(&("make", 301)));
+            assert!(events.contains(&("tick", tick as i64)));
+            assert_eq!(events.contains(&("tick", 3)), ok);
+            assert_eq!(events.contains(&("make", 101)), ok);
+            assert_eq!(events.contains(&("close", 101)), ok);
+            assert!(!events.contains(&("close", 301)));
+            machine
+                .host_context()
+                .close_resource::<Token>(handle, ResourceCloseReason::Requested)
+                .unwrap();
+            assert_eq!(machine.host_context().resource_count(), 0);
+            let events = EVENTS.lock().unwrap().clone();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| **event == ("close", 301))
+                    .count(),
+                1
+            );
+            eprintln!("B combinator try decoded={decoded} ok={ok} events={events:?}");
+        }
+    }
+}

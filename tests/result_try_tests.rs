@@ -1186,3 +1186,92 @@ fn host_overload_sees_selected_try_success_type() {
         "{rejected:?}"
     );
 }
+
+#[test]
+fn result_combinator_chain_propagates_through_question_mark() {
+    let source = r#"
+        fn fail() -> Result<int, string> {
+            Result::Err("bad")
+        }
+        fn relay() -> Result<int, string> {
+            let mapped = fail().map(|value| value + 1);
+            let selected = mapped?;
+            Result::Ok(selected + 1)
+        }
+        let result = relay();
+        let observed = match result {
+            Result::Ok(value) => "unexpected",
+            Result::Err(error) => error,
+        };
+        observed;
+    "#;
+    // The mapped carrier keeps the error payload and the `?` returns it.
+    match vm::compile_source(source) {
+        Ok(compiled) => {
+            let mut machine = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
+            machine.set_fuel(100_000);
+            assert_eq!(machine.run().unwrap(), vm::VmStatus::Halted);
+            assert_eq!(machine.stack().last(), Some(&vm::Value::string("bad")));
+        }
+        Err(error) => panic!("combinator + question mark must compile: {error}"),
+    }
+}
+
+#[test]
+fn fuel_yields_inside_combinator_callback_then_completes() {
+    let compiled = compile_source(
+        r#"
+        fn heavy(value: int) -> int {
+            let mut i = 0;
+            while i < 100 { i = i + 1; }
+            value + i
+        }
+        fn relay(value: Result<int, int>) -> Result<int, int> {
+            let mapped = value.map(heavy);
+            mapped
+        }
+        let caught = match relay(Result::Ok(1)) {
+            Result::Ok(value) => value,
+            Result::Err(error) => -1,
+        };
+        caught;
+    "#,
+    )
+    .expect("combinator fuel source admission");
+    let mut machine = Vm::new_with_jit_config(
+        compiled.program.with_local_count(compiled.locals),
+        vm::JitConfig {
+            enabled: false,
+            hot_loop_threshold: 1,
+            max_trace_len: 512,
+        },
+    );
+    machine.set_fuel(1);
+    assert_eq!(
+        machine.run().expect("fuel suspension is not guest Err"),
+        VmStatus::Yielded
+    );
+    assert_eq!(machine.last_yield_reason(), Some(vm::VmYieldReason::Fuel));
+    let mut halted = false;
+    let mut yielded_inside_callback = false;
+    for _ in 0..1024 {
+        machine.recharge_fuel(32).unwrap();
+        match machine.run().expect("resumed combinator") {
+            VmStatus::Halted => {
+                halted = true;
+                break;
+            }
+            VmStatus::Yielded => {
+                assert_eq!(machine.last_yield_reason(), Some(vm::VmYieldReason::Fuel));
+                yielded_inside_callback |= machine.call_depth() >= 2;
+            }
+            status => panic!("unexpected status {status:?}"),
+        }
+    }
+    assert!(halted, "bounded fuel driver must finish");
+    assert!(
+        yielded_inside_callback,
+        "fuel must yield inside the selected map callback body"
+    );
+    assert_eq!(machine.stack().last(), Some(&vm::Value::Int(101)));
+}

@@ -108,6 +108,33 @@ fn result_diagnostic_source_map_owns_constructor_and_match() {
     }
 }
 
+#[test]
+fn result_combinator_diagnostic_owns_exact_source_span() {
+    let source = "// 変換\r\npub fn relay() -> Result<int, string> {\r\n    let value: Result<int, int> = Result::Ok(1);\r\n    value.and_then(|item| Result::Ok(item))\r\n}\r\n";
+    let slice = "value.and_then(|item| Result::Ok(item))";
+    for _ in 0..2 {
+        assert_origin(source, source, false, slice);
+        assert_origin(
+            source,
+            "use self::lib as lib;\r\nlib::relay();\r\n",
+            true,
+            slice,
+        );
+    }
+}
+
+#[test]
+fn compact_result_combinator_format_is_idempotent_and_preserves_execution() {
+    let source = "fn relay(value:Result<int,int>)->Result<int,int>{value.map(|item|item+1).map_err(|error|error-1)}let result=relay(Result::Ok(2));let answer=result.unwrap_or(9);answer;";
+    let formatted = assert_format(source);
+    for method in [".map(", ".map_err(", ".unwrap_or("] {
+        assert!(
+            formatted.contains(method),
+            "formatted combinator source must keep {method}: {formatted}"
+        );
+    }
+}
+
 fn execute(source: &str) -> Vec<vm::Value> {
     let compiled = vm::compile_source(source).expect("formatter control must type check");
     let mut machine = vm::Vm::new(compiled.program.with_local_count(compiled.locals));

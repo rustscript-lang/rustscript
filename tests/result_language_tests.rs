@@ -761,3 +761,25 @@ fn no_result_nested_inner_outer_returns_three() {
         "no-Result nested inner/outer",
     );
 }
+
+#[test]
+fn result_combinators_keep_generic_language_schemas() {
+    let source = r#"
+        fn wrap<T>(value: T) -> Result<T, string> {
+            Result::Ok(value)
+        }
+        fn identity<T>(value: T) -> T {
+            value
+        }
+        let wrapped = wrap::<int>(4);
+        let mapped = wrapped.map(identity::<int>);
+        let recovered: Result<int, int> = mapped.map_err(|error| 0);
+        let selected = recovered.unwrap_or(-1);
+        let value = match recovered {
+            Result::Ok(item) => item,
+            Result::Err(error) => error,
+        };
+        selected + value;
+    "#;
+    assert_eq!(eval(source), vm::Value::Int(8));
+}

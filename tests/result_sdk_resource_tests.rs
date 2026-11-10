@@ -196,6 +196,14 @@ fn callback_store() -> vm::Store {
         pub fn return_first_three(first: Result<resource<result.success>, resource<result.failure>>, second: Result<resource<result.success>, resource<result.failure>>, third: Result<resource<result.success>, resource<result.failure>>) -> Result<resource<result.success>, resource<result.failure>> { result_resource::observe(); first }
         pub fn retain_success(value: Result<resource<result.success>, resource<result.failure>>) -> int { result_resource::retain(value) }
         pub fn nullable(value: Result<resource<result.success>?, resource<result.failure>>) -> Result<resource<result.success>?, resource<result.failure>> { result_resource::observe(); value }
+        pub fn map_echo(value: Result<resource<result.success>, resource<result.failure>>) -> Result<resource<result.success>, resource<result.failure>> { result_resource::observe(); let mapped = value.map(|item| item); result_resource::observe(); mapped }
+        pub fn map_err_echo(value: Result<resource<result.success>, resource<result.failure>>) -> Result<resource<result.success>, resource<result.failure>> { result_resource::observe(); let mapped = value.map_err(|error| error); result_resource::observe(); mapped }
+        pub fn and_then_echo(value: Result<resource<result.success>, resource<result.failure>>) -> Result<resource<result.success>, resource<result.failure>> { result_resource::observe(); let mapped = value.and_then(|item| Result::Ok(item)); result_resource::observe(); mapped }
+        pub fn or_else_echo(value: Result<resource<result.success>, resource<result.failure>>) -> Result<resource<result.success>, resource<result.failure>> { result_resource::observe(); let mapped = value.or_else(|error| Result::Err(error)); result_resource::observe(); mapped }
+        pub fn to_error_result(value: Result<resource<result.success>, resource<result.failure>>) -> Result<int, resource<result.failure>> { match value { Result::Ok(item) => Result::Ok(0), Result::Err(error) => Result::Err(error) } }
+        pub fn take_error(error: resource<result.failure>) -> int { let wrapped: Result<resource<result.success>, resource<result.failure>> = Result::Err(error); result_resource::take(wrapped) }
+        pub fn map_err_take(value: Result<resource<result.success>, resource<result.failure>>) -> Result<int, int> { let narrowed = to_error_result(value); narrowed.map_err(take_error) }
+        pub fn map_fatal(value: Result<int, int>) -> Result<int, int> { value.map(|item| item + result_resource::fatal()) }
     "#,
     ));
     store.run().unwrap();
@@ -781,4 +789,166 @@ fn generated_owned_result_both_branches_publish_then_take_exactly_once() {
     );
     assert_eq!(descriptors[0].effects.len(), 2);
     assert_eq!(descriptors[1].effects.len(), 2);
+}
+
+fn compile_with_fixture_catalog(source: &str) -> Result<(), String> {
+    let descriptors = descriptors();
+    let catalog = Arc::new(vm::HostFunctionDescriptor::collect_catalog(&descriptors).unwrap());
+    match vm::compile_source_with_flavor_and_options(
+        source,
+        vm::SourceFlavor::RustScript,
+        vm::CompileSourceFileOptions::default().with_host_api_catalog(catalog),
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn assert_combinator_both_branches(name: &str) {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut store = callback_store();
+    let callback = store
+        .vm_script_callback_by_name::<(OwnedResult,), OwnedResult>(name)
+        .unwrap();
+    let closed = CLOSED.load(Ordering::SeqCst);
+    let dropped_ok = DROPPED_OK.load(Ordering::SeqCst);
+    let dropped_err = DROPPED_ERR.load(Ordering::SeqCst);
+    let observations = OBSERVATIONS.load(Ordering::SeqCst);
+    for (index, branch) in [true, false].into_iter().enumerate() {
+        let value = if branch {
+            GuestResult::Ok(ResourceOwned::new(Success(61)))
+        } else {
+            GuestResult::Err(ResourceOwned::new(Failure(73)))
+        };
+        let returned = callback.call_with_vm(&mut store, (value,)).unwrap();
+        // The post-combinator observe inside the guest callback sees the
+        // selected payload still owned by the generated carrier.
+        assert_eq!(OBSERVED_RESOURCE_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            OBSERVATIONS.load(Ordering::SeqCst),
+            observations + 2 * (index + 1)
+        );
+        // The carrier return publishes the selected resource before the VM
+        // frame retires, so the host owns the only live handle.
+        assert_eq!(store.vm_mut().host_context().resource_count(), 0);
+        match returned {
+            GuestResult::Ok(value) => {
+                assert!(branch);
+                let mut value = value.into_inner();
+                assert_eq!(value.0, 61);
+                value.begin_close(ResourceCloseReason::Requested).unwrap();
+            }
+            GuestResult::Err(value) => {
+                assert!(!branch);
+                let mut value = value.into_inner();
+                assert_eq!(value.0, 73);
+                value.begin_close(ResourceCloseReason::Requested).unwrap();
+            }
+        }
+    }
+    assert_eq!(CLOSED.load(Ordering::SeqCst), closed + 2);
+    assert_eq!(DROPPED_OK.load(Ordering::SeqCst), dropped_ok + 1);
+    assert_eq!(DROPPED_ERR.load(Ordering::SeqCst), dropped_err + 1);
+}
+
+#[test]
+fn owned_result_combinator_map_transfers_payload_resource_on_both_branches() {
+    assert_combinator_both_branches("map_echo");
+}
+
+#[test]
+fn owned_result_combinator_map_err_transfers_error_resource_on_both_branches() {
+    assert_combinator_both_branches("map_err_echo");
+}
+
+#[test]
+fn owned_result_combinator_and_then_transfers_payload_resource_on_both_branches() {
+    assert_combinator_both_branches("and_then_echo");
+}
+
+#[test]
+fn owned_result_combinator_or_else_transfers_error_resource_on_both_branches() {
+    assert_combinator_both_branches("or_else_echo");
+}
+
+#[test]
+fn owned_result_map_err_consumes_error_resource_through_native_take() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut store = callback_store();
+    let callback = store
+        .vm_script_callback_by_name::<(OwnedResult,), vm::GuestResult<i64, i64>>("map_err_take")
+        .unwrap();
+    let handler_calls = HANDLER_CALLS.load(Ordering::SeqCst);
+    let dropped_err = DROPPED_ERR.load(Ordering::SeqCst);
+    let returned = callback
+        .call_with_vm(
+            &mut store,
+            (GuestResult::Err(ResourceOwned::new(Failure(73))),),
+        )
+        .unwrap();
+    assert!(
+        matches!(returned, vm::GuestResult::Err(ref error) if *error == 73),
+        "{returned:?}"
+    );
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), handler_calls + 1);
+    assert_eq!(DROPPED_ERR.load(Ordering::SeqCst), dropped_err + 1);
+    assert_eq!(store.vm_mut().host_context().resource_count(), 0);
+}
+
+#[test]
+fn owned_result_combinator_fatal_callback_is_not_guest_err() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut store = callback_store();
+    let callback = store
+        .vm_script_callback_by_name::<(vm::GuestResult<i64, i64>,), vm::GuestResult<i64, i64>>(
+            "map_fatal",
+        )
+        .unwrap();
+    let error = callback
+        .call_with_vm(&mut store, (vm::GuestResult::Ok(1),))
+        .expect_err("host transport failure must stay outside the guest union");
+    assert!(
+        matches!(error, vm::VmError::HostError(ref detail) if detail.contains("callback transport failure")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_resource_closure_capture() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn take_ok(token: resource<result.success>) -> int {
+            let wrapped: Result<resource<result.success>, resource<result.failure>> = Result::Ok(token);
+            result_resource::take(wrapped)
+        }
+        pub fn leak(value: Result<resource<result.success>, resource<result.failure>>, token: resource<result.success>) -> Result<int, resource<result.failure>> {
+            value.map(|item| take_ok(token))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("an unselected resource-capturing callback must be rejected");
+    let text = error.to_string();
+    assert!(
+        text.contains("closure capture") && text.contains("resource"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_eager_unwrap_or_resource_fallback() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+        pub fn discard(value: Result<resource<result.success>, resource<result.failure>>, fallback: resource<result.success>) -> resource<result.success> {
+            value.unwrap_or(fallback)
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("an eager resource fallback has no unselected-branch destination");
+    let text = error.to_string();
+    assert!(
+        text.contains("unwrap_or") && text.contains("resource"),
+        "{text}"
+    );
 }

@@ -540,3 +540,160 @@ fn dynamic_string_payload_both_branches_all_backends() {
         }
     }
 }
+
+fn combinator_loop_source() -> &'static str {
+    r#"
+        pub fn runner(flag: bool, seed: int) -> Result<int, int> {
+            let mut i = 0;
+            let mut acc = seed;
+            while i < 64 {
+                let step: Result<int, int> = if flag || i != 32 => { Result::Ok(i + seed) } else => { Result::Err(acc) };
+                let mapped = step.map(|item| item + 1).map_err(|error| error + 2).unwrap_or(0);
+                let recovered: Result<int, int> = if flag || i != 32 => { Result::Ok(acc + mapped) } else => { Result::Err(mapped) };
+                let selected = recovered.and_then(|item| Result::Ok(item + 1)).unwrap_or_else(|error| error - 1);
+                acc = (acc + selected) % 1000;
+                i = i + 1;
+            }
+            Result::Ok(acc)
+        }
+        runner(input::flag(), input::value());
+    "#
+}
+
+fn expected_combinator_loop(flag: bool, seed: i64) -> i64 {
+    let mut acc = seed;
+    for i in 0..64i64 {
+        // `map`/`map_err` pass the selected branch through and `unwrap_or(0)`
+        // replaces the Err branch with the eager fallback 0.
+        let mapped = if flag || i != 32 { (i + seed) + 1 } else { 0 };
+        let selected = if flag || i != 32 {
+            acc + mapped + 1
+        } else {
+            // Err(0) -> and_then passes through -> unwrap_or_else body 0 - 1.
+            -1
+        };
+        acc = (acc + selected) % 1000;
+    }
+    acc
+}
+
+fn combinator_machine(
+    decoded: bool,
+    trace: bool,
+    aot: bool,
+) -> (Vm, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let mut builder = vm::HostApiBuilder::new();
+    builder.function(vm::HostFunctionSchema::with_return(
+        "input::flag",
+        vec![],
+        HostTypeSchema::Bool,
+    ));
+    builder.function(vm::HostFunctionSchema::with_return(
+        "input::value",
+        vec![],
+        HostTypeSchema::Int,
+    ));
+    let compiled = vm::compile_source_with_flavor_and_options(
+        combinator_loop_source(),
+        vm::SourceFlavor::RustScript,
+        vm::CompileSourceFileOptions::new()
+            .with_host_api_catalog(Arc::new(builder.build().unwrap())),
+    )
+    .unwrap();
+    let program = compiled.program.with_local_count(compiled.locals);
+    let program = if decoded {
+        let bytes = vm::encode_program(&program).unwrap();
+        let decoded = vm::decode_program(&bytes).unwrap();
+        assert_eq!(vm::encode_program(&decoded).unwrap(), bytes);
+        decoded
+    } else {
+        program
+    };
+    let mut machine = Vm::new_with_jit_config(
+        program,
+        vm::JitConfig {
+            enabled: trace,
+            hot_loop_threshold: 1,
+            max_trace_len: 512,
+        },
+    );
+    let flags = Arc::new(AtomicUsize::new(0));
+    let values = Arc::new(AtomicUsize::new(0));
+    machine.bind_function(
+        "input::flag",
+        Box::new(Input(Value::Bool(false), flags.clone())),
+    );
+    machine.bind_function(
+        "input::value",
+        Box::new(Input(Value::Int(7), values.clone())),
+    );
+    machine.set_fuel(100_000);
+    if aot {
+        machine
+            .compile_aot()
+            .expect("combinator loop must admit native AOT lowering");
+    }
+    (machine, flags, values)
+}
+
+fn assert_combinator_run(
+    label: &str,
+    machine: &mut Vm,
+    flags: &Arc<AtomicUsize>,
+    values: &Arc<AtomicUsize>,
+) {
+    assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+    let (tag, payload) = vm::result::payload(machine.stack().last().unwrap()).unwrap();
+    assert!(tag);
+    assert_eq!(payload, &Value::Int(expected_combinator_loop(false, 7)));
+    assert_eq!(flags.load(Ordering::SeqCst), 1);
+    assert_eq!(values.load(Ordering::SeqCst), 1);
+    eprintln!(
+        "B combinator native label={label} trace_native={} aot={} payload={payload:?}",
+        machine.jit_native_exec_count(),
+        machine.aot_exec_count()
+    );
+}
+
+#[test]
+fn dynamic_result_combinator_loop_all_backends_and_loaded_bytecode() {
+    for mode in ["interpreter", "trace", "aot"] {
+        let (mut machine, flags, values) =
+            combinator_machine(false, mode == "trace", mode == "aot");
+        assert_combinator_run(mode, &mut machine, &flags, &values);
+        if mode == "interpreter" {
+            assert_eq!(machine.jit_native_exec_count(), 0);
+            assert_eq!(machine.aot_exec_count(), 0);
+        }
+        if mode == "aot" {
+            let dump = machine.dump_aot_info();
+            assert!(
+                dump.contains("lowering=ssa"),
+                "combinator AOT must keep native lowering: {dump}"
+            );
+            assert!(machine.aot_exec_count() > 0);
+        }
+        if mode == "trace" {
+            let snapshot = machine.jit_snapshot();
+            let native: Vec<_> = snapshot
+                .traces
+                .iter()
+                .filter(|trace| trace.executions > 0 && trace.ssa_text().contains("payload"))
+                .collect();
+            assert!(
+                !native.is_empty(),
+                "combinator trace must execute a native payload region: {:?}",
+                snapshot.attempts
+            );
+            assert!(machine.jit_native_exec_count() > 0);
+        }
+    }
+    // Loaded std bytecode must keep the lowered combinator control flow and
+    // still execute both in the interpreter and through native AOT.
+    let (mut loaded, flags, values) = combinator_machine(true, false, false);
+    assert_combinator_run("loaded-interpreter", &mut loaded, &flags, &values);
+    assert_eq!(loaded.aot_exec_count(), 0);
+    let (mut loaded_aot, flags, values) = combinator_machine(true, false, true);
+    assert_combinator_run("loaded-aot", &mut loaded_aot, &flags, &values);
+    assert!(loaded_aot.aot_exec_count() > 0);
+}
