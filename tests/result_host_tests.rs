@@ -366,3 +366,72 @@ fn callback_guest_result_both_variants_and_store_identity() {
     store.reset_for_reuse().unwrap();
     assert!(callback.call(&mut store, (GuestResult::Ok(1),)).is_err());
 }
+
+#[test]
+fn callback_guest_result_converts_to_native_result_without_losing_branch_identity() {
+    let compiled = vm::compile_source(
+        "pub fn choose(mode: int) -> Result<int, string> {\n\
+         if mode == 0 => { Result::Ok(0) } else => { Result::Err(\"\") }\n\
+         }\n\
+         pub fn choose_bool(flag: bool) -> Result<bool, bool> {\n\
+         if flag => { Result::Ok(false) } else => { Result::Err(false) }\n\
+         }\n\
+         pub fn choose_zero(flag: bool) -> Result<int, int> {\n\
+         if flag => { Result::Ok(0) } else => { Result::Err(0) }\n\
+         }",
+    )
+    .unwrap();
+    let mut store = vm::Store::new(
+        Vm::new(compiled.program.with_local_count(compiled.locals)),
+        (),
+    );
+    store.vm_mut().set_fuel(100_000);
+    assert_eq!(store.run().unwrap(), VmStatus::Halted);
+
+    let int_callback = store
+        .script_callback_by_name::<(i64,), GuestResult<i64, String>>("choose")
+        .unwrap();
+    for (mode, expected) in [(0, Ok::<i64, String>(0)), (1, Err(String::new()))] {
+        let native: Result<i64, String> = int_callback.call(&mut store, (mode,)).unwrap().into();
+        assert_eq!(native, expected);
+    }
+
+    let bool_callback = store
+        .script_callback_by_name::<(bool,), GuestResult<bool, bool>>("choose_bool")
+        .unwrap();
+    for (flag, expected) in [(true, Ok(false)), (false, Err(false))] {
+        let native: Result<bool, bool> = bool_callback.call(&mut store, (flag,)).unwrap().into();
+        assert_eq!(native, expected);
+    }
+
+    let zero_callback = store
+        .script_callback_by_name::<(bool,), GuestResult<i64, i64>>("choose_zero")
+        .unwrap();
+    for (flag, expected) in [(true, Ok::<i64, i64>(0)), (false, Err(0))] {
+        let native: Result<i64, i64> = zero_callback.call(&mut store, (flag,)).unwrap().into();
+        assert_eq!(native, expected);
+    }
+}
+
+#[test]
+fn callback_native_result_keeps_outer_vm_errors_fatal() {
+    let source = "use result_sdk; pub fn host_call(mode: int) -> Result<int, string> { result_sdk::tri(mode) }";
+    let mut store = vm::Store::from_vm(machine(source));
+    assert_eq!(store.run().unwrap(), VmStatus::Halted);
+    let callback = store
+        .script_callback_by_name::<(i64,), GuestResult<i64, String>>("host_call")
+        .unwrap();
+    for (mode, expected) in [
+        (0, Ok::<i64, String>(7)),
+        (1, Err("guest failure".to_string())),
+    ] {
+        let native: Result<i64, String> = callback.call(&mut store, (mode,)).unwrap().into();
+        assert_eq!(native, expected);
+    }
+    match callback.call(&mut store, (2,)) {
+        Err(VmError::HostError(message)) => {
+            assert!(message.contains("transport failure"), "{message}");
+        }
+        other => panic!("outer VM error must stay fatal, got {other:?}"),
+    }
+}

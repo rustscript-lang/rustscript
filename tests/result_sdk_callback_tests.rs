@@ -156,3 +156,24 @@ fn malformed_result_callback_arguments_rejected_without_poisoning_store() {
         GuestResult::Ok(0)
     );
 }
+
+#[test]
+fn vm_aware_result_callback_converts_to_native_result() {
+    type R = GuestResult<i64, String>;
+    let compiled = vm::compile_source(
+        "pub fn echo(value: Result<int, string>) -> Result<int, string> { value }",
+    )
+    .unwrap();
+    let mut store = vm::Store::from_vm(Vm::new(compiled.program.with_local_count(compiled.locals)));
+    store.vm_mut().set_fuel(100_000);
+    assert_eq!(store.run().unwrap(), VmStatus::Halted);
+    let callback = store.vm_script_callback_by_name::<(R,), R>("echo").unwrap();
+    for (input, expected) in [
+        (GuestResult::Ok(0), Ok::<i64, String>(0)),
+        (GuestResult::Err(String::new()), Err(String::new())),
+    ] {
+        let native: Result<i64, String> =
+            callback.call_with_vm(&mut store, (input,)).unwrap().into();
+        assert_eq!(native, expected);
+    }
+}
