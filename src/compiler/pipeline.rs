@@ -3447,12 +3447,17 @@ mod tests {
             .1;
         for stmt in &mut parsed.stmts {
             if let Stmt::Let {
-                expr: Expr::OptionUnwrapOr { value, .. },
+                expr:
+                    Expr::ResultMethod {
+                        method: crate::compiler::ir::ResultMethod::UnwrapOr,
+                        receiver,
+                        ..
+                    },
                 ..
             } = stmt
                 && let Expr::OptionalGet {
                     field_projection, ..
-                } = value.as_mut()
+                } = receiver.as_mut()
             {
                 *field_projection = true;
             }
@@ -3472,6 +3477,47 @@ mod tests {
             panic!("record retained in REPL");
         };
         assert!(record.get(&crate::Value::string("note")).is_none());
+    }
+
+    /// Runtime alias control for the nested projection test above: without
+    /// explicit field-projection intent, native `?.` keeps value mode and
+    /// the present non-copy child stays owned by the retained record. This
+    /// distinguishes producer-intent detachment from an unconditional copy
+    /// or alias change in the `unwrap_or` carrier.
+    #[test]
+    fn native_ir_nested_optional_value_mode_retains_child() {
+        let source = "struct Entry { note: string? }\nlet entry: Entry = { note: \"ready\" };\nlet note = (entry?.note).unwrap_or(\"fallback\");\nnote;";
+        let parsed = crate::compiler::frontends::parse_source(
+            source,
+            SourceFlavor::RustScript,
+            &CompileSourceFileOptions::new(),
+        )
+        .unwrap();
+        let root = parsed
+            .local_bindings
+            .iter()
+            .find(|(name, _)| name == "entry")
+            .unwrap()
+            .1;
+        let compiled = compile_parsed_output(
+            source.to_string(),
+            parsed,
+            CompileBehavior::REPL,
+            TypingMode::Strict,
+            true,
+        )
+        .unwrap();
+        let mut machine = crate::Vm::new(compiled.program);
+        assert_eq!(machine.run().unwrap(), crate::VmStatus::Halted);
+        assert_eq!(machine.stack(), &[crate::Value::string("ready")]);
+        let crate::Value::Map(record) = &machine.locals()[root as usize] else {
+            panic!("record retained in REPL");
+        };
+        assert_eq!(
+            record.get(&crate::Value::string("note")),
+            Some(&crate::Value::string("ready")),
+            "value-mode `?.` retains container ownership: {record:?}"
+        );
     }
 
     #[test]

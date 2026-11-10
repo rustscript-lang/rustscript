@@ -2429,7 +2429,7 @@ mod lowered_provenance_remap_tests {
 /// slice helper `Len` calls) keeps `None` ids.
 #[cfg(test)]
 mod postfix_provenance_tests {
-    use crate::compiler::ir::{Expr, ParsedCallTarget, SemanticNodeId, Stmt};
+    use crate::compiler::ir::{Expr, ParsedCallTarget, ResultMethod, SemanticNodeId, Stmt};
     use crate::compiler::source_map::Span;
     use crate::compiler::{CompileSourceFileOptions, SharedParserOptions};
 
@@ -2620,8 +2620,9 @@ mod postfix_provenance_tests {
     }
 
     /// `.unwrap_or(d)` records the member token as callee, the full
-    /// `o.unwrap_or(5)` expr span, an `Unresolved` target, and the
-    /// `OptionUnwrapOr` node carries the same id.
+    /// `o.unwrap_or(5)` expr span, an `Unresolved` target, and the current
+    /// `ResultMethod` carrier node carries the same id. Non-Result receivers
+    /// lower to the pre-existing `OptionUnwrapOr` nullable path with that id.
     #[test]
     fn unwrap_or_records_member_callee_and_node_id() {
         let source = "let o = null;\no.unwrap_or(5);\n";
@@ -2642,10 +2643,14 @@ mod postfix_provenance_tests {
             })
             .expect("expr stmt");
         match expr {
-            Expr::OptionUnwrapOr { semantic_id, .. } => {
+            Expr::ResultMethod {
+                method: ResultMethod::UnwrapOr,
+                semantic_id,
+                ..
+            } => {
                 assert_eq!(*semantic_id, Some(unwrap.id), "node shares site id")
             }
-            other => panic!("expected OptionUnwrapOr, got {other:?}"),
+            other => panic!("expected ResultMethod UnwrapOr, got {other:?}"),
         }
     }
 
