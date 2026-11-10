@@ -786,6 +786,104 @@ fn resource_free_local_return_factory_and_forwarding_stay_executable() {
 }
 
 #[test]
+fn resource_free_statement_if_and_alias_reassignment_stay_executable() {
+    let _guard = PROBE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use probe;
+        fn make_if(tag: int, flag: bool) -> fn(int) -> int {
+            let mut callback = |value| value + tag;
+            if flag {
+                callback = |value| value + probe::mark(tag + 1);
+            } else {
+                callback = |value| value + tag;
+            }
+            callback
+        }
+        fn make_alias(tag: int) -> fn(int) -> int {
+            let mut callback = |value| value + tag;
+            let alias = callback;
+            callback = |value| value + probe::mark(tag + 2);
+            alias
+        }
+        fn relay_if(value: Result<int, int>, tag: int, flag: bool) -> int {
+            let mapped = value.map(make_if(tag, flag));
+            match mapped {
+                Result::Ok(item) => item,
+                Result::Err(error) => error,
+            }
+        }
+        fn relay_alias(value: Result<int, int>, tag: int) -> int {
+            let mapped = value.map(make_alias(tag));
+            match mapped {
+                Result::Ok(item) => item,
+                Result::Err(error) => error,
+            }
+        }
+        let selected = relay_if(probe::ok(1), 10, true);
+        let fallback = relay_if(probe::ok(2), 20, false);
+        let aliased = relay_alias(probe::ok(3), 30);
+        selected + fallback + aliased;
+    "#;
+    let (value, events) = run_probe(source);
+    // Then branch: 1 + mark(11) = 12. Else branch: 2 + 20 = 22. The alias
+    // keeps the callback bound before the source slot is reassigned:
+    // 3 + 30 = 33. 12 + 22 + 33 = 67.
+    assert_eq!(value, Value::Int(12 + 22 + 33));
+    assert_eq!(events, vec![1, 11, 2, 3]);
+}
+
+#[test]
+fn resource_free_scalar_loop_in_temporary_factory_stays_executable() {
+    let _guard = PROBE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use probe;
+        fn make_while(n: int, tag: int) -> fn(int) -> int {
+            let mut total = 0;
+            let mut index = 0;
+            while index < n {
+                total = total + index;
+                index = index + 1;
+            }
+            let callback = |value| value + total + tag;
+            callback
+        }
+        fn make_for(n: int, tag: int) -> fn(int) -> int {
+            let mut total = 0;
+            for index in 0..n {
+                total = total + index;
+            }
+            let callback = |value| value + total + tag;
+            callback
+        }
+        fn relay_while(value: Result<int, int>, n: int, tag: int) -> int {
+            let mapped = value.map(make_while(n, tag));
+            match mapped {
+                Result::Ok(item) => item,
+                Result::Err(error) => error,
+            }
+        }
+        fn relay_for(value: Result<int, int>, n: int, tag: int) -> int {
+            let mapped = value.map(make_for(n, tag));
+            match mapped {
+                Result::Ok(item) => item,
+                Result::Err(error) => error,
+            }
+        }
+        let while_out = relay_while(probe::ok(4), 3, 7);
+        let for_out = relay_for(probe::ok(5), 3, 9);
+        while_out + for_out;
+    "#;
+    let (value, events) = run_probe(source);
+    // while total 0+1+2=3: 4+3+7=14; for total 3: 5+3+9=17.
+    assert_eq!(value, Value::Int(31));
+    assert_eq!(events, vec![4, 5]);
+}
+
+#[test]
 fn typed_unwrap_payload_in_function_tail_and_annotated_let() {
     let _guard = PROBE_LOCK
         .lock()

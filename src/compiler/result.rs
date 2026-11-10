@@ -6,6 +6,7 @@
 //! rejects non-exhaustive or mistyped Result matches before bytecode emission.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::CompileError;
 use super::ir::{
@@ -34,10 +35,24 @@ struct Env {
 
 #[derive(Clone)]
 struct LocalDefinition {
-    expr: Expr,
+    /// Capture provenance frozen when this value was bound. Reading an alias
+    /// or a closure-copied callable must not chase a newer definition of the
+    /// slot it was copied from.
+    capture: TemporaryCallableCapture,
+    /// Immutable callable target resolved at the binding point. Factory calls
+    /// through an alias resolve this frozen target rather than the slot's
+    /// current definition; `None` means the target is not independently
+    /// resolvable and call provenance is `Unknown`.
+    target: Option<Arc<CallableTarget>>,
     /// Slot schemas at the definition point, so capture provenance stays
     /// accurate after later bindings change the same slot map.
     slots: HashMap<LocalSlot, TypeSchema>,
+}
+
+#[derive(Clone, Debug)]
+enum CallableTarget {
+    Function(u16),
+    Closure(ClosureExpr),
 }
 
 pub(crate) fn resolve_result_types(
@@ -160,13 +175,8 @@ fn resolve_stmt(
                 .get(index)
                 .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }));
             if is_callable {
-                env.local_defs.insert(
-                    *index,
-                    LocalDefinition {
-                        expr: expr.clone(),
-                        slots: env.slots.clone(),
-                    },
-                );
+                env.local_defs
+                    .insert(*index, callable_env_definition(expr, env));
             } else {
                 env.local_defs.remove(index);
             }
@@ -191,13 +201,8 @@ fn resolve_stmt(
                 .get(index)
                 .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }));
             if is_callable {
-                env.local_defs.insert(
-                    *index,
-                    LocalDefinition {
-                        expr: expr.clone(),
-                        slots: env.slots.clone(),
-                    },
-                );
+                env.local_defs
+                    .insert(*index, callable_env_definition(expr, env));
             } else {
                 env.local_defs.remove(index);
             }
@@ -208,7 +213,13 @@ fn resolve_stmt(
             expected_schema,
             ..
         } => resolve_closure(closure, expected_schema.as_ref(), env),
-        Stmt::Expr { expr, .. } => resolve_expr(expr, None, env),
+        Stmt::Expr { expr, .. } => {
+            resolve_expr(expr, None, env)?;
+            let mut written = HashSet::new();
+            collect_expr_writes(expr, &mut written);
+            invalidate_local_definitions(&mut env.local_defs, &written);
+            Ok(())
+        }
         Stmt::IfElse {
             condition,
             then_branch,
@@ -216,8 +227,17 @@ fn resolve_stmt(
             ..
         } => {
             resolve_expr(condition, Some(&TypeSchema::Bool), env)?;
+            let mut condition_writes = HashSet::new();
+            collect_expr_writes(condition, &mut condition_writes);
+            invalidate_local_definitions(&mut env.local_defs, &condition_writes);
+            let before_defs = env.local_defs.clone();
             resolve_stmts(then_branch, expected_tail.cloned(), env)?;
-            resolve_stmts(else_branch, expected_tail.cloned(), env)
+            let then_defs = env.local_defs.clone();
+            env.local_defs = before_defs.clone();
+            resolve_stmts(else_branch, expected_tail.cloned(), env)?;
+            let else_defs = env.local_defs.clone();
+            env.local_defs = join_definitions(&before_defs, &then_defs, &else_defs);
+            Ok(())
         }
         Stmt::For {
             init,
@@ -229,13 +249,25 @@ fn resolve_stmt(
             resolve_stmt(init, None, env)?;
             resolve_expr(condition, Some(&TypeSchema::Bool), env)?;
             resolve_stmt(post, None, env)?;
-            resolve_stmts(body, None, env)
+            resolve_stmts(body, None, env)?;
+            let mut written = HashSet::new();
+            collect_stmt_writes(init, &mut written);
+            collect_expr_writes(condition, &mut written);
+            collect_stmt_writes(post, &mut written);
+            collect_stmt_list_writes(body, &mut written);
+            invalidate_local_definitions(&mut env.local_defs, &written);
+            Ok(())
         }
         Stmt::While {
             condition, body, ..
         } => {
             resolve_expr(condition, Some(&TypeSchema::Bool), env)?;
-            resolve_stmts(body, None, env)
+            resolve_stmts(body, None, env)?;
+            let mut written = HashSet::new();
+            collect_expr_writes(condition, &mut written);
+            collect_stmt_list_writes(body, &mut written);
+            invalidate_local_definitions(&mut env.local_defs, &written);
+            Ok(())
         }
         Stmt::Drop { index, .. } => {
             env.slots.remove(index);
@@ -1398,6 +1430,7 @@ impl TemporaryCallableCapture {
 /// A snapshot of local slot schemas plus callable-typed local definitions,
 /// used to inspect a factory's returned value without re-entering the main
 /// Result resolver.
+#[derive(Clone)]
 struct CaptureWalk<'a> {
     slots: HashMap<LocalSlot, TypeSchema>,
     defs: HashMap<LocalSlot, LocalDefinition>,
@@ -1509,16 +1542,12 @@ fn temporary_callable_capture(
                 depth + 1,
             ))
         }
-        Expr::Closure(closure) => {
-            closure_capture(closure, walk, visiting_slots, visiting_functions, depth)
-        }
+        Expr::Closure(closure) => closure_capture(closure, walk),
         Expr::FunctionRef(index, _) => function_value_capture(*index, walk, visiting_functions),
         // A returned producer-local resolves through the definition/capture
         // facts recorded for that scope. A caller-owned binding (the root
         // prebound local, or a captured user local) keeps its existing owner.
-        Expr::Var(slot) | Expr::MoveVar(slot) => {
-            local_value_capture(*slot, walk, visiting_slots, visiting_functions, depth)
-        }
+        Expr::Var(slot) | Expr::MoveVar(slot) => local_value_capture(*slot, walk),
         // Scalar leaves cannot produce a callable value; every other
         // unmodeled callable-producing expression is unproven, not Free.
         Expr::Null
@@ -1532,13 +1561,7 @@ fn temporary_callable_capture(
 }
 
 /// Capture provenance of the callable value read from `slot` at runtime.
-fn local_value_capture(
-    slot: LocalSlot,
-    walk: &CaptureWalk<'_>,
-    visiting_slots: &mut HashSet<LocalSlot>,
-    visiting_functions: &mut HashSet<u16>,
-    depth: usize,
-) -> TemporaryCallableCapture {
+fn local_value_capture(slot: LocalSlot, walk: &CaptureWalk<'_>) -> TemporaryCallableCapture {
     if let Some(fact) = walk.param_facts.get(&slot) {
         return fact.clone();
     }
@@ -1547,9 +1570,7 @@ fn local_value_capture(
         return TemporaryCallableCapture::Free;
     }
     match walk.defs.get(&slot) {
-        Some(definition) => {
-            definition_value_capture(definition, walk, visiting_slots, visiting_functions, depth)
-        }
+        Some(definition) => definition.capture.clone(),
         None => TemporaryCallableCapture::Unknown,
     }
 }
@@ -1630,25 +1651,28 @@ fn local_callable_return_capture(
         return TemporaryCallableCapture::Unknown;
     }
     let result = match walk.defs.get(&slot) {
-        Some(definition) => match &definition.expr {
-            Expr::Var(next) | Expr::MoveVar(next) => local_callable_return_capture(
-                *next,
-                args,
-                walk,
-                visiting_slots,
-                visiting_functions,
-                depth,
-                hops + 1,
-            ),
-            Expr::FunctionRef(index, _) => call_return_capture(
-                *index,
-                args,
-                walk,
-                visiting_slots,
-                visiting_functions,
-                depth,
-            ),
-            Expr::Closure(closure) => {
+        Some(definition) => match definition.target.as_deref() {
+            Some(CallableTarget::Function(index)) => {
+                // The callable value's target is frozen at binding time; only
+                // the actual arguments are evaluated against the call-site
+                // facts. Captured source schemas use the binding snapshot.
+                let target_walk = CaptureWalk {
+                    slots: definition.slots.clone(),
+                    defs: walk.defs.clone(),
+                    owned_locals: walk.owned_locals.clone(),
+                    param_facts: walk.param_facts.clone(),
+                    env: walk.env,
+                };
+                call_return_capture(
+                    *index,
+                    args,
+                    &target_walk,
+                    visiting_slots,
+                    visiting_functions,
+                    depth,
+                )
+            }
+            Some(CallableTarget::Closure(closure)) => {
                 let mut callee_slots = HashSet::new();
                 let nested = closure_body_walk(
                     closure,
@@ -1667,7 +1691,7 @@ fn local_callable_return_capture(
                     depth + 1,
                 )
             }
-            _ => TemporaryCallableCapture::Unknown,
+            None => TemporaryCallableCapture::Unknown,
         },
         None => TemporaryCallableCapture::Unknown,
     };
@@ -1794,13 +1818,7 @@ fn function_value_capture(
     result
 }
 
-fn closure_capture(
-    closure: &ClosureExpr,
-    walk: &CaptureWalk<'_>,
-    visiting_slots: &mut HashSet<LocalSlot>,
-    visiting_functions: &mut HashSet<u16>,
-    depth: usize,
-) -> TemporaryCallableCapture {
+fn closure_capture(closure: &ClosureExpr, walk: &CaptureWalk<'_>) -> TemporaryCallableCapture {
     let mut verdict = TemporaryCallableCapture::Free;
     for (source, _) in &closure.capture_copies {
         match walk.slots.get(source) {
@@ -1812,13 +1830,7 @@ fn closure_capture(
                     fact.clone()
                 } else {
                     match walk.defs.get(source) {
-                        Some(definition) => definition_value_capture(
-                            definition,
-                            walk,
-                            visiting_slots,
-                            visiting_functions,
-                            depth + 1,
-                        ),
+                        Some(definition) => definition.capture.clone(),
                         None => TemporaryCallableCapture::Unknown,
                     }
                 };
@@ -1831,55 +1843,113 @@ fn closure_capture(
     verdict
 }
 
-fn definition_value_capture(
-    definition: &LocalDefinition,
-    walk: &CaptureWalk<'_>,
-    visiting_slots: &mut HashSet<LocalSlot>,
-    visiting_functions: &mut HashSet<u16>,
-    depth: usize,
-) -> TemporaryCallableCapture {
-    if depth > 8 {
-        return TemporaryCallableCapture::Unknown;
-    }
-    let nested = CaptureWalk {
-        slots: definition.slots.clone(),
-        defs: walk.defs.clone(),
-        owned_locals: walk.owned_locals.clone(),
-        param_facts: walk.param_facts.clone(),
-        env: walk.env,
-    };
-    match &definition.expr {
-        Expr::Closure(closure) => {
-            closure_capture(closure, &nested, visiting_slots, visiting_functions, depth)
-        }
+/// Capture fact frozen for the callable value produced by `expr` at this
+/// binding point.
+fn binding_value_capture(expr: &Expr, walk: &CaptureWalk<'_>) -> TemporaryCallableCapture {
+    temporary_callable_capture(expr, walk, &mut HashSet::new(), &mut HashSet::new(), 0)
+}
+
+/// Resolve an immutable callable target at the binding point. Aliases copy
+/// the target already resolved for the source definition; a callable derived
+/// from an opaque argument has no statically known target.
+fn binding_target(
+    expr: &Expr,
+    defs: &HashMap<LocalSlot, LocalDefinition>,
+    param_facts: Option<&HashMap<LocalSlot, TemporaryCallableCapture>>,
+) -> Option<Arc<CallableTarget>> {
+    match expr {
+        Expr::FunctionRef(index, _) => Some(Arc::new(CallableTarget::Function(*index))),
+        Expr::Closure(closure) => Some(Arc::new(CallableTarget::Closure(closure.clone()))),
         Expr::Var(slot) | Expr::MoveVar(slot) => {
-            if let Some(fact) = nested.param_facts.get(slot) {
-                return fact.clone();
+            if param_facts.is_some_and(|facts| facts.contains_key(slot)) {
+                return None;
             }
-            match nested.defs.get(slot) {
-                Some(next) => definition_value_capture(
-                    next,
-                    &CaptureWalk {
-                        slots: next.slots.clone(),
-                        defs: nested.defs.clone(),
-                        owned_locals: nested.owned_locals.clone(),
-                        param_facts: nested.param_facts.clone(),
-                        env: nested.env,
-                    },
-                    visiting_slots,
-                    visiting_functions,
-                    depth + 1,
-                ),
-                None => TemporaryCallableCapture::Unknown,
-            }
+            defs.get(slot)
+                .and_then(|definition| definition.target.clone())
         }
-        _ => temporary_callable_capture(
-            &definition.expr,
-            &nested,
-            visiting_slots,
-            visiting_functions,
-            depth,
-        ),
+        _ => None,
+    }
+}
+
+fn callable_env_definition(expr: &Expr, env: &Env) -> LocalDefinition {
+    let walk = CaptureWalk {
+        slots: env.slots.clone(),
+        defs: env.local_defs.clone(),
+        owned_locals: HashSet::new(),
+        param_facts: HashMap::new(),
+        env,
+    };
+    LocalDefinition {
+        capture: binding_value_capture(expr, &walk),
+        target: binding_target(expr, &walk.defs, None),
+        slots: env.slots.clone(),
+    }
+}
+
+fn definition_capture(definition: Option<&LocalDefinition>) -> TemporaryCallableCapture {
+    definition
+        .map(|definition| definition.capture.clone())
+        .unwrap_or(TemporaryCallableCapture::Unknown)
+}
+
+fn same_binding_target(
+    then_definition: Option<&LocalDefinition>,
+    else_definition: Option<&LocalDefinition>,
+) -> Option<Arc<CallableTarget>> {
+    let then_target = then_definition?.target.as_ref()?;
+    let else_target = else_definition?.target.as_ref()?;
+    if Arc::ptr_eq(then_target, else_target) {
+        return Some(then_target.clone());
+    }
+    match (then_target.as_ref(), else_target.as_ref()) {
+        (CallableTarget::Function(then_index), CallableTarget::Function(else_index))
+            if then_index == else_index =>
+        {
+            Some(then_target.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Join two branch outcomes for every callable binding that existed before
+/// the branch. Bindings introduced inside one branch are branch-local; a
+/// binding dropped on one path becomes `Unknown`.
+fn join_definitions(
+    before: &HashMap<LocalSlot, LocalDefinition>,
+    then_defs: &HashMap<LocalSlot, LocalDefinition>,
+    else_defs: &HashMap<LocalSlot, LocalDefinition>,
+) -> HashMap<LocalSlot, LocalDefinition> {
+    let mut merged = HashMap::new();
+    for slot in before.keys() {
+        let then_definition = then_defs.get(slot);
+        let else_definition = else_defs.get(slot);
+        let slots = then_definition
+            .or(else_definition)
+            .or_else(|| before.get(slot))
+            .map(|definition| definition.slots.clone())
+            .unwrap_or_default();
+        merged.insert(
+            *slot,
+            LocalDefinition {
+                capture: definition_capture(then_definition)
+                    .merge(definition_capture(else_definition)),
+                target: same_binding_target(then_definition, else_definition),
+                slots,
+            },
+        );
+    }
+    merged
+}
+
+fn invalidate_local_definitions(
+    defs: &mut HashMap<LocalSlot, LocalDefinition>,
+    written: &HashSet<LocalSlot>,
+) {
+    for slot in written {
+        if let Some(definition) = defs.get_mut(slot) {
+            definition.capture = TemporaryCallableCapture::Unknown;
+            definition.target = None;
+        }
     }
 }
 
@@ -1950,77 +2020,524 @@ fn function_capture_walk<'a>(
 
 fn bind_stmts(stmts: &[Stmt], walk: &mut CaptureWalk<'_>) {
     for stmt in stmts {
-        match stmt {
-            Stmt::Let {
-                index,
-                declared_schema,
+        bind_stmt(stmt, walk);
+    }
+}
+
+fn bind_stmt(stmt: &Stmt, walk: &mut CaptureWalk<'_>) {
+    match stmt {
+        Stmt::Noop { .. }
+        | Stmt::FuncDecl { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::ClosureLet { .. } => {}
+        Stmt::Let {
+            index,
+            declared_schema,
+            expr,
+            ..
+        } => {
+            apply_expr_effects(expr, walk);
+            record_callable_binding(*index, expr, declared_schema.as_ref(), true, walk);
+        }
+        Stmt::Assign { index, expr, .. } => {
+            apply_expr_effects(expr, walk);
+            record_callable_binding(*index, expr, None, false, walk);
+        }
+        Stmt::Expr { expr, .. } => apply_expr_effects(expr, walk),
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            apply_expr_effects(condition, walk);
+            let mut then_walk = walk.clone();
+            bind_stmts(then_branch, &mut then_walk);
+            let mut else_walk = walk.clone();
+            bind_stmts(else_branch, &mut else_walk);
+            join_branch_walks(walk, &then_walk, &else_walk);
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            apply_expr_effects(condition, walk);
+            let mut written = HashSet::new();
+            collect_expr_writes(condition, &mut written);
+            collect_stmt_list_writes(body, &mut written);
+            invalidate_possible_writes(walk, &written);
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            bind_stmt(init, walk);
+            apply_expr_effects(condition, walk);
+            let mut written = HashSet::new();
+            collect_expr_writes(condition, &mut written);
+            collect_stmt_writes(post, &mut written);
+            collect_stmt_list_writes(body, &mut written);
+            invalidate_possible_writes(walk, &written);
+        }
+        Stmt::Drop { index, .. } => {
+            walk.slots.remove(index);
+            walk.defs.remove(index);
+            walk.owned_locals.remove(index);
+            walk.param_facts.remove(index);
+        }
+    }
+}
+
+fn record_callable_binding(
+    index: LocalSlot,
+    expr: &Expr,
+    declared_schema: Option<&TypeSchema>,
+    declare: bool,
+    walk: &mut CaptureWalk<'_>,
+) {
+    let schema = declared_schema
+        .cloned()
+        .or_else(|| {
+            super::typing::infer_value_schema(
+                &walk.env.function_list,
+                &walk.env.function_impls,
+                &walk.env.struct_schemas,
                 expr,
-                ..
-            } => {
-                let schema = declared_schema
+                &walk.slots,
+            )
+        })
+        .filter(|schema| !matches!(schema, TypeSchema::Unknown));
+    if let Some(schema) = schema {
+        walk.slots.insert(index, schema);
+    }
+    if declare {
+        walk.owned_locals.insert(index);
+    }
+    walk.param_facts.remove(&index);
+    let is_callable = walk
+        .slots
+        .get(&index)
+        .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }));
+    if is_callable {
+        let capture = binding_value_capture(expr, walk);
+        let target = binding_target(expr, &walk.defs, Some(&walk.param_facts));
+        walk.defs.insert(
+            index,
+            LocalDefinition {
+                capture,
+                target,
+                slots: walk.slots.clone(),
+            },
+        );
+    } else {
+        walk.defs.remove(&index);
+    }
+}
+
+fn callable_outer_slots(walk: &CaptureWalk<'_>) -> HashSet<LocalSlot> {
+    let mut slots: HashSet<LocalSlot> = walk.defs.keys().copied().collect();
+    slots.extend(walk.param_facts.keys().copied());
+    for slot in &walk.owned_locals {
+        if walk
+            .slots
+            .get(slot)
+            .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }))
+        {
+            slots.insert(*slot);
+        }
+    }
+    slots
+}
+
+fn join_branch_walks(
+    walk: &mut CaptureWalk<'_>,
+    then_walk: &CaptureWalk<'_>,
+    else_walk: &CaptureWalk<'_>,
+) {
+    let before_defs = walk.defs.clone();
+    let before_params = walk.param_facts.clone();
+    let mut slots: HashSet<LocalSlot> = callable_outer_slots(walk);
+    slots.extend(before_defs.keys().copied());
+    let mut merged_defs = HashMap::new();
+    for slot in slots {
+        let then_definition = then_walk.defs.get(&slot);
+        let else_definition = else_walk.defs.get(&slot);
+        let before_definition = before_defs.get(&slot);
+        if then_definition.is_none() && else_definition.is_none() && before_definition.is_none() {
+            continue;
+        }
+        let slots = then_definition
+            .or(else_definition)
+            .or(before_definition)
+            .map(|definition| definition.slots.clone())
+            .unwrap_or_default();
+        merged_defs.insert(
+            slot,
+            LocalDefinition {
+                capture: definition_capture(then_definition)
+                    .merge(definition_capture(else_definition)),
+                target: same_binding_target(then_definition, else_definition),
+                slots,
+            },
+        );
+    }
+    let mut merged_params = HashMap::new();
+    for (slot, before_fact) in &before_params {
+        if let (Some(then_fact), Some(else_fact)) = (
+            then_walk.param_facts.get(slot),
+            else_walk.param_facts.get(slot),
+        ) {
+            merged_params.insert(
+                *slot,
+                before_fact
                     .clone()
-                    .or_else(|| {
-                        super::typing::infer_value_schema(
-                            &walk.env.function_list,
-                            &walk.env.function_impls,
-                            &walk.env.struct_schemas,
-                            expr,
-                            &walk.slots,
-                        )
-                    })
-                    .filter(|schema| !matches!(schema, TypeSchema::Unknown));
-                if let Some(schema) = schema {
-                    walk.slots.insert(*index, schema);
-                }
-                walk.owned_locals.insert(*index);
-                let is_callable = walk
-                    .slots
-                    .get(index)
-                    .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }));
-                if is_callable {
-                    walk.defs.insert(
-                        *index,
-                        LocalDefinition {
-                            expr: expr.clone(),
-                            slots: walk.slots.clone(),
-                        },
-                    );
-                } else {
-                    walk.defs.remove(index);
-                }
+                    .merge(then_fact.clone())
+                    .merge(else_fact.clone()),
+            );
+        }
+    }
+    walk.defs = merged_defs;
+    walk.param_facts = merged_params;
+}
+
+fn invalidate_possible_writes(walk: &mut CaptureWalk<'_>, written: &HashSet<LocalSlot>) {
+    for slot in written {
+        let callable_slot = walk.defs.contains_key(slot)
+            || walk
+                .slots
+                .get(slot)
+                .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }));
+        if !callable_slot || (!walk.owned_locals.contains(slot) && !walk.defs.contains_key(slot)) {
+            continue;
+        }
+        walk.param_facts.remove(slot);
+        walk.defs.insert(
+            *slot,
+            LocalDefinition {
+                capture: TemporaryCallableCapture::Unknown,
+                target: None,
+                slots: walk.slots.clone(),
+            },
+        );
+    }
+}
+
+fn copy_outer_callable_state(walk: &mut CaptureWalk<'_>, nested: &CaptureWalk<'_>) {
+    let outer = callable_outer_slots(walk);
+    let mut defs = HashMap::new();
+    for slot in outer {
+        if let Some(definition) = nested.defs.get(&slot) {
+            defs.insert(slot, definition.clone());
+        } else if walk.defs.contains_key(&slot) {
+            defs.insert(
+                slot,
+                LocalDefinition {
+                    capture: TemporaryCallableCapture::Unknown,
+                    target: None,
+                    slots: walk.slots.clone(),
+                },
+            );
+        }
+    }
+    let mut param_facts = HashMap::new();
+    for slot in walk.param_facts.keys() {
+        if let Some(fact) = nested.param_facts.get(slot) {
+            param_facts.insert(*slot, fact.clone());
+        }
+    }
+    walk.defs = defs;
+    walk.param_facts = param_facts;
+}
+
+/// Apply the writes that evaluating `expr` can perform on callable slots in
+/// the enclosing walk. Branch arms are analyzed from the same input state and
+/// joined; the right operand of `&&`/`||` is joined with the state where it
+/// is skipped.
+fn apply_expr_effects(expr: &Expr, walk: &mut CaptureWalk<'_>) {
+    match expr {
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::Bytes(_)
+        | Expr::FunctionRef(_, _)
+        | Expr::ModuleFunctionRef(_, _)
+        | Expr::UnresolvedFunctionRef { .. }
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. }
+        | Expr::Closure(_) => {}
+        Expr::OptionalGet { container, key, .. } => {
+            apply_expr_effects(container, walk);
+            apply_expr_effects(key, walk);
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            apply_expr_effects(value, walk);
+            apply_expr_effects(fallback, walk);
+        }
+        Expr::Call(_, _, args, _, _)
+        | Expr::ModuleCall(_, _, args, _)
+        | Expr::LocalCall(_, _, args, _) => {
+            for argument in args {
+                apply_expr_effects(argument, walk);
             }
-            Stmt::Assign { index, expr, .. } => {
-                if let Some(schema) = super::typing::infer_value_schema(
-                    &walk.env.function_list,
-                    &walk.env.function_impls,
-                    &walk.env.struct_schemas,
-                    expr,
-                    &walk.slots,
-                ) {
-                    walk.slots.insert(*index, schema);
-                }
-                let is_callable = walk
-                    .slots
-                    .get(index)
-                    .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }));
-                if is_callable {
-                    walk.defs.insert(
-                        *index,
-                        LocalDefinition {
-                            expr: expr.clone(),
-                            slots: walk.slots.clone(),
-                        },
-                    );
-                } else {
-                    walk.defs.remove(index);
-                }
+        }
+        Expr::ClosureCall(_, args) => {
+            for argument in args {
+                apply_expr_effects(argument, walk);
             }
-            Stmt::Drop { index, .. } => {
-                walk.slots.remove(index);
-                walk.defs.remove(index);
-                walk.owned_locals.remove(index);
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            apply_expr_effects(lhs, walk);
+            apply_expr_effects(rhs, walk);
+        }
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+            apply_expr_effects(lhs, walk);
+            let skipped = walk.clone();
+            let mut executed = skipped.clone();
+            apply_expr_effects(rhs, &mut executed);
+            join_branch_walks(walk, &skipped, &executed);
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => apply_expr_effects(inner, walk),
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            apply_expr_effects(condition, walk);
+            let mut then_walk = walk.clone();
+            apply_expr_effects(then_expr, &mut then_walk);
+            let mut else_walk = walk.clone();
+            apply_expr_effects(else_expr, &mut else_walk);
+            join_branch_walks(walk, &then_walk, &else_walk);
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            apply_expr_effects(value, walk);
+            let mut branches = Vec::new();
+            for (_, arm) in arms {
+                let mut branch = walk.clone();
+                apply_expr_effects(arm, &mut branch);
+                branches.push(branch);
             }
-            _ => {}
+            let mut default_branch = walk.clone();
+            apply_expr_effects(default, &mut default_branch);
+            branches.push(default_branch);
+            let mut merged = branches.remove(0);
+            for branch in branches {
+                let previous = merged.clone();
+                join_branch_walks(&mut merged, &previous, &branch);
+            }
+            *walk = merged;
+        }
+        Expr::Block { stmts, expr } => {
+            let mut nested = walk.clone();
+            bind_stmts(stmts, &mut nested);
+            apply_expr_effects(expr, &mut nested);
+            copy_outer_callable_state(walk, &nested);
+        }
+        Expr::ResultConstruct { payload, .. } => apply_expr_effects(payload, walk),
+        Expr::ResultQuery { value, .. } => apply_expr_effects(value, walk),
+        Expr::ResultTry { value, .. } => apply_expr_effects(value, walk),
+        Expr::ResultMatch {
+            value,
+            ok_expr,
+            err_expr,
+            ..
+        } => {
+            apply_expr_effects(value, walk);
+            let mut ok_walk = walk.clone();
+            apply_expr_effects(ok_expr, &mut ok_walk);
+            let mut err_walk = walk.clone();
+            apply_expr_effects(err_expr, &mut err_walk);
+            join_branch_walks(walk, &ok_walk, &err_walk);
+        }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            apply_expr_effects(receiver, walk);
+            apply_expr_effects(argument, walk);
+        }
+    }
+}
+
+fn collect_stmt_list_writes(stmts: &[Stmt], written: &mut HashSet<LocalSlot>) {
+    for stmt in stmts {
+        collect_stmt_writes(stmt, written);
+    }
+}
+
+fn collect_stmt_writes(stmt: &Stmt, written: &mut HashSet<LocalSlot>) {
+    match stmt {
+        Stmt::Noop { .. }
+        | Stmt::FuncDecl { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::ClosureLet { .. } => {}
+        Stmt::Let { index, expr, .. } => {
+            written.insert(*index);
+            collect_expr_writes(expr, written);
+        }
+        Stmt::Assign { index, expr, .. } => {
+            written.insert(*index);
+            collect_expr_writes(expr, written);
+        }
+        Stmt::Expr { expr, .. } => collect_expr_writes(expr, written),
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_expr_writes(condition, written);
+            collect_stmt_list_writes(then_branch, written);
+            collect_stmt_list_writes(else_branch, written);
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            collect_stmt_writes(init, written);
+            collect_expr_writes(condition, written);
+            collect_stmt_writes(post, written);
+            collect_stmt_list_writes(body, written);
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            collect_expr_writes(condition, written);
+            collect_stmt_list_writes(body, written);
+        }
+        Stmt::Drop { index, .. } => {
+            written.insert(*index);
+        }
+    }
+}
+
+fn collect_expr_writes(expr: &Expr, written: &mut HashSet<LocalSlot>) {
+    match expr {
+        Expr::Null
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::Bytes(_)
+        | Expr::FunctionRef(_, _)
+        | Expr::ModuleFunctionRef(_, _)
+        | Expr::UnresolvedFunctionRef { .. }
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. }
+        | Expr::Closure(_) => {}
+        Expr::OptionalGet { container, key, .. } => {
+            collect_expr_writes(container, written);
+            collect_expr_writes(key, written);
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            collect_expr_writes(value, written);
+            collect_expr_writes(fallback, written);
+        }
+        Expr::Call(_, _, args, _, _)
+        | Expr::ModuleCall(_, _, args, _)
+        | Expr::LocalCall(_, _, args, _) => {
+            for argument in args {
+                collect_expr_writes(argument, written);
+            }
+        }
+        Expr::ClosureCall(_, args) => {
+            for argument in args {
+                collect_expr_writes(argument, written);
+            }
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            collect_expr_writes(lhs, written);
+            collect_expr_writes(rhs, written);
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => collect_expr_writes(inner, written),
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_expr_writes(condition, written);
+            collect_expr_writes(then_expr, written);
+            collect_expr_writes(else_expr, written);
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            collect_expr_writes(value, written);
+            for (_, arm) in arms {
+                collect_expr_writes(arm, written);
+            }
+            collect_expr_writes(default, written);
+        }
+        Expr::Block { stmts, expr } => {
+            collect_stmt_list_writes(stmts, written);
+            collect_expr_writes(expr, written);
+        }
+        Expr::ResultConstruct { payload, .. } => collect_expr_writes(payload, written),
+        Expr::ResultQuery { value, .. } => collect_expr_writes(value, written),
+        Expr::ResultTry { value, .. } => collect_expr_writes(value, written),
+        Expr::ResultMatch {
+            value,
+            ok_expr,
+            err_expr,
+            ..
+        } => {
+            collect_expr_writes(value, written);
+            collect_expr_writes(ok_expr, written);
+            collect_expr_writes(err_expr, written);
+        }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            collect_expr_writes(receiver, written);
+            collect_expr_writes(argument, written);
         }
     }
 }

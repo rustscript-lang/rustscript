@@ -1372,6 +1372,440 @@ fn owned_result_combinator_rejects_aliased_local_return_factory_resource_capture
 }
 
 #[test]
+fn owned_result_combinator_rejects_statement_if_reassigned_factory_resource_capture() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+
+        pub fn make_if(token: resource<result.success>, flag: bool) -> fn(int) -> int {
+            let mut callback = |value| value;
+            if flag {
+                callback = |value| result_resource::consume_token(token);
+            }
+            callback
+        }
+
+        pub fn leak_if(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make_if(token, true))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source).expect_err(
+        "a statement-if reassignment still returns a temporary resource-capturing callable",
+    );
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary callable")
+            && text.contains("resource")
+            && text.contains("bind the callable before the method"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_alias_after_factory_source_reassignment() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+
+        pub fn make_alias(token: resource<result.success>) -> fn(int) -> int {
+            let mut captured = |value| result_resource::consume_token(token);
+            let alias = captured;
+            captured = |value| value;
+            alias
+        }
+
+        pub fn leak_alias(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make_alias(token))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source).expect_err(
+        "an alias keeps the capture fact from its binding even after the source slot changes",
+    );
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary callable")
+            && text.contains("resource")
+            && text.contains("bind the callable before the method"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_statement_if_else_reassigned_factory_resource_capture() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+
+        pub fn make_if_else(token: resource<result.success>, flag: bool) -> fn(int) -> int {
+            let mut callback = |value| value;
+            if flag {
+                callback = |value| result_resource::consume_token(token);
+            } else {
+                callback = |value| value;
+            }
+            callback
+        }
+
+        pub fn leak_if_else(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make_if_else(token, true))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("either statement branch may return the resource-capturing temporary callable");
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary callable")
+            && text.contains("resource")
+            && text.contains("bind the callable before the method"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_statement_expression_outer_assignment_factory_resource_capture()
+{
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+
+        pub fn touch(value: int) -> int {
+            value
+        }
+
+        pub fn make_statement_expression(token: resource<result.success>, flag: bool) -> fn(int) -> int {
+            let mut callback = |value| value;
+            touch(if flag => {
+                callback = |value| result_resource::consume_token(token);
+                0
+            } else => {
+                callback = |value| value;
+                0
+            });
+            callback
+        }
+
+        pub fn leak_statement_expression(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make_statement_expression(token, true))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("a discarded expression statement still evaluates its branch writes");
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary callable")
+            && text.contains("resource")
+            && text.contains("bind the callable before the method"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_if_expression_outer_assignment_factory_resource_capture() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+
+        pub fn make_if_expr(token: resource<result.success>, flag: bool) -> fn(int) -> int {
+            let mut callback = |value| value;
+            let ignored = if flag => {
+                callback = |value| result_resource::consume_token(token);
+                0
+            } else => {
+                callback = |value| value;
+                0
+            };
+            callback
+        }
+
+        pub fn leak_if_expr(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make_if_expr(token, true))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("an expression-if in a let initializer may write the outer callable slot");
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary callable")
+            && text.contains("resource")
+            && text.contains("bind the callable before the method"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_alias_of_factory_target_after_target_reassignment() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            |value| result_resource::consume_token(token)
+        }
+
+        pub fn make_free_callback(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+
+        pub fn make_factory_alias(token: resource<result.success>) -> fn(int) -> int {
+            let mut factory = make_callback;
+            let alias = factory;
+            factory = make_free_callback;
+            alias(token)
+        }
+
+        pub fn leak_alias(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make_factory_alias(token))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("calling the aliased factory must use the target captured at alias binding");
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary callable")
+            && text.contains("resource")
+            && text.contains("bind the callable before the method"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_closure_capture_after_source_reassignment() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+
+        pub fn make_captured(token: resource<result.success>) -> fn(int) -> int {
+            let mut captured = |value| result_resource::consume_token(token);
+            let callback = |value| captured(value);
+            captured = |value| value;
+            callback
+        }
+
+        pub fn leak_captured(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make_captured(token))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("a closure keeps the capture fact of the callable it copied by value");
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary callable")
+            && text.contains("resource")
+            && text.contains("bind the callable before the method"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_branch_or_loop_reassigned_factory_in_plain_resolver() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cases = [
+        (
+            "branch",
+            r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            |value| result_resource::consume_token(token)
+        }
+        pub fn make_free_callback(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>, flag: bool) -> Result<int, int> {
+            let mut factory = make_callback;
+            if flag {
+                factory = make_free_callback;
+            }
+            value.map(factory(token))
+        }
+        "#,
+        ),
+        (
+            "loop",
+            r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>) -> fn(int) -> int {
+            |value| result_resource::consume_token(token)
+        }
+        pub fn make_free_callback(token: resource<result.success>) -> fn(int) -> int {
+            |value| value
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            let mut factory = make_callback;
+            let mut index = 0;
+            while index < 2 {
+                factory = make_free_callback;
+                index = index + 1;
+            }
+            value.map(factory(token))
+        }
+        "#,
+        ),
+    ];
+    for (label, source) in cases {
+        let error = compile_with_fixture_catalog(source).expect_err(label);
+        let text = error.to_string();
+        assert!(
+            text.contains("temporary callable") && text.contains("cannot prove"),
+            "{label}: {text}"
+        );
+    }
+}
+
+#[test]
+fn owned_result_combinator_rejects_while_assigned_factory_resource_capture() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+
+        pub fn make_while(token: resource<result.success>) -> fn(int) -> int {
+            let mut callback = |value| value;
+            let mut index = 0;
+            while index < 2 {
+                callback = |value| value + index;
+                index = index + 1;
+            }
+            callback
+        }
+
+        pub fn leak_while(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make_while(token))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("a callable written in a loop cannot keep its pre-loop Free fact");
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary callable") && text.contains("cannot prove"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_rejects_for_assigned_factory_resource_capture() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use result_resource;
+
+        pub fn make_for(token: resource<result.success>) -> fn(int) -> int {
+            let mut callback = |value| value;
+            for index in 0..2 {
+                callback = |value| value + index;
+            }
+            callback
+        }
+
+        pub fn leak_for(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map(make_for(token))
+        }
+    "#;
+    let error = compile_with_fixture_catalog(source)
+        .expect_err("a callable written in a for body cannot keep its pre-loop Free fact");
+    let text = error.to_string();
+    assert!(
+        text.contains("temporary callable") && text.contains("cannot prove"),
+        "{text}"
+    );
+}
+
+#[test]
+fn owned_result_combinator_statement_if_rejection_covers_callable_sites() {
+    let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cases = [
+        (
+            "map",
+            r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>, flag: bool) -> fn(int) -> int {
+            let mut callback = |value| value;
+            if flag {
+                callback = |value| result_resource::consume_token(token);
+            }
+            callback
+        }
+        pub fn leak(value: Result<int, resource<result.failure>>, token: resource<result.success>) -> Result<int, resource<result.failure>> {
+            value.map(make_callback(token, true))
+        }
+        "#,
+        ),
+        (
+            "map_err",
+            r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>, flag: bool) -> fn(int) -> int {
+            let mut callback = |value| value;
+            if flag {
+                callback = |value| result_resource::consume_token(token);
+            }
+            callback
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> Result<int, int> {
+            value.map_err(make_callback(token, true))
+        }
+        "#,
+        ),
+        (
+            "and_then",
+            r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>, flag: bool) -> fn(int) -> Result<int, resource<result.failure>> {
+            let mut callback: fn(int) -> Result<int, resource<result.failure>> =
+                |value| Result::Ok(value);
+            if flag {
+                callback = |value| Result::Ok(result_resource::consume_token(token) + value);
+            }
+            callback
+        }
+        pub fn leak(value: Result<int, resource<result.failure>>, token: resource<result.success>) -> Result<int, resource<result.failure>> {
+            value.and_then(make_callback(token, true))
+        }
+        "#,
+        ),
+        (
+            "or_else",
+            r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>, flag: bool) -> fn(resource<result.failure>) -> Result<int, resource<result.failure>> {
+            let mut callback: fn(resource<result.failure>) -> Result<int, resource<result.failure>> =
+                |error| Result::Ok(0);
+            if flag {
+                callback = |error| Result::Ok(result_resource::consume_token(token));
+            }
+            callback
+        }
+        pub fn leak(value: Result<int, resource<result.failure>>, token: resource<result.success>) -> Result<int, resource<result.failure>> {
+            value.or_else(make_callback(token, true))
+        }
+        "#,
+        ),
+        (
+            "unwrap_or_else",
+            r#"
+        use result_resource;
+        pub fn make_callback(token: resource<result.success>, flag: bool) -> fn(int) -> int {
+            let mut callback = |value| value;
+            if flag {
+                callback = |value| result_resource::consume_token(token);
+            }
+            callback
+        }
+        pub fn leak(value: Result<int, int>, token: resource<result.success>) -> int {
+            let out = value.unwrap_or_else(make_callback(token, true));
+            out
+        }
+        "#,
+        ),
+    ];
+    for (method, source) in cases {
+        let error = compile_with_fixture_catalog(source).expect_err(method);
+        let text = error.to_string();
+        assert!(
+            text.contains("temporary") && text.contains("resource") && text.contains("captur"),
+            "{method}: {text}"
+        );
+    }
+}
+
+#[test]
 fn owned_result_combinator_allows_prebound_forwarded_resource_capture_callback() {
     let _lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = r#"
