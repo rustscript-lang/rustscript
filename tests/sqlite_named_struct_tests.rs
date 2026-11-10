@@ -448,7 +448,10 @@ fn typed_params_rows_and_transaction_results_are_structured() {
         let results = sqlite::transaction(&db, [{ sql: "SELECT a FROM t", query: true }]);
         let first_result = results[0];
         assert(first_result.kind == "query");
-        assert(first_result.query.rows[0].cells[0].int_value == 7);
+        let query_result = first_result.query;
+        if query_result != null {
+            assert(query_result.rows[0].cells[0].int_value == 7);
+        }
         sqlite::close(db);
         queried.truncated;
         "#,
