@@ -1340,12 +1340,44 @@ impl Parser {
                         chain_start.lo,
                         self.tokens[self.pos - 1].span.hi,
                     );
-                    expr = self.build_option_unwrap_or_expr(
+                    if self.dialect.allow_result_syntax() {
+                        expr = self.build_result_method_expr(
+                            ResultMethod::UnwrapOr,
+                            expr,
+                            fallback,
+                            member_span,
+                            expr_span,
+                        )?;
+                    } else {
+                        expr = self.build_option_unwrap_or_expr(
+                            expr,
+                            fallback,
+                            member_span,
+                            expr_span,
+                            "unwrap_or".to_string(),
+                        )?;
+                    }
+                } else if self.dialect.allow_result_syntax()
+                    && self.check(&TokenKind::LParen)
+                    && let Some(method) = ResultMethod::from_member(&member)
+                {
+                    self.expect(&TokenKind::LParen, "expected '(' after Result method")?;
+                    let argument = self.parse_expr()?;
+                    self.expect(
+                        &TokenKind::RParen,
+                        "expected ')' after Result method argument",
+                    )?;
+                    let expr_span = Span::new(
+                        chain_start.source_id,
+                        chain_start.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    expr = self.build_result_method_expr(
+                        method,
                         expr,
-                        fallback,
+                        argument,
                         member_span,
                         expr_span,
-                        "unwrap_or".to_string(),
                     )?;
                 } else if self.dialect.allow_result_syntax()
                     && (member == "is_ok" || member == "is_err")
@@ -1712,6 +1744,47 @@ impl Parser {
             value: Box::new(value),
             value_slot: self.allocate_hidden_local()?,
             fallback: Box::new(fallback),
+            semantic_id,
+        })
+    }
+
+    /// Build the structured, type-preserving carrier for a postfix Result
+    /// combinator. All evaluation/ binding slots are parser-assigned hidden
+    /// locals; the Result type owner later decides the actual semantics.
+    pub(super) fn build_result_method_expr(
+        &mut self,
+        method: ResultMethod,
+        receiver: Expr,
+        argument: Expr,
+        callee_span: Span,
+        expr_span: Span,
+    ) -> Result<Expr, ParseError> {
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Unresolved,
+            method.name().to_string(),
+            false,
+        );
+        let receiver_slot = self.allocate_hidden_local()?;
+        let argument_slot = self.allocate_hidden_local()?;
+        let ok_binding = self.allocate_hidden_local()?;
+        let err_binding = if method.retains_option_lowering_on_non_result() {
+            None
+        } else {
+            Some(self.allocate_hidden_local()?)
+        };
+        Ok(Expr::ResultMethod {
+            method,
+            receiver: Box::new(receiver),
+            argument: Box::new(argument),
+            slots: ResultMethodSlots {
+                receiver: receiver_slot,
+                argument: argument_slot,
+                ok_binding,
+                err_binding,
+            },
+            span: expr_span,
             semantic_id,
         })
     }

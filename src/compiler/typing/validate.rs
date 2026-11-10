@@ -1053,6 +1053,27 @@ pub(super) fn validate_expr(
                 merge_bound_types(arm_type, default_ty)
             }
         }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            let _ = validate_expr(
+                receiver,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            let _ = validate_expr(
+                argument,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            BoundType::Unknown
+        }
         Expr::ResultConstruct { payload, .. } => {
             let _ = validate_expr(
                 payload,

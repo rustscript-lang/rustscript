@@ -182,6 +182,12 @@ fn attach_expr_schema(
         Expr::ResultQuery { value, .. } | Expr::ResultTry { value, .. } => {
             attach_expr_schema(value, schemas, structs);
         }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            attach_expr_schema(receiver, schemas, structs);
+            attach_expr_schema(argument, schemas, structs);
+        }
         Expr::Null
         | Expr::Int(_)
         | Expr::Float(_)
@@ -355,6 +361,12 @@ fn rewrite_children(expr: &mut Expr, locals: &mut usize) -> Result<(), ParseErro
         }
         Expr::ResultQuery { value, .. } | Expr::ResultTry { value, .. } => {
             rewrite_expr(value, locals)
+        }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            rewrite_expr(receiver, locals)?;
+            rewrite_expr(argument, locals)
         }
         Expr::Null
         | Expr::Int(_)
@@ -567,6 +579,9 @@ fn contains_try(expr: &Expr) -> bool {
             ..
         } => contains_try(value) || contains_try(ok_expr) || contains_try(err_expr),
         Expr::ResultQuery { value, .. } => contains_try(value),
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => contains_try(receiver) || contains_try(argument),
         Expr::Null
         | Expr::Int(_)
         | Expr::Float(_)

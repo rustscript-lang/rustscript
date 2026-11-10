@@ -533,6 +533,64 @@ pub enum MatchTypePattern {
     Map,
 }
 
+/// The Result combinator methods that keep a typed, structured shape until
+/// the Result type owner resolves the receiver's schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultMethod {
+    Map,
+    MapErr,
+    AndThen,
+    OrElse,
+    UnwrapOr,
+    UnwrapOrElse,
+}
+
+impl ResultMethod {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Map => "map",
+            Self::MapErr => "map_err",
+            Self::AndThen => "and_then",
+            Self::OrElse => "or_else",
+            Self::UnwrapOr => "unwrap_or",
+            Self::UnwrapOrElse => "unwrap_or_else",
+        }
+    }
+
+    pub(crate) fn from_member(member: &str) -> Option<Self> {
+        match member {
+            "map" => Some(Self::Map),
+            "map_err" => Some(Self::MapErr),
+            "and_then" => Some(Self::AndThen),
+            "or_else" => Some(Self::OrElse),
+            "unwrap_or" => Some(Self::UnwrapOr),
+            "unwrap_or_else" => Some(Self::UnwrapOrElse),
+            _ => None,
+        }
+    }
+
+    /// `unwrap_or` keeps the pre-existing nullable lowering when the receiver
+    /// is not a `Result`.
+    pub(crate) fn retains_option_lowering_on_non_result(self) -> bool {
+        matches!(self, Self::UnwrapOr)
+    }
+}
+
+/// Parser-assigned evaluation slots for a [`Expr::ResultMethod`].
+///
+/// `receiver` and `argument` receive the receiver/callback evaluation results
+/// in source order; `ok_binding`/`err_binding` receive the selected `Result`
+/// payload in the lowered match. The lowered block declares the receiver and
+/// argument local schemas explicitly so strict typing validates the callback
+/// body against the contextually expected callable signature.
+#[derive(Clone, Copy, Debug)]
+pub struct ResultMethodSlots {
+    pub receiver: LocalSlot,
+    pub argument: LocalSlot,
+    pub ok_binding: LocalSlot,
+    pub err_binding: Option<LocalSlot>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Expr {
     Null,
@@ -709,6 +767,24 @@ pub enum Expr {
         span: Span,
         semantic_id: Option<SemanticNodeId>,
     },
+    /// A postfix Result combinator method preserved from source until the
+    /// Result type owner resolves the receiver's actual schema.
+    ///
+    /// The parser keeps the receiver and the callback/fallback argument as
+    /// structured children plus their evaluation slots; only the Result
+    /// resolver decides whether the receiver is a `Result<T, E>` (and lowers
+    /// the call into an ordinary typed `ResultMatch`) or whether
+    /// `.unwrap_or(...)` keeps the pre-existing nullable lowering. A
+    /// non-Result receiver never has its ordinary member-call semantics
+    /// stolen by the method name at parse time.
+    ResultMethod {
+        method: ResultMethod,
+        receiver: Box<Expr>,
+        argument: Box<Expr>,
+        slots: ResultMethodSlots,
+        span: Span,
+        semantic_id: Option<SemanticNodeId>,
+    },
     /// Postfix `?`. Evaluates `value` once. Ok continues as `T`; Err returns
     /// the active carrier from the lexical function through the existing `Ret`.
     ResultTry {
@@ -742,6 +818,12 @@ impl Expr {
                 visit(err_expr);
             }
             Expr::ResultTry { value, .. } => visit(value),
+            Expr::ResultMethod {
+                receiver, argument, ..
+            } => {
+                visit(receiver);
+                visit(argument);
+            }
             _ => {}
         }
     }

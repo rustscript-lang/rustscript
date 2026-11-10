@@ -1916,6 +1916,12 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
             expr_contains_param_add(value, param_slots)
                 || expr_contains_param_add(fallback, param_slots)
         }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            expr_contains_param_add(receiver, param_slots)
+                || expr_contains_param_add(argument, param_slots)
+        }
         Expr::Call(_, _, args, _, _)
         | Expr::LocalCall(_, _, args, _)
         | Expr::ModuleCall(_, _, args, _) => args
@@ -1999,6 +2005,9 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
         Expr::OptionUnwrapOr {
             value, fallback, ..
         } => expr_uses_param(value, param_slots) || expr_uses_param(fallback, param_slots),
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => expr_uses_param(receiver, param_slots) || expr_uses_param(argument, param_slots),
         Expr::Call(_, _, args, _, _)
         | Expr::LocalCall(_, _, args, _)
         | Expr::ModuleCall(_, _, args, _) => {
@@ -2250,6 +2259,13 @@ pub(super) fn legalize_expr(
             } else {
                 BoundType::Unknown
             }
+        }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            let _ = legalize_expr(receiver, state, context, site, host_resolution);
+            let _ = legalize_expr(argument, state, context, site, host_resolution);
+            BoundType::Unknown
         }
         Expr::ResultConstruct { payload, .. } => {
             let _ = legalize_expr(payload, state, context, site, host_resolution);

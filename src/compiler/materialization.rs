@@ -488,6 +488,12 @@ impl Classifier {
                 }
                 self.expr(frame, default);
             }
+            Expr::ResultMethod {
+                receiver, argument, ..
+            } => {
+                self.expr(frame, receiver);
+                self.expr(frame, argument);
+            }
             other @ (Expr::ResultConstruct { .. }
             | Expr::ResultQuery { .. }
             | Expr::ResultMatch { .. }

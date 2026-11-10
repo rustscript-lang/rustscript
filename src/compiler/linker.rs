@@ -378,6 +378,12 @@ fn remap_expression_type_names(expression: &mut Expr, names: &HashMap<String, St
             remap_expression_type_names(ok_expr, names);
             remap_expression_type_names(err_expr, names);
         }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            remap_expression_type_names(receiver, names);
+            remap_expression_type_names(argument, names);
+        }
         Expr::Block { stmts, expr } => {
             for statement in stmts {
                 remap_statement_type_names(statement, names);
@@ -1599,6 +1605,35 @@ fn remap_expr_indices(
             )?;
             remap_expr_indices(
                 err_expr,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+        }
+        Expr::ResultMethod {
+            receiver,
+            argument,
+            slots,
+            semantic_id,
+            ..
+        } => {
+            slots.receiver = remap_local_index(slots.receiver, local_base)?;
+            slots.argument = remap_local_index(slots.argument, local_base)?;
+            slots.ok_binding = remap_local_index(slots.ok_binding, local_base)?;
+            if let Some(slot) = slots.err_binding.as_mut() {
+                *slot = remap_local_index(*slot, local_base)?;
+            }
+            rebase_semantic_id(semantic_id, node_offset);
+            remap_expr_indices(
+                receiver,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+            remap_expr_indices(
+                argument,
                 local_base,
                 node_offset,
                 function_map,

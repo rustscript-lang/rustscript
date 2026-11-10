@@ -1286,6 +1286,27 @@ impl AvailabilityAnalyzer {
                 Ok(out)
             }
             Expr::ResultQuery { value, .. } => self.analyze_expr_to_owned(value, state, line),
+            // Unresolved combinator carriers only reach analysis when host
+            // resolution already failed; model their evaluation order and
+            // hidden-local bindings without lowering.
+            Expr::ResultMethod {
+                receiver,
+                argument,
+                slots,
+                ..
+            } => {
+                let mut out = self.analyze_expr(receiver, state, line)?;
+                self.mark_owned_value_reads_moved(receiver, &mut out);
+                self.mark_available(&mut out, slots.receiver, line)?;
+                out = self.analyze_expr(argument, &out, line)?;
+                self.mark_owned_value_reads_moved(argument, &mut out);
+                self.mark_available(&mut out, slots.argument, line)?;
+                self.mark_available(&mut out, slots.ok_binding, line)?;
+                if let Some(slot) = slots.err_binding {
+                    self.mark_available(&mut out, slot, line)?;
+                }
+                Ok(out)
+            }
             Expr::ResultTry {
                 value, value_slot, ..
             } => {
@@ -1837,7 +1858,8 @@ impl AvailabilityAnalyzer {
             other @ (Expr::ResultConstruct { .. }
             | Expr::ResultQuery { .. }
             | Expr::ResultMatch { .. }
-            | Expr::ResultTry { .. }) => {
+            | Expr::ResultTry { .. }
+            | Expr::ResultMethod { .. }) => {
                 let mut found = false;
                 other.visit_result_children(|child| found |= self.expr_contains_owned_local(child));
                 found
@@ -2423,6 +2445,29 @@ impl AvailabilityAnalyzer {
                         self.rewrite_expr_ownership_inner(err_expr, false, &err_in)?,
                     ),
                     scrutinee_schema: scrutinee_schema.clone(),
+                    span: *span,
+                    semantic_id: *semantic_id,
+                })
+            }
+            Expr::ResultMethod {
+                method,
+                receiver,
+                argument,
+                slots,
+                span,
+                semantic_id,
+            } => {
+                let (receiver, mut receiver_state) =
+                    self.rewrite_expr_and_state(receiver, false, state, 1)?;
+                self.mark_owned_value_reads_moved(&receiver, &mut receiver_state);
+                self.mark_available(&mut receiver_state, slots.receiver, 1)?;
+                let argument =
+                    self.rewrite_expr_ownership_inner(argument, false, &receiver_state)?;
+                Ok(Expr::ResultMethod {
+                    method: *method,
+                    receiver: Box::new(receiver),
+                    argument: Box::new(argument),
+                    slots: *slots,
                     span: *span,
                     semantic_id: *semantic_id,
                 })

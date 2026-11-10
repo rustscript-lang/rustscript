@@ -1080,6 +1080,26 @@ pub(crate) fn check_result_payload(
     Ok(())
 }
 
+/// Schema-assignment compatibility check without a payload expression.
+///
+/// Used by the Result type owner for combinator receiver/callback contracts
+/// (callback parameter and return schemas, fallback schemas and annotated
+/// result branches). Numeric widening and nominal resource identity follow the
+/// same strict rules as `check_result_payload`, and generic parameters must
+/// match exactly rather than degrading to `Unknown`.
+pub(crate) fn schema_assignment_mismatch(
+    functions: &[FunctionDecl],
+    function_impls: &HashMap<u16, FunctionImpl>,
+    struct_schemas: &HashMap<String, StructDecl>,
+    expected: &TypeSchema,
+    actual: &TypeSchema,
+) -> Option<String> {
+    let typing = ResultTyping::new(functions, function_impls, struct_schemas);
+    let mut context = typing.context();
+    context.result_payload_strict = true;
+    helpers::find_declared_schema_mismatch(expected, actual, &mut context, String::new())
+}
+
 pub(crate) fn contextual_callable_slot_schemas(
     functions: &[FunctionDecl],
     function_impls: &HashMap<u16, FunctionImpl>,
@@ -1206,18 +1226,6 @@ fn expected_named_or_container_field_schema(
         _ => return None,
     };
     (!matches!(schema, TypeSchema::Unknown)).then_some(schema)
-}
-
-pub(crate) fn result_branch_schemas_compatible(
-    functions: &[FunctionDecl],
-    function_impls: &HashMap<u16, FunctionImpl>,
-    struct_schemas: &HashMap<String, StructDecl>,
-    expected: &TypeSchema,
-    actual: &TypeSchema,
-) -> bool {
-    let typing = ResultTyping::new(functions, function_impls, struct_schemas);
-    let context = typing.context();
-    context.substitute_schema_generics(expected) == context.substitute_schema_generics(actual)
 }
 
 #[cfg(test)]

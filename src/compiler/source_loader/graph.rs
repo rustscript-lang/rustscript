@@ -1875,6 +1875,12 @@ fn resolve_expr_imported_calls(
         | Expr::BorrowMut(inner) => {
             resolve_expr_imported_calls(ctx, inner, line, parsed_semantic_index.as_deref_mut())?;
         }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            resolve_expr_imported_calls(ctx, receiver, line, parsed_semantic_index.as_deref_mut())?;
+            resolve_expr_imported_calls(ctx, argument, line, parsed_semantic_index.as_deref_mut())?;
+        }
         Expr::ResultConstruct { payload, .. } => {
             resolve_expr_imported_calls(ctx, payload, line, parsed_semantic_index.as_deref_mut())?;
         }

@@ -678,7 +678,8 @@ impl LivenessRewriter {
             other @ (Expr::ResultConstruct { .. }
             | Expr::ResultQuery { .. }
             | Expr::ResultMatch { .. }
-            | Expr::ResultTry { .. }) => {
+            | Expr::ResultTry { .. }
+            | Expr::ResultMethod { .. }) => {
                 other.visit_result_children(|child| {
                     self.add_expr_uses_impl(child, live, conservative)
                 });
@@ -686,6 +687,10 @@ impl LivenessRewriter {
                     for (slot, _) in exit_cleanup {
                         self.mark_live(live, *slot);
                     }
+                }
+                if let Expr::ResultMethod { slots, .. } = other {
+                    self.mark_live(live, slots.receiver);
+                    self.mark_live(live, slots.argument);
                 }
             }
             Expr::Block { stmts, expr } => {
@@ -1280,6 +1285,21 @@ impl LocalSlotAllocator {
                 }
                 self.collect_expr_constraints(value, &live_during, protected_slots)?;
             }
+            Expr::ResultMethod {
+                receiver,
+                argument,
+                slots,
+                ..
+            } => {
+                self.add_slot_live_edges(slots.receiver, &live_during);
+                self.add_slot_live_edges(slots.argument, &live_during);
+                self.add_slot_live_edges(slots.ok_binding, &live_during);
+                if let Some(slot) = slots.err_binding {
+                    self.add_slot_live_edges(slot, &live_during);
+                }
+                self.collect_expr_constraints(receiver, &live_during, protected_slots)?;
+                self.collect_expr_constraints(argument, &live_during, protected_slots)?;
+            }
             Expr::ResultMatch {
                 value,
                 value_slot,
@@ -1572,6 +1592,21 @@ impl LocalSlotAllocator {
                     self.mark_set_slot(set, *slot);
                 }
                 self.collect_expr_footprint(value, set, stack);
+            }
+            Expr::ResultMethod {
+                receiver,
+                argument,
+                slots,
+                ..
+            } => {
+                self.mark_set_slot(set, slots.receiver);
+                self.mark_set_slot(set, slots.argument);
+                self.mark_set_slot(set, slots.ok_binding);
+                if let Some(slot) = slots.err_binding {
+                    self.mark_set_slot(set, slot);
+                }
+                self.collect_expr_footprint(receiver, set, stack);
+                self.collect_expr_footprint(argument, set, stack);
             }
             Expr::ResultMatch {
                 value,
@@ -1950,7 +1985,8 @@ fn collect_persistent_closure_sources_from_expr(expr: &Expr, slots: &mut BTreeSe
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
         | Expr::ResultMatch { .. }
-        | Expr::ResultTry { .. }) => {
+        | Expr::ResultTry { .. }
+        | Expr::ResultMethod { .. }) => {
             other.visit_result_children(|child| {
                 collect_persistent_closure_sources_from_expr(child, slots)
             });
@@ -2180,6 +2216,21 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
             remap_expr_slots(value, mapping)?;
             remap_expr_slots(ok_expr, mapping)?;
             remap_expr_slots(err_expr, mapping)?;
+        }
+        Expr::ResultMethod {
+            receiver,
+            argument,
+            slots,
+            ..
+        } => {
+            slots.receiver = remap_slot(slots.receiver, mapping)?;
+            slots.argument = remap_slot(slots.argument, mapping)?;
+            slots.ok_binding = remap_slot(slots.ok_binding, mapping)?;
+            if let Some(slot) = slots.err_binding.as_mut() {
+                *slot = remap_slot(*slot, mapping)?;
+            }
+            remap_expr_slots(receiver, mapping)?;
+            remap_expr_slots(argument, mapping)?;
         }
         Expr::Block { stmts, expr } => {
             for nested in stmts {

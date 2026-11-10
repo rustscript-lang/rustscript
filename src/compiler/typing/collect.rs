@@ -342,6 +342,12 @@ fn collect_root_expr(
             operand(value, false);
             operand(fallback, true);
         }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            operand(receiver, false);
+            operand(argument, false);
+        }
         Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
             operand(lhs, false);
             operand(rhs, true);
@@ -1189,6 +1195,31 @@ fn collect_expr_types(
         | Expr::BorrowMut(inner) => {
             collect_expr_types(
                 inner,
+                state,
+                local_types,
+                local_schemas,
+                local_schema_labels,
+                callable_slots,
+                optional_slots,
+                context,
+            );
+            let _ = context.infer_expr_type(expr, state);
+        }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            collect_expr_types(
+                receiver,
+                state,
+                local_types,
+                local_schemas,
+                local_schema_labels,
+                callable_slots,
+                optional_slots,
+                context,
+            );
+            collect_expr_types(
+                argument,
                 state,
                 local_types,
                 local_schemas,

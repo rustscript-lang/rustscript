@@ -277,13 +277,20 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
         | Expr::ResultMatch { .. }
-        | Expr::ResultTry { .. }) => {
+        | Expr::ResultTry { .. }
+        | Expr::ResultMethod { .. }) => {
             let mut used = false;
             other.visit_result_children(|child| used |= expr_uses_slot(child, slot));
             if let Expr::ResultTry { exit_cleanup, .. } = other {
                 used |= exit_cleanup
                     .iter()
                     .any(|(cleanup_slot, _)| *cleanup_slot == slot);
+            }
+            if let Expr::ResultMethod { slots, .. } = other {
+                used |= slots.receiver == slot
+                    || slots.argument == slot
+                    || slots.ok_binding == slot
+                    || slots.err_binding == Some(slot);
             }
             used
         }
@@ -640,7 +647,8 @@ pub(super) fn collect_consumed_positions_from_expr(
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
         | Expr::ResultMatch { .. }
-        | Expr::ResultTry { .. }) => {
+        | Expr::ResultTry { .. }
+        | Expr::ResultMethod { .. }) => {
             other.visit_result_children(|child| {
                 collect_consumed_positions_from_expr(
                     child,

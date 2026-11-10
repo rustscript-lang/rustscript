@@ -1177,6 +1177,15 @@ impl Compiler {
                 span,
                 ..
             } => self.compile_result_try(value, *value_slot, *payload_slot, exit_cleanup, *span)?,
+            Expr::ResultMethod { span, .. } => {
+                return Err(CompileError::StrictTypingRequired {
+                    line: None,
+                    source_name: None,
+                    detail: "unresolved Result combinator method reached code generation"
+                        .to_string(),
+                    span: Some(*span),
+                });
+            }
         }
         Ok(())
     }

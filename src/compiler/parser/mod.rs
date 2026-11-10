@@ -29,8 +29,8 @@ use super::{
         FunctionImpl, FunctionParam, FunctionRefSite, FunctionRefTarget, HostApiIrMetadata,
         LexerToken, LocalDeclSite, LocalRefSite, LocalSlot, MatchPattern, MatchTypePattern,
         ModuleNamespaceAlias, ParsedCallSite, ParsedCallTarget, ParsedLexicalScope,
-        ParsedSemanticIndex, ResolvedHostCall, ScopeId, SemanticNodeId, Stmt, StmtSpanSite,
-        StructDecl, StructDeclSite, TypeSchema,
+        ParsedSemanticIndex, ResolvedHostCall, ResultMethod, ResultMethodSlots, ScopeId,
+        SemanticNodeId, Stmt, StmtSpanSite, StructDecl, StructDeclSite, TypeSchema,
     },
 };
 

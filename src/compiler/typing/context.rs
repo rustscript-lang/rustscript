@@ -1604,6 +1604,13 @@ impl<'a> TypeContext<'a> {
                 let _ = self.infer_expr_type(value, state);
                 BoundType::Bool
             }
+            Expr::ResultMethod {
+                receiver, argument, ..
+            } => {
+                let _ = self.infer_expr_type(receiver, state);
+                let _ = self.infer_expr_type(argument, state);
+                BoundType::Unknown
+            }
             Expr::ResultTry {
                 value,
                 operand_schema,

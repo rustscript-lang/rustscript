@@ -962,6 +962,16 @@ fn remap_result_expr_spans(expr: &mut super::ir::Expr, map: &impl Fn(&mut Span))
             remap_result_expr_spans(ok_expr, map);
             remap_result_expr_spans(err_expr, map);
         }
+        Expr::ResultMethod {
+            receiver,
+            argument,
+            span,
+            ..
+        } => {
+            map(span);
+            remap_result_expr_spans(receiver, map);
+            remap_result_expr_spans(argument, map);
+        }
         Expr::OptionalGet { container, key, .. } => {
             remap_result_expr_spans(container, map);
             remap_result_expr_spans(key, map);

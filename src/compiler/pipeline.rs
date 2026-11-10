@@ -726,6 +726,21 @@ fn record_expr_local_debug_ranges(
             }
             record_expr_local_debug_ranges(default, line, ranges);
         }
+        Expr::ResultMethod {
+            receiver,
+            argument,
+            slots,
+            ..
+        } => {
+            note_local_use(ranges, slots.receiver, line);
+            note_local_use(ranges, slots.argument, line);
+            note_local_use(ranges, slots.ok_binding, line);
+            if let Some(slot) = slots.err_binding {
+                note_local_use(ranges, slot, line);
+            }
+            record_expr_local_debug_ranges(receiver, line, ranges);
+            record_expr_local_debug_ranges(argument, line, ranges);
+        }
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
         | Expr::ResultMatch { .. }
