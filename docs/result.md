@@ -66,8 +66,97 @@ Ok type; the error type must match without implicit conversion.
 Root scripts, non-Result-returning functions, non-Result operands, optional Result
 operands, and incompatible error types reject `?`. `T?` remains an optional type,
 and `object?.field` remains optional access. Other parser dialects do not gain
-this syntax unless they enable the Result dialect capability. There are no
-`unwrap`, `map`, `and_then`, generic Try traits, or guest throw/catch/finally here.
+this syntax unless they enable the Result dialect capability. There is no implicit
+error conversion, generic Try trait, or guest throw/catch/finally.
+
+## Combine Result values
+
+`Result` provides `map`, `map_err`, `and_then`, `or_else`, `unwrap_or`, and
+`unwrap_or_else`. `map` and `map_err` transform only their selected channel;
+`and_then` keeps the receiver's error type, and `or_else` keeps the receiver's
+success type. `unwrap_or` returns the success payload or an eager fallback
+value; `unwrap_or_else` returns the success payload or the value produced by an
+error callback.
+
+The receiver is evaluated once. The method argument is evaluated once in
+left-to-right order, and the callback body runs only for the selected payload
+branch. A callback expression is still created by the normal call semantics even
+when that body is not invoked; do not rely on skipping its construction or
+captured values. `unwrap_or` evaluates its fallback eagerly, even when the
+receiver is `Ok`. `unwrap_or_else` evaluates the callback body lazily, only for
+`Err`. The callback may be a closure or an existing function value, with exact
+parameter and return types.
+
+```rss
+// expected: 16
+fn build(flag: bool) -> Result<int, string> {
+    if flag => { Result::Ok(2) } else => { Result::Err("bad") }
+}
+fn relay(flag: bool) -> Result<int, int> {
+    let value = build(flag);
+    let combined: Result<int, int> = value
+        .map(|item| item + 1)
+        .map_err(|error| 8)
+        .and_then(|item| Result::Ok(item * 3))
+        .or_else(|error| Result::Ok(error - 1));
+    combined
+}
+let ok_result = relay(true);
+let err_result = relay(false);
+let ok_value: int = match ok_result {
+    Result::Ok(value) => value,
+    Result::Err(error) => -1,
+};
+let err_value: int = match err_result {
+    Result::Ok(value) => value,
+    Result::Err(error) => -1,
+};
+ok_value + err_value;
+```
+
+The Ok path maps `2` to `3` and then to `9`. The Err path maps the string error
+`"bad"` to `8`, then recovers with `or_else` to `7`. Both channels flow through
+the same chain from left to right.
+
+`unwrap_or` is eager, while `unwrap_or_else` is lazy:
+
+```rss
+// expected: 83
+let ok_value: Result<int, int> = Result::Ok(11);
+let err_eager: Result<int, int> = Result::Err(2);
+let err_lazy: Result<int, int> = Result::Err(2);
+let eager_ok: int = ok_value.unwrap_or(20);
+let eager_err: int = err_eager.unwrap_or(30);
+let lazy_err: int = err_lazy.unwrap_or_else(|error| error + 40);
+eager_ok + eager_err + lazy_err;
+```
+
+`map_err` changes only the error type. Because `?` requires the enclosing
+function's error type to match exactly, the explicit conversion must happen
+before `?`; no `From<E>` conversion or special Try implementation is inserted:
+
+```rss
+// expected: 7
+fn load() -> Result<int, string> {
+    Result::Err("bad")
+}
+fn convert(error: string) -> int {
+    7
+}
+fn relay() -> Result<int, int> {
+    let value: int = load().map_err(convert)?;
+    Result::Ok(value)
+}
+let result = relay();
+match result {
+    Result::Ok(value) => value,
+    Result::Err(error) => error,
+};
+```
+
+The `?` operand has error type `int` after `map_err`; `relay` also returns
+`Result<int, int>`. The original string error becomes `7` before propagation,
+and the final match observes that propagated error.
 
 ## Ownership and cleanup: explicit normal close, automatic Err cleanup
 
@@ -94,6 +183,24 @@ explicit normal-path close. Opaque native state must take ownership through the
 typed API; storing a numeric handle or an externally held container is not an
 ownership declaration. Unresolved publication ownership quarantines execution and
 new publications until explicit scope shutdown/reset actually completes.
+
+The combination methods follow the same ownership contract. `map`, `map_err`,
+`and_then`, and `or_else` consume the receiver; the selected payload owner is
+transferred once, and the unselected branch receives no second copy. A selected
+guest resource remains observable until it is returned or explicitly closed, and
+an Err payload consumed by a typed native take has one final destination.
+`unwrap_or` takes its fallback eagerly, so a resource-typed fallback is refused
+statically. An inline closure that moves a resource into its capture cell is also
+refused. Temporary resource-capturing factories, callable sources made
+shared-mutable by a recorded writer, and unbound generic positions that could
+later be instantiated with a resource are treated conservatively as unknown
+ownership and refused when no owner can be proven. Resource-free callbacks,
+named function values, and an already-bound caller-owned callable remain
+supported. These are compile-time ownership refusals; they are not evidence that
+every rejected shape leaks at runtime, and not every temporary resource factory
+is accepted. The VM-aware SDK integration test proves that path's own publication
+and cleanup behavior; it does not certify every lower-level entry point for
+arbitrary combinator shapes.
 
 The maintained generated-host example in
 [`result_sdk_try_integration_tests.rs`](../tests/result_sdk_try_integration_tests.rs)
@@ -133,40 +240,61 @@ unit payload; a distinct guest `()` schema is outside this contract.
 ### Calling an RSS Result from Rust
 
 The typed callback for an exported RSS function returns the same
-`GuestResult<T, E>` wrapper. From application code with `GuestResult` and
-`VmResult` imported from `vm`, given a store that initialized an export
-
-`pub fn echo(value: Result<int, string>) -> Result<int, string> { value }`
-
-the guest value converts into a native Rust `Result` through the existing
-`From` implementation:
+`GuestResult<T, E>` wrapper. The following file is a complete standalone Rust
+program: it compiles an RSS export, initializes a `Store`, runs the program to
+`Halted`, obtains the typed callback, and converts both guest variants into a
+native Rust `Result` through the existing `From` implementation. `main` returns
+`Box<dyn std::error::Error>` so `?` can carry compilation, VM, store, and callback
+setup failures.
 
 ```rust
-let callback = store
-    .script_callback_by_name::<(GuestResult<i64, String>,), GuestResult<i64, String>>("echo")?;
-let ok: Result<i64, String> = callback
-    .call(&mut store, (GuestResult::Ok(0),))?
-    .into();
-let err: Result<i64, String> = callback
-    .call(&mut store, (GuestResult::Err(String::new()),))?
-    .into();
-assert_eq!(ok, Ok(0));
-assert_eq!(err, Err(String::new()));
+use vm::{GuestResult, Store, Vm, VmResult, VmStatus};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let compiled = vm::compile_source(
+        "pub fn echo(value: Result<int, string>) -> Result<int, string> { value }",
+    )?;
+    let mut store = Store::new(
+        Vm::new(compiled.program.with_local_count(compiled.locals)),
+        (),
+    );
+    store.vm_mut().set_fuel(100_000);
+    assert_eq!(store.run()?, VmStatus::Halted);
+
+    let callback = store.script_callback_by_name::<
+        (GuestResult<i64, String>,),
+        GuestResult<i64, String>,
+    >("echo")?;
+
+    let ok: Result<i64, String> = callback.call(&mut store, (GuestResult::Ok(0),))?.into();
+    assert_eq!(ok, Ok(0));
+
+    let err: Result<i64, String> = callback
+        .call(&mut store, (GuestResult::Err(String::new()),))?
+        .into();
+    assert_eq!(err, Err(String::new()));
+
+    let native: VmResult<Result<i64, String>> = callback
+        .call(&mut store, (GuestResult::Ok(7),))
+        .map(Into::into);
+    assert_eq!(native?, Ok(7));
+
+    let guest_error: VmResult<Result<i64, String>> = callback
+        .call(&mut store, (GuestResult::Err("guest failure".into()),))
+        .map(Into::into);
+    assert_eq!(guest_error?, Err("guest failure".to_string()));
+
+    Ok(())
+}
 ```
 
 `Ok(0)` and `Err("")` remain distinct because the carrier's Boolean `tag`
-selects the branch; payload truthiness does not. To keep the VM transport
-channel explicit, map the outer result instead of unwrapping it:
-
-```rust
-let native: VmResult<Result<i64, String>> = callback
-    .call(&mut store, (GuestResult::Err("guest failure".into()),))
-    .map(Into::into);
-```
-
-Here the outer `VmResult` reports fatal VM, transport, fuel, cancellation, or
-ownership failures. A guest error is only the inner `Result::Err`, and an outer
-`VmError` is never wrapped as guest data.
+selects the branch; payload truthiness does not. The explicit
+`VmResult<Result<i64, String>>` binding keeps the transport channel visible:
+the outer result reports fatal VM, transport, fuel, cancellation, or ownership
+failures, while a guest error is only the inner `Result::Err` and is never
+wrapped as an outer `VmError`. The example constructs no document-specific host
+module, mock, or resource token.
 
 ### Ordinary and resource-owning callbacks
 
@@ -176,13 +304,6 @@ Context-free callbacks use `script_callback_by_name` with
 through `call_with_vm` while the VM is halted. That VM-aware path keeps a live
 `ScriptValueContext` for typed publication and resource ownership and is the
 entry for callbacks returning `ResourceOwned<T>`.
-
-The maintained generated-host example in
-[`result_sdk_try_integration_tests.rs`](../tests/result_sdk_try_integration_tests.rs)
-uses `ResourceOwned<T>`, `ResourceRef<'_, T>`, `HostResourceType`,
-`vm_script_callback_by_name`, and `call_with_vm`. It checks resource state
-**before** VM teardown and exercises normal explicit close and Err cleanup
-independently.
 
 Use the generated descriptor's exact catalog; host-call admission validates the
 selected payload before entering a guest body, and typed host return validation

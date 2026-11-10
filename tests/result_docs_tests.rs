@@ -33,7 +33,7 @@ fn product_result_rss_examples_compile_roundtrip_and_execute() {
         assert_eq!(machine.stack().last(), Some(&vm::Value::Int(expected)));
         count += 1;
     }
-    assert_eq!(count, 2);
+    assert_eq!(count, 5);
 }
 
 mod rust_example {
@@ -93,5 +93,16 @@ mod rust_example {
                 }
             }
         }
+    }
+}
+
+mod callback_example {
+    include!("../docs/result_callback_example.rs");
+
+    #[test]
+    fn documented_rust_callback_example_is_exact_and_executes() {
+        let docs = include_str!("../docs/result.md");
+        assert!(docs.contains(include_str!("../docs/result_callback_example.rs").trim()));
+        main().expect("documented callback example should run its full RSS-to-Rust path");
     }
 }
