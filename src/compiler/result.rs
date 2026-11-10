@@ -5,7 +5,7 @@
 //! allows null. This pass fills constructor schemas from annotations and
 //! rejects non-exhaustive or mistyped Result matches before bytecode emission.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::CompileError;
 use super::ir::{
@@ -23,9 +23,21 @@ struct Env {
     function_list: Vec<FunctionDecl>,
     function_impls: HashMap<u16, FunctionImpl>,
     struct_schemas: HashMap<String, super::ir::StructDecl>,
+    /// Local callable bindings captured for temporary-factory provenance.
+    /// Only callable-typed locals are recorded so ordinary value flow does not
+    /// retain expression clones in this pass.
+    local_defs: HashMap<LocalSlot, LocalDefinition>,
     /// Return schema of the function or closure currently being resolved.
     /// `None` at root and inside a callable that does not return `Result`.
     lexical_return: Option<TypeSchema>,
+}
+
+#[derive(Clone)]
+struct LocalDefinition {
+    expr: Expr,
+    /// Slot schemas at the definition point, so capture provenance stays
+    /// accurate after later bindings change the same slot map.
+    slots: HashMap<LocalSlot, TypeSchema>,
 }
 
 pub(crate) fn resolve_result_types(
@@ -49,6 +61,7 @@ pub(crate) fn resolve_result_types(
         function_list,
         function_impls: ir.function_impls.clone(),
         struct_schemas: ir.struct_schemas.clone(),
+        local_defs: HashMap::new(),
         lexical_return: None,
     };
     resolve_stmts(&mut ir.stmts, None, &mut env)?;
@@ -66,6 +79,7 @@ fn resolve_function(
     env: &mut Env,
 ) -> Result<(), CompileError> {
     let saved = env.slots.clone();
+    let saved_defs = env.local_defs.clone();
     let saved_return = env.lexical_return.clone();
     if let Some(function) = env.functions.get(&index).cloned() {
         env.lexical_return = function.return_schema.clone();
@@ -93,6 +107,7 @@ fn resolve_function(
         resolve_expr(&mut function_impl.body_expr, None, env)?;
     }
     env.slots = saved;
+    env.local_defs = saved_defs;
     env.lexical_return = saved_return;
     Ok(())
 }
@@ -140,6 +155,21 @@ fn resolve_stmt(
             {
                 env.slots.insert(*index, schema);
             }
+            let is_callable = env
+                .slots
+                .get(index)
+                .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }));
+            if is_callable {
+                env.local_defs.insert(
+                    *index,
+                    LocalDefinition {
+                        expr: expr.clone(),
+                        slots: env.slots.clone(),
+                    },
+                );
+            } else {
+                env.local_defs.remove(index);
+            }
             Ok(())
         }
         Stmt::Assign {
@@ -155,6 +185,21 @@ fn resolve_stmt(
             resolve_expr(expr, expected.as_ref(), env)?;
             if let Some(schema) = infer_schema(expr, env) {
                 env.slots.insert(*index, schema);
+            }
+            let is_callable = env
+                .slots
+                .get(index)
+                .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }));
+            if is_callable {
+                env.local_defs.insert(
+                    *index,
+                    LocalDefinition {
+                        expr: expr.clone(),
+                        slots: env.slots.clone(),
+                    },
+                );
+            } else {
+                env.local_defs.remove(index);
             }
             Ok(())
         }
@@ -194,6 +239,7 @@ fn resolve_stmt(
         }
         Stmt::Drop { index, .. } => {
             env.slots.remove(index);
+            env.local_defs.remove(index);
             Ok(())
         }
     }
@@ -510,12 +556,54 @@ fn resolve_method(
                     ),
                 ));
             }
+            // The selected Err branch has no binding to receive the error
+            // payload: the lowering extracts it and pops it. A resource-typed
+            // error owner therefore has no destination on that side, exactly
+            // like the eager fallback above. Reject the composition statically
+            // instead of deferring the owner to VM teardown.
+            if err_schema.contains_resource_with_named_types(&env.struct_schemas) {
+                return Err(result_error(
+                    span,
+                    format!(
+                        ".unwrap_or on Result<{}, {}> cannot discard the selected Err payload owner: the Err branch has no destination for resource-typed error value {}",
+                        render_schema(&ok_schema),
+                        render_schema(&err_schema),
+                        render_schema(&err_schema)
+                    ),
+                ));
+            }
+            // A generic parameter is not proven resource-free at this
+            // definition: a later instantiation can bind it to a resource
+            // type, and both the eager fallback and the selected Err payload
+            // would be discarded without an owner destination. Reject the
+            // unresolved branch instead of guessing from the generic body.
+            if schema_contains_generic_param(&ok_schema)
+                || schema_contains_generic_param(&err_schema)
+            {
+                let owner = if schema_contains_generic_param(&err_schema) {
+                    format!("selected Err payload ({})", render_schema(&err_schema))
+                } else {
+                    format!(
+                        "eager fallback against the Ok payload ({})",
+                        render_schema(&ok_schema)
+                    )
+                };
+                return Err(result_error(
+                    span,
+                    format!(
+                        ".unwrap_or on Result<{}, {}> cannot discard the {} owner: its branch contains an unresolved generic parameter that may be instantiated with a resource; use a concrete Result type or preserve the payload explicitly",
+                        render_schema(&ok_schema),
+                        render_schema(&err_schema),
+                        owner
+                    ),
+                ));
+            }
             if let Some(annotated) = &annotated
                 && !schema_contains_unknown(annotated)
             {
                 require_method_schema(env, annotated, &ok_schema, span, method, "result")?;
             }
-            reject_resource_capturing_closure(&argument, span, method, env)?;
+            reject_resource_capturing_closure(&argument, &fallback_schema, span, method, env)?;
             env.slots.insert(slots.receiver, result_schema.clone());
             env.slots.insert(slots.argument, fallback_schema.clone());
             env.slots.insert(slots.ok_binding, ok_schema.clone());
@@ -578,7 +666,7 @@ fn resolve_method(
             {
                 require_method_schema(env, annotated, &ok_schema, span, method, "result")?;
             }
-            reject_resource_capturing_closure(&argument, span, method, env)?;
+            reject_resource_capturing_closure(&argument, &callback_schema, span, method, env)?;
             env.slots.insert(slots.receiver, result_schema.clone());
             env.slots.insert(slots.argument, callback_schema.clone());
             env.slots.insert(slots.ok_binding, ok_schema.clone());
@@ -684,7 +772,7 @@ fn resolve_method(
     }
     require_method_schema(env, &param, &params[0], span, method, "callback parameter")?;
     require_concrete_schema(result, span, method, "callback return")?;
-    reject_resource_capturing_closure(&argument, span, method, env)?;
+    reject_resource_capturing_closure(&argument, &callback_schema, span, method, env)?;
 
     let (ok_expr, err_expr) = match method {
         ResultMethod::Map => {
@@ -1061,6 +1149,32 @@ fn schema_contains_unknown(schema: &TypeSchema) -> bool {
     }
 }
 
+/// Whether a schema still contains an unsubstituted generic parameter. A
+/// branch carrying one cannot be proven resource-free at the generic
+/// definition, because a later instantiation may bind it to a resource type.
+fn schema_contains_generic_param(schema: &TypeSchema) -> bool {
+    match schema {
+        TypeSchema::GenericParam(_) => true,
+        TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
+            schema_contains_generic_param(inner)
+        }
+        TypeSchema::Result { ok, err } => {
+            schema_contains_generic_param(ok) || schema_contains_generic_param(err)
+        }
+        TypeSchema::ArrayTuple(items) => items.iter().any(schema_contains_generic_param),
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            prefix.iter().any(schema_contains_generic_param) || schema_contains_generic_param(rest)
+        }
+        TypeSchema::Object(fields) => fields.values().any(schema_contains_generic_param),
+        TypeSchema::Named(_, args) => args.iter().any(schema_contains_generic_param),
+        TypeSchema::Callable { params, result } => {
+            params.iter().any(schema_contains_generic_param)
+                || schema_contains_generic_param(result)
+        }
+        _ => false,
+    }
+}
+
 fn require_method_schema(
     env: &Env,
     expected: &TypeSchema,
@@ -1205,26 +1319,530 @@ fn merge_callable_branches(
 }
 
 /// The unselected branch of a combinator has no owner destination for
-/// resources moved into an inline closure capture cell, so that composition
-/// is rejected rather than silently leaked or copied. Function values and
-/// already-bound callable locals keep their existing owner.
+/// resources moved into a closure capture cell, so that composition
+/// is rejected rather than silently leaked or copied. A callable produced
+/// by a temporary factory call can carry the same owner with no surviving
+/// local binding; the factory's returned expression is checked for that
+/// capture provenance before lowering. Already-bound callable locals keep
+/// their existing owner.
 fn reject_resource_capturing_closure(
     argument: &Expr,
+    argument_schema: &TypeSchema,
     span: Span,
     method: ResultMethod,
     env: &Env,
 ) -> Result<(), CompileError> {
-    let Some(schema) = find_resource_capturing_closure(argument, env) else {
+    // The inline capture and temporary-factory checks both describe callable
+    // callback ownership. A non-callable fallback (`unwrap_or` on a scalar
+    // payload) keeps its ordinary ownership rules.
+    if !matches!(argument_schema, TypeSchema::Callable { .. }) {
         return Ok(());
+    }
+    if let Some(schema) = find_resource_capturing_closure(argument, env) {
+        return Err(result_error(
+            span,
+            format!(
+                ".{} callback/fallback cannot move a resource value into a closure capture ({}): the unselected branch has no destination for that owner; pass a named function or bind the callable before the method",
+                method.name(),
+                render_schema(&schema)
+            ),
+        ));
+    }
+    match find_temporary_callable_capture(argument, env) {
+        TemporaryCallableCapture::Free => Ok(()),
+        TemporaryCallableCapture::Resource(schema) => Err(result_error(
+            span,
+            format!(
+                ".{} callback/fallback cannot use a temporary callable whose factory moves a resource value into its captures ({}): the unselected branch has no destination for that owner; bind the callable before the method",
+                method.name(),
+                render_schema(&schema)
+            ),
+        )),
+        TemporaryCallableCapture::Unknown => Err(result_error(
+            span,
+            format!(
+                ".{} cannot prove the capture ownership of the temporary callable produced by this call: bind the callable before the method or pass a named function",
+                method.name()
+            ),
+        )),
+    }
+}
+
+#[derive(Clone, Debug)]
+enum TemporaryCallableCapture {
+    Free,
+    Resource(TypeSchema),
+    Unknown,
+}
+
+impl TemporaryCallableCapture {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Resource(schema), _) | (_, Self::Resource(schema)) => Self::Resource(schema),
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::Free, Self::Free) => Self::Free,
+        }
+    }
+}
+
+/// A snapshot of local slot schemas plus callable-typed local definitions,
+/// used to inspect a factory's returned value without re-entering the main
+/// Result resolver.
+struct CaptureWalk<'a> {
+    slots: HashMap<LocalSlot, TypeSchema>,
+    defs: HashMap<LocalSlot, LocalDefinition>,
+    env: &'a Env,
+}
+
+fn find_temporary_callable_capture(expr: &Expr, env: &Env) -> TemporaryCallableCapture {
+    let walk = CaptureWalk {
+        slots: env.slots.clone(),
+        defs: env.local_defs.clone(),
+        env,
     };
-    Err(result_error(
-        span,
-        format!(
-            ".{} callback/fallback cannot move a resource value into a closure capture ({}): the unselected branch has no destination for that owner; pass a named function or bind the callable before the method",
-            method.name(),
-            render_schema(&schema)
+    let mut visiting_slots = HashSet::new();
+    let mut visiting_functions = HashSet::new();
+    temporary_callable_capture(expr, &walk, &mut visiting_slots, &mut visiting_functions, 0)
+}
+
+/// Capture provenance of the callable value produced by `expr` at runtime.
+/// Bare locals stay with their existing owner rules; only call-produced,
+/// IIFE-produced and structured-expression callables are inspected here.
+fn temporary_callable_capture(
+    expr: &Expr,
+    walk: &CaptureWalk<'_>,
+    visiting_slots: &mut HashSet<LocalSlot>,
+    visiting_functions: &mut HashSet<u16>,
+    depth: usize,
+) -> TemporaryCallableCapture {
+    if depth > 8 {
+        return TemporaryCallableCapture::Unknown;
+    }
+    match expr {
+        Expr::Call(index, _, _, _, _) => {
+            call_return_capture(*index, walk, visiting_slots, visiting_functions, depth)
+        }
+        Expr::LocalCall(slot, _, _, _) => {
+            local_call_capture(*slot, walk, visiting_slots, visiting_functions, depth)
+        }
+        Expr::ClosureCall(closure, args) => closure_call_return_capture(
+            closure,
+            args,
+            walk,
+            visiting_slots,
+            visiting_functions,
+            depth,
         ),
-    ))
+        Expr::Block { stmts, expr } => {
+            let mut nested = CaptureWalk {
+                slots: walk.slots.clone(),
+                defs: walk.defs.clone(),
+                env: walk.env,
+            };
+            bind_stmts(stmts, &mut nested);
+            temporary_callable_capture(expr, &nested, visiting_slots, visiting_functions, depth + 1)
+        }
+        Expr::IfElse {
+            then_expr,
+            else_expr,
+            ..
+        } => {
+            let then_capture = temporary_callable_capture(
+                then_expr,
+                walk,
+                visiting_slots,
+                visiting_functions,
+                depth + 1,
+            );
+            let else_capture = temporary_callable_capture(
+                else_expr,
+                walk,
+                visiting_slots,
+                visiting_functions,
+                depth + 1,
+            );
+            then_capture.merge(else_capture)
+        }
+        Expr::Match { arms, default, .. } => {
+            let mut merged = TemporaryCallableCapture::Free;
+            for (_, arm) in arms {
+                merged = merged.merge(temporary_callable_capture(
+                    arm,
+                    walk,
+                    visiting_slots,
+                    visiting_functions,
+                    depth + 1,
+                ));
+            }
+            merged.merge(temporary_callable_capture(
+                default,
+                walk,
+                visiting_slots,
+                visiting_functions,
+                depth + 1,
+            ))
+        }
+        Expr::Closure(closure) => {
+            closure_capture(closure, walk, visiting_slots, visiting_functions, depth)
+        }
+        Expr::FunctionRef(index, _) => function_value_capture(*index, walk, visiting_functions),
+        // A persistent user binding (or any non-execution expression) keeps
+        // its existing owner; this check adds nothing for those shapes.
+        _ => TemporaryCallableCapture::Free,
+    }
+}
+
+fn call_return_capture(
+    index: u16,
+    walk: &CaptureWalk<'_>,
+    visiting_slots: &mut HashSet<LocalSlot>,
+    visiting_functions: &mut HashSet<u16>,
+    depth: usize,
+) -> TemporaryCallableCapture {
+    if depth > 8 || !visiting_functions.insert(index) {
+        return TemporaryCallableCapture::Unknown;
+    }
+    let result = match (
+        walk.env.functions.get(&index),
+        walk.env.function_impls.get(&index),
+    ) {
+        (Some(function), Some(implementation)) => {
+            let nested = function_capture_walk(function, implementation, walk.env);
+            temporary_callable_capture(
+                &implementation.body_expr,
+                &nested,
+                visiting_slots,
+                visiting_functions,
+                depth + 1,
+            )
+        }
+        // A host-produced callable has no inspectable guest capture story.
+        (Some(_), None) => TemporaryCallableCapture::Unknown,
+        (None, _) => TemporaryCallableCapture::Unknown,
+    };
+    visiting_functions.remove(&index);
+    result
+}
+
+fn local_call_capture(
+    slot: LocalSlot,
+    walk: &CaptureWalk<'_>,
+    visiting_slots: &mut HashSet<LocalSlot>,
+    visiting_functions: &mut HashSet<u16>,
+    depth: usize,
+) -> TemporaryCallableCapture {
+    local_callable_return_capture(slot, walk, visiting_slots, visiting_functions, depth, 0)
+}
+
+fn local_callable_return_capture(
+    slot: LocalSlot,
+    walk: &CaptureWalk<'_>,
+    visiting_slots: &mut HashSet<LocalSlot>,
+    visiting_functions: &mut HashSet<u16>,
+    depth: usize,
+    hops: usize,
+) -> TemporaryCallableCapture {
+    if hops > 8 || depth > 8 || !visiting_slots.insert(slot) {
+        return TemporaryCallableCapture::Unknown;
+    }
+    let result = match walk.defs.get(&slot) {
+        Some(definition) => match &definition.expr {
+            Expr::Var(next) | Expr::MoveVar(next) => local_callable_return_capture(
+                *next,
+                walk,
+                visiting_slots,
+                visiting_functions,
+                depth,
+                hops + 1,
+            ),
+            Expr::FunctionRef(index, _) => {
+                call_return_capture(*index, walk, visiting_slots, visiting_functions, depth)
+            }
+            Expr::Closure(closure) => {
+                let nested = closure_body_walk(closure, &definition.slots, walk.env);
+                temporary_callable_capture(
+                    &closure.body,
+                    &nested,
+                    visiting_slots,
+                    visiting_functions,
+                    depth + 1,
+                )
+            }
+            _ => TemporaryCallableCapture::Unknown,
+        },
+        None => TemporaryCallableCapture::Unknown,
+    };
+    visiting_slots.remove(&slot);
+    result
+}
+
+fn closure_call_return_capture(
+    closure: &ClosureExpr,
+    args: &[Expr],
+    walk: &CaptureWalk<'_>,
+    visiting_slots: &mut HashSet<LocalSlot>,
+    visiting_functions: &mut HashSet<u16>,
+    depth: usize,
+) -> TemporaryCallableCapture {
+    let mut nested = closure_body_walk(closure, &walk.slots, walk.env);
+    if let Some(arg_schemas) = argument_schemas(&closure.param_slots, args, walk) {
+        nested.slots.extend(arg_schemas);
+    }
+    temporary_callable_capture(
+        &closure.body,
+        &nested,
+        visiting_slots,
+        visiting_functions,
+        depth + 1,
+    )
+}
+
+fn argument_schemas(
+    param_slots: &[LocalSlot],
+    args: &[Expr],
+    walk: &CaptureWalk<'_>,
+) -> Option<HashMap<LocalSlot, TypeSchema>> {
+    let mut schemas = HashMap::new();
+    for (slot, argument) in param_slots.iter().zip(args.iter()) {
+        let schema = super::typing::infer_value_schema(
+            &walk.env.function_list,
+            &walk.env.function_impls,
+            &walk.env.struct_schemas,
+            argument,
+            &walk.slots,
+        )?;
+        schemas.insert(*slot, schema);
+    }
+    Some(schemas)
+}
+
+fn closure_body_walk<'a>(
+    closure: &ClosureExpr,
+    slots: &HashMap<LocalSlot, TypeSchema>,
+    env: &'a Env,
+) -> CaptureWalk<'a> {
+    let mut nested_slots = slots.clone();
+    for (source, captured) in &closure.capture_copies {
+        if let Some(schema) = slots.get(source) {
+            nested_slots.insert(*captured, schema.clone());
+        }
+    }
+    CaptureWalk {
+        slots: nested_slots,
+        defs: HashMap::new(),
+        env,
+    }
+}
+
+fn function_value_capture(
+    index: u16,
+    walk: &CaptureWalk<'_>,
+    visiting_functions: &mut HashSet<u16>,
+) -> TemporaryCallableCapture {
+    if !visiting_functions.insert(index) {
+        return TemporaryCallableCapture::Unknown;
+    }
+    let result = match walk.env.function_impls.get(&index) {
+        Some(implementation) => {
+            let mut verdict = TemporaryCallableCapture::Free;
+            for (source, _) in &implementation.capture_copies {
+                match walk.slots.get(source) {
+                    Some(schema)
+                        if schema.contains_resource_with_named_types(&walk.env.struct_schemas) =>
+                    {
+                        verdict = TemporaryCallableCapture::Resource(schema.clone());
+                        break;
+                    }
+                    Some(_) => {}
+                    None => verdict = TemporaryCallableCapture::Unknown,
+                }
+            }
+            verdict
+        }
+        None => TemporaryCallableCapture::Free,
+    };
+    visiting_functions.remove(&index);
+    result
+}
+
+fn closure_capture(
+    closure: &ClosureExpr,
+    walk: &CaptureWalk<'_>,
+    visiting_slots: &mut HashSet<LocalSlot>,
+    visiting_functions: &mut HashSet<u16>,
+    depth: usize,
+) -> TemporaryCallableCapture {
+    let mut verdict = TemporaryCallableCapture::Free;
+    for (source, _) in &closure.capture_copies {
+        match walk.slots.get(source) {
+            Some(schema) if schema.contains_resource_with_named_types(&walk.env.struct_schemas) => {
+                return TemporaryCallableCapture::Resource(schema.clone());
+            }
+            Some(TypeSchema::Callable { .. }) => {
+                let nested = match walk.defs.get(source) {
+                    Some(definition) => definition_value_capture(
+                        definition,
+                        walk,
+                        visiting_slots,
+                        visiting_functions,
+                        depth + 1,
+                    ),
+                    None => TemporaryCallableCapture::Unknown,
+                };
+                verdict = verdict.merge(nested);
+            }
+            Some(_) => {}
+            None => verdict = verdict.merge(TemporaryCallableCapture::Unknown),
+        }
+    }
+    verdict
+}
+
+fn definition_value_capture(
+    definition: &LocalDefinition,
+    walk: &CaptureWalk<'_>,
+    visiting_slots: &mut HashSet<LocalSlot>,
+    visiting_functions: &mut HashSet<u16>,
+    depth: usize,
+) -> TemporaryCallableCapture {
+    if depth > 8 {
+        return TemporaryCallableCapture::Unknown;
+    }
+    let nested = CaptureWalk {
+        slots: definition.slots.clone(),
+        defs: walk.defs.clone(),
+        env: walk.env,
+    };
+    match &definition.expr {
+        Expr::Closure(closure) => {
+            closure_capture(closure, &nested, visiting_slots, visiting_functions, depth)
+        }
+        Expr::Var(slot) | Expr::MoveVar(slot) => match nested.defs.get(slot) {
+            Some(next) => definition_value_capture(
+                next,
+                &CaptureWalk {
+                    slots: next.slots.clone(),
+                    defs: nested.defs.clone(),
+                    env: nested.env,
+                },
+                visiting_slots,
+                visiting_functions,
+                depth + 1,
+            ),
+            None => TemporaryCallableCapture::Unknown,
+        },
+        _ => temporary_callable_capture(
+            &definition.expr,
+            &nested,
+            visiting_slots,
+            visiting_functions,
+            depth,
+        ),
+    }
+}
+
+fn function_capture_walk<'a>(
+    function: &FunctionDecl,
+    implementation: &FunctionImpl,
+    env: &'a Env,
+) -> CaptureWalk<'a> {
+    let mut slots = HashMap::new();
+    for (slot, schema) in implementation
+        .param_slots
+        .iter()
+        .zip(function.arg_schemas.iter())
+    {
+        if let Some(schema) = schema {
+            slots.insert(*slot, schema.clone());
+        }
+    }
+    for (source, captured) in &implementation.capture_copies {
+        if let Some(schema) = env.slots.get(source) {
+            slots.insert(*captured, schema.clone());
+        }
+    }
+    let mut walk = CaptureWalk {
+        slots,
+        defs: HashMap::new(),
+        env,
+    };
+    bind_stmts(&implementation.body_stmts, &mut walk);
+    walk
+}
+
+fn bind_stmts(stmts: &[Stmt], walk: &mut CaptureWalk<'_>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Let {
+                index,
+                declared_schema,
+                expr,
+                ..
+            } => {
+                let schema = declared_schema
+                    .clone()
+                    .or_else(|| {
+                        super::typing::infer_value_schema(
+                            &walk.env.function_list,
+                            &walk.env.function_impls,
+                            &walk.env.struct_schemas,
+                            expr,
+                            &walk.slots,
+                        )
+                    })
+                    .filter(|schema| !matches!(schema, TypeSchema::Unknown));
+                if let Some(schema) = schema {
+                    walk.slots.insert(*index, schema);
+                }
+                let is_callable = walk
+                    .slots
+                    .get(index)
+                    .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }));
+                if is_callable {
+                    walk.defs.insert(
+                        *index,
+                        LocalDefinition {
+                            expr: expr.clone(),
+                            slots: walk.slots.clone(),
+                        },
+                    );
+                } else {
+                    walk.defs.remove(index);
+                }
+            }
+            Stmt::Assign { index, expr, .. } => {
+                if let Some(schema) = super::typing::infer_value_schema(
+                    &walk.env.function_list,
+                    &walk.env.function_impls,
+                    &walk.env.struct_schemas,
+                    expr,
+                    &walk.slots,
+                ) {
+                    walk.slots.insert(*index, schema);
+                }
+                let is_callable = walk
+                    .slots
+                    .get(index)
+                    .is_some_and(|schema| matches!(schema, TypeSchema::Callable { .. }));
+                if is_callable {
+                    walk.defs.insert(
+                        *index,
+                        LocalDefinition {
+                            expr: expr.clone(),
+                            slots: walk.slots.clone(),
+                        },
+                    );
+                } else {
+                    walk.defs.remove(index);
+                }
+            }
+            Stmt::Drop { index, .. } => {
+                walk.slots.remove(index);
+                walk.defs.remove(index);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn find_resource_capturing_closure(expr: &Expr, env: &Env) -> Option<TypeSchema> {
@@ -1755,6 +2373,7 @@ fn resolve_closure(
         &closure.capture_copies,
     );
     let saved = std::mem::replace(&mut env.slots, nested);
+    let saved_defs = env.local_defs.clone();
     let saved_return = env.lexical_return.clone();
     env.lexical_return = match expected_return {
         Some(schema @ TypeSchema::Result { .. }) => Some(schema.clone()),
@@ -1762,6 +2381,7 @@ fn resolve_closure(
     };
     let resolved = resolve_expr(&mut closure.body, expected_return, env);
     env.slots = saved;
+    env.local_defs = saved_defs;
     env.lexical_return = saved_return;
     resolved
 }

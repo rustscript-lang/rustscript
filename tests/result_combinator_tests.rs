@@ -723,3 +723,31 @@ fn analyzer_entry_accepts_typed_combinators() {
     let model = vm::analyze_source(source).expect("analyzer must accept typed combinators");
     assert!(model.diagnostics().is_empty(), "{:?}", model.diagnostics());
 }
+
+#[test]
+fn resource_free_temporary_factory_callback_keeps_construction_and_selected_body() {
+    let _guard = PROBE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = r#"
+        use probe;
+        fn make_callback(tag: int) -> fn(int) -> int {
+            probe::mark(tag);
+            |item| item + probe::mark(tag + 1)
+        }
+        fn relay(value: Result<int, int>, tag: int) -> int {
+            let mapped = value.map(make_callback(tag));
+            match mapped {
+                Result::Ok(item) => item,
+                Result::Err(error) => error,
+            }
+        }
+        let ok_out = relay(probe::ok(1), 20);
+        let err_out = relay(probe::err(2), 30);
+        ok_out + err_out;
+    "#;
+    let (value, events) = run_probe(source);
+    // Ok: 1 -> factory 20 -> body 21 => 22. Err: 2 -> factory 30, no body.
+    assert_eq!(value, Value::Int(24));
+    assert_eq!(events, vec![1, 20, 21, 2, 30]);
+}
