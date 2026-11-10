@@ -1,0 +1,5 @@
+error: GuestOption<T> requires one generic argument
+ --> tests/ui/fail/guest_option_arity.rs:6:17
+  |
+6 | fn invalid() -> VmResult<GuestOption<i64, bool>> {
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

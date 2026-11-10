@@ -483,6 +483,50 @@ impl<T: IntoVmValue, E: IntoVmValue> IntoVmValue for crate::GuestResult<T, E> {
     }
 }
 
+impl<'a, T> FromVmValue<'a> for crate::GuestOption<T>
+where
+    T: FromVmValue<'a>,
+{
+    fn from_vm_value(value: &'a Value, label: &str) -> VmResult<Self> {
+        let (some, payload) = crate::option::payload(value)?;
+        if some {
+            let payload = payload.unwrap_or(&Value::Null);
+            T::from_vm_value(payload, label).map(Self::Some)
+        } else {
+            Ok(Self::None)
+        }
+    }
+}
+
+impl<T> TakeVmValue for crate::GuestOption<T>
+where
+    T: TakeVmValue,
+{
+    fn take_vm_value(slot: &mut Value, label: &str) -> VmResult<Self> {
+        let (some, _) = crate::option::payload(slot)?;
+        if !some {
+            let _ = std::mem::replace(slot, Value::Null);
+            return Ok(Self::None);
+        }
+        let Value::Map(mut entries) = std::mem::replace(slot, Value::Null) else {
+            unreachable!();
+        };
+        let mut payload = std::sync::Arc::make_mut(&mut entries)
+            .remove(&Value::string("payload"))
+            .unwrap_or(Value::Null);
+        T::take_vm_value(&mut payload, label).map(Self::Some)
+    }
+}
+
+impl<T: IntoVmValue> IntoVmValue for crate::GuestOption<T> {
+    fn into_vm_value(self) -> Value {
+        match self {
+            Self::Some(value) => crate::option::some_carrier(value.into_vm_value()),
+            Self::None => crate::option::none_carrier(),
+        }
+    }
+}
+
 pub trait IntoVmValue {
     fn into_vm_value(self) -> Value;
 }

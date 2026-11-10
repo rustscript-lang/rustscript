@@ -19,6 +19,7 @@ pub(crate) enum SimpleType {
 pub(crate) enum BoundType {
     Unknown,
     Null,
+    Unit,
     Int,
     Float,
     Number,
@@ -37,6 +38,7 @@ impl BoundType {
         match self {
             BoundType::Unknown => None,
             BoundType::Null => Some("null"),
+            BoundType::Unit => Some("()"),
             BoundType::Int => Some("int"),
             BoundType::Float => Some("float"),
             BoundType::Number => Some("number"),
@@ -78,6 +80,7 @@ impl From<BoundType> for ValueType {
         match value {
             BoundType::Unknown => ValueType::Unknown,
             BoundType::Null => ValueType::Null,
+            BoundType::Unit => ValueType::Null,
             BoundType::Int => ValueType::Int,
             BoundType::Float => ValueType::Float,
             BoundType::Number => ValueType::Unknown,

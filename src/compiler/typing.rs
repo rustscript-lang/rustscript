@@ -120,6 +120,7 @@ impl FrontendTypedIr<'_> {
 fn scalar_schema_from_bound_type(bound_type: BoundType) -> Option<TypeSchema> {
     match bound_type {
         BoundType::Null => Some(TypeSchema::Null),
+        BoundType::Unit => Some(TypeSchema::Unit),
         BoundType::Int => Some(TypeSchema::Int),
         BoundType::Float => Some(TypeSchema::Float),
         BoundType::Number => Some(TypeSchema::Number),

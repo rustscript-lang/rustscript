@@ -231,7 +231,22 @@ macro_rules! impl_vm_script_scalar {
 impl_vm_script_scalar!(i64, Int);
 impl_vm_script_scalar!(bool, Bool);
 impl_vm_script_scalar!(String, String);
-impl_vm_script_scalar!((), Null);
+
+impl VmScriptValue for () {
+    fn schema() -> VmResult<HostTypeSchema> {
+        Ok(HostTypeSchema::Unit)
+    }
+    fn into_value(self, _: &mut ScriptValueContext<'_>) -> VmResult<Value> {
+        Ok(Value::Null)
+    }
+    fn from_value(_: &mut Vm, value: Value) -> VmResult<Self> {
+        if matches!(value, Value::Null) {
+            Ok(())
+        } else {
+            Err(VmError::TypeMismatch("() callback result"))
+        }
+    }
+}
 
 impl<T: VmScriptValue, E: VmScriptValue> VmScriptValue for crate::GuestResult<T, E> {
     fn schema() -> VmResult<HostTypeSchema> {
@@ -269,6 +284,28 @@ impl<T: VmScriptValue> VmScriptValue for Option<T> {
             Ok(None)
         } else {
             T::from_value(vm, value).map(Some)
+        }
+    }
+}
+
+impl<T: VmScriptValue> VmScriptValue for crate::GuestOption<T> {
+    fn schema() -> VmResult<HostTypeSchema> {
+        Ok(HostTypeSchema::Option(Box::new(T::schema()?)))
+    }
+    fn into_value(self, context: &mut ScriptValueContext<'_>) -> VmResult<Value> {
+        match self {
+            Self::Some(value) => Ok(crate::option::some_carrier(value.into_value(context)?)),
+            Self::None => Ok(crate::option::none_carrier()),
+        }
+    }
+    fn from_value(vm: &mut Vm, value: Value) -> VmResult<Self> {
+        vm.validate_guest_result_value(&value, &Self::schema()?)?;
+        let (some, payload) = crate::option::payload(&value)?;
+        if some {
+            let payload = payload.cloned().unwrap_or(Value::Null);
+            T::from_value(vm, payload).map(Self::Some)
+        } else {
+            Ok(Self::None)
         }
     }
 }
@@ -557,12 +594,12 @@ impl ScriptResult for () {
     fn from_value(value: Value) -> VmResult<Self> {
         match value {
             Value::Null => Ok(()),
-            _ => Err(VmError::TypeMismatch("null callback result")),
+            _ => Err(VmError::TypeMismatch("() callback result")),
         }
     }
 
     fn schema() -> Option<TypeSchema> {
-        Some(TypeSchema::Null)
+        Some(TypeSchema::Unit)
     }
 }
 
@@ -647,6 +684,18 @@ impl<T: IntoScriptValue> IntoScriptValue for Option<T> {
     }
 }
 
+impl<T: IntoScriptValue> IntoScriptValue for crate::GuestOption<T> {
+    fn into_script_value(self) -> Value {
+        match self {
+            Self::Some(value) => crate::option::some_carrier(value.into_script_value()),
+            Self::None => crate::option::none_carrier(),
+        }
+    }
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::Option(Box::new(T::schema()?)))
+    }
+}
+
 impl<T: ScriptResult> ScriptResult for Option<T> {
     fn from_value(value: Value) -> VmResult<Self> {
         if matches!(value, Value::Null) {
@@ -657,6 +706,21 @@ impl<T: ScriptResult> ScriptResult for Option<T> {
     }
     fn schema() -> Option<TypeSchema> {
         Some(TypeSchema::Optional(Box::new(T::schema()?)))
+    }
+}
+
+impl<T: ScriptResult> ScriptResult for crate::GuestOption<T> {
+    fn from_value(value: Value) -> VmResult<Self> {
+        let (some, payload) = crate::option::payload(&value)?;
+        if some {
+            let payload = payload.cloned().unwrap_or(Value::Null);
+            T::from_value(payload).map(Self::Some)
+        } else {
+            Ok(Self::None)
+        }
+    }
+    fn schema() -> Option<TypeSchema> {
+        Some(TypeSchema::Option(Box::new(T::schema()?)))
     }
 }
 

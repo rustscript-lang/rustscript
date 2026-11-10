@@ -994,6 +994,7 @@ impl<'a> SourceFormatter<'a> {
     fn find_generic_angle_group_close(&self, less_index: usize) -> Option<usize> {
         let mut angle_depth = 0usize;
         let mut bracket_depth = 0usize;
+        let mut paren_depth = 0usize;
         let mut saw_content = false;
 
         for index in less_index + 1..self.tokens.len() {
@@ -1002,6 +1003,19 @@ impl<'a> SourceFormatter<'a> {
                     saw_content = true;
                 }
                 TokenKind::Comma | TokenKind::Ellipsis => {}
+                TokenKind::LParen => {
+                    // Callable signatures and the `()` unit type both live in
+                    // type-argument position; arbitrary expression
+                    // parentheses never carry a generic close.
+                    paren_depth += 1;
+                    saw_content = true;
+                }
+                TokenKind::RParen => {
+                    if paren_depth == 0 {
+                        return None;
+                    }
+                    paren_depth -= 1;
+                }
                 TokenKind::LBracket => {
                     bracket_depth += 1;
                 }
@@ -1016,6 +1030,9 @@ impl<'a> SourceFormatter<'a> {
                 }
                 TokenKind::Greater => {
                     if bracket_depth > 0 {
+                        return None;
+                    }
+                    if paren_depth > 0 {
                         return None;
                     }
                     if angle_depth == 0 {

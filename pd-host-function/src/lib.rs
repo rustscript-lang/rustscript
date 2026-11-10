@@ -1515,7 +1515,7 @@ fn return_schema_tokens(
     let sdk = sdk_path();
     let ReturnType::Type(_, ty) = output else {
         return Ok((
-            quote!(#sdk::host_extension::HostTypeSchema::Null),
+            quote!(#sdk::host_extension::HostTypeSchema::Unit),
             None,
             None,
         ));
@@ -1634,6 +1634,7 @@ fn host_type_schema_from_label(label: &str, _ty: &Type) -> Result<proc_macro2::T
         "bytes" => quote!(#sdk::host_extension::HostTypeSchema::Bytes),
         "number" => quote!(#sdk::host_extension::HostTypeSchema::Number),
         "null" => quote!(#sdk::host_extension::HostTypeSchema::Null),
+        "()" => quote!(#sdk::host_extension::HostTypeSchema::Unit),
         "any" | "unknown" => quote!(#sdk::host_extension::HostTypeSchema::Unknown),
         "array" => quote!(#sdk::host_extension::HostTypeSchema::Array(Box::new(
             #sdk::host_extension::HostTypeSchema::Unknown

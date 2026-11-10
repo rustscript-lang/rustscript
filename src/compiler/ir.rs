@@ -26,6 +26,10 @@ pub struct SemanticNodeId(pub u32);
 pub enum TypeSchema {
     Unknown,
     Null,
+    /// Guest `()`. The physical carrier is the internal Null value; the
+    /// logical type is distinct from [`TypeSchema::Null`] and
+    /// [`TypeSchema::Optional`].
+    Unit,
     Int,
     Float,
     Number,
@@ -33,6 +37,10 @@ pub enum TypeSchema {
     String,
     Bytes,
     Optional(Box<TypeSchema>),
+    /// Guest `Option<T>`. Runtime values are maps with a Boolean `tag`
+    /// (`true` = Some) and the active `payload`; this variant is not a
+    /// [`TypeSchema::Named`] or [`TypeSchema::Map`].
+    Option(Box<TypeSchema>),
     GenericParam(String),
     Named(String, Vec<TypeSchema>),
     Array(Box<TypeSchema>),
@@ -70,13 +78,17 @@ impl Hash for TypeSchema {
         match self {
             TypeSchema::Unknown
             | TypeSchema::Null
+            | TypeSchema::Unit
             | TypeSchema::Int
             | TypeSchema::Float
             | TypeSchema::Number
             | TypeSchema::Bool
             | TypeSchema::String
             | TypeSchema::Bytes => {}
-            TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
+            TypeSchema::Optional(inner)
+            | TypeSchema::Option(inner)
+            | TypeSchema::Array(inner)
+            | TypeSchema::Map(inner) => {
                 inner.hash(state);
             }
             TypeSchema::GenericParam(name) => name.hash(state),
@@ -137,6 +149,7 @@ impl TypeSchema {
             }
             TypeSchema::Callable { .. } => ValueType::Callable,
             TypeSchema::Null => ValueType::Null,
+            TypeSchema::Unit => ValueType::Null,
             TypeSchema::Int => ValueType::Int,
             TypeSchema::Float => ValueType::Float,
             TypeSchema::Bool => ValueType::Bool,
@@ -144,6 +157,7 @@ impl TypeSchema {
             TypeSchema::Bytes => ValueType::Bytes,
             TypeSchema::Optional(inner) => inner.coarse_value_type(),
             TypeSchema::Named(_, _)
+            | TypeSchema::Option(_)
             | TypeSchema::Map(_)
             | TypeSchema::Object(_)
             | TypeSchema::Result { .. } => ValueType::Map,
@@ -216,7 +230,7 @@ impl TypeSchema {
     pub(crate) fn contains_resource(&self) -> bool {
         match self {
             TypeSchema::Resource(_) => true,
-            TypeSchema::Optional(inner) => inner.contains_resource(),
+            TypeSchema::Optional(inner) | TypeSchema::Option(inner) => inner.contains_resource(),
             TypeSchema::Named(_, type_args) => type_args.iter().any(|arg| arg.contains_resource()),
             TypeSchema::Array(element) => element.contains_resource(),
             TypeSchema::ArrayTuple(items) => items.iter().any(|item| item.contains_resource()),
@@ -231,6 +245,7 @@ impl TypeSchema {
             TypeSchema::Result { ok, err } => ok.contains_resource() || err.contains_resource(),
             TypeSchema::Unknown
             | TypeSchema::Null
+            | TypeSchema::Unit
             | TypeSchema::Int
             | TypeSchema::Float
             | TypeSchema::Number
@@ -253,6 +268,9 @@ impl TypeSchema {
                     .unwrap_or_else(|| schema.clone()),
                 TypeSchema::Optional(inner) => {
                     TypeSchema::Optional(Box::new(substitute(inner, bindings)))
+                }
+                TypeSchema::Option(inner) => {
+                    TypeSchema::Option(Box::new(substitute(inner, bindings)))
                 }
                 TypeSchema::Named(name, args) => TypeSchema::Named(
                     name.clone(),
@@ -310,9 +328,10 @@ impl TypeSchema {
         ) -> bool {
             match schema {
                 TypeSchema::Resource(_) => true,
-                TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
-                    visit(inner, structs, active, reentries)
-                }
+                TypeSchema::Optional(inner)
+                | TypeSchema::Option(inner)
+                | TypeSchema::Array(inner)
+                | TypeSchema::Map(inner) => visit(inner, structs, active, reentries),
                 TypeSchema::ArrayTuple(items) => items
                     .iter()
                     .any(|item| visit(item, structs, active, reentries)),
@@ -370,6 +389,7 @@ impl TypeSchema {
                 }
                 TypeSchema::Unknown
                 | TypeSchema::Null
+                | TypeSchema::Unit
                 | TypeSchema::Int
                 | TypeSchema::Float
                 | TypeSchema::Number
@@ -594,6 +614,9 @@ pub struct ResultMethodSlots {
 #[derive(Clone, Debug)]
 pub enum Expr {
     Null,
+    /// Guest `()` value. The physical carrier is the internal Null constant;
+    /// this node keeps the logical type distinct from an explicit null.
+    Unit,
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -800,6 +823,27 @@ pub enum Expr {
         span: Span,
         semantic_id: Option<SemanticNodeId>,
     },
+    /// `Option::Some(payload)` or `Option::None`. `some` selects the branch;
+    /// None has no payload. `option_schema` is filled by the Option resolver.
+    OptionConstruct {
+        some: bool,
+        payload: Option<Box<Expr>>,
+        option_schema: TypeSchema,
+        span: Span,
+        semantic_id: Option<SemanticNodeId>,
+    },
+    /// Exhaustive two-arm Option match. The Some binding is `None` for a
+    /// wildcard Some arm; the None arm never binds a payload.
+    OptionMatch {
+        value: Box<Expr>,
+        value_slot: LocalSlot,
+        some_binding: Option<LocalSlot>,
+        some_expr: Box<Expr>,
+        none_expr: Box<Expr>,
+        scrutinee_schema: TypeSchema,
+        span: Span,
+        semantic_id: Option<SemanticNodeId>,
+    },
 }
 
 impl Expr {
@@ -823,6 +867,27 @@ impl Expr {
             } => {
                 visit(receiver);
                 visit(argument);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn visit_option_children(&self, mut visit: impl FnMut(&Expr)) {
+        match self {
+            Expr::OptionConstruct {
+                payload: Some(payload),
+                ..
+            } => visit(payload),
+            Expr::OptionConstruct { payload: None, .. } => {}
+            Expr::OptionMatch {
+                value,
+                some_expr,
+                none_expr,
+                ..
+            } => {
+                visit(value);
+                visit(some_expr);
+                visit(none_expr);
             }
             _ => {}
         }

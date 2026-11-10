@@ -7,7 +7,9 @@ pub mod debug_info;
 #[cfg(feature = "runtime")]
 pub mod debugger;
 pub mod host_api;
+pub mod option;
 pub mod result;
+pub use option::GuestOption;
 pub use result::GuestResult;
 #[cfg(feature = "runtime")]
 pub use result::{ScriptValueContext, VmScriptArgs, VmScriptValue};

@@ -234,8 +234,9 @@ invalid representation, and outer `VmError` never become catchable guest Errs.
 Host descriptors and build-script schema generation preserve both parameters and
 resource effects. Borrowed-resource returns remain rejected, including nested
 GuestResult combinations. Existing HTTP/database business return types are not
-implicitly migrated. `Result<(), E>` continues to use the existing Null-backed
-unit payload; a distinct guest `()` schema is outside this contract.
+implicitly migrated. `Result<(), E>` continues to use the Null-backed unit
+payload; guest `()` is a distinct logical Unit schema whose physical carrier is
+also the internal Null value (see [Option and Unit](option.md)).
 
 ### Calling an RSS Result from Rust
 
@@ -317,8 +318,8 @@ Plugins can construct `TypeSchema::Result { ok, err }`,
 `ResultMatch`, and `ResultTry` IR. Preserve the full schemas through typing and
 ownership passes; do not substitute Unknown or invent a named-map identity.
 
-The current VMBC contract is **v13 only**. Std writer/reader and no-std reader use
-one current schema layout. Non-v13, unknown schema tags, malformed carriers, and
+The current VMBC contract is **v14 only**. Std writer/reader and no-std reader use
+one current schema layout. Non-v14, unknown schema tags, malformed carriers, and
 invalid schema budgets are rejected; there is no legacy reader, adapter, or
 version-dependent writer. The physical carrier is the existing Map with a Boolean
 `tag` (`true` = Ok) and the active `payload`. Missing payload means Null only if

@@ -308,9 +308,10 @@ fn actual_passing(arg: &Expr, schema: &TypeSchema) -> Option<HostParamPassing> {
 fn schema_contains_unresolved(schema: &TypeSchema) -> bool {
     match schema {
         TypeSchema::Unknown | TypeSchema::GenericParam(_) => true,
-        TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
-            schema_contains_unresolved(inner)
-        }
+        TypeSchema::Optional(inner)
+        | TypeSchema::Option(inner)
+        | TypeSchema::Array(inner)
+        | TypeSchema::Map(inner) => schema_contains_unresolved(inner),
         TypeSchema::Named(_, args) | TypeSchema::ArrayTuple(args) => {
             args.iter().any(schema_contains_unresolved)
         }
@@ -325,6 +326,7 @@ fn schema_contains_unresolved(schema: &TypeSchema) -> bool {
             schema_contains_unresolved(ok) || schema_contains_unresolved(err)
         }
         TypeSchema::Null
+        | TypeSchema::Unit
         | TypeSchema::Int
         | TypeSchema::Float
         | TypeSchema::Number
@@ -1314,6 +1316,7 @@ fn find_declared_schema_mismatch_with_recursion(
         }
         (_, TypeSchema::Unknown | TypeSchema::Null) | (TypeSchema::Unknown, _) => None,
         (TypeSchema::Int, TypeSchema::Int)
+        | (TypeSchema::Unit, TypeSchema::Unit)
         | (TypeSchema::Number, TypeSchema::Int)
         | (TypeSchema::Float, TypeSchema::Float)
         | (TypeSchema::Number, TypeSchema::Float)
@@ -1499,6 +1502,18 @@ fn find_declared_schema_mismatch_with_recursion(
                     schema_type_label(&actual)
                 ))
             }
+        }
+        (TypeSchema::Option(expected), TypeSchema::Option(actual)) => {
+            let expected = context.substitute_schema_generics(expected);
+            let actual = context.substitute_schema_generics(actual);
+            find_declared_schema_mismatch_with_recursion(
+                &expected,
+                &actual,
+                context,
+                path,
+                recursive_named,
+                allow_partial_object,
+            )
         }
         _ => Some(format!(
             "{} is declared as schema type '{}' but was assigned {}",
@@ -1894,6 +1909,7 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
                 || expr_contains_param_add(rhs, param_slots)
         }
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -1981,6 +1997,13 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
             });
             found
         }
+        other @ (Expr::OptionConstruct { .. } | Expr::OptionMatch { .. }) => {
+            let mut found = false;
+            other.visit_option_children(|child| {
+                found |= expr_contains_param_add(child, param_slots)
+            });
+            found
+        }
         Expr::Block { stmts, expr } => function_body_contains_param_add(param_slots, stmts, expr),
     }
 }
@@ -1989,6 +2012,7 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
     match expr {
         Expr::Var(slot) | Expr::MoveVar(slot) => param_slots.contains(slot),
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -2062,6 +2086,11 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
         | Expr::ResultTry { .. }) => {
             let mut found = false;
             other.visit_result_children(|child| found |= expr_uses_param(child, param_slots));
+            found
+        }
+        other @ (Expr::OptionConstruct { .. } | Expr::OptionMatch { .. }) => {
+            let mut found = false;
+            other.visit_option_children(|child| found |= expr_uses_param(child, param_slots));
             found
         }
         Expr::Block { stmts, expr } => {
@@ -2153,6 +2182,7 @@ pub(super) fn legalize_expr(
 ) -> BoundType {
     match expr {
         Expr::Null => BoundType::Null,
+        Expr::Unit => BoundType::Unit,
         Expr::Int(_) => BoundType::Int,
         Expr::Float(_) => BoundType::Float,
         Expr::Bool(_) => BoundType::Bool,
@@ -2324,6 +2354,43 @@ pub(super) fn legalize_expr(
             let err_ty = legalize_expr(err_expr, &err_state, context, site, host_resolution);
             if ok_ty == err_ty {
                 ok_ty
+            } else {
+                BoundType::Unknown
+            }
+        }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                let _ = legalize_expr(payload, state, context, site, host_resolution);
+            }
+            BoundType::Map
+        }
+        Expr::OptionMatch {
+            value,
+            some_binding,
+            some_expr,
+            none_expr,
+            scrutinee_schema,
+            ..
+        } => {
+            let _ = legalize_expr(value, state, context, site, host_resolution);
+            let inner = match scrutinee_schema {
+                TypeSchema::Option(inner) => inner.as_ref().clone(),
+                _ => TypeSchema::Unknown,
+            };
+            let mut some_state = state.clone();
+            if let Some(slot) = *some_binding {
+                some_state.set_with_optional_schema_origin(
+                    slot,
+                    context.bound_type_for_schema(&inner),
+                    Some(inner.clone()),
+                    true,
+                    matches!(inner, TypeSchema::Optional(_)),
+                );
+            }
+            let some_ty = legalize_expr(some_expr, &some_state, context, site, host_resolution);
+            let none_ty = legalize_expr(none_expr, state, context, site, host_resolution);
+            if some_ty == none_ty {
+                some_ty
             } else {
                 BoundType::Unknown
             }
@@ -2513,6 +2580,7 @@ pub(super) fn bound_type_label(ty: BoundType) -> &'static str {
     match ty {
         BoundType::Unknown => "unknown",
         BoundType::Null => "null",
+        BoundType::Unit => "()",
         BoundType::Int => "int",
         BoundType::Float => "float",
         BoundType::Number => "number",

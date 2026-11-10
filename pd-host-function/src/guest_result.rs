@@ -32,6 +32,11 @@ pub(super) fn schema(shape: &GuestTypeShape<'_>) -> Result<TokenStream, Error> {
             let err = schema(err)?;
             quote!(#sdk::HostTypeSchema::Result { ok: Box::new(#ok), err: Box::new(#err) })
         }
+        GuestTypeShape::Option(inner) => {
+            let inner = schema(inner)?;
+            quote!(#sdk::HostTypeSchema::Option(Box::new(#inner)))
+        }
+        GuestTypeShape::Unit => quote!(#sdk::HostTypeSchema::Unit),
         GuestTypeShape::Optional(inner) => {
             let inner = schema(inner)?;
             quote!(#sdk::HostTypeSchema::Optional(Box::new(#inner)))
@@ -60,6 +65,17 @@ pub(super) fn decode(shape: &GuestTypeShape<'_>, value: TokenStream) -> TokenStr
             quote!({ let (__pd_tag, __pd_payload) = #sdk::result::payload(#value)?;
                 if __pd_tag { #sdk::GuestResult::Ok(#ok) } else { #sdk::GuestResult::Err(#err) } })
         }
+        GuestTypeShape::Option(inner) => {
+            let inner = decode(inner, quote!(&__pd_option_value));
+            quote!({ let (__pd_some, __pd_payload) = #sdk::option::payload(#value)?;
+                if __pd_some {
+                    let __pd_option_value = __pd_payload.cloned().unwrap_or(#sdk::Value::Null);
+                    #sdk::GuestOption::Some(#inner)
+                } else { #sdk::GuestOption::None } })
+        }
+        GuestTypeShape::Unit => quote!({
+            #sdk::FromVmValue::from_vm_value(#value, "Unit")?
+        }),
         GuestTypeShape::Optional(inner) => {
             let inner = decode(inner, quote!(__pd_optional));
             quote!({ let __pd_optional = #value; if matches!(__pd_optional, #sdk::Value::Null) { None } else { Some(#inner) } })
@@ -111,6 +127,14 @@ pub(super) fn encode(
                 });
                 quote!(match #value { #sdk::GuestResult::Ok(__pd_selected) => #ok, #sdk::GuestResult::Err(__pd_selected) => #err })
             }
+            GuestTypeShape::Option(inner) => {
+                let some = walk(inner, quote!(__pd_selected), root, &|v| {
+                    wrap(quote!(#sdk::option::some_carrier(#v)))
+                });
+                let none = wrap(quote!(#sdk::option::none_carrier()));
+                quote!(match #value { #sdk::GuestOption::Some(__pd_selected) => #some, #sdk::GuestOption::None => #none })
+            }
+            GuestTypeShape::Unit => wrap(quote!(#sdk::Value::Null)),
             GuestTypeShape::Optional(inner) => {
                 let some = walk(inner, quote!(__pd_selected), root, wrap);
                 let none = wrap(quote!(#sdk::Value::Null));

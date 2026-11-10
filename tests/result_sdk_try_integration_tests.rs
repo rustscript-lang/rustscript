@@ -129,7 +129,7 @@ fn machine(source: &str, decoded: bool) -> Vm {
     let program = compiled.program.with_local_count(compiled.locals);
     let program = if decoded {
         let bytes = vm::encode_program(&program).unwrap();
-        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 14);
         let decoded = vm::decode_program(&bytes).unwrap();
         assert_eq!(decoded.host_import_schemas(), program.host_import_schemas());
         assert_eq!(vm::encode_program(&decoded).unwrap(), bytes);
@@ -269,7 +269,7 @@ fn dynamic_resource_try_hot_loop_before_teardown_all_backends() {
 }
 
 #[test]
-fn generated_host_try_is_once_only_function_local_and_fatal_across_v13() {
+fn generated_host_try_is_once_only_function_local_and_fatal_across_current_wire() {
     let _lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     for decoded in [false, true] {
         for mode in [0, 1, 2] {
@@ -359,7 +359,7 @@ pub fn host_relay(ok: bool) -> Result<resource<joined.token>, resource<joined.to
 "#;
 
 #[test]
-fn generated_owned_host_result_try_preserves_active_owner_on_v13_callback_return() {
+fn generated_owned_host_result_try_preserves_active_owner_on_current_wire_callback_return() {
     let _lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     for decoded in [false, true] {
         for ok in [false, true] {
@@ -496,7 +496,7 @@ fn try_callback_preserves_surviving_factory_capture_through_alias() {
 }
 
 #[test]
-fn owned_callback_try_ret_and_publication_reclaim_preserve_return_and_unrelated_v13() {
+fn owned_callback_try_ret_and_publication_reclaim_preserve_return_and_unrelated_current_wire() {
     let _lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     for decoded in [false, true] {
         for name in ["relay", "nested"] {
@@ -565,7 +565,7 @@ fn owned_callback_try_ret_and_publication_reclaim_preserve_return_and_unrelated_
 }
 
 #[test]
-fn owned_combinator_map_before_try_keeps_selected_owner_across_v13() {
+fn owned_combinator_map_before_try_keeps_selected_owner_across_current_wire() {
     let _lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
     for decoded in [false, true] {
         for ok in [true, false] {

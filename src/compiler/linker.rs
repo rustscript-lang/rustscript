@@ -154,7 +154,10 @@ pub(super) fn remap_guest_type_schemas(parsed: &mut FrontendIr, names: &HashMap<
 
 pub(super) fn remap_type_schema_names(schema: &mut TypeSchema, names: &HashMap<String, String>) {
     match schema {
-        TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
+        TypeSchema::Optional(inner)
+        | TypeSchema::Option(inner)
+        | TypeSchema::Array(inner)
+        | TypeSchema::Map(inner) => {
             remap_type_schema_names(inner, names);
         }
         TypeSchema::Named(name, args) => {
@@ -193,6 +196,7 @@ pub(super) fn remap_type_schema_names(schema: &mut TypeSchema, names: &HashMap<S
         }
         TypeSchema::Unknown
         | TypeSchema::Null
+        | TypeSchema::Unit
         | TypeSchema::Int
         | TypeSchema::Float
         | TypeSchema::Number
@@ -384,6 +388,28 @@ fn remap_expression_type_names(expression: &mut Expr, names: &HashMap<String, St
             remap_expression_type_names(receiver, names);
             remap_expression_type_names(argument, names);
         }
+        Expr::OptionConstruct {
+            payload,
+            option_schema,
+            ..
+        } => {
+            remap_type_schema_names(option_schema, names);
+            if let Some(payload) = payload {
+                remap_expression_type_names(payload, names);
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            scrutinee_schema,
+            ..
+        } => {
+            remap_type_schema_names(scrutinee_schema, names);
+            remap_expression_type_names(value, names);
+            remap_expression_type_names(some_expr, names);
+            remap_expression_type_names(none_expr, names);
+        }
         Expr::Block { stmts, expr } => {
             for statement in stmts {
                 remap_statement_type_names(statement, names);
@@ -391,6 +417,7 @@ fn remap_expression_type_names(expression: &mut Expr, names: &HashMap<String, St
             remap_expression_type_names(expr, names);
         }
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -1332,6 +1359,7 @@ fn remap_expr_indices(
 ) -> Result<(), SourcePathError> {
     match expr {
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -1634,6 +1662,58 @@ fn remap_expr_indices(
             )?;
             remap_expr_indices(
                 argument,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+        }
+        Expr::OptionConstruct {
+            payload,
+            semantic_id,
+            ..
+        } => {
+            rebase_semantic_id(semantic_id, node_offset);
+            if let Some(payload) = payload {
+                remap_expr_indices(
+                    payload,
+                    local_base,
+                    node_offset,
+                    function_map,
+                    flat_index_by_symbol,
+                )?;
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            value_slot,
+            some_binding,
+            some_expr,
+            none_expr,
+            semantic_id,
+            ..
+        } => {
+            *value_slot = remap_local_index(*value_slot, local_base)?;
+            if let Some(slot) = some_binding {
+                *slot = remap_local_index(*slot, local_base)?;
+            }
+            rebase_semantic_id(semantic_id, node_offset);
+            remap_expr_indices(
+                value,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+            remap_expr_indices(
+                some_expr,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+            remap_expr_indices(
+                none_expr,
                 local_base,
                 node_offset,
                 function_map,

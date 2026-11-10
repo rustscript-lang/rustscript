@@ -371,6 +371,7 @@ impl Classifier {
     fn expr(&mut self, frame: usize, expr: &Expr) {
         match expr {
             Expr::Null
+            | Expr::Unit
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
@@ -499,6 +500,9 @@ impl Classifier {
             | Expr::ResultMatch { .. }
             | Expr::ResultTry { .. }) => {
                 other.visit_result_children(|child| self.expr(frame, child));
+            }
+            other @ (Expr::OptionConstruct { .. } | Expr::OptionMatch { .. }) => {
+                other.visit_option_children(|child| self.expr(frame, child));
             }
             Expr::Block { stmts, expr } => {
                 for stmt in stmts {

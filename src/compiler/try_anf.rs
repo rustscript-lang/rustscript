@@ -188,7 +188,23 @@ fn attach_expr_schema(
             attach_expr_schema(receiver, schemas, structs);
             attach_expr_schema(argument, schemas, structs);
         }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                attach_expr_schema(payload, schemas, structs);
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            attach_expr_schema(value, schemas, structs);
+            attach_expr_schema(some_expr, schemas, structs);
+            attach_expr_schema(none_expr, schemas, structs);
+        }
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -368,7 +384,24 @@ fn rewrite_children(expr: &mut Expr, locals: &mut usize) -> Result<(), ParseErro
             rewrite_expr(receiver, locals)?;
             rewrite_expr(argument, locals)
         }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                rewrite_expr(payload, locals)?;
+            }
+            Ok(())
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            rewrite_expr(value, locals)?;
+            rewrite_expr(some_expr, locals)?;
+            rewrite_expr(none_expr, locals)
+        }
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -582,7 +615,15 @@ fn contains_try(expr: &Expr) -> bool {
         Expr::ResultMethod {
             receiver, argument, ..
         } => contains_try(receiver) || contains_try(argument),
+        Expr::OptionConstruct { payload, .. } => payload.as_deref().is_some_and(contains_try),
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => contains_try(value) || contains_try(some_expr) || contains_try(none_expr),
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)

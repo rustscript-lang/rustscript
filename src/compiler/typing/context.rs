@@ -1238,6 +1238,7 @@ impl<'a> TypeContext<'a> {
     ) -> Option<TypeSchema> {
         match expr {
             Expr::Null => Some(TypeSchema::Null),
+            Expr::Unit => Some(TypeSchema::Unit),
             Expr::Int(_) => Some(TypeSchema::Int),
             Expr::Float(_) => Some(TypeSchema::Float),
             Expr::Bool(_) => Some(TypeSchema::Bool),
@@ -1469,6 +1470,59 @@ impl<'a> TypeContext<'a> {
                     _ => None,
                 }
             }
+            Expr::OptionConstruct {
+                option_schema,
+                some,
+                payload,
+                ..
+            } => match option_schema {
+                TypeSchema::Unknown => {
+                    let payload = payload.as_deref()?;
+                    let actual = self.infer_expr_schema(payload, state).or_else(|| {
+                        super::scalar_schema_from_bound_type(self.infer_expr_type(payload, state))
+                    })?;
+                    if matches!(actual, TypeSchema::Unknown | TypeSchema::GenericParam(_))
+                        || schema_contains_unknown_schema(&actual)
+                    {
+                        return None;
+                    }
+                    // `Some` can infer its payload; `None` never invents a
+                    // missing type argument without surrounding context.
+                    (*some).then(|| TypeSchema::Option(Box::new(actual)))
+                }
+                other => Some(self.substitute_schema_generics(other)),
+            },
+            Expr::OptionMatch {
+                value,
+                some_binding,
+                some_expr,
+                none_expr,
+                scrutinee_schema,
+                ..
+            } => {
+                let inner = match scrutinee_schema {
+                    TypeSchema::Option(inner) => inner.as_ref().clone(),
+                    _ => match self.infer_expr_schema(value, state) {
+                        Some(TypeSchema::Option(inner)) => inner.as_ref().clone(),
+                        _ => TypeSchema::Unknown,
+                    },
+                };
+                let mut some_state = state.clone();
+                if let Some(slot) = *some_binding {
+                    some_state.set_with_schema_origin(
+                        slot,
+                        self.bound_type_for_schema(&inner),
+                        Some(inner),
+                        true,
+                    );
+                }
+                let some_schema = self.infer_expr_schema(some_expr, &some_state);
+                let none_schema = self.infer_expr_schema(none_expr, state);
+                match (some_schema, none_schema) {
+                    (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -1476,6 +1530,7 @@ impl<'a> TypeContext<'a> {
     pub(super) fn infer_expr_type(&mut self, expr: &Expr, state: &LocalTypeState) -> BoundType {
         match expr {
             Expr::Null => BoundType::Null,
+            Expr::Unit => BoundType::Unit,
             Expr::Int(_) => BoundType::Int,
             Expr::Float(_) => BoundType::Float,
             Expr::Bool(_) => BoundType::Bool,
@@ -1605,11 +1660,30 @@ impl<'a> TypeContext<'a> {
                 BoundType::Bool
             }
             Expr::ResultMethod {
-                receiver, argument, ..
+                method,
+                receiver,
+                argument,
+                ..
             } => {
                 let _ = self.infer_expr_type(receiver, state);
                 let _ = self.infer_expr_type(argument, state);
-                BoundType::Unknown
+                if method.retains_option_lowering_on_non_result() {
+                    // `.unwrap_or` on a nullable chain keeps the pre-existing
+                    // Option lowering. Inference must publish the unwrapped
+                    // payload type before the Result resolution pass runs, or
+                    // dynamic editor hints lose the concrete local type.
+                    let value_ty = self.infer_optional_expr_inner_type(receiver, state);
+                    let fallback_ty = self.infer_expr_type(argument, state);
+                    if value_ty == BoundType::Unknown {
+                        fallback_ty
+                    } else if fallback_ty == BoundType::Unknown || fallback_ty == value_ty {
+                        value_ty
+                    } else {
+                        merge_bound_types(value_ty, fallback_ty)
+                    }
+                } else {
+                    BoundType::Unknown
+                }
             }
             Expr::ResultTry {
                 value,
@@ -1659,6 +1733,43 @@ impl<'a> TypeContext<'a> {
                 let err_ty = self.infer_expr_type(err_expr, &err_state);
                 if ok_ty == err_ty {
                     ok_ty
+                } else {
+                    BoundType::Unknown
+                }
+            }
+            Expr::OptionConstruct { payload, .. } => {
+                if let Some(payload) = payload {
+                    let _ = self.infer_expr_type(payload, state);
+                }
+                BoundType::Map
+            }
+            Expr::OptionMatch {
+                value,
+                some_binding,
+                some_expr,
+                none_expr,
+                scrutinee_schema,
+                ..
+            } => {
+                let _ = self.infer_expr_type(value, state);
+                let inner = match scrutinee_schema {
+                    TypeSchema::Option(inner) => inner.as_ref().clone(),
+                    _ => TypeSchema::Unknown,
+                };
+                let mut some_state = state.clone();
+                if let Some(slot) = *some_binding {
+                    some_state.set_with_optional_schema_origin(
+                        slot,
+                        self.bound_type_for_schema(&inner),
+                        Some(inner),
+                        true,
+                        false,
+                    );
+                }
+                let some_ty = self.infer_expr_type(some_expr, &some_state);
+                let none_ty = self.infer_expr_type(none_expr, state);
+                if some_ty == none_ty {
+                    some_ty
                 } else {
                     BoundType::Unknown
                 }
@@ -2970,6 +3081,7 @@ fn callable_param_schema(param: crate::builtins::CallableParamType) -> crate::co
     match param {
         CallableParamType::Any => TypeSchema::Unknown,
         CallableParamType::Null => TypeSchema::Null,
+        CallableParamType::Unit => TypeSchema::Unit,
         CallableParamType::Int => TypeSchema::Int,
         CallableParamType::Float => TypeSchema::Float,
         CallableParamType::Number => TypeSchema::Number,
@@ -3040,6 +3152,7 @@ fn schema_from_bound_type(ty: BoundType) -> Option<TypeSchema> {
     match ty {
         BoundType::Unknown => None,
         BoundType::Null => Some(TypeSchema::Null),
+        BoundType::Unit => Some(TypeSchema::Unit),
         BoundType::Int => Some(TypeSchema::Int),
         BoundType::Float => Some(TypeSchema::Float),
         BoundType::Number => Some(TypeSchema::Number),
@@ -3072,6 +3185,41 @@ fn logical_optional_schema(schema: TypeSchema, optional: bool) -> TypeSchema {
     }
 }
 
+fn schema_contains_unknown_schema(schema: &TypeSchema) -> bool {
+    match schema {
+        TypeSchema::Unknown => true,
+        TypeSchema::Optional(inner)
+        | TypeSchema::Option(inner)
+        | TypeSchema::Array(inner)
+        | TypeSchema::Map(inner) => schema_contains_unknown_schema(inner),
+        TypeSchema::Named(_, args) | TypeSchema::ArrayTuple(args) => {
+            args.iter().any(schema_contains_unknown_schema)
+        }
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            prefix.iter().any(schema_contains_unknown_schema)
+                || schema_contains_unknown_schema(rest)
+        }
+        TypeSchema::Object(fields) => fields.values().any(schema_contains_unknown_schema),
+        TypeSchema::Callable { params, result } => {
+            params.iter().any(schema_contains_unknown_schema)
+                || schema_contains_unknown_schema(result)
+        }
+        TypeSchema::Result { ok, err } => {
+            schema_contains_unknown_schema(ok) || schema_contains_unknown_schema(err)
+        }
+        TypeSchema::Null
+        | TypeSchema::Unit
+        | TypeSchema::Int
+        | TypeSchema::Float
+        | TypeSchema::Number
+        | TypeSchema::Bool
+        | TypeSchema::String
+        | TypeSchema::Bytes
+        | TypeSchema::Resource(_)
+        | TypeSchema::GenericParam(_) => false,
+    }
+}
+
 fn observed_return_key(index: u16, type_args: &[TypeSchema]) -> (u16, Vec<String>) {
     (
         index,
@@ -3086,6 +3234,7 @@ pub(crate) fn bound_type_from_schema(schema: &TypeSchema) -> BoundType {
     match schema {
         TypeSchema::Unknown => BoundType::Unknown,
         TypeSchema::Null => BoundType::Null,
+        TypeSchema::Unit => BoundType::Unit,
         TypeSchema::Int => BoundType::Int,
         TypeSchema::Float => BoundType::Float,
         TypeSchema::Number => BoundType::Number,
@@ -3099,7 +3248,10 @@ pub(crate) fn bound_type_from_schema(schema: &TypeSchema) -> BoundType {
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
             BoundType::Array
         }
-        TypeSchema::Map(_) | TypeSchema::Object(_) | TypeSchema::Result { .. } => BoundType::Map,
+        TypeSchema::Map(_)
+        | TypeSchema::Option(_)
+        | TypeSchema::Object(_)
+        | TypeSchema::Result { .. } => BoundType::Map,
         // Resources are opaque (nominal) values: they are never reduced to the
         // `Map` bound or to an integral token in semantic inference.
         TypeSchema::Resource(_) => BoundType::Unknown,
@@ -3340,6 +3492,7 @@ pub(super) fn schema_label(schema: &TypeSchema) -> &'static str {
     match schema {
         TypeSchema::Unknown => "unknown",
         TypeSchema::Null => "null",
+        TypeSchema::Unit => "()",
         TypeSchema::Int => "int",
         TypeSchema::Float => "float",
         TypeSchema::Number => "number",
@@ -3353,7 +3506,10 @@ pub(super) fn schema_label(schema: &TypeSchema) -> &'static str {
         TypeSchema::Array(_) | TypeSchema::ArrayTuple(_) | TypeSchema::ArrayTupleRest { .. } => {
             "array"
         }
-        TypeSchema::Map(_) | TypeSchema::Object(_) | TypeSchema::Result { .. } => "map",
+        TypeSchema::Map(_)
+        | TypeSchema::Option(_)
+        | TypeSchema::Object(_)
+        | TypeSchema::Result { .. } => "map",
         TypeSchema::Resource(_) => "resource",
     }
 }
@@ -3371,6 +3527,7 @@ pub(crate) fn render_schema_label(schema: &TypeSchema) -> String {
     match schema {
         TypeSchema::Unknown => "unknown".to_string(),
         TypeSchema::Null => "null".to_string(),
+        TypeSchema::Unit => "()".to_string(),
         TypeSchema::Int => "int".to_string(),
         TypeSchema::Float => "float".to_string(),
         TypeSchema::Number => "number".to_string(),
@@ -3378,6 +3535,7 @@ pub(crate) fn render_schema_label(schema: &TypeSchema) -> String {
         TypeSchema::String => "string".to_string(),
         TypeSchema::Bytes => "bytes".to_string(),
         TypeSchema::Optional(inner) => format!("{}?", render_schema_label(inner)),
+        TypeSchema::Option(inner) => format!("Option<{}>", render_schema_label(inner)),
         TypeSchema::GenericParam(name) => name.clone(),
         TypeSchema::Callable { params, result } => format!(
             "fn({}) -> {}",

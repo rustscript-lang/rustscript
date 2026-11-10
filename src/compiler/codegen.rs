@@ -817,6 +817,9 @@ impl Compiler {
             Expr::Null => {
                 self.assembler.push_const(Value::Null);
             }
+            Expr::Unit => {
+                self.assembler.push_const(Value::Null);
+            }
             Expr::Int(value) => {
                 self.assembler.push_const(Value::Int(*value));
             }
@@ -1185,6 +1188,48 @@ impl Compiler {
                         .to_string(),
                     span: Some(*span),
                 });
+            }
+            Expr::OptionConstruct { some, payload, .. } => {
+                self.assembler.call(BuiltinFunction::MapNew.call_index(), 0);
+                self.assembler
+                    .push_const(Value::string(super::option::OPTION_TAG_KEY));
+                self.assembler.push_const(Value::Bool(*some));
+                self.assembler.call(BuiltinFunction::Set.call_index(), 3);
+                if let Some(payload) = payload {
+                    self.assembler
+                        .push_const(Value::string(super::option::OPTION_PAYLOAD_KEY));
+                    self.compile_expr(payload)?;
+                    self.assembler.call(BuiltinFunction::Set.call_index(), 3);
+                }
+            }
+            Expr::OptionMatch {
+                value,
+                value_slot,
+                some_binding,
+                some_expr,
+                none_expr,
+                ..
+            } => {
+                self.compile_expr(value)?;
+                self.emit_stloc(*value_slot)?;
+                self.emit_copy_ldloc(*value_slot)?;
+                self.assembler
+                    .push_const(Value::string(super::option::OPTION_TAG_KEY));
+                self.assembler.call(BuiltinFunction::Get.call_index(), 2);
+                let none_label = self.fresh_label("option_none");
+                let end_label = self.fresh_label("option_end");
+                self.record_unary_operand_type(ValueType::Bool);
+                self.assembler.brfalse_label(&none_label);
+                self.compile_result_binding(*value_slot, *some_binding)?;
+                self.compile_expr(some_expr)?;
+                self.assembler.br_label(&end_label);
+                self.assembler
+                    .label(&none_label)
+                    .map_err(CompileError::Assembler)?;
+                self.compile_expr(none_expr)?;
+                self.assembler
+                    .label(&end_label)
+                    .map_err(CompileError::Assembler)?;
             }
         }
         Ok(())

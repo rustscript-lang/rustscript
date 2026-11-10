@@ -19,7 +19,7 @@ use crate::host_api::{
 use crate::vm::{HostImport, OpCode, Program, Value};
 
 const MAGIC: [u8; 4] = *b"VMBC";
-const VERSION_V13: u16 = 13;
+const VERSION_V14: u16 = 14;
 const FLAGS: u16 = 0;
 const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;
@@ -511,7 +511,7 @@ fn cleanup_schema_owns_resource(
     let next = depth + 1;
     match schema {
         TypeSchema::Resource(_) => Ok(true),
-        TypeSchema::Optional(inner) | TypeSchema::Array(inner) => {
+        TypeSchema::Optional(inner) | TypeSchema::Option(inner) | TypeSchema::Array(inner) => {
             cleanup_schema_owns_resource(inner, decls, next, nodes, active)
         }
         TypeSchema::ArrayTuple(items) => {
@@ -572,6 +572,7 @@ fn cleanup_schema_owns_resource(
         }
         TypeSchema::Unknown
         | TypeSchema::Null
+        | TypeSchema::Unit
         | TypeSchema::Int
         | TypeSchema::Float
         | TypeSchema::Number
@@ -595,6 +596,9 @@ fn substitute_cleanup_schema(
             .unwrap_or_else(|| schema.clone()),
         TypeSchema::Optional(inner) => {
             TypeSchema::Optional(Box::new(substitute_cleanup_schema(inner, params, args)))
+        }
+        TypeSchema::Option(inner) => {
+            TypeSchema::Option(Box::new(substitute_cleanup_schema(inner, params, args)))
         }
         TypeSchema::Array(inner) => {
             TypeSchema::Array(Box::new(substitute_cleanup_schema(inner, params, args)))
@@ -644,6 +648,7 @@ fn substitute_cleanup_schema(
         },
         TypeSchema::Unknown
         | TypeSchema::Null
+        | TypeSchema::Unit
         | TypeSchema::Int
         | TypeSchema::Float
         | TypeSchema::Number
@@ -657,7 +662,7 @@ fn substitute_cleanup_schema(
 pub fn encode_program(program: &Program) -> Result<Vec<u8>, WireError> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION_V13.to_le_bytes());
+    out.extend_from_slice(&VERSION_V14.to_le_bytes());
     out.extend_from_slice(&FLAGS.to_le_bytes());
     write_u32_count("constants", program.constants.len(), &mut out)?;
 
@@ -712,7 +717,7 @@ pub fn decode_program(bytes: &[u8]) -> Result<Program, WireError> {
     }
 
     let version = cursor.read_u16()?;
-    if version != VERSION_V13 {
+    if version != VERSION_V14 {
         return Err(WireError::UnsupportedVersion(version));
     }
 
@@ -1994,6 +1999,7 @@ fn write_host_type_schema(
     match schema {
         HostTypeSchema::Unknown => out.push(0),
         HostTypeSchema::Null => out.push(1),
+        HostTypeSchema::Unit => out.push(16),
         HostTypeSchema::Int => out.push(2),
         HostTypeSchema::Float => out.push(3),
         HostTypeSchema::Number => out.push(4),
@@ -2037,6 +2043,10 @@ fn write_host_type_schema(
             out.push(14);
             write_host_type_schema(ok, out, next_host_schema_depth(depth)?)?;
             write_host_type_schema(err, out, next_host_schema_depth(depth)?)?;
+        }
+        HostTypeSchema::Option(inner) => {
+            out.push(15);
+            write_host_type_schema(inner, out, next_host_schema_depth(depth)?)?;
         }
     }
     Ok(())
@@ -2131,6 +2141,11 @@ fn read_host_type_schema(
                 next_host_schema_depth(depth)?,
             )?),
         }),
+        15 => Ok(HostTypeSchema::Option(Box::new(read_host_type_schema(
+            cursor,
+            next_host_schema_depth(depth)?,
+        )?))),
+        16 => Ok(HostTypeSchema::Unit),
         other => Err(WireError::InvalidHostSchemaTag(other)),
     }
 }
@@ -2146,6 +2161,7 @@ fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(), WireError>
     match schema {
         TypeSchema::Unknown => out.push(0),
         TypeSchema::Null => out.push(1),
+        TypeSchema::Unit => out.push(20),
         TypeSchema::Int => out.push(2),
         TypeSchema::Float => out.push(3),
         TypeSchema::Number => out.push(4),
@@ -2154,6 +2170,10 @@ fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(), WireError>
         TypeSchema::Bytes => out.push(7),
         TypeSchema::Optional(inner) => {
             out.push(16);
+            write_schema(inner, out)?;
+        }
+        TypeSchema::Option(inner) => {
+            out.push(19);
             write_schema(inner, out)?;
         }
         TypeSchema::GenericParam(name) => {
@@ -2312,6 +2332,11 @@ fn read_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<TypeSchema, Wire
             ok: Box::new(read_schema(cursor, nested_depth)?),
             err: Box::new(read_schema(cursor, nested_depth)?),
         }),
+        19 => Ok(TypeSchema::Option(Box::new(read_schema(
+            cursor,
+            nested_depth,
+        )?))),
+        20 => Ok(TypeSchema::Unit),
         other => Err(WireError::InvalidValueType(other)),
     }
 }

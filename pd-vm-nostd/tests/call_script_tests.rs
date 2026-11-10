@@ -70,8 +70,8 @@ fn call_script_executes_direct_call() {
     let compiled = compile_source("fn add2(value: int) -> int { value + 2 } add2(40);")
         .expect("direct call source should compile");
     let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
-        .expect("direct call program should encode as VMBC v13");
-    let program = decode_program(&bytes).expect("no-std should decode VMBC v13");
+        .expect("direct call program should encode as VMBC v14");
+    let program = decode_program(&bytes).expect("no-std should decode VMBC v14");
     assert!(
         program.code().windows(2).any(|pair| pair[0] == 0x1A),
         "compiler output should contain CallScript"
@@ -109,8 +109,8 @@ fn nostd_executes_std_encoded_result_ok_and_err_without_source() {
         let compiled = compile_source(source).expect("Result source should compile");
         let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
             .expect("Result program should encode");
-        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 13);
-        let std_program = vm::decode_program(&bytes).expect("std current v13 decode");
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 14);
+        let std_program = vm::decode_program(&bytes).expect("std current v14 decode");
         assert_eq!(encode_program(&std_program).unwrap(), bytes);
         let mut std_vm = vm::Vm::new_with_jit_config(
             std_program,
@@ -129,13 +129,85 @@ fn nostd_executes_std_encoded_result_ok_and_err_without_source() {
             _ => unreachable!(),
         };
         assert_eq!(std_vm.stack().last(), Some(&std_expected));
-        let program = decode_program(&bytes).expect("no-std should decode v13 Result program");
+        let program = decode_program(&bytes).expect("no-std should decode v14 Result program");
         let mut vm = EmbeddedVm::new(program);
         assert_eq!(
             vm.run().expect("decoded Result program should halt"),
             EmbeddedVmStatus::Halted
         );
         assert_eq!(vm.stack().last().cloned(), Some(expected));
+    }
+}
+
+#[test]
+fn nostd_executes_std_encoded_option_and_unit_without_source() {
+    let cases = [
+        (
+            "let nested: Option<Option<int>> = Option::Some(Option::None); match nested { Option::Some(inner) => match inner { Option::Some(v) => v, Option::None => 0 }, Option::None => -1 };",
+            EmbeddedValue::Int(0),
+        ),
+        (
+            "let value: Option<Result<int, string>> = Option::Some(Result::Ok(1)); match value { Option::Some(result) => match result { Result::Ok(v) => v, Result::Err(e) => -1 }, Option::None => -2 };",
+            EmbeddedValue::Int(1),
+        ),
+        (
+            "let value: Result<Option<int>, string> = Result::Ok(Option::Some(2)); match value { Result::Ok(option) => match option { Option::Some(v) => v, Option::None => -4 }, Result::Err(e) => -8 };",
+            EmbeddedValue::Int(2),
+        ),
+        (
+            "let value: Option<()> = Option::Some(()); match value { Option::Some(unit) => 7, Option::None => -1 };",
+            EmbeddedValue::Int(7),
+        ),
+        (
+            "let value: Option<bool> = Option::Some(false); match value { Option::Some(flag) => flag, Option::None => true };",
+            EmbeddedValue::Bool(false),
+        ),
+        (
+            "let value: Option<int> = Option::Some(0); match value { Option::Some(v) => v, Option::None => 1 };",
+            EmbeddedValue::Int(0),
+        ),
+        (
+            "let value: Option<string> = Option::Some(\"\"); match value { Option::Some(text) => text, Option::None => \"missing\" };",
+            EmbeddedValue::string(""),
+        ),
+        ("let unit: () = (); unit;", EmbeddedValue::Null),
+        (
+            "let value: Option<int> = Option::None; match value { Option::Some(v) => v, Option::None => 9 };",
+            EmbeddedValue::Int(9),
+        ),
+    ];
+    for (source, expected) in cases {
+        let compiled = compile_source(source).expect("Option source should compile");
+        let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
+            .expect("Option program should encode");
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 14);
+        let std_program = vm::decode_program(&bytes).expect("std current v14 decode");
+        assert_eq!(encode_program(&std_program).unwrap(), bytes);
+        let mut std_vm = vm::Vm::new_with_jit_config(
+            std_program,
+            vm::JitConfig {
+                enabled: false,
+                hot_loop_threshold: 1,
+                max_trace_len: 512,
+            },
+        );
+        std_vm.set_fuel(100_000);
+        assert_eq!(std_vm.run().unwrap(), vm::VmStatus::Halted);
+        let std_expected = match &expected {
+            EmbeddedValue::Int(n) => vm::Value::Int(*n),
+            EmbeddedValue::Bool(b) => vm::Value::Bool(*b),
+            EmbeddedValue::Null => vm::Value::Null,
+            EmbeddedValue::String(text) => vm::Value::string(text.as_str()),
+            _ => unreachable!(),
+        };
+        assert_eq!(std_vm.stack().last(), Some(&std_expected), "{source}");
+        let program = decode_program(&bytes).expect("no-std should decode v14 Option program");
+        let mut vm = EmbeddedVm::new(program);
+        assert_eq!(
+            vm.run().expect("decoded Option program should halt"),
+            EmbeddedVmStatus::Halted
+        );
+        assert_eq!(vm.stack().last().cloned(), Some(expected), "{source}");
     }
 }
 
@@ -488,6 +560,59 @@ fn nostd_rejects_nonempty_resource_cleanup_without_executing() {
     let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
         .expect("resource try should encode");
     let err = decode_program(&bytes).expect_err("no-std must reject a nonempty resource cleanup");
+    assert!(
+        matches!(
+            err,
+            WireError::UnsupportedCapability("ret cleanup resource plans")
+        ),
+        "expected an explicit capability rejection before execution, got {err:?}"
+    );
+}
+
+#[test]
+fn nostd_reads_option_cleanup_schema_and_refuses_the_resource_capability() {
+    use std::sync::Arc;
+    use vm::{
+        CompileSourceFileOptions, HostApiBuilder, HostFunctionSchema, HostTypeSchema,
+        ResourceTypeKey, ResourceTypeSchema, SourceFlavor, compile_source_with_flavor_and_options,
+    };
+
+    let key = ResourceTypeKey::new("pr24.closure").expect("resource key");
+    let mut builder = HostApiBuilder::new();
+    builder.resource(ResourceTypeSchema::new(key.clone(), "closure resource"));
+    builder.function(HostFunctionSchema::with_return(
+        "test::make_local",
+        Vec::new(),
+        HostTypeSchema::Resource(key.clone()),
+    ));
+    builder.function(HostFunctionSchema::with_return(
+        "test::fail",
+        Vec::new(),
+        HostTypeSchema::Result {
+            ok: Box::new(HostTypeSchema::Int),
+            err: Box::new(HostTypeSchema::String),
+        },
+    ));
+    let catalog = Arc::new(builder.build().expect("catalog"));
+    let source = r#"
+        fn relay() -> Result<int, string> {
+            let local: Option<resource<pr24.closure>> = Option::Some(test::make_local());
+            let value = test::fail()?;
+            Result::Ok(value)
+        }
+        relay();
+    "#;
+    let compiled = compile_source_with_flavor_and_options(
+        source,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::new().with_host_api_catalog(catalog),
+    )
+    .expect("Option resource cleanup source should compile");
+    let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
+        .expect("Option resource cleanup program should encode");
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 14);
+    let err = decode_program(&bytes)
+        .expect_err("no-std must decode the Option cleanup schema and refuse resources");
     assert!(
         matches!(
             err,

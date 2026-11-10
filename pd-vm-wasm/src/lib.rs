@@ -14,6 +14,10 @@ mod coherent_typehint;
 #[path = "../tests/fixtures/result_consumer.rs"]
 mod result_consumer;
 
+#[cfg(test)]
+#[path = "../tests/fixtures/option_consumer.rs"]
+mod option_consumer;
+
 use serde::{Deserialize, Serialize};
 use vm::{
     CompileSourceFileOptions, InferredLocalTypeHint, SourceFlavor,
@@ -92,6 +96,7 @@ fn type_schema_to_json(schema: &vm::TypeSchema) -> serde_json::Value {
     match schema {
         TypeSchema::Unknown => json!({"kind": "unknown"}),
         TypeSchema::Null => json!({"kind": "null"}),
+        TypeSchema::Unit => json!({"kind": "unit"}),
         TypeSchema::Int => json!({"kind": "int"}),
         TypeSchema::Float => json!({"kind": "float"}),
         TypeSchema::Number => json!({"kind": "number"}),
@@ -105,6 +110,9 @@ fn type_schema_to_json(schema: &vm::TypeSchema) -> serde_json::Value {
         }
         TypeSchema::Optional(inner) => {
             json!({"kind": "optional", "inner": type_schema_to_json(inner)})
+        }
+        TypeSchema::Option(inner) => {
+            json!({"kind": "option", "inner": type_schema_to_json(inner)})
         }
         TypeSchema::Array(item) => json!({"kind": "array", "item": type_schema_to_json(item)}),
         TypeSchema::Map(item) => json!({"kind": "map", "item": type_schema_to_json(item)}),

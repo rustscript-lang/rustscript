@@ -552,6 +552,7 @@ impl LivenessRewriter {
     fn add_expr_uses_impl(&self, expr: &Expr, live: &mut LiveSet, conservative: bool) {
         match expr {
             Expr::Null
+            | Expr::Unit
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
@@ -692,6 +693,27 @@ impl LivenessRewriter {
                     self.mark_live(live, slots.receiver);
                     self.mark_live(live, slots.argument);
                 }
+            }
+            Expr::OptionConstruct { payload, .. } => {
+                if let Some(payload) = payload {
+                    self.add_expr_uses_impl(payload, live, conservative);
+                }
+            }
+            Expr::OptionMatch {
+                value,
+                value_slot,
+                some_binding,
+                some_expr,
+                none_expr,
+                ..
+            } => {
+                self.mark_live(live, *value_slot);
+                if let Some(slot) = *some_binding {
+                    self.mark_live(live, slot);
+                }
+                self.add_expr_uses_impl(value, live, conservative);
+                self.add_expr_uses_impl(some_expr, live, conservative);
+                self.add_expr_uses_impl(none_expr, live, conservative);
             }
             Expr::Block { stmts, expr } => {
                 let live_out = if conservative {
@@ -1129,6 +1151,7 @@ impl LocalSlotAllocator {
             .union_inplace(&mut live_during, &self.liveness.uses_expr_precise(expr));
         match expr {
             Expr::Null
+            | Expr::Unit
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
@@ -1320,6 +1343,27 @@ impl LocalSlotAllocator {
                 self.collect_expr_constraints(ok_expr, &live_during, protected_slots)?;
                 self.collect_expr_constraints(err_expr, &live_during, protected_slots)?;
             }
+            Expr::OptionConstruct { payload, .. } => {
+                if let Some(payload) = payload {
+                    self.collect_expr_constraints(payload, &live_during, protected_slots)?;
+                }
+            }
+            Expr::OptionMatch {
+                value,
+                value_slot,
+                some_binding,
+                some_expr,
+                none_expr,
+                ..
+            } => {
+                self.add_slot_live_edges(*value_slot, &live_during);
+                if let Some(slot) = *some_binding {
+                    self.add_slot_live_edges(slot, &live_during);
+                }
+                self.collect_expr_constraints(value, &live_during, protected_slots)?;
+                self.collect_expr_constraints(some_expr, &live_during, protected_slots)?;
+                self.collect_expr_constraints(none_expr, &live_during, protected_slots)?;
+            }
             Expr::Block { stmts, expr } => {
                 self.collect_expr_constraints(expr, &live_during, protected_slots)?;
                 let mut block_live_out = live_during.clone();
@@ -1460,6 +1504,7 @@ impl LocalSlotAllocator {
     fn collect_expr_footprint(&mut self, expr: &Expr, set: &mut LiveSet, stack: &mut Vec<u16>) {
         match expr {
             Expr::Null
+            | Expr::Unit
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::Bool(_)
@@ -1627,6 +1672,27 @@ impl LocalSlotAllocator {
                 self.collect_expr_footprint(value, set, stack);
                 self.collect_expr_footprint(ok_expr, set, stack);
                 self.collect_expr_footprint(err_expr, set, stack);
+            }
+            Expr::OptionConstruct { payload, .. } => {
+                if let Some(payload) = payload {
+                    self.collect_expr_footprint(payload, set, stack);
+                }
+            }
+            Expr::OptionMatch {
+                value,
+                value_slot,
+                some_binding,
+                some_expr,
+                none_expr,
+                ..
+            } => {
+                self.mark_set_slot(set, *value_slot);
+                if let Some(slot) = *some_binding {
+                    self.mark_set_slot(set, slot);
+                }
+                self.collect_expr_footprint(value, set, stack);
+                self.collect_expr_footprint(some_expr, set, stack);
+                self.collect_expr_footprint(none_expr, set, stack);
             }
             Expr::Block { stmts, expr } => {
                 for nested in stmts {
@@ -1905,6 +1971,7 @@ fn collect_persistent_closure_sources_from_stmts(stmts: &[Stmt], slots: &mut BTr
 fn collect_persistent_closure_sources_from_expr(expr: &Expr, slots: &mut BTreeSet<LocalSlot>) {
     match expr {
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -1991,6 +2058,11 @@ fn collect_persistent_closure_sources_from_expr(expr: &Expr, slots: &mut BTreeSe
                 collect_persistent_closure_sources_from_expr(child, slots)
             });
         }
+        other @ (Expr::OptionConstruct { .. } | Expr::OptionMatch { .. }) => {
+            other.visit_option_children(|child| {
+                collect_persistent_closure_sources_from_expr(child, slots)
+            });
+        }
         Expr::Block { stmts, expr } => {
             collect_persistent_closure_sources_from_stmts(stmts, slots);
             collect_persistent_closure_sources_from_expr(expr, slots);
@@ -2071,6 +2143,7 @@ fn remap_stmt_slots(stmt: &mut Stmt, mapping: &[LocalSlot]) -> Result<(), ParseE
 fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseError> {
     match expr {
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
@@ -2216,6 +2289,27 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
             remap_expr_slots(value, mapping)?;
             remap_expr_slots(ok_expr, mapping)?;
             remap_expr_slots(err_expr, mapping)?;
+        }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                remap_expr_slots(payload, mapping)?;
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            value_slot,
+            some_binding,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            *value_slot = remap_slot(*value_slot, mapping)?;
+            if let Some(slot) = some_binding {
+                *slot = remap_slot(*slot, mapping)?;
+            }
+            remap_expr_slots(value, mapping)?;
+            remap_expr_slots(some_expr, mapping)?;
+            remap_expr_slots(none_expr, mapping)?;
         }
         Expr::ResultMethod {
             receiver,

@@ -450,6 +450,7 @@ fn validate_json_schema_with_seen(
         | TypeSchema::Number
         | TypeSchema::Bool
         | TypeSchema::String => Ok(()),
+        TypeSchema::Unit => Err(format!("{path} is (), which json::encode does not support")),
         TypeSchema::Bytes => Err(format!(
             "{path} uses bytes, which json::encode does not support"
         )),
@@ -463,6 +464,9 @@ fn validate_json_schema_with_seen(
         TypeSchema::Optional(inner) => {
             validate_json_schema_with_seen(inner, context, path, seen, reentries)
         }
+        TypeSchema::Option(_) => Err(format!(
+            "{path} is Option, which json::encode does not support"
+        )),
         TypeSchema::Callable { .. } => Err(format!(
             "{path} is callable, which json::encode does not support"
         )),
@@ -602,6 +606,7 @@ fn param_accepts_bound_type(expected: CallableParamType, actual: BoundType, stri
     match expected {
         CallableParamType::Any => true,
         CallableParamType::Null => actual == BoundType::Null,
+        CallableParamType::Unit => actual == BoundType::Unit,
         CallableParamType::Int => actual == BoundType::Int,
         CallableParamType::Float => actual == BoundType::Float,
         CallableParamType::Bool => actual == BoundType::Bool,
@@ -658,6 +663,7 @@ pub(super) fn validate_expr(
 ) -> Result<BoundType, CompileError> {
     Ok(match expr {
         Expr::Null => BoundType::Null,
+        Expr::Unit => BoundType::Unit,
         Expr::Int(_) => BoundType::Int,
         Expr::Float(_) => BoundType::Float,
         Expr::Bool(_) => BoundType::Bool,
@@ -1172,6 +1178,67 @@ pub(super) fn validate_expr(
                 strict_function_add_types,
             )?;
             merge_bound_types(ok_ty, err_ty)
+        }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                let _ = validate_expr(
+                    payload,
+                    state,
+                    line_context,
+                    source_name,
+                    context,
+                    strict_function_add_types,
+                )?;
+            }
+            BoundType::Map
+        }
+        Expr::OptionMatch {
+            value,
+            some_binding,
+            some_expr,
+            none_expr,
+            scrutinee_schema,
+            ..
+        } => {
+            let _ = validate_expr(
+                value,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            let inner = match scrutinee_schema {
+                TypeSchema::Option(inner) => inner.as_ref().clone(),
+                _ => TypeSchema::Unknown,
+            };
+            let mut some_state = state.clone();
+            if let Some(slot) = some_binding {
+                some_state.set_with_optional_schema_origin(
+                    *slot,
+                    context.bound_type_for_schema(&inner),
+                    Some(inner.clone()),
+                    true,
+                    matches!(inner, TypeSchema::Optional(_)),
+                );
+            }
+            let some_ty = validate_expr(
+                some_expr,
+                &some_state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            let none_ty = validate_expr(
+                none_expr,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            merge_bound_types(some_ty, none_ty)
         }
         Expr::Block { stmts, expr } => {
             let mut nested = state.clone();

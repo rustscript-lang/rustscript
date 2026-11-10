@@ -536,6 +536,15 @@ impl Parser {
                     .to_string(),
             });
         }
+        if self.dialect.allow_option_syntax() && name == "Option" {
+            return Err(ParseError {
+                span: Some(name_span),
+                code: None,
+                line: self.current_line(),
+                message: "Option is a built-in generic type and cannot be declared as a struct"
+                    .to_string(),
+            });
+        }
         let type_params = self.parse_type_params("struct", &name)?;
         self.push_active_type_params(&type_params);
         self.expect(&TokenKind::LBrace, "expected '{' after struct name")?;
@@ -591,7 +600,11 @@ impl Parser {
             || self.check(&TokenKind::RBrace)
             || self.check(&TokenKind::Eof)
         {
-            Expr::Null
+            if self.dialect.allow_option_syntax() {
+                Expr::Unit
+            } else {
+                Expr::Null
+            }
         } else {
             let expr = self.parse_expr()?;
             self.consume_stmt_terminator("expected ';' after return value")?;
@@ -885,7 +898,15 @@ impl Parser {
     }
 
     pub(super) fn parse_declared_type_schema(&mut self) -> Result<TypeSchema, ParseError> {
-        let mut schema = if self.match_kind(&TokenKind::LBracket) {
+        let mut schema = if self.dialect.allow_option_syntax()
+            && self.match_kind(&TokenKind::LParen)
+        {
+            self.expect(
+                &TokenKind::RParen,
+                "expected ')' after '()' unit type schema",
+            )?;
+            TypeSchema::Unit
+        } else if self.match_kind(&TokenKind::LBracket) {
             let mut elements = Vec::new();
             let mut rest = None;
             if self.check(&TokenKind::RBracket) {
@@ -1003,6 +1024,19 @@ impl Parser {
                     } else {
                         TypeSchema::Map(Box::new(TypeSchema::Unknown))
                     }
+                }
+                "Option" if self.dialect.allow_option_syntax() => {
+                    if !self.match_kind(&TokenKind::Less) {
+                        return Err(ParseError {
+                            span: Some(span),
+                            code: None,
+                            line: self.current_line(),
+                            message: "Option<T> requires one type argument".to_string(),
+                        });
+                    }
+                    let inner = self.parse_declared_type_schema()?;
+                    self.expect(&TokenKind::Greater, "expected '>' after Option<T>")?;
+                    TypeSchema::Option(Box::new(inner))
                 }
                 "Result" if self.dialect.allow_result_syntax() => {
                     self.expect(&TokenKind::Less, "expected '<' after Result")?;
@@ -1129,23 +1163,29 @@ impl Parser {
                     trailing_expr_line.expect("trailing expr should record a line"),
                 )
             } else {
-                let Some(last_stmt) = body_stmts.pop() else {
-                    return Err(ParseError {
-                        span: None,
-                        code: None,
-                        line: parser.current_line(),
-                        message: "function body must end with an expression statement".to_string(),
-                    });
-                };
-                if let Stmt::Expr { expr, line } = last_stmt {
-                    (expr, line)
-                } else {
-                    return Err(ParseError {
-                        span: None,
-                        code: None,
-                        line: parser.current_line(),
-                        message: "function body must end with an expression statement".to_string(),
-                    });
+                match body_stmts.last() {
+                    Some(Stmt::Expr { .. }) => {
+                        let last_stmt = body_stmts.pop().expect("checked last statement");
+                        let Stmt::Expr { expr, line } = last_stmt else {
+                            unreachable!("checked expression statement");
+                        };
+                        (expr, line)
+                    }
+                    Some(_) if parser.dialect.allow_option_syntax() => {
+                        (Expr::Unit, parser.current_line_u32())
+                    }
+                    None if parser.dialect.allow_option_syntax() => {
+                        (Expr::Unit, parser.current_line_u32())
+                    }
+                    _ => {
+                        return Err(ParseError {
+                            span: None,
+                            code: None,
+                            line: parser.current_line(),
+                            message: "function body must end with an expression statement"
+                                .to_string(),
+                        });
+                    }
                 }
             };
 

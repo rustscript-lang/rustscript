@@ -255,7 +255,8 @@ fn collect_named_host_types(
         }
         HostTypeSchema::Array(inner)
         | HostTypeSchema::Map(inner)
-        | HostTypeSchema::Optional(inner) => {
+        | HostTypeSchema::Optional(inner)
+        | HostTypeSchema::Option(inner) => {
             collect_named_host_types(inner, catalog, visited, pending)
         }
         HostTypeSchema::Callable { params, result } => {
@@ -270,6 +271,7 @@ fn collect_named_host_types(
         }
         HostTypeSchema::Unknown
         | HostTypeSchema::Null
+        | HostTypeSchema::Unit
         | HostTypeSchema::Int
         | HostTypeSchema::Float
         | HostTypeSchema::Number
@@ -972,6 +974,24 @@ fn remap_result_expr_spans(expr: &mut super::ir::Expr, map: &impl Fn(&mut Span))
             remap_result_expr_spans(receiver, map);
             remap_result_expr_spans(argument, map);
         }
+        Expr::OptionConstruct { payload, span, .. } => {
+            map(span);
+            if let Some(payload) = payload {
+                remap_result_expr_spans(payload, map);
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            span,
+            ..
+        } => {
+            map(span);
+            remap_result_expr_spans(value, map);
+            remap_result_expr_spans(some_expr, map);
+            remap_result_expr_spans(none_expr, map);
+        }
         Expr::OptionalGet { container, key, .. } => {
             remap_result_expr_spans(container, map);
             remap_result_expr_spans(key, map);
@@ -1042,6 +1062,7 @@ fn remap_result_expr_spans(expr: &mut super::ir::Expr, map: &impl Fn(&mut Span))
             remap_result_expr_spans(expr, map);
         }
         Expr::Null
+        | Expr::Unit
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Bool(_)
