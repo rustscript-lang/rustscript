@@ -696,6 +696,12 @@ impl<T: IntoScriptValue> IntoScriptValue for crate::GuestOption<T> {
     }
 }
 
+impl<Signature> IntoScriptValue for crate::VmCallable<Signature> {
+    fn into_script_value(self) -> Value {
+        self.into_value()
+    }
+}
+
 impl<T: ScriptResult> ScriptResult for Option<T> {
     fn from_value(value: Value) -> VmResult<Self> {
         if matches!(value, Value::Null) {
@@ -721,6 +727,12 @@ impl<T: ScriptResult> ScriptResult for crate::GuestOption<T> {
     }
     fn schema() -> Option<TypeSchema> {
         Some(TypeSchema::Option(Box::new(T::schema()?)))
+    }
+}
+
+impl<Signature> ScriptResult for crate::VmCallable<Signature> {
+    fn from_value(value: Value) -> VmResult<Self> {
+        <Self as crate::FromVmValue>::from_vm_value(&value, "callable")
     }
 }
 

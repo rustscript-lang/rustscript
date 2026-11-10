@@ -620,6 +620,13 @@ pub enum GuestTypeShape<'a> {
     Optional(Box<Self>),
     Array(Box<Self>),
     Resource(Box<ResourceSpec>),
+    /// A typed callable value: the signature is part of the public schema, the
+    /// value itself owns no resources. Dispatch identity stays with the VM
+    /// callable and its Program.
+    Callable {
+        params: Vec<Self>,
+        result: Box<Self>,
+    },
     Scalar(&'static str),
     Named(&'a Type),
 }
@@ -633,6 +640,14 @@ impl GuestTypeShape<'_> {
             Self::Optional(inner) => format!("{} | null", inner.label()),
             Self::Array(inner) => format!("array<{}>", inner.label()),
             Self::Resource(_) => "resource".into(),
+            Self::Callable { params, result } => {
+                let params = params
+                    .iter()
+                    .map(Self::label)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("fn({params}) -> {}", result.label())
+            }
             Self::Scalar(label) => (*label).into(),
             Self::Named(ty) => path_last_ident(ty).expect("named path"),
         }
@@ -648,6 +663,10 @@ impl GuestTypeShape<'_> {
             }
             Self::Option(inner) | Self::Optional(inner) | Self::Array(inner) => inner.resources(),
             Self::Resource(spec) => vec![spec],
+            // A callable value transfers dispatch identity only; signature
+            // resource types describe invocation arguments, not values this
+            // payload owns.
+            Self::Callable { .. } => Vec::new(),
             _ => Vec::new(),
         }
     }
@@ -692,6 +711,29 @@ pub fn guest_type_shape(ty: &Type) -> Result<GuestTypeShape<'_>, String> {
                 let argument = one_type_argument(segment, &ident)?;
                 let inner = walk(argument, depth + 1)?;
                 return Ok(GuestTypeShape::Option(Box::new(inner)));
+            }
+            if ident == "VmCallable" {
+                let PathArguments::AngleBracketed(args) = &segment.arguments else {
+                    return Err("VmCallable requires a function signature".into());
+                };
+                let Some(GenericArgument::Type(Type::BareFn(function))) = args.args.first() else {
+                    return Err("VmCallable requires fn(...) -> ...".into());
+                };
+                if args.args.len() != 1 {
+                    return Err("VmCallable requires one function signature".into());
+                }
+                let mut params = Vec::with_capacity(function.inputs.len());
+                for input in &function.inputs {
+                    params.push(walk(&input.ty, depth + 1)?);
+                }
+                let result = match &function.output {
+                    syn::ReturnType::Default => GuestTypeShape::Scalar("null"),
+                    syn::ReturnType::Type(_, ty) => walk(ty, depth + 1)?,
+                };
+                return Ok(GuestTypeShape::Callable {
+                    params,
+                    result: Box::new(result),
+                });
             }
             if ident == "Option" || ident == "Vec" {
                 let argument = one_type_argument(segment, &ident)?;

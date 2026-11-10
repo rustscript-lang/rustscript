@@ -2235,6 +2235,15 @@ fn guest_schema_expr(shape: &pd_host_schema::GuestTypeShape<'_>) -> String {
             "vm::HostTypeSchema::Resource({})",
             guest_resource_key_expr(spec)
         ),
+        S::Callable { params, result } => format!(
+            "vm::HostTypeSchema::Callable {{ params: vec![{}], result: Box::new({}) }}",
+            params
+                .iter()
+                .map(guest_schema_expr)
+                .collect::<Vec<_>>()
+                .join(", "),
+            guest_schema_expr(result)
+        ),
         S::Named(ty) => format!(
             "<{} as vm::HostNamedStruct>::host_type_schema()",
             rust_schema_type(ty)

@@ -49,6 +49,17 @@ pub(super) fn schema(shape: &GuestTypeShape<'_>) -> Result<TokenStream, Error> {
             let key = super::resource_key_tokens(spec);
             quote!(#sdk::HostTypeSchema::Resource(#key))
         }
+        GuestTypeShape::Callable { params, result } => {
+            let params = params
+                .iter()
+                .map(schema)
+                .collect::<Result<Vec<_>, Error>>()?;
+            let result = schema(result)?;
+            quote!(#sdk::HostTypeSchema::Callable {
+                params: vec![#(#params),*],
+                result: Box::new(#result),
+            })
+        }
         GuestTypeShape::Scalar(label) => {
             super::host_type_schema_from_label(label, &syn::parse_quote!(()))?
         }
@@ -101,6 +112,9 @@ pub(super) fn decode(shape: &GuestTypeShape<'_>, value: TokenStream) -> TokenStr
                 extracted
             }
         }
+        GuestTypeShape::Callable { .. } => {
+            quote!(#sdk::FromVmValue::from_vm_value(#value, "callable")?)
+        }
         _ => quote!(#sdk::FromVmValue::from_vm_value(#value, "Result payload")?),
     }
 }
@@ -150,6 +164,9 @@ pub(super) fn encode(
                 let inner = &spec.inner;
                 let wrapped = wrap(quote!(__pd_token));
                 quote!(#sdk::result::publish_owned::<#inner, _>(vm, #value, &#root, |__pd_token| Ok(#wrapped))?)
+            }
+            GuestTypeShape::Callable { .. } => {
+                wrap(quote!(#sdk::IntoVmValue::into_vm_value(#value)))
             }
             _ => wrap(quote!(#sdk::IntoVmValue::into_vm_value(#value))),
         }

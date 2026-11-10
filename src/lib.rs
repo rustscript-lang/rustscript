@@ -69,8 +69,8 @@ pub use builtins::runtime::http::{
 };
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
-    BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, IntoVmValue, TakeVmValue, arg,
-    borrow_arg, return_one, take_arg,
+    BorrowVmValue, FromVmValue, HostCallResult, IntoHostCallOutcome, IntoVmValue, TakeVmValue,
+    VmCallable, arg, borrow_arg, return_one, take_arg,
 };
 #[cfg(feature = "runtime")]
 pub use builtins::runtime::{
