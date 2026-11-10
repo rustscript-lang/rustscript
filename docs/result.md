@@ -127,11 +127,63 @@ invalid representation, and outer `VmError` never become catchable guest Errs.
 Host descriptors and build-script schema generation preserve both parameters and
 resource effects. Borrowed-resource returns remain rejected, including nested
 GuestResult combinations. Existing HTTP/database business return types are not
-implicitly migrated.
+implicitly migrated. `Result<(), E>` continues to use the existing Null-backed
+unit payload; a distinct guest `()` schema is outside this contract.
 
-Ordinary context-free callbacks use `IntoScriptValue` / `ScriptResult` and
-`script_callback_by_name`. Resource-owning callbacks use `VmScriptValue`,
-`VmScriptArgs`, and a live `ScriptValueContext` through the VM-aware callback API.
+### Calling an RSS Result from Rust
+
+The typed callback for an exported RSS function returns the same
+`GuestResult<T, E>` wrapper. From application code with `GuestResult` and
+`VmResult` imported from `vm`, given a store that initialized an export
+
+`pub fn echo(value: Result<int, string>) -> Result<int, string> { value }`
+
+the guest value converts into a native Rust `Result` through the existing
+`From` implementation:
+
+```rust
+let callback = store
+    .script_callback_by_name::<(GuestResult<i64, String>,), GuestResult<i64, String>>("echo")?;
+let ok: Result<i64, String> = callback
+    .call(&mut store, (GuestResult::Ok(0),))?
+    .into();
+let err: Result<i64, String> = callback
+    .call(&mut store, (GuestResult::Err(String::new()),))?
+    .into();
+assert_eq!(ok, Ok(0));
+assert_eq!(err, Err(String::new()));
+```
+
+`Ok(0)` and `Err("")` remain distinct because the carrier's Boolean `tag`
+selects the branch; payload truthiness does not. To keep the VM transport
+channel explicit, map the outer result instead of unwrapping it:
+
+```rust
+let native: VmResult<Result<i64, String>> = callback
+    .call(&mut store, (GuestResult::Err("guest failure".into()),))
+    .map(Into::into);
+```
+
+Here the outer `VmResult` reports fatal VM, transport, fuel, cancellation, or
+ownership failures. A guest error is only the inner `Result::Err`, and an outer
+`VmError` is never wrapped as guest data.
+
+### Ordinary and resource-owning callbacks
+
+Context-free callbacks use `script_callback_by_name` with
+`IntoScriptValue` / `ScriptResult`. Resource-owning callbacks use
+`vm_script_callback_by_name` with `VmScriptValue` / `VmScriptArgs` and invoke
+through `call_with_vm` while the VM is halted. That VM-aware path keeps a live
+`ScriptValueContext` for typed publication and resource ownership and is the
+entry for callbacks returning `ResourceOwned<T>`.
+
+The maintained generated-host example in
+[`result_sdk_try_integration_tests.rs`](../tests/result_sdk_try_integration_tests.rs)
+uses `ResourceOwned<T>`, `ResourceRef<'_, T>`, `HostResourceType`,
+`vm_script_callback_by_name`, and `call_with_vm`. It checks resource state
+**before** VM teardown and exercises normal explicit close and Err cleanup
+independently.
+
 Use the generated descriptor's exact catalog; host-call admission validates the
 selected payload before entering a guest body, and typed host return validation
 runs before the guest continues. Callback handles are Store/VM/Program-bound and
