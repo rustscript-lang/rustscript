@@ -384,14 +384,12 @@ fn sqlite_value_discriminators_reject_unknown_missing_and_multiple_payloads() {
 
 #[test]
 fn sqlite_value_mismatched_payload_and_limits_are_rejected() {
-    let mismatch_source = format!(
-        "use sqlite;\n\
-         let db_limits: SqliteLimits = {{}};\n\
-         let db_options: SqliteOpenOptions = {{ path: Option::Some(\"state.db\"), mode: Option::Some(\"read_write_create\"), limits: Option::Some(db_limits) }};\n\
-         let db = sqlite::open(db_options);\n\
-         let execute_params9: [SqliteValue] = [{{ kind: \"int\", int_value: Option::Some(\"wrong\") }}];\n\
-         sqlite::execute(db, \"SELECT ?\", execute_params9);"
-    );
+    let mismatch_source = r#"use sqlite;
+         let db_limits: SqliteLimits = {};
+         let db_options: SqliteOpenOptions = { path: Option::Some("state.db"), mode: Option::Some("read_write_create"), limits: Option::Some(db_limits) };
+         let db = sqlite::open(db_options);
+         let execute_params9: [SqliteValue] = [{ kind: "int", int_value: Option::Some("wrong") }];
+         sqlite::execute(db, "SELECT ?", execute_params9);"#;
     let mismatch = match compile_source_with_flavor_and_options(
         &mismatch_source,
         vm::compiler::SourceFlavor::RustScript,
