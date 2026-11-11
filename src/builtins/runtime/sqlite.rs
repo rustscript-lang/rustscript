@@ -708,11 +708,41 @@ fn required_string(map: &VmMap, key: &str) -> VmResult<String> {
     }
 }
 
-fn optional_string(map: &VmMap, key: &str) -> VmResult<Option<String>> {
+/// Decodes one canonical logical `Option` carrier. A present `Null` scalar is
+/// not a second reading of an optional public field.
+fn logical_option_value(value: &Value) -> VmResult<Option<&Value>> {
+    let (some, payload) = crate::option::payload(value)?;
+    if !some {
+        return Ok(None);
+    }
+    payload
+        .map(Some)
+        .ok_or(VmError::TypeMismatch("SQLite Option payload"))
+}
+
+fn logical_option_field<'a>(map: &'a VmMap, key: &str) -> VmResult<Option<&'a Value>> {
     match map_value(map, key) {
-        Some(Value::String(value)) => Ok(Some(value.as_ref().clone())),
-        Some(Value::Null) | None => Ok(None),
+        Some(value) => logical_option_value(value),
+        None => Ok(None),
+    }
+}
+
+fn required_option_string(map: &VmMap, key: &str) -> VmResult<String> {
+    match logical_option_field(map, key)? {
+        Some(Value::String(value)) if !value.is_empty() => Ok(value.as_ref().clone()),
+        Some(Value::String(_)) => Err(VmError::HostError(format!(
+            "SQLite {key} must not be empty"
+        ))),
         Some(_) => Err(VmError::TypeMismatch("SQLite option string")),
+        None => Err(VmError::HostError(format!("missing SQLite {key}"))),
+    }
+}
+
+fn optional_option_string(map: &VmMap, key: &str) -> VmResult<Option<String>> {
+    match logical_option_field(map, key)? {
+        Some(Value::String(value)) => Ok(Some(value.as_ref().clone())),
+        Some(_) => Err(VmError::TypeMismatch("SQLite option string")),
+        None => Ok(None),
     }
 }
 
@@ -740,24 +770,15 @@ fn parse_positive_u64(value: &Value, label: &str) -> VmResult<u64> {
     u64::try_from(*value).map_err(|_| VmError::HostError(format!("SQLite {label} is too large")))
 }
 
-fn parse_limits(value: Option<&Value>, ceiling: SqliteLimits) -> VmResult<SqliteLimits> {
-    let Some(value) = value else {
-        return Ok(ceiling);
-    };
-    if matches!(value, Value::Null) {
-        return Ok(ceiling);
-    }
-    let Value::Map(map) = value else {
-        return Err(VmError::TypeMismatch("SQLite limits map"));
-    };
+fn parse_limits(map: &VmMap, ceiling: SqliteLimits) -> VmResult<SqliteLimits> {
     let mut limits = ceiling;
     for (key, value) in map.iter() {
         let Value::String(key) = key else {
             return Err(VmError::TypeMismatch("SQLite limit name"));
         };
-        if matches!(value, Value::Null) {
+        let Some(value) = logical_option_value(value)? else {
             continue;
-        }
+        };
         match key.as_str() {
             "max_connections" => {
                 limits.max_connections =
@@ -808,7 +829,7 @@ fn parse_limits(value: Option<&Value>, ceiling: SqliteLimits) -> VmResult<Sqlite
 }
 
 fn parse_query_limits(value: &VmMap, ceiling: SqliteLimits) -> VmResult<SqliteLimits> {
-    parse_limits(Some(&Value::Map(Arc::new(value.clone()))), ceiling)
+    parse_limits(value, ceiling)
 }
 
 fn validate_relative_path(path: &Path) -> VmResult<()> {
@@ -1103,13 +1124,6 @@ fn reject_unexpected_fields(map: &VmMap, allowed: &[&str], context: &'static str
     Ok(())
 }
 
-fn present_payload<'a>(map: &'a VmMap, key: &str) -> Option<&'a Value> {
-    match map_value(map, key) {
-        Some(Value::Null) | None => None,
-        Some(value) => Some(value),
-    }
-}
-
 fn sqlite_parameter_value(
     value: &Value,
     parameter_bytes: &mut usize,
@@ -1136,38 +1150,43 @@ fn sqlite_parameter_value(
         }
         Some(_) => return Err(VmError::TypeMismatch("SQLite value kind")),
     };
-    let payload_count = ["int_value", "float_value", "text_value", "blob_value"]
+    let int_value = logical_option_field(map, "int_value")?;
+    let float_value = logical_option_field(map, "float_value")?;
+    let text_value = logical_option_field(map, "text_value")?;
+    let blob_value = logical_option_field(map, "blob_value")?;
+    let payload_count = [int_value, float_value, text_value, blob_value]
         .into_iter()
-        .filter(|key| present_payload(map, key).is_some())
+        .filter(Option::is_some)
         .count();
     if payload_count > 1 {
         return Err(VmError::HostError(
             "SQLite value has multiple non-null payloads".to_string(),
         ));
     }
-    let selected_payload = match kind {
-        "null" => {
-            if payload_count != 0 {
-                return Err(VmError::HostError(
-                    "SQLite null value must not have a payload".to_string(),
-                ));
+    let selected_payload =
+        match kind {
+            "null" => {
+                if payload_count != 0 {
+                    return Err(VmError::HostError(
+                        "SQLite null value must not have a payload".to_string(),
+                    ));
+                }
+                return Ok(SqlValue::Null);
             }
-            return Ok(SqlValue::Null);
-        }
-        "int" => present_payload(map, "int_value")
-            .ok_or_else(|| VmError::HostError("missing SQLite int_value".to_string()))?,
-        "float" => present_payload(map, "float_value")
-            .ok_or_else(|| VmError::HostError("missing SQLite float_value".to_string()))?,
-        "text" => present_payload(map, "text_value")
-            .ok_or_else(|| VmError::HostError("missing SQLite text_value".to_string()))?,
-        "blob" => present_payload(map, "blob_value")
-            .ok_or_else(|| VmError::HostError("missing SQLite blob_value".to_string()))?,
-        _ => {
-            return Err(VmError::HostError(format!(
-                "unknown SQLite value kind '{kind}'"
-            )));
-        }
-    };
+            "int" => int_value
+                .ok_or_else(|| VmError::HostError("missing SQLite int_value".to_string()))?,
+            "float" => float_value
+                .ok_or_else(|| VmError::HostError("missing SQLite float_value".to_string()))?,
+            "text" => text_value
+                .ok_or_else(|| VmError::HostError("missing SQLite text_value".to_string()))?,
+            "blob" => blob_value
+                .ok_or_else(|| VmError::HostError("missing SQLite blob_value".to_string()))?,
+            _ => {
+                return Err(VmError::HostError(format!(
+                    "unknown SQLite value kind '{kind}'"
+                )));
+            }
+        };
     match kind {
         "int" => match selected_payload {
             Value::Int(value) => Ok(SqlValue::Integer(*value)),
@@ -1240,6 +1259,13 @@ fn estimate_value_bytes(value: &Value) -> usize {
     }
 }
 
+fn option_payload_carrier(value: Option<Value>) -> Value {
+    match value {
+        Some(value) => crate::option::some_carrier(value),
+        None => crate::option::none_carrier(),
+    }
+}
+
 fn sqlite_value_map(
     kind: &str,
     int_value: Option<i64>,
@@ -1251,19 +1277,19 @@ fn sqlite_value_map(
         (Value::string("kind"), Value::string(kind)),
         (
             Value::string("int_value"),
-            int_value.map_or(Value::Null, Value::Int),
+            option_payload_carrier(int_value.map(Value::Int)),
         ),
         (
             Value::string("float_value"),
-            float_value.map_or(Value::Null, Value::Float),
+            option_payload_carrier(float_value.map(Value::Float)),
         ),
         (
             Value::string("text_value"),
-            text_value.map_or(Value::Null, Value::string),
+            option_payload_carrier(text_value.map(Value::string)),
         ),
         (
             Value::string("blob_value"),
-            blob_value.map_or(Value::Null, Value::bytes),
+            option_payload_carrier(blob_value.map(Value::bytes)),
         ),
     ])))
 }
@@ -1415,8 +1441,8 @@ fn transaction_result_value(kind: &str, execute: Option<VmMap>, query: Option<Vm
 }
 
 fn parse_open_options(policy: &SqlitePolicy, options: &VmMap) -> VmResult<OpenOptions> {
-    let path = required_string(options, "path")?;
-    let mode = match optional_string(options, "mode")?.as_deref() {
+    let path = required_option_string(options, "path")?;
+    let mode = match optional_option_string(options, "mode")?.as_deref() {
         Some("memory") => OpenMode::Memory,
         Some("read_only") => OpenMode::ReadOnly,
         Some("read_write") => OpenMode::ReadWrite,
@@ -1428,7 +1454,7 @@ fn parse_open_options(policy: &SqlitePolicy, options: &VmMap) -> VmResult<OpenOp
         }
     };
     let configured_root = policy.database_root.as_deref().map(PathBuf::from);
-    if let Some(requested_root) = optional_string(options, "root")? {
+    if let Some(requested_root) = optional_option_string(options, "root")? {
         let requested_root = PathBuf::from(requested_root);
         if configured_root.as_ref() != Some(&requested_root) {
             return Err(VmError::HostError(
@@ -1441,7 +1467,11 @@ fn parse_open_options(policy: &SqlitePolicy, options: &VmMap) -> VmResult<OpenOp
             "SQLite database root is not configured".to_string(),
         ));
     }
-    let limits = parse_limits(map_value(options, "limits"), policy.limits)?;
+    let limits = match logical_option_field(options, "limits")? {
+        Some(Value::Map(limits)) => parse_limits(limits.as_ref(), policy.limits)?,
+        Some(_) => return Err(VmError::TypeMismatch("SQLite limits map")),
+        None => policy.limits,
+    };
     Ok(OpenOptions {
         path,
         mode,
@@ -1577,20 +1607,22 @@ fn parse_transaction_statements(
             };
             let sql = required_string(statement, "sql")?;
             validate_sql(&sql, limits, allow_unsafe_sql)?;
-            let params = match map_value(statement, "params") {
+            let params = match logical_option_field(statement, "params")? {
                 Some(Value::Array(params)) => sqlite_params(params, limits)?,
-                Some(Value::Null) | None => Vec::new(),
                 Some(_) => return Err(VmError::TypeMismatch("SQLite parameter array")),
+                None => Vec::new(),
             };
-            let query = match map_value(statement, "query") {
+            let query = match logical_option_field(statement, "query")? {
                 Some(Value::Bool(query)) => *query,
-                Some(Value::Null) | None => false,
                 Some(_) => return Err(VmError::TypeMismatch("SQLite query flag")),
+                None => false,
             };
-            let statement_limits = match map_value(statement, "limits") {
-                Some(Value::Map(statement_limits)) => parse_query_limits(statement_limits, limits)?,
-                Some(Value::Null) | None => limits,
+            let statement_limits = match logical_option_field(statement, "limits")? {
+                Some(Value::Map(statement_limits)) => {
+                    parse_query_limits(statement_limits.as_ref(), limits)?
+                }
                 Some(_) => return Err(VmError::TypeMismatch("SQLite limits map")),
+                None => limits,
             };
             Ok(TransactionStatement {
                 sql,

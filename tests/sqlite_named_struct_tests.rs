@@ -72,10 +72,6 @@ impl HostAsyncBridge for TokioHostDriver {
     }
 }
 
-fn opt(inner: HostTypeSchema) -> HostTypeSchema {
-    HostTypeSchema::Optional(Box::new(inner))
-}
-
 fn array(inner: HostTypeSchema) -> HostTypeSchema {
     HostTypeSchema::Array(Box::new(inner))
 }
@@ -99,16 +95,16 @@ fn limits_fields() -> Vec<HostStructField> {
         "busy_timeout_ms",
     ]
     .into_iter()
-    .map(|name| HostStructField::new(name, opt(HostTypeSchema::Int)))
+    .map(|name| HostStructField::new(name, option(HostTypeSchema::Int)))
     .collect()
 }
 
 fn open_options_fields() -> Vec<HostStructField> {
     vec![
-        HostStructField::new("path", opt(HostTypeSchema::String)),
-        HostStructField::new("mode", opt(HostTypeSchema::String)),
-        HostStructField::new("root", opt(HostTypeSchema::String)),
-        HostStructField::new("limits", opt(named("SqliteLimits", limits_fields()))),
+        HostStructField::new("path", option(HostTypeSchema::String)),
+        HostStructField::new("mode", option(HostTypeSchema::String)),
+        HostStructField::new("root", option(HostTypeSchema::String)),
+        HostStructField::new("limits", option(named("SqliteLimits", limits_fields()))),
     ]
 }
 
@@ -122,10 +118,10 @@ fn execute_result_fields() -> Vec<HostStructField> {
 fn sqlite_value_fields() -> Vec<HostStructField> {
     vec![
         HostStructField::new("kind", HostTypeSchema::String),
-        HostStructField::new("int_value", opt(HostTypeSchema::Int)),
-        HostStructField::new("float_value", opt(HostTypeSchema::Float)),
-        HostStructField::new("text_value", opt(HostTypeSchema::String)),
-        HostStructField::new("blob_value", opt(HostTypeSchema::Bytes)),
+        HostStructField::new("int_value", option(HostTypeSchema::Int)),
+        HostStructField::new("float_value", option(HostTypeSchema::Float)),
+        HostStructField::new("text_value", option(HostTypeSchema::String)),
+        HostStructField::new("blob_value", option(HostTypeSchema::Bytes)),
     ]
 }
 
@@ -150,10 +146,10 @@ fn statement_fields() -> Vec<HostStructField> {
         HostStructField::new("sql", HostTypeSchema::String),
         HostStructField::new(
             "params",
-            opt(array(named("SqliteValue", sqlite_value_fields()))),
+            option(array(named("SqliteValue", sqlite_value_fields()))),
         ),
-        HostStructField::new("query", opt(HostTypeSchema::Bool)),
-        HostStructField::new("limits", opt(named("SqliteLimits", limits_fields()))),
+        HostStructField::new("query", option(HostTypeSchema::Bool)),
+        HostStructField::new("limits", option(named("SqliteLimits", limits_fields()))),
     ]
 }
 
@@ -320,10 +316,17 @@ fn object_literal_open_query_and_statement_params_compile() {
     compile(
         r#"
         use sqlite;
-        let db = sqlite::open({ path: ":memory:", mode: "memory", limits: {} });
+        let options: SqliteOpenOptions = {
+            path: Option::Some(":memory:"),
+            mode: Option::Some("memory"),
+        };
+        let db = sqlite::open(options);
         sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
-        sqlite::query(&db, "SELECT a FROM t", [], { max_rows: 8 });
-        sqlite::transaction(&db, [{ sql: "INSERT INTO t VALUES (1)", query: false }]);
+        let query_limits: SqliteLimits = { max_rows: Option::Some(8) };
+        sqlite::query(&db, "SELECT a FROM t", [], query_limits);
+        let statement: SqliteStatement = { sql: "INSERT INTO t VALUES (1)", query: Option::Some(false) };
+        let statements: [SqliteStatement] = [statement];
+        sqlite::transaction(&db, statements);
         sqlite::close(db);
         "#,
     )
@@ -335,8 +338,10 @@ fn empty_open_and_limits_objects_compile() {
     compile(
         r#"
         use sqlite;
-        let db = sqlite::open({});
-        sqlite::query(&db, "SELECT 1", [], {});
+        let options: SqliteOpenOptions = {};
+        let db = sqlite::open(options);
+        let limits: SqliteLimits = {};
+        sqlite::query(&db, "SELECT 1", [], limits);
         sqlite::close(db);
         "#,
     )
@@ -348,7 +353,7 @@ fn extra_field_on_open_options_is_rejected() {
     let message = compile_err(
         r#"
         use sqlite;
-        sqlite::open({ path: ":memory:", extra: 1 });
+        sqlite::open({ path: Option::Some(":memory:"), extra: 1 });
         "#,
     );
     assert!(
@@ -362,21 +367,22 @@ fn extra_field_on_open_options_is_rejected() {
 }
 
 #[test]
-fn extra_field_on_limits_is_rejected() {
-    let message = compile_err(
+fn extra_field_on_a_sqlite_value_is_rejected_at_the_native_boundary() {
+    let compiled = compile_standard(
         r#"
         use sqlite;
-        let db = sqlite::open({ path: ":memory:", mode: "memory" });
-        sqlite::query(&db, "SELECT 1", [], { max_rows: 1, nope: 2 });
+        let options: SqliteOpenOptions = { path: Option::Some(":memory:"), mode: Option::Some("memory") };
+        let db = sqlite::open(options);
+        let value: SqliteValue = { kind: "null", nope: 2 };
+        let values: [SqliteValue] = [value];
+        sqlite::execute(&db, "SELECT 1", values);
         "#,
-    );
+    )
+    .expect("the extra payload field should compile into the typed value");
+    let message = run_compiled_sqlite_host_error(compiled);
     assert!(
-        message.contains("sqlite::query") && message.contains("SqliteLimits"),
-        "extra limits field diagnostic should name the function and struct, got {message}"
-    );
-    assert!(
-        message.contains("nope"),
-        "extra limits field diagnostic should name the extra key, got {message}"
+        message.contains("nope") && message.contains("unknown field"),
+        "the native boundary must reject extra public value fields, got {message}"
     );
 }
 
@@ -385,13 +391,16 @@ fn missing_sql_on_transaction_statement_is_rejected() {
     let message = compile_err(
         r#"
         use sqlite;
-        let db = sqlite::open({ path: ":memory:", mode: "memory" });
-        sqlite::transaction(&db, [{ params: [] }]);
+        let options: SqliteOpenOptions = { path: Option::Some(":memory:"), mode: Option::Some("memory") };
+        let db = sqlite::open(options);
+        let statement: SqliteStatement = {};
+        let statements: [SqliteStatement] = [statement];
+        sqlite::transaction(&db, statements);
         "#,
     );
     assert!(
-        message.contains("sqlite::transaction") && message.contains("SqliteStatement"),
-        "missing sql diagnostic should name the function and struct, got {message}"
+        message.contains("sql") && message.contains("required"),
+        "missing sql diagnostic should name the missing required field, got {message}"
     );
 }
 
@@ -418,11 +427,13 @@ fn typed_field_access_on_execute_and_query_results_compiles() {
     compile(
         r#"
         use sqlite;
-        let db = sqlite::open({ path: ":memory:", mode: "memory", limits: {} });
+        let options: SqliteOpenOptions = { path: Option::Some(":memory:"), mode: Option::Some("memory") };
+        let db = sqlite::open(options);
         let created = sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
         let affected = created.rows_affected;
         let rowid = created.last_insert_rowid;
-        let queried = sqlite::query(&db, "SELECT a FROM t", [], {});
+        let limits: SqliteLimits = {};
+        let queried = sqlite::query(&db, "SELECT a FROM t", [], limits);
         let columns = queried.columns;
         let rows = queried.rows;
         let truncated = queried.truncated;
@@ -438,18 +449,30 @@ fn typed_params_rows_and_transaction_results_are_structured() {
     compile(
         r#"
         use sqlite;
-        let db = sqlite::open({ path: ":memory:", mode: "memory" });
+        let options: SqliteOpenOptions = { path: Option::Some(":memory:"), mode: Option::Some("memory") };
+        let db = sqlite::open(options);
         sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
-        sqlite::execute(&db, "INSERT INTO t VALUES (?)", [{ kind: "int", int_value: 7 }]);
-        let queried = sqlite::query(&db, "SELECT a FROM t", [], {});
+        let params: [SqliteValue] = [{ kind: "int", int_value: Option::Some(7) }];
+        sqlite::execute(&db, "INSERT INTO t VALUES (?)", params);
+        let limits: SqliteLimits = {};
+        let queried = sqlite::query(&db, "SELECT a FROM t", [], limits);
         let first = queried.rows[0].cells[0];
         assert(first.kind == "int");
-        assert(first.int_value == 7);
-        let results = sqlite::transaction(&db, [{ sql: "SELECT a FROM t", query: true }]);
+        let first_value = match first.int_value {
+            Option::Some(value) => value,
+            Option::None => -1,
+        };
+        assert(first_value == 7);
+        let statement: SqliteStatement = { sql: "SELECT a FROM t", query: Option::Some(true) };
+        let statements: [SqliteStatement] = [statement];
+        let results = sqlite::transaction(&db, statements);
         let first_result = results[0];
         assert(first_result.kind == "query");
         let present_value = match first_result.query {
-            Option::Some(query_result) => query_result.rows[0].cells[0].int_value,
+            Option::Some(query_result) => match query_result.rows[0].cells[0].int_value {
+                Option::Some(value) => value,
+                Option::None => -1,
+            },
             Option::None => -1,
         };
         assert(present_value == 7);
@@ -465,7 +488,8 @@ fn raw_sqlite_scalar_params_are_rejected() {
     let message = compile_err(
         r#"
         use sqlite;
-        let db = sqlite::open({ path: ":memory:", mode: "memory" });
+        let options: SqliteOpenOptions = { path: Option::Some(":memory:"), mode: Option::Some("memory") };
+        let db = sqlite::open(options);
         sqlite::execute(&db, "SELECT ?", [7]);
         "#,
     );
@@ -480,13 +504,16 @@ fn wrong_nested_sqlite_value_shapes_are_rejected() {
     let message = compile_err(
         r#"
         use sqlite;
-        let db = sqlite::open({ path: ":memory:", mode: "memory" });
-        sqlite::query(&db, "SELECT ?", [{ kind: "int", int_value: "wrong" }], {});
+        let options: SqliteOpenOptions = { path: Option::Some(":memory:"), mode: Option::Some("memory") };
+        let db = sqlite::open(options);
+        let values: [SqliteValue] = [{ kind: "int", int_value: Option::Some("wrong") }];
+        let limits: SqliteLimits = {};
+        sqlite::query(&db, "SELECT ?", values, limits);
         "#,
     );
     assert!(
-        message.contains("sqlite::query") && message.contains("int_value"),
-        "wrong nested payload diagnostic should name the typed field, got {message}"
+        message.contains("int") && message.contains("string"),
+        "wrong logical Option payload diagnostic should name the declared and actual types, got {message}"
     );
 }
 
@@ -526,7 +553,7 @@ fn sqlite_nullable_fields_are_logical_option() {
     let value = catalog.struct_named("SqliteValue").expect("SqliteValue");
     assert_eq!(
         value.fields[1].ty,
-        opt(HostTypeSchema::Int),
+        option(HostTypeSchema::Int),
         "SqliteValue keeps its tagged SQL NULL payload contract"
     );
     let statement = catalog
@@ -534,7 +561,7 @@ fn sqlite_nullable_fields_are_logical_option() {
         .expect("SqliteStatement");
     assert_eq!(
         statement.fields[1].ty,
-        opt(array(named("SqliteValue", sqlite_value_fields()))),
+        option(array(named("SqliteValue", sqlite_value_fields()))),
         "SqliteStatement keeps its optional-entry params contract"
     );
 }
@@ -554,13 +581,21 @@ fn logical_option_sqlite_consumer_compiles_and_runs() {
     let compiled = compile_standard(
         r#"
         use sqlite;
-        let db = sqlite::open({ path: ":memory:", mode: "memory", limits: { max_rows: 8 } });
+        let open_limits: SqliteLimits = { max_rows: Option::Some(8) };
+        let options: SqliteOpenOptions = {
+            path: Option::Some(":memory:"),
+            mode: Option::Some("memory"),
+            limits: Option::Some(open_limits),
+        };
+        let db = sqlite::open(options);
         sqlite::execute(&db, "CREATE TABLE t (a INTEGER, z TEXT)", []);
-        sqlite::execute(&db, "INSERT INTO t (a, z) VALUES (?1, ?2)", [
-            { kind: "int", int_value: 7, float_value: null, text_value: null, blob_value: null },
-            { kind: "null", int_value: null, float_value: null, text_value: null, blob_value: null }
-        ]);
-        let q = sqlite::query(&db, "SELECT a, z FROM t", [], { max_rows: 8 });
+        let insert_params: [SqliteValue] = [
+            { kind: "int", int_value: Option::Some(7) },
+            { kind: "null" }
+        ];
+        sqlite::execute(&db, "INSERT INTO t (a, z) VALUES (?1, ?2)", insert_params);
+        let query_limits: SqliteLimits = { max_rows: Option::Some(8) };
+        let q = sqlite::query(&db, "SELECT a, z FROM t", [], query_limits);
         let cursor = match q.next_cursor {
             Option::Some(value) => value,
             Option::None => -1,
@@ -568,11 +603,16 @@ fn logical_option_sqlite_consumer_compiles_and_runs() {
         assert(cursor == 7);
         let cell = q.rows[0].cells[1];
         assert(cell.kind == "null");
-        assert(cell.text_value == null);
-        let results = sqlite::transaction(&db, [
-            { sql: "INSERT INTO t (a) VALUES (?1)", params: [{ kind: "int", int_value: 8, float_value: null, text_value: null, blob_value: null }] },
-            { sql: "SELECT a FROM t", query: true }
-        ]);
+        let text_absent = match cell.text_value {
+            Option::Some(_) => false,
+            Option::None => true,
+        };
+        assert(text_absent);
+        let insert_statement_params: [SqliteValue] = [{ kind: "int", int_value: Option::Some(8) }];
+        let insert_statement: SqliteStatement = { sql: "INSERT INTO t (a) VALUES (?1)", params: Option::Some(insert_statement_params) };
+        let query_statement: SqliteStatement = { sql: "SELECT a FROM t", query: Option::Some(true) };
+        let statements: [SqliteStatement] = [insert_statement, query_statement];
+        let results = sqlite::transaction(&db, statements);
         let execute_absent = match results[0].query {
             Option::Some(result) => false,
             Option::None => true,
@@ -639,15 +679,58 @@ fn run_compiled_sqlite(compiled: CompiledProgram) {
     drive_to_halt(&mut vm);
 }
 
+fn run_compiled_sqlite_host_error(compiled: CompiledProgram) -> String {
+    let mut vm = vm::vm::Vm::try_new(compiled.program).expect("vm");
+    vm.set_async_bridge(Box::<TokioHostDriver>::default())
+        .expect("test async bridge should install");
+    let mut registry = HostFunctionRegistry::empty();
+    register_sqlite_builtin_module(&mut registry)
+        .expect("sqlite exact registration should succeed");
+    registry
+        .bind_vm_cached(&mut vm)
+        .expect("sqlite exact host imports should bind");
+    vm.configure_sqlite(SqlitePolicy::default());
+    let mut status = match vm.run() {
+        Ok(status) => status,
+        Err(VmError::HostError(message)) => return message,
+        Err(other) => panic!("unexpected VM error: {other:?}"),
+    };
+    loop {
+        status = match status {
+            vm::vm::VmStatus::Halted => panic!("expected host error, got success"),
+            vm::vm::VmStatus::Yielded => match vm.resume() {
+                Ok(status) => status,
+                Err(VmError::HostError(message)) => return message,
+                Err(other) => panic!("unexpected VM error: {other:?}"),
+            },
+            vm::vm::VmStatus::Waiting(_) => {
+                if let Err(error) = vm.wait_for_host_op_blocking() {
+                    return match error {
+                        VmError::HostError(message) => message,
+                        other => format!("{other:?}"),
+                    };
+                }
+                match vm.resume() {
+                    Ok(status) => status,
+                    Err(VmError::HostError(message)) => return message,
+                    Err(other) => panic!("unexpected VM error: {other:?}"),
+                }
+            }
+        };
+    }
+}
+
 #[test]
 fn runtime_execute_and_query_results_remain_maps_with_typed_fields() {
     let compiled = compile_standard(
         r#"
         use sqlite;
-        let db = sqlite::open({ path: ":memory:", mode: "memory", limits: {} });
+        let options: SqliteOpenOptions = { path: Option::Some(":memory:"), mode: Option::Some("memory") };
+        let db = sqlite::open(options);
         sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
         let inserted = sqlite::execute(&db, "INSERT INTO t VALUES (9)", []);
-        let queried = sqlite::query(&db, "SELECT a FROM t", [], { max_rows: 10 });
+        let limits: SqliteLimits = { max_rows: Option::Some(10) };
+        let queried = sqlite::query(&db, "SELECT a FROM t", [], limits);
         let affected = inserted.rows_affected;
         let rowid = inserted.last_insert_rowid;
         let columns = queried.columns;
@@ -666,39 +749,54 @@ fn documented_open_modes_compile() {
     compile(
         r#"
         use sqlite;
-        sqlite::open({ path: ":memory:", mode: "memory" });
-        sqlite::open({ path: "state.db", mode: "read_only" });
-        sqlite::open({ path: "state.db", mode: "read_write" });
-        sqlite::open({ path: "state.db", mode: "read_write_create" });
-        sqlite::open({ path: "state.db" });
+        let memory: SqliteOpenOptions = { path: Option::Some(":memory:"), mode: Option::Some("memory") };
+        sqlite::open(memory);
+        let read_only: SqliteOpenOptions = { path: Option::Some("state.db"), mode: Option::Some("read_only") };
+        sqlite::open(read_only);
+        let read_write: SqliteOpenOptions = { path: Option::Some("state.db"), mode: Option::Some("read_write") };
+        sqlite::open(read_write);
+        let read_write_create: SqliteOpenOptions = { path: Option::Some("state.db"), mode: Option::Some("read_write_create") };
+        sqlite::open(read_write_create);
+        let default_mode: SqliteOpenOptions = { path: Option::Some("state.db") };
+        sqlite::open(default_mode);
         "#,
     )
     .expect("exact open modes and omitted default should compile");
 }
 
 #[test]
-fn optional_null_fields_compile_as_omitted() {
+fn explicit_none_option_configuration_fields_compile() {
     compile(
         r#"
         use sqlite;
-        let db = sqlite::open({
-            path: ":memory:",
-            mode: "memory",
-            root: null,
-            limits: null,
-        });
+        let no_root: Option<string> = Option::None;
+        let no_open_limits: Option<SqliteLimits> = Option::None;
+        let options: SqliteOpenOptions = {
+            path: Option::Some(":memory:"),
+            mode: Option::Some("memory"),
+            root: no_root,
+            limits: no_open_limits,
+        };
+        let db = sqlite::open(options);
         sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
-        sqlite::query(&db, "SELECT a FROM t", [], { max_rows: null });
-        sqlite::transaction(&db, [{
+        let no_max_rows: Option<int> = Option::None;
+        let query_limits: SqliteLimits = { max_rows: no_max_rows };
+        let empty = sqlite::query(&db, "SELECT a FROM t", [], query_limits);
+        let no_params: Option<[SqliteValue]> = Option::None;
+        let no_query: Option<bool> = Option::None;
+        let no_statement_limits: Option<SqliteLimits> = Option::None;
+        let statement: SqliteStatement = {
             sql: "INSERT INTO t VALUES (1)",
-            params: null,
-            query: null,
-            limits: null,
-        }]);
+            params: no_params,
+            query: no_query,
+            limits: no_statement_limits,
+        };
+        let statements: [SqliteStatement] = [statement];
+        sqlite::transaction(&db, statements);
         sqlite::close(db);
         "#,
     )
-    .expect("present Null on optional sqlite fields should compile");
+    .expect("explicit None logical Option fields should compile");
 }
 
 #[test]
@@ -706,9 +804,11 @@ fn next_cursor_field_access_compiles() {
     compile(
         r#"
         use sqlite;
-        let db = sqlite::open({ path: ":memory:", mode: "memory", limits: {} });
+        let options: SqliteOpenOptions = { path: Option::Some(":memory:"), mode: Option::Some("memory") };
+        let db = sqlite::open(options);
         sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
-        let queried = sqlite::query(&db, "SELECT a FROM t", [], {});
+        let limits: SqliteLimits = {};
+        let queried = sqlite::query(&db, "SELECT a FROM t", [], limits);
         let cursor = queried.next_cursor;
         sqlite::close(db);
         "#,
@@ -721,26 +821,37 @@ fn runtime_null_optional_fields_and_next_cursor_field_access() {
     let compiled = compile_standard(
         r#"
         use sqlite;
-        let db = sqlite::open({
-            path: ":memory:",
-            mode: "memory",
-            root: null,
-            limits: null,
-        });
+        let no_root: Option<string> = Option::None;
+        let no_open_limits: Option<SqliteLimits> = Option::None;
+        let options: SqliteOpenOptions = {
+            path: Option::Some(":memory:"),
+            mode: Option::Some("memory"),
+            root: no_root,
+            limits: no_open_limits,
+        };
+        let db = sqlite::open(options);
         sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
-        let empty = sqlite::query(&db, "SELECT a FROM t", [], { max_rows: null });
+        let no_max_rows: Option<int> = Option::None;
+        let empty_limits: SqliteLimits = { max_rows: no_max_rows };
+        let empty = sqlite::query(&db, "SELECT a FROM t", [], empty_limits);
         let empty_cursor = match empty.next_cursor {
             Option::Some(value) => value,
             Option::None => -1,
         };
         assert(empty_cursor == -1);
-        sqlite::transaction(&db, [{
+        let no_params: Option<[SqliteValue]> = Option::None;
+        let no_query: Option<bool> = Option::None;
+        let no_statement_limits: Option<SqliteLimits> = Option::None;
+        let statement: SqliteStatement = {
             sql: "INSERT INTO t VALUES (9)",
-            params: null,
-            query: null,
-            limits: null,
-        }]);
-        let queried = sqlite::query(&db, "SELECT a FROM t", [], {});
+            params: no_params,
+            query: no_query,
+            limits: no_statement_limits,
+        };
+        let statements: [SqliteStatement] = [statement];
+        sqlite::transaction(&db, statements);
+        let queried_limits: SqliteLimits = {};
+        let queried = sqlite::query(&db, "SELECT a FROM t", [], queried_limits);
         let cursor = match queried.next_cursor {
             Option::Some(value) => value,
             Option::None => -2,
@@ -752,4 +863,227 @@ fn runtime_null_optional_fields_and_next_cursor_field_access() {
     )
     .expect("null optional fields and next_cursor access should compile");
     run_compiled_sqlite(compiled);
+}
+
+// ------------------------------------------- public field Option completion
+
+fn schema_contains_legacy_optional(schema: &HostTypeSchema) -> bool {
+    match schema {
+        HostTypeSchema::Optional(_) => true,
+        HostTypeSchema::Array(inner)
+        | HostTypeSchema::Option(inner)
+        | HostTypeSchema::Map(inner) => schema_contains_legacy_optional(inner),
+        HostTypeSchema::Named { fields, .. } => fields
+            .iter()
+            .any(|field| schema_contains_legacy_optional(&field.ty)),
+        HostTypeSchema::Callable { params, result } => {
+            params.iter().any(schema_contains_legacy_optional)
+                || schema_contains_legacy_optional(result)
+        }
+        _ => false,
+    }
+}
+
+#[test]
+fn sqlite_public_optional_fields_are_all_logical_option() {
+    let catalog = sqlite_host_catalog();
+    let limits = catalog.struct_named("SqliteLimits").expect("SqliteLimits");
+    for field in &limits.fields {
+        assert_eq!(
+            field.ty,
+            option(HostTypeSchema::Int),
+            "SqliteLimits.{} must be a logical Option<int>",
+            field.name
+        );
+    }
+
+    let open = catalog
+        .struct_named("SqliteOpenOptions")
+        .expect("SqliteOpenOptions");
+    for (index, expected) in [
+        option(HostTypeSchema::String),
+        option(HostTypeSchema::String),
+        option(HostTypeSchema::String),
+        option(named("SqliteLimits", limits_fields())),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            open.fields[index].ty, expected,
+            "SqliteOpenOptions field {index}"
+        );
+    }
+
+    let value = catalog.struct_named("SqliteValue").expect("SqliteValue");
+    for (index, expected) in [
+        option(HostTypeSchema::Int),
+        option(HostTypeSchema::Float),
+        option(HostTypeSchema::String),
+        option(HostTypeSchema::Bytes),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            value.fields[index + 1].ty,
+            expected,
+            "SqliteValue payload field {index}"
+        );
+    }
+
+    let statement = catalog
+        .struct_named("SqliteStatement")
+        .expect("SqliteStatement");
+    assert_eq!(
+        statement.fields[1].ty,
+        option(array(named("SqliteValue", sqlite_value_fields()))),
+        "SqliteStatement.params must be a logical Option"
+    );
+    assert_eq!(
+        statement.fields[2].ty,
+        option(HostTypeSchema::Bool),
+        "SqliteStatement.query must be a logical Option"
+    );
+    assert_eq!(
+        statement.fields[3].ty,
+        option(named("SqliteLimits", limits_fields())),
+        "SqliteStatement.limits must be a logical Option"
+    );
+
+    for function in catalog.functions() {
+        assert!(
+            !schema_contains_legacy_optional(&function.return_type)
+                && function
+                    .params
+                    .iter()
+                    .all(|param| !schema_contains_legacy_optional(&param.ty)),
+            "{} must not keep a public legacy Optional field or result",
+            function.name
+        );
+    }
+}
+
+#[test]
+fn logical_option_configuration_and_value_consumers_run() {
+    let compiled = compile_standard(
+        r#"
+        use sqlite;
+        let open_limits: SqliteLimits = { max_rows: Option::Some(8) };
+        let options: SqliteOpenOptions = {
+            path: Option::Some(":memory:"),
+            mode: Option::Some("memory"),
+            limits: Option::Some(open_limits),
+        };
+        let db = sqlite::open(options);
+        sqlite::execute(&db, "CREATE TABLE t (i INTEGER, f REAL, s TEXT, z INTEGER)", []);
+        let insert_params: [SqliteValue] = [
+            { kind: "int", int_value: Option::Some(7) },
+            { kind: "float", float_value: Option::Some(1.5) },
+            { kind: "text", text_value: Option::Some("") },
+            { kind: "null" }
+        ];
+        sqlite::execute(
+            &db,
+            "INSERT INTO t (i, f, s, z) VALUES (?1, ?2, ?3, ?4)",
+            insert_params
+        );
+        let query_limits: SqliteLimits = { max_rows: Option::Some(8) };
+        let rows = sqlite::query(&db, "SELECT i, f, s, z FROM t", [], query_limits);
+        let int_cell = rows.rows.copy()[0].cells.copy()[0];
+        let int_value = match int_cell.int_value {
+            Option::Some(value) => value,
+            Option::None => -1,
+        };
+        let int_float_absent = match int_cell.float_value {
+            Option::Some(_) => false,
+            Option::None => true,
+        };
+        let float_cell = rows.rows.copy()[0].cells.copy()[1];
+        let float_value = match float_cell.float_value {
+            Option::Some(value) => value,
+            Option::None => -1.0,
+        };
+        let text_cell = rows.rows.copy()[0].cells.copy()[2];
+        let text_value = match text_cell.text_value {
+            Option::Some(value) => value,
+            Option::None => "missing",
+        };
+        let null_cell = rows.rows.copy()[0].cells.copy()[3];
+        let null_absent = match null_cell.int_value {
+            Option::Some(_) => false,
+            Option::None => true,
+        };
+        assert(int_value == 7 && int_float_absent);
+        assert(float_value == 1.5);
+        assert(text_value == "");
+        assert(null_cell.kind == "null" && null_absent);
+        let insert_statement_params: [SqliteValue] = [{ kind: "int", int_value: Option::Some(8) }];
+        let empty_params: [SqliteValue] = [];
+        let statement_limits: SqliteLimits = { max_rows: Option::Some(8) };
+        let insert_statement: SqliteStatement = {
+            sql: "INSERT INTO t (i) VALUES (?1)",
+            params: Option::Some(insert_statement_params),
+            query: Option::Some(false),
+        };
+        let query_statement: SqliteStatement = {
+            sql: "SELECT i FROM t",
+            params: Option::Some(empty_params),
+            query: Option::Some(true),
+            limits: Option::Some(statement_limits),
+        };
+        let default_statement: SqliteStatement = { sql: "INSERT INTO t (i) VALUES (9)" };
+        let statements: [SqliteStatement] = [insert_statement, query_statement, default_statement];
+        let results = sqlite::transaction(&db, statements);
+        assert(results.copy()[0].kind == "execute");
+        assert(results.copy()[1].kind == "query");
+        assert(results.copy()[2].kind == "execute");
+        let present = match results.copy()[1].query {
+            Option::Some(result) => result.rows.length,
+            Option::None => 0,
+        };
+        assert(present == 2);
+        sqlite::close(db);
+        "#,
+    )
+    .expect("logical Option sqlite consumers should compile");
+    run_compiled_sqlite(compiled);
+}
+
+#[test]
+fn legacy_scalar_and_physical_null_public_fields_are_rejected() {
+    for source in [
+        r#"use sqlite; sqlite::open({ path: ":memory:", mode: Option::Some("memory") });"#,
+        r#"use sqlite; sqlite::open({ path: Option::Some(":memory:"), mode: ":memory:" });"#,
+        r#"use sqlite; let db = sqlite::open({ path: Option::Some(":memory:"), mode: Option::Some("memory") }); sqlite::execute(&db, "SELECT ?", [{ kind: "int", int_value: 7, float_value: Option::None, text_value: Option::None, blob_value: Option::None }]);"#,
+        r#"use sqlite; let db = sqlite::open({ path: Option::Some(":memory:"), mode: Option::Some("memory") }); sqlite::execute(&db, "SELECT ?", [{ kind: "int", int_value: null, float_value: Option::None, text_value: Option::None, blob_value: Option::None }]);"#,
+        r#"use sqlite; let db = sqlite::open({ path: Option::Some(":memory:"), mode: Option::Some("memory") }); sqlite::query(&db, "SELECT 1", [], { max_rows: 8 });"#,
+    ] {
+        let message = compile_err(source);
+        assert!(
+            message.contains("sqlite") && message.contains("expected"),
+            "legacy field reading must be rejected, got {message}"
+        );
+    }
+}
+
+#[test]
+fn logical_option_limit_zero_is_a_provided_invalid_value() {
+    let compiled = compile_standard(
+        r#"
+        let options: SqliteOpenOptions = {
+            path: Option::Some(":memory:"),
+            mode: Option::Some("memory"),
+        };
+        let db = sqlite::open(options);
+        let limits: SqliteLimits = { max_rows: Option::Some(0) };
+        sqlite::query(&db, "SELECT 1", [], limits);
+        "#,
+    )
+    .expect("the explicit Some(0) limit should compile");
+    let message = run_compiled_sqlite_host_error(compiled);
+    assert!(
+        message.contains("max_rows must be positive"),
+        "Some(0) must be a provided invalid limit rather than the default, got {message}"
+    );
 }

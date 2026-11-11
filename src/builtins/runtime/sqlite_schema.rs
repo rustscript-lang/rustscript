@@ -25,12 +25,7 @@ fn sqlite_connection_key() -> crate::host_api::ResourceTypeKey {
     sqlite_connection_resource().schema.key
 }
 
-fn sqlite_optional_type(inner: HostTypeSchema) -> HostTypeSchema {
-    HostTypeSchema::Optional(Box::new(inner))
-}
-
-/// A result value whose absence is logical, not a tagged SQL NULL cell or an
-/// optional configuration entry.
+/// A public field whose absence is logical, not a tagged SQL NULL cell.
 fn sqlite_option_type(inner: HostTypeSchema) -> HostTypeSchema {
     HostTypeSchema::Option(Box::new(inner))
 }
@@ -52,7 +47,7 @@ fn sqlite_limits_struct() -> HostStructSchema {
             "busy_timeout_ms",
         ]
         .into_iter()
-        .map(|name| HostStructField::new(name, sqlite_optional_type(HostTypeSchema::Int)))
+        .map(|name| HostStructField::new(name, sqlite_option_type(HostTypeSchema::Int)))
         .collect(),
     )
     .with_description("Effective SQLite host limits. Omitted keys keep the embedding ceiling.")
@@ -62,10 +57,10 @@ fn sqlite_open_options_struct(limits: &HostStructSchema) -> HostStructSchema {
     HostStructSchema::new(
         "SqliteOpenOptions",
         vec![
-            HostStructField::new("path", sqlite_optional_type(HostTypeSchema::String)),
-            HostStructField::new("mode", sqlite_optional_type(HostTypeSchema::String)),
-            HostStructField::new("root", sqlite_optional_type(HostTypeSchema::String)),
-            HostStructField::new("limits", sqlite_optional_type(limits.as_type())),
+            HostStructField::new("path", sqlite_option_type(HostTypeSchema::String)),
+            HostStructField::new("mode", sqlite_option_type(HostTypeSchema::String)),
+            HostStructField::new("root", sqlite_option_type(HostTypeSchema::String)),
+            HostStructField::new("limits", sqlite_option_type(limits.as_type())),
         ],
     )
     .with_description("SQLite open options. Runtime still requires a non-empty path.")
@@ -87,10 +82,10 @@ fn sqlite_value_struct() -> HostStructSchema {
         "SqliteValue",
         vec![
             HostStructField::new("kind", HostTypeSchema::String),
-            HostStructField::new("int_value", sqlite_optional_type(HostTypeSchema::Int)),
-            HostStructField::new("float_value", sqlite_optional_type(HostTypeSchema::Float)),
-            HostStructField::new("text_value", sqlite_optional_type(HostTypeSchema::String)),
-            HostStructField::new("blob_value", sqlite_optional_type(HostTypeSchema::Bytes)),
+            HostStructField::new("int_value", sqlite_option_type(HostTypeSchema::Int)),
+            HostStructField::new("float_value", sqlite_option_type(HostTypeSchema::Float)),
+            HostStructField::new("text_value", sqlite_option_type(HostTypeSchema::String)),
+            HostStructField::new("blob_value", sqlite_option_type(HostTypeSchema::Bytes)),
         ],
     )
     .with_description(
@@ -132,10 +127,10 @@ fn sqlite_statement_struct(
             HostStructField::new("sql", HostTypeSchema::String),
             HostStructField::new(
                 "params",
-                sqlite_optional_type(sqlite_array_type(value.as_type())),
+                sqlite_option_type(sqlite_array_type(value.as_type())),
             ),
-            HostStructField::new("query", sqlite_optional_type(HostTypeSchema::Bool)),
-            HostStructField::new("limits", sqlite_optional_type(limits.as_type())),
+            HostStructField::new("query", sqlite_option_type(HostTypeSchema::Bool)),
+            HostStructField::new("limits", sqlite_option_type(limits.as_type())),
         ],
     )
     .with_description("One sqlite::transaction statement with optional typed parameters.")
