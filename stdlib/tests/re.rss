@@ -1,12 +1,7 @@
 use re;
 
-fn assert_some_string(actual: string?, expected: string) -> bool {
-    let out = if type(actual) == "string" => {
-        actual == expected
-    } else => {
-        false
-    };
-    out
+fn assert_some_string(actual: Option<string>, expected: string) -> bool {
+    actual.unwrap_or("") == expected
 }
 
 assert(re::match("^foo", "foobar"));
@@ -16,46 +11,54 @@ assert(re::match("(?i)^foo$", "FoO"));
 assert(re::match("(?is)^foo.bar$", "FoO\nbar"));
 assert(re::match("(?m)^bar$", "foo\nbar\nbaz"));
 
-let mut first = re::find("bar+", "foobarr");
+let first = re::find("bar+", "foobarr");
 assert(assert_some_string(first, "barr"));
 
-let mut first_icase = re::find("(?i)^foo", "FoO bar");
+let first_icase = re::find("(?i)^foo", "FoO bar");
 assert(assert_some_string(first_icase, "FoO"));
 
-let mut missing = re::find("z+", "foobarr");
-assert(type(missing) == "null");
+let missing = re::find("z+", "foobarr");
+let missing_is_none = match missing {
+    Option::Some(_) => false,
+    Option::None => true,
+};
+assert(missing_is_none);
 
-let mut replaced = re::replace("(foo)+", "foofoo bar", "x");
+let replaced = re::replace("(foo)+", "foofoo bar", "x");
 assert(replaced == "x bar");
 
-let mut replaced_icase = re::replace("(?i)foo", "FoO bar", "x");
+let replaced_icase = re::replace("(?i)foo", "FoO bar", "x");
 assert(replaced_icase == "x bar");
 
-let mut parts = re::split(" +", "a   b c");
+let parts = re::split(" +", "a   b c");
 assert(parts.length == 3);
 assert(parts[0] == "a");
 assert(parts[1] == "b");
 assert(parts[2] == "c");
 
-let mut parts_icase = re::split("(?i)x", "aXb");
+let parts_icase = re::split("(?i)x", "aXb");
 assert(parts_icase.length == 2);
 assert(parts_icase[0] == "a");
 assert(parts_icase[1] == "b");
 
-let mut groups = re::captures("([a-z]+)-([0-9]+)", "item-42");
+let groups = re::captures("([a-z]+)-([0-9]+)", "item-42");
 assert(groups.length == 3);
-assert(groups[0] == "item-42");
-assert(groups[1] == "item");
-assert(groups[2] == "42");
+assert(groups[0].unwrap_or("") == "item-42");
+assert(groups[1].unwrap_or("") == "item");
+assert(groups[2].unwrap_or("") == "42");
 
-let mut groups_icase = re::captures("(?i)^(foo)-([0-9]+)$", "FoO-42");
+let groups_icase = re::captures("(?i)^(foo)-([0-9]+)$", "FoO-42");
 assert(groups_icase.length == 3);
-assert(groups_icase[1] == "FoO");
-assert(groups_icase[2] == "42");
+assert(groups_icase[1].unwrap_or("") == "FoO");
+assert(groups_icase[2].unwrap_or("") == "42");
 
-let mut no_groups = re::captures("(foo)", "bar");
+let no_groups = re::captures("(foo)", "bar");
 assert(no_groups.length == 0);
 
-let mut optional = re::captures("(a)?b", "b");
+let optional = re::captures("(a)?b", "b");
 assert(optional.length == 2);
-assert(type(optional[1]) == "null");
+let unmatched_is_none = match optional[1] {
+    Option::Some(_) => false,
+    Option::None => true,
+};
+assert(unmatched_is_none);
