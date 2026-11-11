@@ -98,6 +98,50 @@ fn host_error(error: VmError) -> String {
     }
 }
 
+/// The IO guest contract has no nullable or void route: absence is a domain
+/// value (`false`, an empty string, or a host error), never an implicit
+/// `Option`/`Optional`/`Null` carrier, and every void-free call keeps its
+/// concrete return type.
+fn assert_no_nullable_or_void_route(path: &str, schema: &HostTypeSchema) {
+    match schema {
+        HostTypeSchema::Null | HostTypeSchema::Unit => {
+            panic!("io public schema {path} exposes a void/null route: {schema:?}")
+        }
+        HostTypeSchema::Optional(_) | HostTypeSchema::Option(_) => {
+            panic!("io public schema {path} exposes a nullable route: {schema:?}")
+        }
+        HostTypeSchema::Array(inner) => {
+            assert_no_nullable_or_void_route(&format!("{path}[]"), inner)
+        }
+        HostTypeSchema::Map(inner) => {
+            assert_no_nullable_or_void_route(&format!("{path}{{}}"), inner)
+        }
+        HostTypeSchema::Callable { params, result } => {
+            for (index, param) in params.iter().enumerate() {
+                assert_no_nullable_or_void_route(&format!("{path}.callback_param[{index}]"), param);
+            }
+            assert_no_nullable_or_void_route(&format!("{path}.callback_result"), result);
+        }
+        HostTypeSchema::Result { ok, err } => {
+            assert_no_nullable_or_void_route(&format!("{path}.ok"), ok);
+            assert_no_nullable_or_void_route(&format!("{path}.err"), err);
+        }
+        HostTypeSchema::Named { fields, .. } => {
+            for field in fields {
+                assert_no_nullable_or_void_route(&format!("{path}.{}", field.name), &field.ty);
+            }
+        }
+        HostTypeSchema::Unknown
+        | HostTypeSchema::Int
+        | HostTypeSchema::Float
+        | HostTypeSchema::Number
+        | HostTypeSchema::Bool
+        | HostTypeSchema::String
+        | HostTypeSchema::Bytes
+        | HostTypeSchema::Resource(_) => {}
+    }
+}
+
 /// A unique, empty scratch directory for one test run.
 fn scratch_dir(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -226,6 +270,33 @@ fn io_module_descriptors_carry_coherent_schema_binding_and_effects() {
 }
 
 // -------------------------------------------------------------------- install
+
+#[test]
+fn io_owned_public_schemas_have_no_nullable_or_void_route() {
+    for descriptor in owned_descriptors().values() {
+        assert_no_nullable_or_void_route(
+            &format!("{}(return)", descriptor.schema.name),
+            &descriptor.schema.return_type,
+        );
+        for param in &descriptor.schema.params {
+            assert_no_nullable_or_void_route(
+                &format!("{}({})", descriptor.schema.name, param.name),
+                &param.ty,
+            );
+        }
+    }
+
+    // The domain keeps its actual present/absent policy: a missing path is
+    // `false`, an empty file is an empty string, and close reports its Boolean
+    // result. None of these is a logical nullable route.
+    let owned = owned_descriptors();
+    assert_eq!(owned["io::exists"].schema.return_type, HostTypeSchema::Bool);
+    assert_eq!(
+        owned["io::read_all"].schema.return_type,
+        HostTypeSchema::String
+    );
+    assert_eq!(owned["io::close"].schema.return_type, HostTypeSchema::Bool);
+}
 
 #[test]
 fn io_module_install_grants_its_owned_functions_on_a_restricted_registry() {
@@ -452,13 +523,17 @@ fn install_async_driver(_vm: &mut Vm) -> SubmittedOps {
 /// backend that is compiled in: the async backend resolves each one through the
 /// submitted-future bridge, while the synchronous backend yields no pending
 /// operation.
-fn assert_pending_ops_resolved_by_backend(submitted: &SubmittedOps, driven_ops: usize) {
+fn assert_pending_ops_resolved_by_backend(
+    submitted: &SubmittedOps,
+    driven_ops: usize,
+    minimum_driven: usize,
+) {
     use std::sync::atomic::Ordering;
     let submitted = submitted.load(Ordering::SeqCst);
     #[cfg(feature = "async")]
     {
         assert!(
-            driven_ops >= ROUND_TRIP_IO_CALLS,
+            driven_ops >= minimum_driven,
             "the async backend must yield a pending operation per IO call, drove {driven_ops}"
         );
         assert_eq!(
@@ -557,7 +632,7 @@ fn installed_io_descriptors_execute_open_write_read_close() {
         fs::read_to_string(&inside).expect("the written file must exist"),
         "descriptor-installed"
     );
-    assert_pending_ops_resolved_by_backend(&submitted, run.driven_ops);
+    assert_pending_ops_resolved_by_backend(&submitted, run.driven_ops, ROUND_TRIP_IO_CALLS);
     assert_eq!(
         vm.host_context().resource_count(),
         0,
@@ -566,6 +641,52 @@ fn installed_io_descriptors_execute_open_write_read_close() {
     assert!(
         vm.execution_scope().operations().is_empty(),
         "a completed IO script must leave no pending operation behind"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn installed_io_descriptors_preserve_absent_false_and_empty_file_string() {
+    let dir = scratch_dir("absent-empty");
+    let empty = dir.join("empty.txt");
+    let missing = dir.join("missing.txt");
+    fs::write(&empty, "").expect("the empty fixture should be writable");
+    let (mut vm, submitted) = vm_with_installed_io(&format!(
+        r#"
+        let present = io::exists("{empty}");
+        let absent = io::exists("{missing}");
+        let handle = io::open("{empty}", "r");
+        let contents = io::read_all(handle);
+        let closed = io::close(handle);
+        present && !absent && contents == "" && closed;
+        "#,
+        empty = empty.display(),
+        missing = missing.display()
+    ));
+    vm.configure_io(IoPolicy {
+        allowed_roots: vec![dir.display().to_string()],
+        ..IoPolicy::default()
+    });
+
+    let run = run_driven(&mut vm).expect("the installed absent/empty IO path must run");
+    assert_eq!(
+        run.stack.last(),
+        Some(&Value::Bool(true)),
+        "a present empty file stays an empty string, a missing path stays false, and close stays Boolean"
+    );
+    assert_pending_ops_resolved_by_backend(&submitted, run.driven_ops, 5);
+    assert_eq!(
+        vm.host_context().resource_count(),
+        0,
+        "the explicitly closed file resource must be retired"
+    );
+    assert!(
+        vm.execution_scope().operations().is_empty(),
+        "a completed absent/empty IO script must leave no pending operation behind"
+    );
+    assert!(
+        !missing.exists(),
+        "reading absence must not create the missing path"
     );
     let _ = fs::remove_dir_all(&dir);
 }
