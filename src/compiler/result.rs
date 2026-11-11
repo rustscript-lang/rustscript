@@ -870,13 +870,23 @@ fn resolve_method(
         }
         ResultMethod::UnwrapOrElse => {
             let hint = annotated.clone().unwrap_or(TypeSchema::Unknown);
+            let callback_context = annotated
+                .as_ref()
+                .filter(|schema| !schema_contains_unknown(schema))
+                .unwrap_or(&ok_schema);
             let callback_hint = TypeSchema::Callable {
                 params: vec![err_schema.clone()],
                 result: Box::new(hint),
             };
             resolve_expr(&mut argument, Some(&callback_hint), env)?;
-            let callback_schema =
-                method_callback_schema(&argument, &err_schema, span, method, env)?;
+            let callback_schema = method_callback_schema(
+                &argument,
+                &err_schema,
+                Some(callback_context),
+                span,
+                method,
+                env,
+            )?;
             let TypeSchema::Callable { params, .. } = &callback_schema else {
                 unreachable!("method_callback_schema returns a Callable");
             };
@@ -954,35 +964,35 @@ fn resolve_method(
         }
     }
 
-    let (param, callback_result_hint) = match method {
-        ResultMethod::Map => (
-            ok_schema.clone(),
-            annotated_result
-                .as_ref()
-                .and_then(branch_schemas)
-                .map(|(ok, _)| ok),
-        ),
-        ResultMethod::MapErr => (
-            err_schema.clone(),
-            annotated_result
-                .as_ref()
-                .and_then(branch_schemas)
-                .map(|(_, err)| err),
-        ),
+    let annotated_branches = annotated_result.as_ref().and_then(branch_schemas);
+    let (param, callback_result_hint, callback_context) = match method {
+        ResultMethod::Map => {
+            let annotated_ok = annotated_branches.as_ref().map(|(ok, _)| ok.clone());
+            (ok_schema.clone(), annotated_ok.clone(), annotated_ok)
+        }
+        ResultMethod::MapErr => {
+            let annotated_err = annotated_branches.as_ref().map(|(_, err)| err.clone());
+            (err_schema.clone(), annotated_err.clone(), annotated_err)
+        }
         ResultMethod::AndThen => (
             ok_schema.clone(),
             // and_then keeps the receiver's error type, so the callback's
             // Result error branch is always known even without an annotation.
             Some(TypeSchema::Result {
                 ok: Box::new(
-                    annotated_result
+                    annotated_branches
                         .as_ref()
-                        .and_then(branch_schemas)
-                        .map(|(ok, _)| ok)
+                        .map(|(ok, _)| ok.clone())
                         .unwrap_or(TypeSchema::Unknown),
                 ),
                 err: Box::new(err_schema.clone()),
             }),
+            annotated_branches
+                .as_ref()
+                .map(|(ok, _)| TypeSchema::Result {
+                    ok: Box::new(ok.clone()),
+                    err: Box::new(err_schema.clone()),
+                }),
         ),
         ResultMethod::OrElse => (
             err_schema.clone(),
@@ -991,13 +1001,18 @@ fn resolve_method(
             Some(TypeSchema::Result {
                 ok: Box::new(ok_schema.clone()),
                 err: Box::new(
-                    annotated_result
+                    annotated_branches
                         .as_ref()
-                        .and_then(branch_schemas)
-                        .map(|(_, err)| err)
+                        .map(|(_, err)| err.clone())
                         .unwrap_or(TypeSchema::Unknown),
                 ),
             }),
+            annotated_branches
+                .as_ref()
+                .map(|(_, err)| TypeSchema::Result {
+                    ok: Box::new(ok_schema.clone()),
+                    err: Box::new(err.clone()),
+                }),
         ),
         ResultMethod::UnwrapOr | ResultMethod::UnwrapOrElse => unreachable!("handled above"),
     };
@@ -1006,7 +1021,14 @@ fn resolve_method(
         result: Box::new(callback_result_hint.unwrap_or(TypeSchema::Unknown)),
     };
     resolve_expr(&mut argument, Some(&callback_hint), env)?;
-    let mut callback_schema = method_callback_schema(&argument, &param, span, method, env)?;
+    let mut callback_schema = method_callback_schema(
+        &argument,
+        &param,
+        callback_context.as_ref(),
+        span,
+        method,
+        env,
+    )?;
     let TypeSchema::Callable { params, .. } = &callback_schema else {
         unreachable!("method_callback_schema returns a Callable");
     };
@@ -1515,19 +1537,18 @@ fn resolve_option_method(
 
     let (argument_schema, mut some_expr, mut none_expr) = match method {
         OptionMethod::Map => {
-            let callback_result_hint = annotated
-                .as_ref()
-                .and_then(|schema| match schema {
-                    TypeSchema::Option(inner) if !matches!(inner.as_ref(), TypeSchema::Unknown) => {
-                        Some(inner.as_ref().clone())
-                    }
-                    _ => None,
-                })
-                .unwrap_or(TypeSchema::Unknown);
+            let annotated_payload = annotated.as_ref().and_then(|schema| match schema {
+                TypeSchema::Option(inner) if !matches!(inner.as_ref(), TypeSchema::Unknown) => {
+                    Some(inner.as_ref().clone())
+                }
+                _ => None,
+            });
+            let callback_result_hint = annotated_payload.clone().unwrap_or(TypeSchema::Unknown);
             let mut callback_schema = option_callback_schema(
                 &mut argument,
                 vec![inner.clone()],
                 callback_result_hint,
+                annotated_payload.as_ref(),
                 span,
                 method_name,
                 env,
@@ -1595,19 +1616,24 @@ fn resolve_option_method(
             )
         }
         OptionMethod::AndThen => {
-            let callback_result_hint = annotated
+            let annotated_payload = annotated.as_ref().and_then(|schema| match schema {
+                TypeSchema::Option(inner) if !matches!(inner.as_ref(), TypeSchema::Unknown) => {
+                    Some(inner.as_ref().clone())
+                }
+                _ => None,
+            });
+            let callback_result_hint = annotated_payload
                 .as_ref()
-                .and_then(|schema| match schema {
-                    TypeSchema::Option(inner) if !matches!(inner.as_ref(), TypeSchema::Unknown) => {
-                        Some(TypeSchema::Option(inner.clone()))
-                    }
-                    _ => None,
-                })
+                .map(|inner| TypeSchema::Option(Box::new(inner.clone())))
                 .unwrap_or(TypeSchema::Unknown);
+            let callback_context = annotated_payload
+                .as_ref()
+                .map(|inner| TypeSchema::Option(Box::new(inner.clone())));
             let mut callback_schema = option_callback_schema(
                 &mut argument,
                 vec![inner.clone()],
                 callback_result_hint,
+                callback_context.as_ref(),
                 span,
                 method_name,
                 env,
@@ -1697,6 +1723,7 @@ fn resolve_option_method(
                 &mut argument,
                 Vec::new(),
                 receiver_schema.clone(),
+                Some(&receiver_schema),
                 span,
                 method_name,
                 env,
@@ -1847,10 +1874,12 @@ fn resolve_option_method(
         }
         OptionMethod::UnwrapOrElse => {
             let callback_result_hint = annotated.clone().unwrap_or_else(|| inner.clone());
+            let callback_context = callback_result_hint.clone();
             let mut callback_schema = option_callback_schema(
                 &mut argument,
                 Vec::new(),
                 callback_result_hint,
+                Some(&callback_context),
                 span,
                 method_name,
                 env,
@@ -2014,10 +2043,12 @@ fn resolve_option_method(
                 }
                 _ => None,
             });
+            let callback_result_hint = err_hint.clone().unwrap_or(TypeSchema::Unknown);
             let mut callback_schema = option_callback_schema(
                 &mut argument,
                 Vec::new(),
-                err_hint.unwrap_or(TypeSchema::Unknown),
+                callback_result_hint,
+                err_hint.as_ref(),
                 span,
                 method_name,
                 env,
@@ -2170,6 +2201,7 @@ fn option_callback_schema(
     argument: &mut Expr,
     params: Vec<TypeSchema>,
     result_hint: TypeSchema,
+    contextual_result: Option<&TypeSchema>,
     span: Span,
     method_name: &str,
     env: &mut Env,
@@ -2179,8 +2211,14 @@ fn option_callback_schema(
         result: Box::new(result_hint),
     };
     resolve_expr(argument, Some(&hint), env)?;
-    let callback_schema =
-        super::result::callback_schema_for_params(argument, &params, span, method_name, env)?;
+    let callback_schema = super::result::callback_schema_for_params(
+        argument,
+        &params,
+        contextual_result,
+        span,
+        method_name,
+        env,
+    )?;
     let TypeSchema::Callable {
         params: actual_params,
         result,
@@ -2647,6 +2685,7 @@ fn require_method_schema_named(
 fn method_callback_schema(
     argument: &Expr,
     param: &TypeSchema,
+    contextual_result: Option<&TypeSchema>,
     span: Span,
     method: ResultMethod,
     env: &Env,
@@ -2654,6 +2693,7 @@ fn method_callback_schema(
     callback_schema_for_params(
         argument,
         std::slice::from_ref(param),
+        contextual_result,
         span,
         method.name(),
         env,
@@ -2662,10 +2702,15 @@ fn method_callback_schema(
 
 /// Shared contextual callback inference for Result and logical Option
 /// methods. `params` is the exact expected callable parameter list, including
-/// the empty list for zero-argument Option fallbacks.
+/// the empty list for zero-argument Option fallbacks. `contextual_result`
+/// carries the already-known callback return schema, when the method owner has
+/// one, so each branch can be checked and substituted before the strict
+/// callable merge. Without a known result context the branches keep their
+/// inferred schemas.
 fn callback_schema_for_params(
     argument: &Expr,
     params: &[TypeSchema],
+    contextual_result: Option<&TypeSchema>,
     span: Span,
     method_name: &str,
     env: &Env,
@@ -2686,23 +2731,51 @@ fn callback_schema_for_params(
                 Some(params),
                 &closure.capture_copies,
             ));
-            infer_callable_callback(argument, &nested, span, method_name, env)
+            let callback_schema =
+                infer_callable_callback(argument, &nested, span, method_name, env)?;
+            contextualize_callback_result(
+                argument,
+                callback_schema,
+                contextual_result,
+                span,
+                method_name,
+                env,
+            )
         }
         Expr::IfElse {
             then_expr,
             else_expr,
             ..
         } => {
-            let then_schema =
-                callback_schema_for_params(then_expr, params, span, method_name, env)?;
-            let else_schema =
-                callback_schema_for_params(else_expr, params, span, method_name, env)?;
+            let then_schema = callback_schema_for_params(
+                then_expr,
+                params,
+                contextual_result,
+                span,
+                method_name,
+                env,
+            )?;
+            let else_schema = callback_schema_for_params(
+                else_expr,
+                params,
+                contextual_result,
+                span,
+                method_name,
+                env,
+            )?;
             merge_callable_branches_named(then_schema, else_schema, span, method_name)
         }
         Expr::Match { arms, default, .. } => {
             let mut merged: Option<TypeSchema> = None;
             for (_, arm) in arms {
-                let arm_schema = callback_schema_for_params(arm, params, span, method_name, env)?;
+                let arm_schema = callback_schema_for_params(
+                    arm,
+                    params,
+                    contextual_result,
+                    span,
+                    method_name,
+                    env,
+                )?;
                 merged = Some(match merged {
                     Some(existing) => {
                         merge_callable_branches_named(existing, arm_schema, span, method_name)?
@@ -2710,8 +2783,14 @@ fn callback_schema_for_params(
                     None => arm_schema,
                 });
             }
-            let default_schema =
-                callback_schema_for_params(default, params, span, method_name, env)?;
+            let default_schema = callback_schema_for_params(
+                default,
+                params,
+                contextual_result,
+                span,
+                method_name,
+                env,
+            )?;
             match merged {
                 Some(existing) => {
                     merge_callable_branches_named(existing, default_schema, span, method_name)
@@ -2720,9 +2799,121 @@ fn callback_schema_for_params(
             }
         }
         Expr::Block { expr, .. } => {
-            callback_schema_for_params(expr, params, span, method_name, env)
+            callback_schema_for_params(expr, params, contextual_result, span, method_name, env)
         }
-        _ => infer_callable_callback(argument, &env.slots, span, method_name, env),
+        _ => {
+            let callback_schema =
+                infer_callable_callback(argument, &env.slots, span, method_name, env)?;
+            contextualize_callback_result(
+                argument,
+                callback_schema,
+                contextual_result,
+                span,
+                method_name,
+                env,
+            )
+        }
+    }
+}
+
+/// Apply the known contextual callback result to one branch before the shared
+/// exact merge. The branch result expression must still pass the existing
+/// named structural check and the construction-admission walk; incompatible
+/// shapes keep their precise rejection instead of being relabelled.
+fn contextualize_callback_result(
+    expression: &Expr,
+    callback_schema: TypeSchema,
+    contextual_result: Option<&TypeSchema>,
+    span: Span,
+    method_name: &str,
+    env: &Env,
+) -> Result<TypeSchema, CompileError> {
+    let Some(contextual) = contextual_result else {
+        return Ok(callback_schema);
+    };
+    if !method_context_schema_is_known(contextual) || !contextual_schema_carries_record(contextual)
+    {
+        return Ok(callback_schema);
+    }
+    let TypeSchema::Callable { params, .. } = &callback_schema else {
+        return Ok(callback_schema);
+    };
+    let inferred_result = callback_result_schema(&callback_schema);
+    if let Some(detail) = contextual_callback_result_mismatch(env, contextual, &inferred_result) {
+        return Err(result_error(
+            span,
+            format!(
+                ".{} callback result expects {} but found {} ({detail})",
+                method_name,
+                render_schema(contextual),
+                render_schema(&inferred_result)
+            ),
+        ));
+    }
+    let expected = TypeSchema::Callable {
+        params: params.clone(),
+        result: Box::new(contextual.clone()),
+    };
+    require_materialized_context_result(
+        expression,
+        &expected,
+        span,
+        method_name,
+        "callback result",
+        env,
+    )?;
+    Ok(TypeSchema::Callable {
+        params: params.clone(),
+        result: Box::new(contextual.clone()),
+    })
+}
+
+/// Compare a contextual callback result against its inferred counterpart
+/// through the same structural field rules used elsewhere, while descending
+/// `Option`/`Result` payload branches instead of applying the special exact
+/// Result-branch equality used when a whole Result value is compared.
+fn contextual_callback_result_mismatch(
+    env: &Env,
+    expected: &TypeSchema,
+    actual: &TypeSchema,
+) -> Option<String> {
+    match expected {
+        TypeSchema::Option(expected_inner) => match actual {
+            TypeSchema::Option(actual_inner) => {
+                contextual_callback_result_mismatch(env, expected_inner, actual_inner)
+            }
+            _ => super::typing::schema_assignment_mismatch(
+                &env.function_list,
+                &env.function_impls,
+                &env.struct_schemas,
+                expected,
+                actual,
+            ),
+        },
+        TypeSchema::Result {
+            ok: expected_ok,
+            err: expected_err,
+        } => match actual {
+            TypeSchema::Result {
+                ok: actual_ok,
+                err: actual_err,
+            } => contextual_callback_result_mismatch(env, expected_ok, actual_ok)
+                .or_else(|| contextual_callback_result_mismatch(env, expected_err, actual_err)),
+            _ => super::typing::schema_assignment_mismatch(
+                &env.function_list,
+                &env.function_impls,
+                &env.struct_schemas,
+                expected,
+                actual,
+            ),
+        },
+        _ => super::typing::schema_assignment_mismatch(
+            &env.function_list,
+            &env.function_impls,
+            &env.struct_schemas,
+            expected,
+            actual,
+        ),
     }
 }
 

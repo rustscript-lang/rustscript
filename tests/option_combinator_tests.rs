@@ -670,3 +670,78 @@ fn unwrap_or_keeps_a_previously_materialized_named_fallback() {
     "#;
     assert_eq!(eval(source), Value::Int(0));
 }
+
+#[test]
+fn conditional_callbacks_with_distinct_present_key_shapes_materialize_the_known_record() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        fn make(flag: Option<int>, select: bool) -> Option<Entry> {
+            flag.map(if select => {
+                |n| { name: "x" }
+            } else => {
+                |n| { name: "y", note: Option::None }
+            })
+        }
+        let item: Entry = make(Option::Some(1), true).unwrap_or({ name: "fallback" });
+        match item.note { Option::Some(value) => value, Option::None => 0 };
+    "#;
+    assert_eq!(eval(source), Value::Int(0));
+}
+
+#[test]
+fn match_callbacks_with_distinct_present_key_shapes_materialize_the_known_record() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        fn make(flag: Option<int>, select: int) -> Option<Entry> {
+            flag.map(match select {
+                1 => |n| { name: "x" },
+                _ => |n| { name: "y", note: Option::Some(1) },
+            })
+        }
+        let item: Entry = make(Option::Some(1), 1).unwrap_or({ name: "fallback" });
+        match item.note { Option::Some(value) => value, Option::None => 0 };
+    "#;
+    assert_eq!(eval(source), Value::Int(0));
+}
+
+#[test]
+fn conditional_callback_missing_a_required_field_is_rejected() {
+    let diagnostic = reject(
+        r#"
+        struct Entry { name: string, note: Option<int> }
+        fn make(flag: Option<int>, select: bool) -> Option<Entry> {
+            flag.map(if select => {
+                |n| { name: "x" }
+            } else => {
+                |n| { note: Option::None }
+            })
+        }
+        make(Option::Some(1), true);
+        "#,
+    );
+    assert!(
+        diagnostic.contains("field 'name'") && diagnostic.contains("required"),
+        "a branch missing a required field must keep the focused missing-field rejection: {diagnostic}"
+    );
+}
+
+#[test]
+fn conditional_callback_with_a_wrong_field_type_is_rejected() {
+    let diagnostic = reject(
+        r#"
+        struct Entry { name: string, note: Option<int> }
+        fn make(flag: Option<int>, select: bool) -> Option<Entry> {
+            flag.map(if select => {
+                |n| { name: "x" }
+            } else => {
+                |n| { name: 2 }
+            })
+        }
+        make(Option::Some(1), true);
+        "#,
+    );
+    assert!(
+        diagnostic.contains("field 'name'") && diagnostic.contains("string"),
+        "a wrong branch field type must keep the focused schema rejection: {diagnostic}"
+    );
+}
