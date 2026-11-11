@@ -1053,6 +1053,34 @@ fn inferred_value_schema(
         .filter(|schema| !matches!(schema, TypeSchema::Unknown))
 }
 
+/// Construction-admission check for producer-side method lowering. The same
+/// expression-aware walker used by declaration/argument validation decides
+/// whether an omitted logical `Option` field can be materialized at this
+/// result position. It is not a schema rewrite and does not infer a new type.
+pub(crate) fn omitted_option_materialization_detail_for_slots(
+    functions: &[FunctionDecl],
+    function_impls: &HashMap<u16, FunctionImpl>,
+    struct_schemas: &HashMap<String, StructDecl>,
+    expr: &Expr,
+    expected: &TypeSchema,
+    slots: &HashMap<LocalSlot, TypeSchema>,
+) -> Option<String> {
+    let state = result_local_state(slots);
+    let typing = ResultTyping::new(functions, function_impls, struct_schemas);
+    let mut context = typing.context();
+    let actual = context
+        .infer_expr_schema(expr, &state)
+        .or_else(|| scalar_schema_from_bound_type(infer_expr_type(expr, &state)))
+        .filter(|schema| !matches!(schema, TypeSchema::Unknown));
+    helpers::omitted_option_materialization_detail(
+        expr,
+        expected,
+        actual.as_ref(),
+        &mut context,
+        &state,
+    )
+}
+
 /// Infer and check a Result payload with the typing owner's schema rules.
 /// Numeric compatibility applies only at this selected-payload position.
 /// `Unknown` and unbound generic parameters are not success.

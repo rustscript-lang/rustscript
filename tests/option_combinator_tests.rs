@@ -569,3 +569,104 @@ fn ok_or_and_ok_or_else_named_errors_materialize_omitted_option_fields() {
     "#;
     assert_eq!(eval(source), Value::Int(3));
 }
+
+#[test]
+fn nonconstruction_sparse_object_cannot_be_annotated_as_named_record() {
+    let diagnostic = reject(
+        r#"
+        struct Entry { name: string, note: Option<int> }
+        let raw = { name: "x" };
+        let item: Entry = raw;
+        item.name;
+        "#,
+    );
+    assert!(
+        diagnostic.contains("field 'note'")
+            && diagnostic.contains("non-construction")
+            && diagnostic.contains("must be materialized"),
+        "the missing-field obligation must be asserted at the compile boundary: {diagnostic}"
+    );
+}
+
+#[test]
+fn nonconstruction_sparse_object_cannot_be_an_ordinary_record_argument() {
+    let diagnostic = reject(
+        r#"
+        struct Entry { name: string, note: Option<int> }
+        fn read(entry: Entry) -> string { entry.name }
+        let raw = { name: "x" };
+        read(raw);
+        "#,
+    );
+    assert!(
+        diagnostic.contains("field 'note'") && diagnostic.contains("must be materialized"),
+        "an ordinary record argument must carry the same missing-field obligation: {diagnostic}"
+    );
+}
+
+#[test]
+fn nonconstruction_sparse_object_cannot_be_an_eager_unwrap_or_fallback() {
+    let diagnostic = reject(
+        r#"
+        struct Entry { name: string, note: Option<int> }
+        let flag: Option<Entry> = Option::None;
+        let raw = { name: "x" };
+        let item: Entry = flag.unwrap_or(raw);
+        item.name;
+        "#,
+    );
+    assert!(
+        diagnostic.contains("unwrap_or")
+            && diagnostic.contains("field 'note'")
+            && diagnostic.contains("must be materialized"),
+        "the eager fallback must be rejected before the named label is installed: {diagnostic}"
+    );
+}
+
+#[test]
+fn nonconstruction_sparse_object_cannot_be_a_map_callback_payload() {
+    let diagnostic = reject(
+        r#"
+        struct Entry { name: string, note: Option<int> }
+        let flag: Option<int> = Option::Some(1);
+        let raw = { name: "x" };
+        let item: Option<Entry> = flag.map(|n| raw);
+        item;
+        "#,
+    );
+    assert!(
+        diagnostic.contains("map")
+            && diagnostic.contains("field 'note'")
+            && diagnostic.contains("must be materialized"),
+        "a callback payload that is a plain variable must not be relabelled: {diagnostic}"
+    );
+}
+
+#[test]
+fn nested_nonconstruction_sparse_object_is_not_excused_by_an_ancestor_literal() {
+    let diagnostic = reject(
+        r#"
+        struct Inner { name: string, note: Option<int> }
+        struct Outer { inner: Option<Inner> }
+        let raw = { name: "x" };
+        let outer: Outer = { inner: Option::Some(raw) };
+        outer;
+        "#,
+    );
+    assert!(
+        diagnostic.contains("inner.note") && diagnostic.contains("must be materialized"),
+        "the nested value position, not the ancestor literal, owns the obligation: {diagnostic}"
+    );
+}
+
+#[test]
+fn unwrap_or_keeps_a_previously_materialized_named_fallback() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        let fallback: Entry = { name: "x" };
+        let flag: Option<Entry> = Option::None;
+        let item: Entry = flag.unwrap_or(fallback);
+        match item.note { Option::Some(value) => value, Option::None => 0 };
+    "#;
+    assert_eq!(eval(source), Value::Int(0));
+}
