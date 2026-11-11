@@ -1868,9 +1868,8 @@ mod runtime_tests {
             struct Data { values: [int] }
             let data: Data = { values: [41] };
             let result = match data?.values?.[0] {
-                None => 0,
-                Some(value) => value + 1,
-                _ => 0,
+                Option::None => 0,
+                Option::Some(value) => value + 1,
             };
             result;
         "#;
