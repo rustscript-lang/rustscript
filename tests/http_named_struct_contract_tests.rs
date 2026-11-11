@@ -146,6 +146,74 @@ fn http_catalog_declares_resources_and_no_named_structs() {
     }
 }
 
+fn assert_no_public_nullable_schema(schema: &HostTypeSchema, owner: &str) {
+    match schema {
+        HostTypeSchema::Null
+        | HostTypeSchema::Optional(_)
+        | HostTypeSchema::Option(_)
+        | HostTypeSchema::Unknown
+        | HostTypeSchema::Map(_) => panic!(
+            "HTTP public surface must not publish a nullable/dynamic schema, {owner} uses {schema:?}"
+        ),
+        HostTypeSchema::Array(inner) => assert_no_public_nullable_schema(inner, owner),
+        HostTypeSchema::Callable { params, result } => {
+            for param in params {
+                assert_no_public_nullable_schema(param, owner);
+            }
+            assert_no_public_nullable_schema(result, owner);
+        }
+        HostTypeSchema::Named { fields, .. } => {
+            for field in fields {
+                assert_no_public_nullable_schema(&field.ty, owner);
+            }
+        }
+        HostTypeSchema::Result { ok, err } => {
+            assert_no_public_nullable_schema(ok, owner);
+            assert_no_public_nullable_schema(err, owner);
+        }
+        HostTypeSchema::Unit
+        | HostTypeSchema::Int
+        | HostTypeSchema::Float
+        | HostTypeSchema::Number
+        | HostTypeSchema::Bool
+        | HostTypeSchema::String
+        | HostTypeSchema::Bytes
+        | HostTypeSchema::Resource(_) => {}
+    }
+}
+
+#[test]
+fn public_http_catalog_uses_unit_mutators_and_no_nullable_carriers() {
+    let catalog = http_host_catalog();
+    assert_eq!(
+        catalog.functions().len(),
+        23,
+        "the installed HTTP catalog must publish 23 descriptor declarations"
+    );
+
+    for name in [
+        "http::request::set_header",
+        "http::request::set_body_text",
+        "http::request::set_body_bytes",
+    ] {
+        let schema = catalog
+            .function(name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        assert_eq!(
+            schema.return_type,
+            HostTypeSchema::Unit,
+            "{name} must publish the logical Unit result, not Null or a nullable schema"
+        );
+    }
+
+    for function in catalog.functions() {
+        for param in &function.params {
+            assert_no_public_nullable_schema(&param.ty, &function.name);
+        }
+        assert_no_public_nullable_schema(&function.return_type, &function.name);
+    }
+}
+
 #[test]
 fn buffered_request_takes_an_owned_builder_and_returns_a_response_resource() {
     let catalog = http_host_catalog();
