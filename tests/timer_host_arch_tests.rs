@@ -15,6 +15,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use vm::HostTypeSchema;
+
 /// The single file that owns every timer implementation symbol.
 const TIMER_HOST_MODULE: &str = "src/builtins/runtime/timer.rs";
 
@@ -530,4 +532,92 @@ fn architecture_scanner_ignores_literals_and_comment_markers_inside_them() {
     assert!(!code.contains("interval"));
     assert!(!code.contains("max_running"));
     assert!(!code.contains("poll_reporting"));
+}
+
+// --------------------------------------------- Option/Unit public contract
+
+fn assert_timer_no_nullable_or_void(path: &str, schema: &HostTypeSchema) {
+    match schema {
+        HostTypeSchema::Optional(_) | HostTypeSchema::Option(_) => {
+            panic!("timer public schema {path} exposes a nullable route: {schema:?}")
+        }
+        HostTypeSchema::Null | HostTypeSchema::Unit => {
+            panic!("timer public schema {path} exposes a void/null route: {schema:?}")
+        }
+        HostTypeSchema::Array(inner) => {
+            assert_timer_no_nullable_or_void(&format!("{path}[]"), inner)
+        }
+        HostTypeSchema::Map(inner) => {
+            assert_timer_no_nullable_or_void(&format!("{path}{{}}"), inner)
+        }
+        HostTypeSchema::Callable { params, result } => {
+            for (index, param) in params.iter().enumerate() {
+                assert_timer_no_nullable_or_void(&format!("{path}.callback_param[{index}]"), param);
+            }
+            // The standard callback result is the accepted discarded-callable
+            // exception; it is not a nullable or void route.
+            if !matches!(result.as_ref(), HostTypeSchema::Unknown) {
+                assert_timer_no_nullable_or_void(&format!("{path}.callback_result"), result);
+            }
+        }
+        HostTypeSchema::Result { ok, err } => {
+            assert_timer_no_nullable_or_void(&format!("{path}.ok"), ok);
+            assert_timer_no_nullable_or_void(&format!("{path}.err"), err);
+        }
+        HostTypeSchema::Named { fields, .. } => {
+            for field in fields {
+                assert_timer_no_nullable_or_void(&format!("{path}.{}", field.name), &field.ty);
+            }
+        }
+        HostTypeSchema::Unknown
+        | HostTypeSchema::Int
+        | HostTypeSchema::Float
+        | HostTypeSchema::Number
+        | HostTypeSchema::Bool
+        | HostTypeSchema::String
+        | HostTypeSchema::Bytes
+        | HostTypeSchema::Resource(_) => {}
+    }
+}
+
+#[test]
+fn timer_public_contract_keeps_boolean_and_count_results_without_nullable_routes() {
+    let catalog = vm::timer_host_catalog();
+    for function in catalog.functions() {
+        for param in &function.params {
+            assert_timer_no_nullable_or_void(
+                &format!("{}({})", function.name, param.name),
+                &param.ty,
+            );
+        }
+        assert_timer_no_nullable_or_void(
+            &format!("{} return", function.name),
+            &function.return_type,
+        );
+    }
+
+    let at = catalog.function("timer::at").expect("timer::at");
+    assert_eq!(at.return_type, HostTypeSchema::Bool);
+    assert_eq!(
+        at.params[1].ty,
+        HostTypeSchema::Callable {
+            params: vec![HostTypeSchema::Bool],
+            result: Box::new(HostTypeSchema::Unknown),
+        },
+        "the discarded callback result stays the documented narrow exception"
+    );
+    assert_eq!(
+        catalog
+            .function("timer::pending_count")
+            .expect("timer::pending_count")
+            .return_type,
+        HostTypeSchema::Int
+    );
+    assert_eq!(
+        catalog
+            .function("timer::every")
+            .expect("timer::every")
+            .return_type,
+        HostTypeSchema::Bool
+    );
 }
