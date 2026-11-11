@@ -1040,6 +1040,113 @@ fn result_returning_combinators_still_reject_non_result_annotations() {
 }
 
 #[test]
+fn result_map_known_named_ok_schema_materializes_omitted_option_field() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        fn observe_note(note: Option<Option<int>>) -> int {
+            match note {
+                Option::Some(inner_note) => match inner_note {
+                    Option::Some(value) => value,
+                    Option::None => 1,
+                },
+                Option::None => -2,
+            }
+        }
+        fn observe_entry(value: Entry) -> int {
+            observe_note(value?.note)
+        }
+        let flag: Result<int, string> = Result::Ok(1);
+        let item: Result<Entry, string> = flag.map(|n| { name: "x" });
+        match item {
+            Result::Ok(entry) => observe_entry(entry),
+            Result::Err(error) => -1,
+        };
+    "#;
+    assert_eq!(eval(source), Value::Int(1));
+}
+
+#[test]
+fn result_map_err_known_named_error_schema_materializes_omitted_option_field() {
+    let source = r#"
+        struct Failure { code: int, detail: Option<int> }
+        fn observe_note(note: Option<Option<int>>) -> int {
+            match note {
+                Option::Some(inner_note) => match inner_note {
+                    Option::Some(value) => value,
+                    Option::None => 1,
+                },
+                Option::None => -2,
+            }
+        }
+        fn observe_failure(error: Failure) -> int {
+            observe_note(error?.detail)
+        }
+        let flag: Result<int, int> = Result::Err(7);
+        let item: Result<int, Failure> = flag.map_err(|error| { code: error });
+        match item {
+            Result::Ok(value) => -1,
+            Result::Err(error) => observe_failure(error),
+        };
+    "#;
+    assert_eq!(eval(source), Value::Int(1));
+}
+
+#[test]
+fn result_unwrap_or_and_unwrap_or_else_known_named_payload_materialize_none() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        fn observe_note(note: Option<Option<int>>) -> int {
+            match note {
+                Option::Some(inner_note) => match inner_note {
+                    Option::Some(value) => value,
+                    Option::None => 1,
+                },
+                Option::None => -2,
+            }
+        }
+        fn observe_entry(value: Entry) -> int {
+            observe_note(value?.note)
+        }
+        let absent: Result<Entry, int> = Result::Err(3);
+        let eager: Entry = absent.unwrap_or({ name: "eager" });
+        let lazy: Entry = absent.unwrap_or_else(|error| { name: "lazy" });
+        observe_entry(eager) + observe_entry(lazy);
+    "#;
+    assert_eq!(eval(source), Value::Int(2));
+}
+
+#[test]
+fn result_and_then_and_or_else_known_named_payloads_materialize_none() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        fn observe_note(note: Option<Option<int>>) -> int {
+            match note {
+                Option::Some(inner_note) => match inner_note {
+                    Option::Some(value) => value,
+                    Option::None => 1,
+                },
+                Option::None => -2,
+            }
+        }
+        fn observe_entry(value: Entry) -> int {
+            observe_note(value?.note)
+        }
+        let ok_value: Result<int, string> = Result::Ok(2);
+        let chained: Result<Entry, string> = ok_value.and_then(|n| Result::Ok({ name: "x" }));
+        let err_value: Result<Entry, int> = Result::Err(5);
+        let recovered: Result<Entry, int> = err_value.or_else(|error| Result::Ok({ name: "y" }));
+        match chained {
+            Result::Ok(entry) => observe_entry(entry),
+            Result::Err(error) => -1,
+        } + match recovered {
+            Result::Ok(entry) => observe_entry(entry),
+            Result::Err(error) => -1,
+        };
+    "#;
+    assert_eq!(eval(source), Value::Int(2));
+}
+
+#[test]
 fn typed_unwrap_payload_still_requires_the_payload_type() {
     for (label, source) in [
         (
