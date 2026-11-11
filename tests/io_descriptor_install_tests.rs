@@ -358,7 +358,6 @@ fn io_module_install_rejects_a_descriptor_list_whose_adapters_disagree() {
 /// The IO calls the round-trip script makes. Each one is dispatched through the
 /// installed descriptor and must be driven to completion as a pending host
 /// operation.
-#[cfg(feature = "async")]
 const ROUND_TRIP_IO_CALLS: usize = 7;
 
 /// Submitted-future count of the async host driver; stays zero on the inline
