@@ -833,6 +833,14 @@ fn resolve_method(
                 require_method_schema(env, annotated, &ok_schema, span, method, "result")?;
                 contextual = annotated.clone();
             }
+            require_materialized_context_result(
+                &argument,
+                &contextual,
+                span,
+                method.name(),
+                "fallback",
+                env,
+            )?;
             let fallback_schema = retain_contextual_eager_schema(fallback_schema, &contextual);
             reject_resource_capturing_closure(&argument, &fallback_schema, span, method, env)?;
             env.slots.insert(slots.receiver, result_schema.clone());
@@ -900,7 +908,14 @@ fn resolve_method(
                 require_method_schema(env, annotated, &returned, span, method, "callback result")?;
                 contextual = annotated.clone();
             }
-            let callback_schema = retain_contextual_callback_result(callback_schema, &contextual);
+            let callback_schema = retain_contextual_callback_result_for_expr(
+                &argument,
+                callback_schema,
+                &contextual,
+                span,
+                method.name(),
+                env,
+            )?;
             reject_resource_capturing_closure(&argument, &callback_schema, span, method, env)?;
             env.slots.insert(slots.receiver, result_schema.clone());
             env.slots.insert(slots.argument, callback_schema.clone());
@@ -1029,7 +1044,14 @@ fn resolve_method(
                     method,
                     "result",
                 )?;
-                callback_schema = retain_contextual_callback_result(callback_schema, &annotated_ok);
+                callback_schema = retain_contextual_callback_result_for_expr(
+                    &argument,
+                    callback_schema,
+                    &annotated_ok,
+                    span,
+                    method.name(),
+                    env,
+                )?;
                 output_ok = callback_result_schema(&callback_schema);
             }
             let output = TypeSchema::Result {
@@ -1068,8 +1090,14 @@ fn resolve_method(
                     method,
                     "result",
                 )?;
-                callback_schema =
-                    retain_contextual_callback_result(callback_schema, &annotated_err);
+                callback_schema = retain_contextual_callback_result_for_expr(
+                    &argument,
+                    callback_schema,
+                    &annotated_err,
+                    span,
+                    method.name(),
+                    env,
+                )?;
                 output_err = callback_result_schema(&callback_schema);
             }
             let output = TypeSchema::Result {
@@ -1131,13 +1159,18 @@ fn resolve_method(
                 )?;
                 contextual_ok = annotated_ok;
             }
-            callback_schema = retain_contextual_callback_result(
+            let callback_context = TypeSchema::Result {
+                ok: Box::new(contextual_ok.clone()),
+                err: Box::new(err_schema.clone()),
+            };
+            callback_schema = retain_contextual_callback_result_for_expr(
+                &argument,
                 callback_schema,
-                &TypeSchema::Result {
-                    ok: Box::new(contextual_ok.clone()),
-                    err: Box::new(err_schema.clone()),
-                },
-            );
+                &callback_context,
+                span,
+                method.name(),
+                env,
+            )?;
             let output_ok = contextual_ok;
             let output = TypeSchema::Result {
                 ok: Box::new(output_ok),
@@ -1195,13 +1228,18 @@ fn resolve_method(
                     "result error type",
                 )?;
             }
-            callback_schema = retain_contextual_callback_result(
+            let callback_context = TypeSchema::Result {
+                ok: Box::new(ok_schema.clone()),
+                err: Box::new(output_err.clone()),
+            };
+            callback_schema = retain_contextual_callback_result_for_expr(
+                &argument,
                 callback_schema,
-                &TypeSchema::Result {
-                    ok: Box::new(ok_schema.clone()),
-                    err: Box::new(output_err.clone()),
-                },
-            );
+                &callback_context,
+                span,
+                method.name(),
+                env,
+            )?;
             let output = TypeSchema::Result {
                 ok: Box::new(ok_schema.clone()),
                 err: Box::new(output_err),
@@ -1514,8 +1552,14 @@ fn resolve_option_method(
                         method_name,
                         "result",
                     )?;
-                    callback_schema =
-                        retain_contextual_callback_result(callback_schema, annotated_inner);
+                    callback_schema = retain_contextual_callback_result_for_expr(
+                        &argument,
+                        callback_schema,
+                        annotated_inner,
+                        span,
+                        method_name,
+                        env,
+                    )?;
                 }
             }
             let output_payload = callback_result_schema(&callback_schema);
@@ -1607,10 +1651,16 @@ fn resolve_option_method(
                         method_name,
                         "result",
                     )?;
-                    callback_schema = retain_contextual_callback_result(
+                    let callback_context =
+                        TypeSchema::Option(Box::new((**annotated_inner).clone()));
+                    callback_schema = retain_contextual_callback_result_for_expr(
+                        &argument,
                         callback_schema,
-                        &TypeSchema::Option(Box::new((**annotated_inner).clone())),
-                    );
+                        &callback_context,
+                        span,
+                        method_name,
+                        env,
+                    )?;
                 }
             }
             let TypeSchema::Option(output_payload) = callback_result_schema(&callback_schema)
@@ -1695,7 +1745,14 @@ fn resolve_option_method(
                     contextual = annotated.clone();
                 }
             }
-            callback_schema = retain_contextual_callback_result(callback_schema, &contextual);
+            callback_schema = retain_contextual_callback_result_for_expr(
+                &argument,
+                callback_schema,
+                &contextual,
+                span,
+                method_name,
+                env,
+            )?;
             super::result::reject_resource_capturing_closure_named(
                 &argument,
                 &callback_schema,
@@ -1773,6 +1830,14 @@ fn resolve_option_method(
                 )?;
                 contextual = annotated.clone();
             }
+            require_materialized_context_result(
+                &argument,
+                &contextual,
+                span,
+                method_name,
+                "fallback",
+                env,
+            )?;
             let fallback_schema = retain_contextual_eager_schema(fallback_schema, &contextual);
             (
                 fallback_schema,
@@ -1821,7 +1886,14 @@ fn resolve_option_method(
                 )?;
                 contextual = annotated.clone();
             }
-            callback_schema = retain_contextual_callback_result(callback_schema, &contextual);
+            callback_schema = retain_contextual_callback_result_for_expr(
+                &argument,
+                callback_schema,
+                &contextual,
+                span,
+                method_name,
+                env,
+            )?;
             super::result::reject_resource_capturing_closure_named(
                 &argument,
                 &callback_schema,
@@ -1904,6 +1976,14 @@ fn resolve_option_method(
                 )?;
                 context_err = (**annotated_err).clone();
             }
+            require_materialized_context_result(
+                &argument,
+                &context_err,
+                span,
+                method_name,
+                "error argument",
+                env,
+            )?;
             let output_err = retain_contextual_eager_schema(error_schema.clone(), &context_err);
             let output = TypeSchema::Result {
                 ok: Box::new(inner.clone()),
@@ -1985,7 +2065,14 @@ fn resolve_option_method(
                 )?;
                 context_err = (**annotated_err).clone();
             }
-            callback_schema = retain_contextual_callback_result(callback_schema, &context_err);
+            callback_schema = retain_contextual_callback_result_for_expr(
+                &argument,
+                callback_schema,
+                &context_err,
+                span,
+                method_name,
+                env,
+            )?;
             let output_err = callback_result_schema(&callback_schema);
             let output = TypeSchema::Result {
                 ok: Box::new(inner.clone()),
@@ -2415,6 +2502,75 @@ fn retain_contextual_eager_schema(inferred: TypeSchema, contextual: &TypeSchema)
     } else {
         inferred
     }
+}
+
+/// Reject a contextual named-record label when the expression at the eager or
+/// callback result position is not a construction the normalizer can
+/// materialize. A typed/materialized record value has no omitted field and
+/// passes; an ordinary partial map variable does not acquire the label.
+fn require_materialized_context_result(
+    expression: &Expr,
+    expected: &TypeSchema,
+    span: Span,
+    method_name: &str,
+    position: &str,
+    env: &Env,
+) -> Result<(), CompileError> {
+    if !method_context_schema_is_known(expected) || !contextual_schema_carries_record(expected) {
+        return Ok(());
+    }
+    if let Some(detail) = super::typing::omitted_option_materialization_detail_for_slots(
+        &env.function_list,
+        &env.function_impls,
+        &env.struct_schemas,
+        expression,
+        expected,
+        &env.slots,
+    ) {
+        return Err(result_error(
+            span,
+            format!(
+                ".{} {} requires a materialized {} ({detail})",
+                method_name,
+                position,
+                render_schema(expected)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Retain the checked contextual callback result only after proving the
+/// callback result position can realize the omitted logical `Option` field.
+fn retain_contextual_callback_result_for_expr(
+    expression: &Expr,
+    callback_schema: TypeSchema,
+    contextual: &TypeSchema,
+    span: Span,
+    method_name: &str,
+    env: &Env,
+) -> Result<TypeSchema, CompileError> {
+    if method_context_schema_is_known(contextual) && contextual_schema_carries_record(contextual) {
+        let TypeSchema::Callable { params, .. } = &callback_schema else {
+            return Ok(callback_schema);
+        };
+        let expected = TypeSchema::Callable {
+            params: params.clone(),
+            result: Box::new(contextual.clone()),
+        };
+        require_materialized_context_result(
+            expression,
+            &expected,
+            span,
+            method_name,
+            "callback result",
+            env,
+        )?;
+    }
+    Ok(retain_contextual_callback_result(
+        callback_schema,
+        contextual,
+    ))
 }
 
 /// Whether a schema still contains an unsubstituted generic parameter. A

@@ -531,6 +531,8 @@ pub(super) fn validate_function_impl(
             observed_body_ty,
             actual_optional,
             actual_schema.as_ref(),
+            &function_impl.body_expr,
+            &state,
             context,
             Some(function_impl.body_expr_line),
             source_name,
@@ -794,9 +796,13 @@ pub(super) fn validate_stmts(
                 let actual_schema = inferred_expr_assignment_schema(expr, &expr_state, context);
                 validate_declared_local_schema(
                     declared_schema.as_ref(),
-                    ty,
-                    context.expr_is_optional(expr, &expr_state),
-                    actual_schema.as_ref(),
+                    DeclaredLocalAssignment {
+                        ty,
+                        optional: context.expr_is_optional(expr, &expr_state),
+                        schema: actual_schema.as_ref(),
+                        expr,
+                        state: &expr_state,
+                    },
                     context,
                     Some(*line),
                     source_name,
@@ -862,9 +868,13 @@ pub(super) fn validate_stmts(
                 let actual_schema = inferred_expr_assignment_schema(expr, &expr_state, context);
                 validate_declared_local_schema(
                     declared_schema.as_ref(),
-                    ty,
-                    context.expr_is_optional(expr, &expr_state),
-                    actual_schema.as_ref(),
+                    DeclaredLocalAssignment {
+                        ty,
+                        optional: context.expr_is_optional(expr, &expr_state),
+                        schema: actual_schema.as_ref(),
+                        expr,
+                        state: &expr_state,
+                    },
                     context,
                     Some(*line),
                     source_name,
@@ -1016,11 +1026,17 @@ pub(super) fn validate_stmts(
     Ok(())
 }
 
+struct DeclaredLocalAssignment<'a> {
+    ty: BoundType,
+    optional: bool,
+    schema: Option<&'a TypeSchema>,
+    expr: &'a Expr,
+    state: &'a LocalTypeState,
+}
+
 fn validate_declared_local_schema(
     schema: Option<&TypeSchema>,
-    actual: BoundType,
-    actual_optional: bool,
-    actual_schema: Option<&TypeSchema>,
+    assignment: DeclaredLocalAssignment<'_>,
     context: &mut TypeContext<'_>,
     line: Option<u32>,
     source_name: Option<&str>,
@@ -1031,7 +1047,7 @@ fn validate_declared_local_schema(
     let resolved = context.resolve_schema(schema);
     let (expected_schema, expected_optional) = resolved.split_optional();
     let expected = context.bound_type_for_schema(&expected_schema);
-    if actual_optional && !expected_optional {
+    if assignment.optional && !expected_optional {
         return Err(CompileError::InvalidFieldAccess {
             line,
             source_name: owned_source_name(source_name),
@@ -1042,7 +1058,7 @@ fn validate_declared_local_schema(
             span: context.stmt_span(line.unwrap_or_default()),
         });
     }
-    if actual == BoundType::Null && !expected_optional && expected != BoundType::Null {
+    if assignment.ty == BoundType::Null && !expected_optional && expected != BoundType::Null {
         return Err(CompileError::InvalidFieldAccess {
             line,
             source_name: owned_source_name(source_name),
@@ -1053,19 +1069,35 @@ fn validate_declared_local_schema(
             span: context.stmt_span(line.unwrap_or_default()),
         });
     }
-    if actual == BoundType::Unknown
-        || (expected_optional && actual == BoundType::Null)
-        || actual == expected
-        || (expected == BoundType::Number && is_numeric_bound_type(actual))
-        || (expected == BoundType::Array && matches!(actual, BoundType::ArrayOf(_)))
-        || (expected == BoundType::Map && matches!(actual, BoundType::MapOf(_)))
+    if assignment.ty == BoundType::Unknown
+        || (expected_optional && assignment.ty == BoundType::Null)
+        || assignment.ty == expected
+        || (expected == BoundType::Number && is_numeric_bound_type(assignment.ty))
+        || (expected == BoundType::Array && matches!(assignment.ty, BoundType::ArrayOf(_)))
+        || (expected == BoundType::Map && matches!(assignment.ty, BoundType::MapOf(_)))
     {
-        if let Some(actual_schema) = actual_schema
+        if let Some(actual_schema) = assignment.schema
             && let Some(detail) = find_declared_schema_mismatch(
                 &expected_schema,
                 actual_schema,
                 context,
                 String::new(),
+            )
+        {
+            return Err(CompileError::InvalidFieldAccess {
+                line,
+                source_name: owned_source_name(source_name),
+                detail,
+                span: context.stmt_span(line.unwrap_or_default()),
+            });
+        }
+        if let Some(actual_schema) = assignment.schema
+            && let Some(detail) = omitted_option_materialization_detail(
+                assignment.expr,
+                &expected_schema,
+                Some(actual_schema),
+                context,
+                assignment.state,
             )
         {
             return Err(CompileError::InvalidFieldAccess {
@@ -1083,7 +1115,7 @@ fn validate_declared_local_schema(
         detail: format!(
             "local is declared as schema type '{}' but was assigned {}",
             schema_type_label(schema),
-            bound_type_label(actual)
+            bound_type_label(assignment.ty)
         ),
         span: context.stmt_span(line.unwrap_or_default()),
     })
@@ -1096,6 +1128,8 @@ fn validate_declared_return_schema(
     actual: BoundType,
     actual_optional: bool,
     actual_schema: Option<&TypeSchema>,
+    expr: &Expr,
+    expr_state: &LocalTypeState,
     context: &mut TypeContext<'_>,
     line: Option<u32>,
     source_name: Option<&str>,
@@ -1138,6 +1172,22 @@ fn validate_declared_return_schema(
                 actual_schema,
                 context,
                 String::new(),
+            )
+        {
+            return Err(CompileError::StrictTypingRequired {
+                line,
+                source_name: owned_source_name(source_name),
+                detail: format!("function '{function_name}' return type mismatch: {detail}"),
+                span: context.stmt_span(line.unwrap_or_default()),
+            });
+        }
+        if let Some(actual_schema) = actual_schema
+            && let Some(detail) = omitted_option_materialization_detail(
+                expr,
+                &expected_schema,
+                Some(actual_schema),
+                context,
+                expr_state,
             )
         {
             return Err(CompileError::StrictTypingRequired {
@@ -1236,6 +1286,370 @@ pub(super) fn find_declared_schema_mismatch(
         &mut recursive_named,
         false,
     )
+}
+
+/// Reject a logical `Option` field omission when the expression at the
+/// requiring position is not a construction the compiler-owned normalizer
+/// can materialize. The schema mismatch owner deliberately admits a missing
+/// `Option` field so that map literals can be completed before this check.
+/// A plain variable, call, parameter or other non-construction value carries
+/// no such construction, so admitting it would install a named record label
+/// without the tagged `None` entry.
+pub(super) fn omitted_option_materialization_detail(
+    expr: &Expr,
+    expected: &TypeSchema,
+    actual: Option<&TypeSchema>,
+    context: &mut TypeContext<'_>,
+    state: &LocalTypeState,
+) -> Option<String> {
+    omission_admission_detail(expr, expected, actual, context, state, "")
+}
+
+fn omission_admission_detail(
+    expr: &Expr,
+    expected: &TypeSchema,
+    actual: Option<&TypeSchema>,
+    context: &mut TypeContext<'_>,
+    state: &LocalTypeState,
+    path: &str,
+) -> Option<String> {
+    let expected = context.substitute_schema_generics(expected);
+    if matches!(expected, TypeSchema::Named(_, _)) {
+        let resolved = context.resolve_schema(&expected);
+        return omission_admission_detail(expr, &resolved, actual, context, state, path);
+    }
+    match &expected {
+        // Legacy nullable `Optional` fields keep their pre-existing admission
+        // rule until the later schema transition.
+        TypeSchema::Optional(_) => None,
+        TypeSchema::Object(fields) => {
+            record_omission_admission_detail(expr, fields, &expected, actual, context, state, path)
+        }
+        TypeSchema::Option(inner) => {
+            if let Expr::OptionConstruct {
+                payload: Some(payload),
+                ..
+            } = expr
+            {
+                let actual_payload = inferred_expr_assignment_schema(payload, state, context);
+                return omission_admission_detail(
+                    payload,
+                    inner,
+                    actual_payload.as_ref(),
+                    context,
+                    state,
+                    path,
+                );
+            }
+            let actual_inner = actual.and_then(|schema| match context.resolve_schema(schema) {
+                TypeSchema::Option(inner) => Some(*inner),
+                _ => None,
+            });
+            actual_inner.and_then(|actual_inner| {
+                omission_admission_detail(expr, inner, Some(&actual_inner), context, state, path)
+            })
+        }
+        TypeSchema::Result { ok, err } => {
+            if let Expr::ResultConstruct {
+                ok: constructed_ok,
+                payload,
+                ..
+            } = expr
+            {
+                let branch = if *constructed_ok { ok } else { err };
+                let actual_payload = inferred_expr_assignment_schema(payload, state, context);
+                return omission_admission_detail(
+                    payload,
+                    branch,
+                    actual_payload.as_ref(),
+                    context,
+                    state,
+                    path,
+                );
+            }
+            let branches = actual.and_then(|schema| match context.resolve_schema(schema) {
+                TypeSchema::Result { ok, err } => Some((*ok, *err)),
+                _ => None,
+            });
+            branches.and_then(|(actual_ok, actual_err)| {
+                omission_admission_detail(expr, ok, Some(&actual_ok), context, state, path).or_else(
+                    || {
+                        omission_admission_detail(
+                            expr,
+                            err,
+                            Some(&actual_err),
+                            context,
+                            state,
+                            path,
+                        )
+                    },
+                )
+            })
+        }
+        TypeSchema::Array(inner) => {
+            let mut values = Vec::new();
+            if array_literal_values(expr, &mut values) {
+                for value in values {
+                    let actual_value = inferred_expr_assignment_schema(value, state, context);
+                    if let Some(detail) = omission_admission_detail(
+                        value,
+                        inner,
+                        actual_value.as_ref(),
+                        context,
+                        state,
+                        path,
+                    ) {
+                        return Some(detail);
+                    }
+                }
+                return None;
+            }
+            let actual_inner = actual.and_then(|schema| match context.resolve_schema(schema) {
+                TypeSchema::Array(inner) => Some(*inner),
+                _ => None,
+            });
+            actual_inner.and_then(|actual_inner| {
+                omission_admission_detail(expr, inner, Some(&actual_inner), context, state, path)
+            })
+        }
+        TypeSchema::Callable { result, .. } => {
+            let expected_callable = expected.clone();
+            match expr {
+                Expr::Closure(closure) => {
+                    let actual_result =
+                        actual.and_then(|schema| callable_result_schema(schema, context));
+                    omission_admission_detail(
+                        &closure.body,
+                        result,
+                        actual_result.as_ref(),
+                        context,
+                        state,
+                        path,
+                    )
+                }
+                Expr::IfElse {
+                    then_expr,
+                    else_expr,
+                    ..
+                } => {
+                    for branch in [then_expr.as_ref(), else_expr.as_ref()] {
+                        let branch_actual = inferred_expr_assignment_schema(branch, state, context);
+                        if let Some(detail) = omission_admission_detail(
+                            branch,
+                            &expected_callable,
+                            branch_actual.as_ref(),
+                            context,
+                            state,
+                            path,
+                        ) {
+                            return Some(detail);
+                        }
+                    }
+                    None
+                }
+                Expr::Match { arms, default, .. } => {
+                    for (_, arm) in arms {
+                        let branch_actual = inferred_expr_assignment_schema(arm, state, context);
+                        if let Some(detail) = omission_admission_detail(
+                            arm,
+                            &expected_callable,
+                            branch_actual.as_ref(),
+                            context,
+                            state,
+                            path,
+                        ) {
+                            return Some(detail);
+                        }
+                    }
+                    let branch_actual = inferred_expr_assignment_schema(default, state, context);
+                    omission_admission_detail(
+                        default,
+                        &expected_callable,
+                        branch_actual.as_ref(),
+                        context,
+                        state,
+                        path,
+                    )
+                }
+                Expr::Block { expr: tail, .. } => omission_admission_detail(
+                    tail,
+                    &expected_callable,
+                    actual,
+                    context,
+                    state,
+                    path,
+                ),
+                _ => {
+                    let actual_result =
+                        actual.and_then(|schema| callable_result_schema(schema, context));
+                    omission_admission_detail(
+                        expr,
+                        result,
+                        actual_result.as_ref(),
+                        context,
+                        state,
+                        path,
+                    )
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+fn record_omission_admission_detail(
+    expr: &Expr,
+    fields: &HashMap<String, TypeSchema>,
+    expected: &TypeSchema,
+    actual: Option<&TypeSchema>,
+    context: &mut TypeContext<'_>,
+    state: &LocalTypeState,
+    path: &str,
+) -> Option<String> {
+    let mut entries = Vec::new();
+    if map_literal_entries(expr, &mut entries) {
+        let mut seen = HashSet::new();
+        for (name, value) in entries.iter().rev() {
+            if !seen.insert(*name) {
+                continue;
+            }
+            let Some(expected_field) = fields.get(*name) else {
+                continue;
+            };
+            let field_path = extend_schema_path(path, name);
+            let actual_value = inferred_expr_assignment_schema(value, state, context);
+            if let Some(detail) = omission_admission_detail(
+                value,
+                expected_field,
+                actual_value.as_ref(),
+                context,
+                state,
+                &field_path,
+            ) {
+                return Some(detail);
+            }
+        }
+        return None;
+    }
+    if let Expr::IfElse {
+        then_expr,
+        else_expr,
+        ..
+    } = expr
+    {
+        for branch in [then_expr.as_ref(), else_expr.as_ref()] {
+            let branch_actual = inferred_expr_assignment_schema(branch, state, context);
+            if let Some(detail) = omission_admission_detail(
+                branch,
+                expected,
+                branch_actual.as_ref(),
+                context,
+                state,
+                path,
+            ) {
+                return Some(detail);
+            }
+        }
+        return None;
+    }
+    if let Expr::Match { arms, default, .. } = expr {
+        for (_, arm) in arms {
+            let branch_actual = inferred_expr_assignment_schema(arm, state, context);
+            if let Some(detail) = omission_admission_detail(
+                arm,
+                expected,
+                branch_actual.as_ref(),
+                context,
+                state,
+                path,
+            ) {
+                return Some(detail);
+            }
+        }
+        let branch_actual = inferred_expr_assignment_schema(default, state, context);
+        return omission_admission_detail(
+            default,
+            expected,
+            branch_actual.as_ref(),
+            context,
+            state,
+            path,
+        );
+    }
+    if let Expr::Block { expr: tail, .. } = expr {
+        let tail_actual = inferred_expr_assignment_schema(tail, state, context);
+        return omission_admission_detail(
+            tail,
+            expected,
+            tail_actual.as_ref(),
+            context,
+            state,
+            path,
+        );
+    }
+    let actual = context.resolve_schema(actual?);
+    let TypeSchema::Object(actual_fields) = &actual else {
+        return None;
+    };
+    for (name, expected_field) in fields {
+        let expected_field = context.substitute_schema_generics(expected_field);
+        if matches!(expected_field, TypeSchema::Option(_)) && !actual_fields.contains_key(name) {
+            let field_path = extend_schema_path(path, name);
+            return Some(format!(
+                "field '{}' is missing from a non-construction value: an omitted logical Option field must be materialized at a map literal construction with the declared schema",
+                field_path
+            ));
+        }
+    }
+    None
+}
+
+fn map_literal_entries<'a>(expr: &'a Expr, entries: &mut Vec<(&'a str, &'a Expr)>) -> bool {
+    match expr {
+        Expr::Call(index, _, args, _, _)
+            if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::MapNew) =>
+        {
+            args.is_empty()
+        }
+        Expr::Call(index, _, args, _, _)
+            if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::Set)
+                && args.len() == 3 =>
+        {
+            if let Expr::String(key) = &args[1] {
+                entries.push((key.as_str(), &args[2]));
+            }
+            map_literal_entries(&args[0], entries)
+        }
+        _ => false,
+    }
+}
+
+fn array_literal_values<'a>(expr: &'a Expr, values: &mut Vec<&'a Expr>) -> bool {
+    match expr {
+        Expr::Call(index, _, args, _, _)
+            if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::ArrayNew) =>
+        {
+            args.is_empty()
+        }
+        Expr::Call(index, _, args, _, _)
+            if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::ArrayPush)
+                && args.len() == 2 =>
+        {
+            values.push(&args[1]);
+            array_literal_values(&args[0], values)
+        }
+        _ => false,
+    }
+}
+
+fn callable_result_schema(
+    schema: &TypeSchema,
+    context: &mut TypeContext<'_>,
+) -> Option<TypeSchema> {
+    match context.resolve_schema(schema) {
+        TypeSchema::Callable { result, .. } => Some(*result),
+        _ => None,
+    }
 }
 
 fn find_declared_schema_mismatch_with_recursion(

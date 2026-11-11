@@ -1173,3 +1173,35 @@ fn typed_unwrap_payload_still_requires_the_payload_type() {
         );
     }
 }
+
+#[test]
+fn result_unwrap_or_rejects_nonconstruction_sparse_fallback() {
+    let diagnostic = reject(
+        r#"
+        struct Entry { name: string, note: Option<int> }
+        fn make(flag: Result<Entry, int>) -> Entry {
+            let raw = { name: "x" };
+            flag.unwrap_or(raw)
+        }
+        make(Result::Err(3)).name;
+        "#,
+    );
+    assert!(
+        diagnostic.contains("unwrap_or")
+            && diagnostic.contains("field 'note'")
+            && diagnostic.contains("must be materialized"),
+        "the Result eager fallback must be rejected before the named label is installed: {diagnostic}"
+    );
+}
+
+#[test]
+fn result_unwrap_or_keeps_a_previously_materialized_named_fallback() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        let fallback: Entry = { name: "x" };
+        let absent: Result<Entry, int> = Result::Err(3);
+        let item: Entry = absent.unwrap_or(fallback);
+        match item.note { Option::Some(value) => value, Option::None => 0 };
+    "#;
+    assert_eq!(eval(source), Value::Int(0));
+}

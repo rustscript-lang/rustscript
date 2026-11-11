@@ -8,7 +8,8 @@ use super::super::source_map::Span;
 use super::context::{TypeContext, infer_access_schema, render_schema_label};
 use super::helpers::{
     bind_expr_result_to_slot, bound_type_label, find_declared_schema_mismatch, infer_binary_type,
-    infer_unary_type, is_numeric_bound_type, refine_state_for_match_pattern, validate_stmts,
+    infer_unary_type, is_numeric_bound_type, omitted_option_materialization_detail,
+    refine_state_for_match_pattern, validate_stmts,
 };
 use super::state::{
     BoundType, InferredCallable, LocalTypeState, are_compatible_bound_types, merge_bound_types,
@@ -229,6 +230,15 @@ fn validate_expr_matches_schema(
         if let Some(detail) =
             find_declared_schema_mismatch(&expected_schema, actual_schema, context, String::new())
         {
+            return callable_argument_mismatch(site, format!("{label} type mismatch: {detail}"));
+        }
+        if let Some(detail) = omitted_option_materialization_detail(
+            expr,
+            &expected_schema,
+            Some(actual_schema),
+            context,
+            state,
+        ) {
             return callable_argument_mismatch(site, format!("{label} type mismatch: {detail}"));
         }
         return Ok(());
