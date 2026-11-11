@@ -643,7 +643,7 @@ fn record_expr_local_debug_ranges(
             key,
             container_slot,
             key_slot,
-            semantic_id: _,
+            ..
         } => {
             note_local_use(ranges, *container_slot, line);
             note_local_use(ranges, *key_slot, line);
@@ -749,6 +749,30 @@ fn record_expr_local_debug_ranges(
             }
             record_expr_local_debug_ranges(receiver, line, ranges);
             record_expr_local_debug_ranges(argument, line, ranges);
+        }
+        Expr::OptionMethod {
+            receiver,
+            argument,
+            slots,
+            ..
+        } => {
+            note_local_use(ranges, slots.receiver, line);
+            note_local_use(ranges, slots.argument, line);
+            note_local_use(ranges, slots.some_binding, line);
+            record_expr_local_debug_ranges(receiver, line, ranges);
+            record_expr_local_debug_ranges(argument, line, ranges);
+        }
+        Expr::ResultConvert {
+            value,
+            value_slot,
+            ok_binding,
+            err_binding,
+            ..
+        } => {
+            note_local_use(ranges, *value_slot, line);
+            note_local_use(ranges, *ok_binding, line);
+            note_local_use(ranges, *err_binding, line);
+            record_expr_local_debug_ranges(value, line, ranges);
         }
         Expr::OptionConstruct { payload, .. } => {
             if let Some(payload) = payload {
@@ -3413,7 +3437,17 @@ mod tests {
         .unwrap_or_else(|error| panic!("native strict sibling projection: {error}"));
         let mut machine = crate::Vm::new(compiled.program);
         assert_eq!(machine.run().unwrap(), crate::VmStatus::Halted);
-        assert_eq!(machine.stack(), &[crate::Value::Null]);
+        let stack = machine.stack();
+        assert_eq!(stack.len(), 1);
+        match &stack[0] {
+            crate::Value::Map(map) => {
+                assert_eq!(
+                    map.get(&crate::Value::string("tag")),
+                    Some(&crate::Value::Bool(false))
+                );
+            }
+            other => panic!("logical projection must yield None, found {other:?}"),
+        }
     }
 
     #[test]

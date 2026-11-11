@@ -495,6 +495,13 @@ impl Classifier {
                 self.expr(frame, receiver);
                 self.expr(frame, argument);
             }
+            Expr::ResultConvert { value, .. } => self.expr(frame, value),
+            Expr::OptionMethod {
+                receiver, argument, ..
+            } => {
+                self.expr(frame, receiver);
+                self.expr(frame, argument);
+            }
             other @ (Expr::ResultConstruct { .. }
             | Expr::ResultQuery { .. }
             | Expr::ResultMatch { .. }

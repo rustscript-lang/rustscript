@@ -2474,7 +2474,7 @@ fn nested_local_call_in_call_arg_optional_key_and_unwrap_fallback_stays_compact(
         "struct Payload { values: [int] }\n\
          fn helper(x: int) -> int { x + 1 }\n\
          pub fn run(context: map) -> map {\n\
-             let f = |x| x + 1;\n\
+             let f: fn(int) -> int = |x| x + 1;\n\
              let payload: Payload = { values: [1, 2, 3] };\n\
              let a: int = helper(f(10));\n\
              let b: int = payload?.values?.[f(20)].unwrap_or(-1);\n\

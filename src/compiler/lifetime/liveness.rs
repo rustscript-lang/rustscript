@@ -571,7 +571,7 @@ impl LivenessRewriter {
                 key,
                 container_slot,
                 key_slot,
-                semantic_id: _,
+                ..
             } => {
                 self.mark_live(live, *container_slot);
                 self.mark_live(live, *key_slot);
@@ -678,6 +678,7 @@ impl LivenessRewriter {
             }
             other @ (Expr::ResultConstruct { .. }
             | Expr::ResultQuery { .. }
+            | Expr::ResultConvert { .. }
             | Expr::ResultMatch { .. }
             | Expr::ResultTry { .. }
             | Expr::ResultMethod { .. }) => {
@@ -692,6 +693,27 @@ impl LivenessRewriter {
                 if let Expr::ResultMethod { slots, .. } = other {
                     self.mark_live(live, slots.receiver);
                     self.mark_live(live, slots.argument);
+                }
+                if let Expr::ResultConvert {
+                    value_slot,
+                    ok_binding,
+                    err_binding,
+                    ..
+                } = other
+                {
+                    self.mark_live(live, *value_slot);
+                    self.mark_live(live, *ok_binding);
+                    self.mark_live(live, *err_binding);
+                }
+            }
+            other @ Expr::OptionMethod { .. } => {
+                other.visit_option_children(|child| {
+                    self.add_expr_uses_impl(child, live, conservative)
+                });
+                if let Expr::OptionMethod { slots, .. } = other {
+                    self.mark_live(live, slots.receiver);
+                    self.mark_live(live, slots.argument);
+                    self.mark_live(live, slots.some_binding);
                 }
             }
             Expr::OptionConstruct { payload, .. } => {
@@ -1172,7 +1194,7 @@ impl LocalSlotAllocator {
                 key,
                 container_slot,
                 key_slot,
-                semantic_id: _,
+                ..
             } => {
                 self.add_slot_live_edges(*container_slot, &live_during);
                 self.add_slot_live_edges(*key_slot, &live_during);
@@ -1322,6 +1344,30 @@ impl LocalSlotAllocator {
                 }
                 self.collect_expr_constraints(receiver, &live_during, protected_slots)?;
                 self.collect_expr_constraints(argument, &live_during, protected_slots)?;
+            }
+            Expr::OptionMethod {
+                receiver,
+                argument,
+                slots,
+                ..
+            } => {
+                self.add_slot_live_edges(slots.receiver, &live_during);
+                self.add_slot_live_edges(slots.argument, &live_during);
+                self.add_slot_live_edges(slots.some_binding, &live_during);
+                self.collect_expr_constraints(receiver, &live_during, protected_slots)?;
+                self.collect_expr_constraints(argument, &live_during, protected_slots)?;
+            }
+            Expr::ResultConvert {
+                value,
+                value_slot,
+                ok_binding,
+                err_binding,
+                ..
+            } => {
+                self.add_slot_live_edges(*value_slot, &live_during);
+                self.add_slot_live_edges(*ok_binding, &live_during);
+                self.add_slot_live_edges(*err_binding, &live_during);
+                self.collect_expr_constraints(value, &live_during, protected_slots)?;
             }
             Expr::ResultMatch {
                 value,
@@ -1525,7 +1571,7 @@ impl LocalSlotAllocator {
                 key,
                 container_slot,
                 key_slot,
-                semantic_id: _,
+                ..
             } => {
                 self.mark_set_slot(set, *container_slot);
                 self.mark_set_slot(set, *key_slot);
@@ -1652,6 +1698,30 @@ impl LocalSlotAllocator {
                 }
                 self.collect_expr_footprint(receiver, set, stack);
                 self.collect_expr_footprint(argument, set, stack);
+            }
+            Expr::OptionMethod {
+                receiver,
+                argument,
+                slots,
+                ..
+            } => {
+                self.mark_set_slot(set, slots.receiver);
+                self.mark_set_slot(set, slots.argument);
+                self.mark_set_slot(set, slots.some_binding);
+                self.collect_expr_footprint(receiver, set, stack);
+                self.collect_expr_footprint(argument, set, stack);
+            }
+            Expr::ResultConvert {
+                value,
+                value_slot,
+                ok_binding,
+                err_binding,
+                ..
+            } => {
+                self.mark_set_slot(set, *value_slot);
+                self.mark_set_slot(set, *ok_binding);
+                self.mark_set_slot(set, *err_binding);
+                self.collect_expr_footprint(value, set, stack);
             }
             Expr::ResultMatch {
                 value,
@@ -2051,6 +2121,7 @@ fn collect_persistent_closure_sources_from_expr(expr: &Expr, slots: &mut BTreeSe
         }
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
+        | Expr::ResultConvert { .. }
         | Expr::ResultMatch { .. }
         | Expr::ResultTry { .. }
         | Expr::ResultMethod { .. }) => {
@@ -2058,7 +2129,9 @@ fn collect_persistent_closure_sources_from_expr(expr: &Expr, slots: &mut BTreeSe
                 collect_persistent_closure_sources_from_expr(child, slots)
             });
         }
-        other @ (Expr::OptionConstruct { .. } | Expr::OptionMatch { .. }) => {
+        other @ (Expr::OptionConstruct { .. }
+        | Expr::OptionMatch { .. }
+        | Expr::OptionMethod { .. }) => {
             other.visit_option_children(|child| {
                 collect_persistent_closure_sources_from_expr(child, slots)
             });
@@ -2210,7 +2283,7 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
             key,
             container_slot,
             key_slot,
-            semantic_id: _,
+            ..
         } => {
             *container_slot = remap_slot(*container_slot, mapping)?;
             *key_slot = remap_slot(*key_slot, mapping)?;
@@ -2325,6 +2398,30 @@ fn remap_expr_slots(expr: &mut Expr, mapping: &[LocalSlot]) -> Result<(), ParseE
             }
             remap_expr_slots(receiver, mapping)?;
             remap_expr_slots(argument, mapping)?;
+        }
+        Expr::OptionMethod {
+            receiver,
+            argument,
+            slots,
+            ..
+        } => {
+            slots.receiver = remap_slot(slots.receiver, mapping)?;
+            slots.argument = remap_slot(slots.argument, mapping)?;
+            slots.some_binding = remap_slot(slots.some_binding, mapping)?;
+            remap_expr_slots(receiver, mapping)?;
+            remap_expr_slots(argument, mapping)?;
+        }
+        Expr::ResultConvert {
+            value,
+            value_slot,
+            ok_binding,
+            err_binding,
+            ..
+        } => {
+            *value_slot = remap_slot(*value_slot, mapping)?;
+            *ok_binding = remap_slot(*ok_binding, mapping)?;
+            *err_binding = remap_slot(*err_binding, mapping)?;
+            remap_expr_slots(value, mapping)?;
         }
         Expr::Block { stmts, expr } => {
             for nested in stmts {

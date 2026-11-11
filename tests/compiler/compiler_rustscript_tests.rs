@@ -2871,14 +2871,12 @@ fn rustscript_if_and_match_runtime_cases_work() {
                 let data: Data = { values: [41] };
 
                 let present = match data?.values?.[0] {
-                    None => 0,
-                    Some(value) => value + 1,
-                    _ => 0,
+                    Option::None => 0,
+                    Option::Some(value) => value + 1,
                 };
                 let missing = match data?.values?.[1] {
-                    None => 1,
-                    Some(value) => value,
-                    _ => 0,
+                    Option::None => 1,
+                    Option::Some(value) => value,
                 };
 
                 present + missing;
@@ -3553,7 +3551,7 @@ fn rustscript_referenced_struct_schema_runtime_cases_work() {
                 struct User { age: Age }
                 let user: User = { age: { first: 41 } };
                 let age = user?.age;
-                age?.first;
+                age?.first.unwrap_or(-1);
             "#,
             vec![Value::Int(41)],
         ),
@@ -3682,7 +3680,7 @@ fn rustscript_recursive_struct_schema_runtime_cases_work() {
 
             let node: Node = { value: 1, next: { value: 41, next: {} }};
             let next = node?.next;
-            next?.value;
+            next?.value.unwrap_or(-1);
         "#,
         vec![Value::Int(41)],
     )];
@@ -3869,9 +3867,8 @@ fn rustscript_optional_chain_rejects_statistically_mismatched_declared_schemas()
 
                 let profile: Profile = { stats: { score: "oops" } };
                 match profile?.stats?.score {
-                    None => 0,
-                    Some(score) => score + 1,
-                    _ => 0,
+                    Option::None => 0,
+                    Option::Some(score) => score + 1,
                 };
             "#,
             flavor: SourceFlavor::RustScript,

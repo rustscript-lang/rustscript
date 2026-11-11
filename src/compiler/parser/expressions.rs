@@ -1609,6 +1609,28 @@ impl Parser {
                         expr_span,
                     )?;
                 } else if self.dialect.allow_result_syntax()
+                    && self.check(&TokenKind::LParen)
+                    && let Some(method) = OptionMethod::from_member(&member)
+                {
+                    self.expect(&TokenKind::LParen, "expected '(' after Option method")?;
+                    let argument = self.parse_expr()?;
+                    self.expect(
+                        &TokenKind::RParen,
+                        "expected ')' after Option method argument",
+                    )?;
+                    let expr_span = Span::new(
+                        chain_start.source_id,
+                        chain_start.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    expr = self.build_option_method_expr(
+                        method,
+                        expr,
+                        argument,
+                        member_span,
+                        expr_span,
+                    )?;
+                } else if self.dialect.allow_result_syntax()
                     && (member == "is_ok" || member == "is_err")
                     && self.check(&TokenKind::LParen)
                 {
@@ -1624,6 +1646,33 @@ impl Parser {
                         ok: member == "is_ok",
                         span: expr_span,
                         semantic_id: None,
+                    };
+                } else if self.dialect.allow_result_syntax()
+                    && (member == "ok" || member == "err")
+                    && self.check(&TokenKind::LParen)
+                {
+                    self.expect(&TokenKind::LParen, "expected '(' after Result conversion")?;
+                    self.expect(&TokenKind::RParen, "Result conversion takes no arguments")?;
+                    let expr_span = Span::new(
+                        chain_start.source_id,
+                        chain_start.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    let semantic_id = self.alloc_call_id(
+                        member_span,
+                        expr_span,
+                        ParsedCallTarget::Unresolved,
+                        member.clone(),
+                        false,
+                    );
+                    expr = Expr::ResultConvert {
+                        ok: member == "ok",
+                        value: Box::new(expr),
+                        value_slot: self.allocate_hidden_local()?,
+                        ok_binding: self.allocate_hidden_local()?,
+                        err_binding: self.allocate_hidden_local()?,
+                        span: expr_span,
+                        semantic_id,
                     };
                 } else if member == "length" {
                     let expr_span =
@@ -1929,6 +1978,9 @@ impl Parser {
         );
         Ok(Expr::OptionalGet {
             field_projection: false,
+            logical_projection: self.dialect.allow_result_syntax(),
+            option_receiver: false,
+            logical_unit_field: false,
             container: Box::new(container),
             key: Box::new(key),
             container_slot: self.allocate_hidden_local()?,
@@ -2012,6 +2064,41 @@ impl Parser {
                 argument: argument_slot,
                 ok_binding,
                 err_binding,
+            },
+            span: expr_span,
+            semantic_id,
+        })
+    }
+
+    /// Build the structured, type-preserving carrier for an Option-only
+    /// conversion (`ok_or`, `ok_or_else`). Shared combinator names keep the
+    /// Result carrier and are resolved by the receiver's owner.
+    pub(super) fn build_option_method_expr(
+        &mut self,
+        method: OptionMethod,
+        receiver: Expr,
+        argument: Expr,
+        callee_span: Span,
+        expr_span: Span,
+    ) -> Result<Expr, ParseError> {
+        let semantic_id = self.alloc_call_id(
+            callee_span,
+            expr_span,
+            ParsedCallTarget::Unresolved,
+            method.name().to_string(),
+            false,
+        );
+        let receiver_slot = self.allocate_hidden_local()?;
+        let argument_slot = self.allocate_hidden_local()?;
+        let some_binding = self.allocate_hidden_local()?;
+        Ok(Expr::OptionMethod {
+            method,
+            receiver: Box::new(receiver),
+            argument: Box::new(argument),
+            slots: OptionMethodSlots {
+                receiver: receiver_slot,
+                argument: argument_slot,
+                some_binding,
             },
             span: expr_span,
             semantic_id,

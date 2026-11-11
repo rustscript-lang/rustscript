@@ -1308,6 +1308,35 @@ impl AvailabilityAnalyzer {
                 }
                 Ok(out)
             }
+            Expr::OptionMethod {
+                receiver,
+                argument,
+                slots,
+                ..
+            } => {
+                let mut out = self.analyze_expr(receiver, state, line)?;
+                self.mark_owned_value_reads_moved(receiver, &mut out);
+                self.mark_available(&mut out, slots.receiver, line)?;
+                out = self.analyze_expr(argument, &out, line)?;
+                self.mark_owned_value_reads_moved(argument, &mut out);
+                self.mark_available(&mut out, slots.argument, line)?;
+                self.mark_available(&mut out, slots.some_binding, line)?;
+                Ok(out)
+            }
+            Expr::ResultConvert {
+                value,
+                value_slot,
+                ok_binding,
+                err_binding,
+                ..
+            } => {
+                let mut out = self.analyze_expr(value, state, line)?;
+                self.mark_owned_value_reads_moved(value, &mut out);
+                self.mark_available(&mut out, *value_slot, line)?;
+                self.mark_available(&mut out, *ok_binding, line)?;
+                self.mark_available(&mut out, *err_binding, line)?;
+                Ok(out)
+            }
             Expr::ResultTry {
                 value, value_slot, ..
             } => {
@@ -1831,7 +1860,7 @@ impl AvailabilityAnalyzer {
                 key,
                 container_slot,
                 key_slot,
-                semantic_id: _,
+                ..
             } => {
                 self.is_owned_slot(*container_slot)
                     || self.is_owned_slot(*key_slot)
@@ -1907,6 +1936,7 @@ impl AvailabilityAnalyzer {
             }
             other @ (Expr::ResultConstruct { .. }
             | Expr::ResultQuery { .. }
+            | Expr::ResultConvert { .. }
             | Expr::ResultMatch { .. }
             | Expr::ResultTry { .. }
             | Expr::ResultMethod { .. }) => {
@@ -1914,7 +1944,9 @@ impl AvailabilityAnalyzer {
                 other.visit_result_children(|child| found |= self.expr_contains_owned_local(child));
                 found
             }
-            other @ (Expr::OptionConstruct { .. } | Expr::OptionMatch { .. }) => {
+            other @ (Expr::OptionConstruct { .. }
+            | Expr::OptionMatch { .. }
+            | Expr::OptionMethod { .. }) => {
                 let mut found = false;
                 other.visit_option_children(|child| found |= self.expr_contains_owned_local(child));
                 found
@@ -2232,6 +2264,9 @@ impl AvailabilityAnalyzer {
             } => Ok(self.rewrite_runtime_field_move_expr(expr, state)),
             Expr::OptionalGet {
                 field_projection,
+                logical_projection,
+                option_receiver,
+                logical_unit_field,
                 container,
                 key,
                 container_slot,
@@ -2243,6 +2278,9 @@ impl AvailabilityAnalyzer {
                 self.mark_owned_value_reads_moved(&container, &mut container_state);
                 Ok(Expr::OptionalGet {
                     field_projection: *field_projection,
+                    logical_projection: *logical_projection,
+                    option_receiver: *option_receiver,
+                    logical_unit_field: *logical_unit_field,
                     container: Box::new(container),
                     key: Box::new(self.rewrite_expr_ownership_inner(
                         key,
@@ -2524,6 +2562,52 @@ impl AvailabilityAnalyzer {
                     receiver: Box::new(receiver),
                     argument: Box::new(argument),
                     slots: *slots,
+                    span: *span,
+                    semantic_id: *semantic_id,
+                })
+            }
+            Expr::OptionMethod {
+                method,
+                receiver,
+                argument,
+                slots,
+                span,
+                semantic_id,
+            } => {
+                let (receiver, mut receiver_state) =
+                    self.rewrite_expr_and_state(receiver, false, state, 1)?;
+                self.mark_owned_value_reads_moved(&receiver, &mut receiver_state);
+                self.mark_available(&mut receiver_state, slots.receiver, 1)?;
+                let argument =
+                    self.rewrite_expr_ownership_inner(argument, false, &receiver_state)?;
+                Ok(Expr::OptionMethod {
+                    method: *method,
+                    receiver: Box::new(receiver),
+                    argument: Box::new(argument),
+                    slots: *slots,
+                    span: *span,
+                    semantic_id: *semantic_id,
+                })
+            }
+            Expr::ResultConvert {
+                ok,
+                value,
+                value_slot,
+                ok_binding,
+                err_binding,
+                span,
+                semantic_id,
+            } => {
+                let (value, mut receiver_state) =
+                    self.rewrite_expr_and_state(value, false, state, 1)?;
+                self.mark_owned_value_reads_moved(&value, &mut receiver_state);
+                self.mark_available(&mut receiver_state, *value_slot, 1)?;
+                Ok(Expr::ResultConvert {
+                    ok: *ok,
+                    value: Box::new(value),
+                    value_slot: *value_slot,
+                    ok_binding: *ok_binding,
+                    err_binding: *err_binding,
                     span: *span,
                     semantic_id: *semantic_id,
                 })
@@ -3268,6 +3352,9 @@ mod tests {
         }
         let optional = Expr::OptionalGet {
             field_projection: false,
+            logical_projection: false,
+            option_receiver: false,
+            logical_unit_field: false,
             container: Box::new(take_call(Expr::Var(0), &key)),
             key: Box::new(polex_try_expr()),
             container_slot: 4,

@@ -348,6 +348,13 @@ fn collect_root_expr(
             operand(receiver, false);
             operand(argument, false);
         }
+        Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            operand(receiver, false);
+            operand(argument, false);
+        }
+        Expr::ResultConvert { value, .. } => operand(value, false),
         Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
             operand(lhs, false);
             operand(rhs, true);
@@ -1237,6 +1244,44 @@ fn collect_expr_types(
             );
             collect_expr_types(
                 argument,
+                state,
+                local_types,
+                local_schemas,
+                local_schema_labels,
+                callable_slots,
+                optional_slots,
+                context,
+            );
+            let _ = context.infer_expr_type(expr, state);
+        }
+        Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            collect_expr_types(
+                receiver,
+                state,
+                local_types,
+                local_schemas,
+                local_schema_labels,
+                callable_slots,
+                optional_slots,
+                context,
+            );
+            collect_expr_types(
+                argument,
+                state,
+                local_types,
+                local_schemas,
+                local_schema_labels,
+                callable_slots,
+                optional_slots,
+                context,
+            );
+            let _ = context.infer_expr_type(expr, state);
+        }
+        Expr::ResultConvert { value, .. } => {
+            collect_expr_types(
+                value,
                 state,
                 local_types,
                 local_schemas,

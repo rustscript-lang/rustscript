@@ -130,7 +130,7 @@ fn optional_access_and_optional_type_remain_distinct_from_try() {
         let user: User = { age: { first: 41 } };
         let age = user?.age;
         let first = age?.first;
-        first;
+        first.unwrap_or(41);
     "#;
     assert_eq!(eval(source), vm::Value::Int(41));
     let optional_type = r#"

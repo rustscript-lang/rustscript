@@ -1007,6 +1007,39 @@ fn option_states_execute_in_trace_jit() {
 
 #[cfg(feature = "cranelift-jit")]
 #[test]
+fn option_combinators_and_projection_execute_in_trace_jit() {
+    let source = r#"
+        struct Row { value: int }
+        let row: Row = { value: 2 };
+        let mut index = 0;
+        let mut total = 0;
+        while index < 128 {
+            let base: Option<int> = Option::Some(index);
+            let mapped = base.map(|value| value + 1).and_then(|value| Option::Some(value + 1));
+            let selected = mapped.unwrap_or(0);
+            let projected = row?.value.unwrap_or(0);
+            total = total + selected + projected;
+            index = index + 1;
+        }
+        total;
+    "#;
+    let mut machine = machine(source);
+    machine.set_jit_config(vm::JitConfig {
+        enabled: true,
+        hot_loop_threshold: 1,
+        max_trace_len: 1024,
+    });
+    assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+    assert_eq!(machine.stack().last(), Some(&Value::Int(8640)));
+    assert!(
+        machine.jit_native_exec_count() > 0,
+        "Option combinators and projection must execute in a native trace: {}",
+        machine.dump_jit_info()
+    );
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[test]
 fn option_roundtrip_executes_from_loaded_aot_artifact() {
     let source = "use option_sdk; let value: Option<int[]> = option_sdk::fixture(Option::Some([3, 4])); option_sdk::inspect(value);";
     let mut source_machine = machine(source);

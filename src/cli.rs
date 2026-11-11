@@ -2213,15 +2213,18 @@ mod tests {
             .find(|b| b.name == "field")
             .unwrap();
         assert_eq!(
-            field.schema.as_ref().map(|s| s.split_optional().0),
-            Some(crate::TypeSchema::Int)
+            field.schema,
+            Some(crate::TypeSchema::Option(Box::new(crate::TypeSchema::Int)))
         );
-        assert!(field.optional);
+        assert!(!field.optional);
         run_repl_snippet_and_sync(&mut session, source);
-        assert_eq!(session.locals["field"].value, Value::Int(41));
-        assert!(session.locals["field"].optional);
-        let machine =
-            run_repl_snippet_and_sync(&mut session, "let y: int? = field; y.unwrap_or(0);");
+        assert!(matches!(session.locals["field"].value, Value::Map(_)));
+        assert_eq!(
+            session.locals["field"].schema,
+            Some(crate::TypeSchema::Option(Box::new(crate::TypeSchema::Int)))
+        );
+        assert!(!session.locals["field"].optional);
+        let machine = run_repl_snippet_and_sync(&mut session, "field.unwrap_or(0);");
         assert_eq!(machine.stack(), &[Value::Int(41)]);
     }
 

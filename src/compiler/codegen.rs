@@ -89,6 +89,13 @@ impl Default for Compiler {
     }
 }
 
+#[derive(Clone, Copy)]
+struct OptionalProjection {
+    logical: bool,
+    receiver: bool,
+    unit_field: bool,
+}
+
 impl Compiler {
     pub fn new() -> Self {
         Self {
@@ -837,13 +844,27 @@ impl Compiler {
             }
             Expr::OptionalGet {
                 field_projection: _,
+                logical_projection,
+                option_receiver,
+                logical_unit_field,
                 container,
                 key,
                 container_slot,
                 key_slot,
                 semantic_id: _,
             } => {
-                self.compile_optional_get_expr(container, key, *container_slot, *key_slot)?;
+                self.compile_optional_get_expr(
+                    container,
+                    key,
+                    *container_slot,
+                    *key_slot,
+                    OptionalProjection {
+                        logical: *logical_projection,
+                        receiver: *option_receiver,
+                        unit_field: *logical_unit_field,
+                    },
+                    crate::compiler::source_map::Span::new(0, 0, 0),
+                )?;
             }
             Expr::OptionUnwrapOr {
                 value,
@@ -1176,16 +1197,52 @@ impl Compiler {
                 value,
                 value_slot,
                 payload_slot,
+                operand_schema,
                 exit_cleanup,
                 span,
                 ..
-            } => self.compile_result_try(value, *value_slot, *payload_slot, exit_cleanup, *span)?,
+            } => {
+                if matches!(operand_schema, crate::compiler::TypeSchema::Option(_)) {
+                    self.compile_option_try(
+                        value,
+                        *value_slot,
+                        *payload_slot,
+                        exit_cleanup,
+                        *span,
+                    )?;
+                } else {
+                    self.compile_result_try(
+                        value,
+                        *value_slot,
+                        *payload_slot,
+                        exit_cleanup,
+                        *span,
+                    )?;
+                }
+            }
             Expr::ResultMethod { span, .. } => {
                 return Err(CompileError::StrictTypingRequired {
                     line: None,
                     source_name: None,
                     detail: "unresolved Result combinator method reached code generation"
                         .to_string(),
+                    span: Some(*span),
+                });
+            }
+            Expr::OptionMethod { span, .. } => {
+                return Err(CompileError::StrictTypingRequired {
+                    line: None,
+                    source_name: None,
+                    detail: "unresolved Option combinator method reached code generation"
+                        .to_string(),
+                    span: Some(*span),
+                });
+            }
+            Expr::ResultConvert { span, .. } => {
+                return Err(CompileError::StrictTypingRequired {
+                    line: None,
+                    source_name: None,
+                    detail: "unresolved Result conversion reached code generation".to_string(),
                     span: Some(*span),
                 });
             }
@@ -1352,17 +1409,102 @@ impl Compiler {
         Ok(())
     }
 
+    fn compile_option_try(
+        &mut self,
+        value: &Expr,
+        value_slot: LocalSlot,
+        payload_slot: LocalSlot,
+        exit_cleanup: &[(LocalSlot, crate::compiler::TypeSchema)],
+        span: crate::compiler::source_map::Span,
+    ) -> Result<(), CompileError> {
+        if !self.in_callable {
+            return Err(CompileError::StrictTypingRequired {
+                line: None,
+                source_name: None,
+                detail: "? requires the enclosing function or closure to return Option<U>"
+                    .to_string(),
+                span: Some(span),
+            });
+        }
+        self.compile_expr(value)?;
+        self.emit_stloc(value_slot)?;
+        self.emit_copy_ldloc(value_slot)?;
+        self.assembler
+            .push_const(Value::string(super::option::OPTION_TAG_KEY));
+        self.record_operand_types(ValueType::Map, ValueType::String);
+        self.assembler.call(BuiltinFunction::Get.call_index(), 2);
+        let none_label = self.fresh_label("option_try_none");
+        let some_label = self.fresh_label("option_try_some");
+        self.record_unary_operand_type(ValueType::Bool);
+        self.assembler.brfalse_label(&none_label);
+        self.compile_result_binding(value_slot, Some(payload_slot))?;
+        self.emit_move_ldloc(payload_slot)?;
+        self.assembler.br_label(&some_label);
+        self.assembler
+            .label(&none_label)
+            .map_err(CompileError::Assembler)?;
+        self.emit_move_ldloc(value_slot)?;
+        self.emit_err_ret(exit_cleanup)?;
+        self.assembler
+            .label(&some_label)
+            .map_err(CompileError::Assembler)?;
+        Ok(())
+    }
+
     fn compile_optional_get_expr(
         &mut self,
         container: &Expr,
         key: &Expr,
         container_slot: LocalSlot,
         key_slot: LocalSlot,
+        projection: OptionalProjection,
+        span: crate::compiler::source_map::Span,
     ) -> Result<(), CompileError> {
         self.compile_scalar_expr(container)?;
         self.emit_stloc(container_slot)?;
         self.compile_scalar_expr(key)?;
         self.emit_stloc(key_slot)?;
+
+        if projection.logical {
+            let none_label = self.fresh_label("option_projection_none");
+            let done_label = self.fresh_label("option_projection_done");
+            if projection.receiver {
+                // Consume exactly one receiver Option layer: None projects to
+                // None; Some(payload) projects the payload's child. The
+                // payload's own shape/schema (including a nested Option) is
+                // preserved by the lookup below.
+                self.emit_copy_ldloc(container_slot)?;
+                self.assembler
+                    .push_const(Value::string(super::option::OPTION_TAG_KEY));
+                self.record_operand_types(ValueType::Map, ValueType::String);
+                self.assembler.call(BuiltinFunction::Get.call_index(), 2);
+                self.record_unary_operand_type(ValueType::Bool);
+                self.assembler.brfalse_label(&none_label);
+                self.compile_result_binding(container_slot, Some(container_slot))?;
+            }
+            let lookup = self.logical_projection_lookup(
+                container_slot,
+                key_slot,
+                projection.unit_field,
+                span,
+            );
+            self.compile_expr(&lookup)?;
+            self.assembler.br_label(&done_label);
+            self.assembler
+                .label(&none_label)
+                .map_err(CompileError::Assembler)?;
+            self.compile_expr(&Expr::OptionConstruct {
+                some: false,
+                payload: None,
+                option_schema: crate::compiler::TypeSchema::Unknown,
+                span,
+                semantic_id: None,
+            })?;
+            self.assembler
+                .label(&done_label)
+                .map_err(CompileError::Assembler)?;
+            return Ok(());
+        }
 
         let map_lookup = Expr::IfElse {
             condition: Box::new(Expr::Call(
@@ -1476,6 +1618,113 @@ impl Compiler {
         };
 
         self.compile_expr(&lowered)
+    }
+
+    /// Logical `?.` lookup: the projected child is wrapped as `Some` only when
+    /// the key/index is present. A missing key/out-of-range index yields
+    /// `None`; a present value is never collapsed to absence, including a
+    /// present Unit/Null payload or a nested Option map.
+    fn logical_projection_lookup(
+        &mut self,
+        container_slot: LocalSlot,
+        key_slot: LocalSlot,
+        logical_unit_field: bool,
+        span: crate::compiler::source_map::Span,
+    ) -> Expr {
+        let call = |index: u16, args: Vec<Expr>| Expr::Call(index, Vec::new(), args, None, None);
+        let none = || Expr::OptionConstruct {
+            some: false,
+            payload: None,
+            option_schema: crate::compiler::TypeSchema::Unknown,
+            span,
+            semantic_id: None,
+        };
+        let some = |value: Expr| Expr::OptionConstruct {
+            some: true,
+            payload: Some(Box::new(value)),
+            option_schema: crate::compiler::TypeSchema::Unknown,
+            span,
+            semantic_id: None,
+        };
+        let type_of =
+            |slot: LocalSlot| call(BuiltinFunction::TypeOf.call_index(), vec![Expr::Var(slot)]);
+        let get = || {
+            Expr::Call(
+                BuiltinFunction::Get.call_index(),
+                Vec::new(),
+                vec![Expr::Var(container_slot), Expr::Var(key_slot)],
+                None,
+                None,
+            )
+        };
+        let map_has_key = Expr::Call(
+            BuiltinFunction::Has.call_index(),
+            Vec::new(),
+            vec![Expr::Var(container_slot), Expr::Var(key_slot)],
+            None,
+            None,
+        );
+        let map_lookup = Expr::IfElse {
+            condition: Box::new(map_has_key),
+            then_expr: Box::new(some(get())),
+            else_expr: Box::new(if logical_unit_field {
+                // A required Unit field's canonical payload is Null and may be
+                // omitted from the physical map; its declared schema still
+                // makes the field present with an internal Null payload.
+                some(Expr::Null)
+            } else {
+                none()
+            }),
+        };
+        let key_is_int = Expr::Eq(
+            Box::new(type_of(key_slot)),
+            Box::new(Expr::String("int".to_string())),
+        );
+        let key_non_negative = Expr::Not(Box::new(Expr::Lt(
+            Box::new(Expr::Var(key_slot)),
+            Box::new(Expr::Int(0)),
+        )));
+        let key_in_bounds = Expr::Lt(
+            Box::new(Expr::Var(key_slot)),
+            Box::new(call(
+                BuiltinFunction::Len.call_index(),
+                vec![Expr::Var(container_slot)],
+            )),
+        );
+        let index_value = Expr::IfElse {
+            condition: Box::new(Expr::And(
+                Box::new(key_is_int),
+                Box::new(Expr::And(
+                    Box::new(key_non_negative),
+                    Box::new(key_in_bounds),
+                )),
+            )),
+            then_expr: Box::new(some(get())),
+            else_expr: Box::new(none()),
+        };
+        let container_is_map = Expr::Eq(
+            Box::new(type_of(container_slot)),
+            Box::new(Expr::String("map".to_string())),
+        );
+        let container_is_sequence = Expr::Or(
+            Box::new(Expr::Eq(
+                Box::new(type_of(container_slot)),
+                Box::new(Expr::String("array".to_string())),
+            )),
+            Box::new(Expr::Eq(
+                Box::new(type_of(container_slot)),
+                Box::new(Expr::String("string".to_string())),
+            )),
+        );
+        Expr::IfElse {
+            condition: Box::new(container_is_map),
+            then_expr: Box::new(map_lookup),
+            else_expr: Box::new(Expr::IfElse {
+                condition: Box::new(container_is_sequence),
+                then_expr: Box::new(index_value),
+                else_expr: Box::new(none()),
+            }),
+        }
     }
 
     fn compile_option_unwrap_or_expr(

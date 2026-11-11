@@ -1158,6 +1158,23 @@ pub(crate) fn infer_value_schema(
     inferred_value_schema(&mut typing, expr, slots)
 }
 
+/// Resolve one field/index read against a concrete container schema using the
+/// same access rules as the typing owner. Used by the Option resolver to
+/// classify a logical projection leaf (for example a required Unit field).
+pub(crate) fn infer_access_value_schema(
+    functions: &[FunctionDecl],
+    function_impls: &HashMap<u16, FunctionImpl>,
+    struct_schemas: &HashMap<String, StructDecl>,
+    container_schema: &TypeSchema,
+    key: &Expr,
+    slots: &HashMap<LocalSlot, TypeSchema>,
+) -> Option<TypeSchema> {
+    let typing = ResultTyping::new(functions, function_impls, struct_schemas);
+    let state = result_local_state(slots);
+    let mut context = typing.context();
+    context::infer_access_schema(container_schema, key, &mut context, &state).ok()
+}
+
 pub(crate) fn argument_schemas_for_call(
     functions: &[FunctionDecl],
     function_impls: &HashMap<u16, FunctionImpl>,
