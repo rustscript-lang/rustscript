@@ -1158,6 +1158,23 @@ pub(crate) fn infer_value_schema(
     inferred_value_schema(&mut typing, expr, slots)
 }
 
+pub(crate) fn object_fields_for_schema(
+    functions: &[FunctionDecl],
+    function_impls: &HashMap<u16, FunctionImpl>,
+    struct_schemas: &HashMap<String, StructDecl>,
+    schema: &TypeSchema,
+) -> Option<HashMap<String, TypeSchema>> {
+    match schema {
+        TypeSchema::Object(fields) => Some(fields.clone()),
+        TypeSchema::Named(name, type_args) => {
+            let typing = ResultTyping::new(functions, function_impls, struct_schemas);
+            let mut context = typing.context();
+            context::resolved_named_struct_fields(name, type_args, &mut context)
+        }
+        _ => None,
+    }
+}
+
 /// Resolve one field/index read against a concrete container schema using the
 /// same access rules as the typing owner. Used by the Option resolver to
 /// classify a logical projection leaf (for example a required Unit field).
@@ -1203,8 +1220,9 @@ pub(crate) fn expected_container_argument_schemas(
     match builtin {
         crate::builtins::BuiltinFunction::ArrayPush if args.len() == 2 => {
             expected.array_prefix_and_rest()?;
+            let index = array_push_literal_index(&args[0]).unwrap_or(0);
             let element = expected
-                .array_item_schema_at(0)
+                .array_item_schema_at(index)
                 .or_else(|| expected.collapsed_array_item_schema())
                 .filter(|schema| !matches!(schema, TypeSchema::Unknown));
             Some(vec![Some(expected.clone()), element])
@@ -1218,6 +1236,19 @@ pub(crate) fn expected_container_argument_schemas(
                 &args[1],
             );
             Some(vec![Some(expected.clone()), None, value])
+        }
+        _ => None,
+    }
+}
+
+fn array_push_literal_index(container: &Expr) -> Option<usize> {
+    let Expr::Call(index, _, args, _, _) = container else {
+        return None;
+    };
+    match crate::builtins::BuiltinFunction::from_call_index(*index)? {
+        crate::builtins::BuiltinFunction::ArrayNew if args.is_empty() => Some(0),
+        crate::builtins::BuiltinFunction::ArrayPush if args.len() == 2 => {
+            Some(array_push_literal_index(&args[0])? + 1)
         }
         _ => None,
     }
