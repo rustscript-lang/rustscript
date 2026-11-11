@@ -29,29 +29,33 @@ Execution also requires an async host bridge and the SQLite module registered.
 ```rust
 use sqlite;
 
-let db = sqlite::open({
-    path: ":memory:",
-    mode: "memory",
-    limits: { max_rows: 100 },
-});
+let limits: SqliteLimits = { max_rows: Option::Some(100) };
+let options: SqliteOpenOptions = {
+    path: Option::Some(":memory:"),
+    mode: Option::Some("memory"),
+    limits: Option::Some(limits),
+};
+let db = sqlite::open(options);
 ```
 
-All fields are optional in object literals. A missing field or `null` keeps the host default,
-except that `path` remains required at runtime for a usable connection.
+Every field is a logical `Option`. `Option::None` keeps the host default; `Option::Some(value)`
+explicitly supplies it, including `Some(false)`, `Some(0)`, and `Some("")`. A `path` of
+`Option::None` is still rejected at runtime for a usable connection.
 
 | Field | Type | Runtime behavior |
 | --- | --- | --- |
-| `path` | optional string | Required and non-empty; resolved under the embedding policy root |
-| `mode` | optional string | `memory`, `read_only`, `read_write`, or `read_write_create`; the last is the default |
-| `root` | optional string | Must match the embedding policy root when supplied |
-| `limits` | optional `SqliteLimits` | Per-connection ceilings; omitted fields keep the host ceiling |
+| `path` | `Option<string>` | Required and non-empty when `Some`; resolved under the embedding policy root |
+| `mode` | `Option<string>` | `memory`, `read_only`, `read_write`, or `read_write_create`; `None` defaults to the last |
+| `root` | `Option<string>` | Must match the embedding policy root when `Some` |
+| `limits` | `Option<SqliteLimits>` | Per-connection ceilings; `None` keeps the host ceiling |
 
 Unknown fields are rejected by the named-struct compiler contract.
 
 ## Limits (`SqliteLimits`)
 
-Every limit is an optional int. Omitted or `null` fields keep the embedding ceiling. Supplied
-limits must be positive and cannot exceed that ceiling.
+Every limit is `Option<int>`. `Option::None` keeps the embedding ceiling; `Option::Some(0)` is a
+provided invalid value rather than a default. Supplied limits must be positive and cannot exceed
+that ceiling.
 
 - `max_connections`
 - `max_statements`
@@ -65,7 +69,7 @@ limits must be positive and cannot exceed that ceiling.
 - `max_transaction_ms`
 - `busy_timeout_ms`
 
-An empty `{}` is valid. Extra fields are rejected.
+An empty `{}` is valid for a typed `SqliteLimits` local. Extra fields are rejected.
 
 ## Values (`SqliteValue`)
 
@@ -74,10 +78,10 @@ Parameters and result cells use the same tagged named struct:
 ```text
 SqliteValue {
     kind: string,
-    int_value: optional<int>,
-    float_value: optional<float>,
-    text_value: optional<string>,
-    blob_value: optional<bytes>,
+    int_value: Option<int>,
+    float_value: Option<float>,
+    text_value: Option<string>,
+    blob_value: Option<bytes>,
 }
 ```
 
@@ -85,21 +89,21 @@ The five `kind` values and their selected payloads are:
 
 | `kind` | Required payload | Other payloads |
 | --- | --- | --- |
-| `"null"` | none | must be `null` or omitted |
-| `"int"` | `int_value` | must be `null` or omitted |
-| `"float"` | `float_value` | must be `null` or omitted |
-| `"text"` | `text_value` | must be `null` or omitted |
-| `"blob"` | `blob_value` | must be `null` or omitted |
+| `"null"` | none | all payloads `Option::None` |
+| `"int"` | `int_value` | other payloads `Option::None` |
+| `"float"` | `float_value` | other payloads `Option::None` |
+| `"text"` | `text_value` | other payloads `Option::None` |
+| `"blob"` | `blob_value` | other payloads `Option::None` |
 
 For example:
 
 ```rust
 let values = [
     { kind: "null" },
-    { kind: "int", int_value: 7 },
-    { kind: "float", float_value: 1.5 },
-    { kind: "text", text_value: "hello" },
-    { kind: "blob", blob_value: bytes::from_hex("000102") },
+    { kind: "int", int_value: Option::Some(7) },
+    { kind: "float", float_value: Option::Some(1.5) },
+    { kind: "text", text_value: Option::Some("hello") },
+    { kind: "blob", blob_value: Option::Some(bytes::from_hex("000102")) },
 ];
 ```
 
@@ -112,12 +116,12 @@ with its original bytes.
 
 SQLite exposes three distinct absence forms and they are not interchangeable:
 
-- Optional configuration entries (`SqliteOpenOptions`, `SqliteLimits`, and the
-  `params`/`query`/`limits` fields of `SqliteStatement`) are omission entries:
-  a missing field or `null` keeps the documented default. They are not logical
-  `Option::None` values.
+- Configuration and statement entries use logical `Option`: `Option::None` keeps the
+  documented default and `Option::Some(value)` supplies it. A physical `null` scalar is
+  not a second reading of a present public field.
 - A SQL `NULL` result cell remains the tagged `SqliteValue { kind: "null", ... }`
-  business value with no payload. It is not rewritten to `Option::None`.
+  business value; its four payload slots are logical `Option::None`. It is not an
+  absent row and it is not rewritten into an option-of-cell.
 - Result-value absence uses logical `Option`: `SqliteQueryResult.next_cursor` and
   the unselected `SqliteTransactionResult` branch are `Option::Some`/`Option::None`
   values, matched with `match` rather than a sentinel.
@@ -130,7 +134,7 @@ SQLite exposes three distinct absence forms and they are not interchangeable:
 let inserted = sqlite::execute(
     &db,
     "INSERT INTO t (value) VALUES (?1)",
-    [{ kind: "int", int_value: 7 }],
+    [{ kind: "int", int_value: Option::Some(7) }],
 );
 let affected = inserted.rows_affected;
 let rowid = inserted.last_insert_rowid;
@@ -149,17 +153,13 @@ limits before the adapter call is awaited.
 `sqlite::query` takes an `array<SqliteValue>` and returns a `SqliteQueryResult`:
 
 ```rust
-let queried = sqlite::query(
-    &db,
-    "SELECT value FROM t ORDER BY rowid",
-    [],
-    { max_rows: 32 },
-);
+let limits: SqliteLimits = { max_rows: Option::Some(32) };
+let queried = sqlite::query(&db, "SELECT value FROM t ORDER BY rowid", [], limits);
 
 let first_row = queried.rows[0];
 let first_cell = first_row.cells[0];
 if first_cell.kind == "int" {
-    let value = first_cell.int_value;
+    let value = first_cell.int_value.unwrap_or(-1);
 }
 ```
 
@@ -187,18 +187,18 @@ let next = match queried.next_cursor {
 ## Transactions (`SqliteStatement` and `SqliteTransactionResult`)
 
 A transaction receives an array of named `SqliteStatement` values. Each statement has a required
-`sql` string and optional typed `params`, `query`, and `limits` fields:
+`sql` string and logical option `params`, `query`, and `limits` fields:
 
 ```rust
 let results = sqlite::transaction(&db, [
     {
         sql: "INSERT INTO t (value) VALUES (?1)",
-        params: [{ kind: "int", int_value: 8 }],
+        params: Option::Some([{ kind: "int", int_value: Option::Some(8) }]),
     },
     {
         sql: "SELECT value FROM t ORDER BY rowid",
-        query: true,
-        limits: { max_rows: 8 },
+        query: Option::Some(true),
+        limits: Option::Some(limits),
     },
 ]);
 ```
@@ -206,9 +206,9 @@ let results = sqlite::transaction(&db, [
 | Field | Type | Runtime behavior |
 | --- | --- | --- |
 | `sql` | string | Required non-empty SQL |
-| `params` | optional `array<SqliteValue>` | Omitted or `null` means no parameters |
-| `query` | optional bool | Omitted or `null` means execute; `true` returns a query result |
-| `limits` | optional `SqliteLimits` | Omitted or `null` keeps the connection ceiling |
+| `params` | `Option<array<SqliteValue>>` | `None` means no parameters |
+| `query` | `Option<bool>` | `None` means execute; `Some(true)` returns a query result |
+| `limits` | `Option<SqliteLimits>` | `None` keeps the connection ceiling |
 
 The return value is an `array<SqliteTransactionResult>` in statement order:
 
