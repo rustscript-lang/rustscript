@@ -372,9 +372,9 @@ fn prepare_owned_typed_ir(
     // legalize. Fill Result schemas from those owners before ownership.
     // A failed host resolution keeps its own diagnostic.
     if host_error.is_none() {
-        super::option::normalize_omitted_option_fields(&mut legalized);
         super::result::resolve_result_types(&mut legalized, entry.types)
             .map_err(SourceError::Compile)?;
+        super::option::normalize_omitted_option_fields(&mut legalized);
         super::option::resolve_option_types(&mut legalized, entry.types)
             .map_err(SourceError::Compile)?;
     }
@@ -936,9 +936,9 @@ fn compile_parsed_output_with_capture_output(
     }
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
     let mut parsed = parsed;
-    super::option::normalize_omitted_option_fields(&mut parsed);
     super::result::resolve_result_types(&mut parsed, entry_local_types)
         .map_err(SourceError::Compile)?;
+    super::option::normalize_omitted_option_fields(&mut parsed);
     super::option::resolve_option_types(&mut parsed, entry_local_types)
         .map_err(SourceError::Compile)?;
     let mut parsed =

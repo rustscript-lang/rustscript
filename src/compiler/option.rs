@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use super::CompileError;
 use super::ir::{
     AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt,
-    TypeSchema,
+    StructDecl, TypeSchema,
 };
 use super::source_map::Span;
 
@@ -858,60 +858,112 @@ fn schema_contains_unknown(schema: &TypeSchema) -> bool {
     }
 }
 
-/// Materialize permitted omitted logical Option fields as explicit `None` map
-/// entries at construction sites. This runs before the typed resolvers so the
-/// synthesized `Option::None` constructor is resolved by the ordinary Option
-/// owner. Required fields and legacy nullable fields are untouched.
+struct NormalizeEnv<'a> {
+    function_list: &'a [FunctionDecl],
+    function_impls: &'a HashMap<u16, FunctionImpl>,
+    struct_schemas: &'a HashMap<String, StructDecl>,
+    slots: HashMap<LocalSlot, TypeSchema>,
+}
+
+/// Materialize permitted omitted logical Option fields as explicit None map
+/// entries at construction sites where the surrounding typed context supplies
+/// the expected record schema. Generic named fields are instantiated through
+/// the typing owner's existing substitution rules before an entry is added.
 pub(crate) fn normalize_omitted_option_fields(ir: &mut FrontendIr) {
+    let functions = ir.functions.clone();
     let structs = ir.struct_schemas.clone();
-    let returns: HashMap<u16, Option<TypeSchema>> = ir
-        .functions
-        .iter()
-        .map(|function| (function.index, function.return_schema.clone()))
-        .collect();
+    let impls = ir.function_impls.clone();
+    let mut env = NormalizeEnv {
+        function_list: &functions,
+        function_impls: &impls,
+        struct_schemas: &structs,
+        slots: HashMap::new(),
+    };
     for stmt in &mut ir.stmts {
-        normalize_stmt_omitted(stmt, None, &structs);
+        normalize_stmt_omitted(stmt, None, &mut env);
     }
-    let mut impls = std::mem::take(&mut ir.function_impls);
-    for (index, implementation) in impls.iter_mut() {
-        let expected = returns.get(index).cloned().flatten();
-        for stmt in &mut implementation.body_stmts {
-            normalize_stmt_omitted(stmt, expected.clone(), &structs);
+    let mut targets = std::mem::take(&mut ir.function_impls);
+    for (index, implementation) in targets.iter_mut() {
+        let Some(function) = functions.iter().find(|function| function.index == *index) else {
+            continue;
+        };
+        env.slots.clear();
+        for (slot, schema) in implementation
+            .param_slots
+            .iter()
+            .zip(function.arg_schemas.iter())
+        {
+            if let Some(schema) = schema {
+                env.slots.insert(*slot, schema.clone());
+            }
         }
-        normalize_expr_omitted(&mut implementation.body_expr, expected.as_ref(), &structs);
+        let expected = function.return_schema.clone();
+        for stmt in &mut implementation.body_stmts {
+            normalize_stmt_omitted(stmt, expected.clone(), &mut env);
+        }
+        normalize_expr_omitted(&mut implementation.body_expr, expected.as_ref(), &mut env);
     }
-    ir.function_impls = impls;
+    ir.function_impls = targets;
+}
+
+fn infer_omitted_schema(expr: &Expr, env: &NormalizeEnv<'_>) -> Option<TypeSchema> {
+    super::typing::infer_value_schema(
+        env.function_list,
+        env.function_impls,
+        env.struct_schemas,
+        expr,
+        &env.slots,
+    )
+    .filter(|schema| !matches!(schema, TypeSchema::Unknown))
 }
 
 fn normalize_stmt_omitted(
     stmt: &mut Stmt,
     expected_tail: Option<TypeSchema>,
-    structs: &HashMap<String, super::ir::StructDecl>,
+    env: &mut NormalizeEnv<'_>,
 ) {
     match stmt {
         Stmt::Let {
+            index,
             declared_schema,
             expr,
             ..
-        } => normalize_expr_omitted(expr, declared_schema.as_ref(), structs),
-        Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-            normalize_expr_omitted(expr, None, structs)
+        } => {
+            normalize_expr_omitted(expr, declared_schema.as_ref(), env);
+            let inferred = declared_schema
+                .clone()
+                .or_else(|| infer_omitted_schema(expr, env));
+            if let Some(schema) = inferred.filter(|schema| !matches!(schema, TypeSchema::Unknown)) {
+                env.slots.insert(*index, schema);
+            }
         }
-        Stmt::ClosureLet { closure, .. } => {
-            normalize_expr_omitted(&mut closure.body, None, structs)
+        Stmt::Assign { index, expr, .. } => {
+            let expected = env.slots.get(index).cloned();
+            normalize_expr_omitted(expr, expected.as_ref(), env);
+            if !env.slots.contains_key(index)
+                && let Some(schema) = infer_omitted_schema(expr, env)
+            {
+                env.slots.insert(*index, schema);
+            }
         }
+        Stmt::Expr { expr, .. } => normalize_expr_omitted(expr, None, env),
+        Stmt::ClosureLet {
+            closure,
+            expected_schema,
+            ..
+        } => normalize_closure_omitted(closure, expected_schema.as_ref(), env),
         Stmt::IfElse {
             condition,
             then_branch,
             else_branch,
             ..
         } => {
-            normalize_expr_omitted(condition, Some(&TypeSchema::Bool), structs);
+            normalize_expr_omitted(condition, Some(&TypeSchema::Bool), env);
             for nested in then_branch {
-                normalize_stmt_omitted(nested, expected_tail.clone(), structs);
+                normalize_stmt_omitted(nested, expected_tail.clone(), env);
             }
             for nested in else_branch {
-                normalize_stmt_omitted(nested, expected_tail.clone(), structs);
+                normalize_stmt_omitted(nested, expected_tail.clone(), env);
             }
         }
         Stmt::For {
@@ -921,54 +973,53 @@ fn normalize_stmt_omitted(
             body,
             ..
         } => {
-            normalize_stmt_omitted(init, None, structs);
-            normalize_expr_omitted(condition, Some(&TypeSchema::Bool), structs);
-            normalize_stmt_omitted(post, None, structs);
+            normalize_stmt_omitted(init, None, env);
+            normalize_expr_omitted(condition, Some(&TypeSchema::Bool), env);
+            normalize_stmt_omitted(post, None, env);
             for nested in body {
-                normalize_stmt_omitted(nested, None, structs);
+                normalize_stmt_omitted(nested, None, env);
             }
         }
         Stmt::While {
             condition, body, ..
         } => {
-            normalize_expr_omitted(condition, Some(&TypeSchema::Bool), structs);
+            normalize_expr_omitted(condition, Some(&TypeSchema::Bool), env);
             for nested in body {
-                normalize_stmt_omitted(nested, None, structs);
+                normalize_stmt_omitted(nested, None, env);
             }
         }
-        Stmt::Noop { .. }
-        | Stmt::FuncDecl { .. }
-        | Stmt::Break { .. }
-        | Stmt::Continue { .. }
-        | Stmt::Drop { .. } => {}
+        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::Drop { index, .. } => {
+            env.slots.remove(index);
+        }
     }
 }
 
 fn normalize_expr_omitted(
     expr: &mut Expr,
     expected: Option<&TypeSchema>,
-    structs: &HashMap<String, super::ir::StructDecl>,
+    env: &mut NormalizeEnv<'_>,
 ) {
     if let Some(expected) = expected
-        && let Some(fields) = object_fields_for_normalization(expected, structs)
+        && normalize_map_literal_omitted(expr, expected, env)
     {
-        normalize_map_literal_omitted(expr, &fields);
+        return;
     }
     match expr {
         Expr::Block { stmts, expr } => {
             for stmt in stmts {
-                normalize_stmt_omitted(stmt, expected.cloned(), structs);
+                normalize_stmt_omitted(stmt, expected.cloned(), env);
             }
-            normalize_expr_omitted(expr, expected, structs);
+            normalize_expr_omitted(expr, expected, env);
         }
         Expr::IfElse {
             condition,
             then_expr,
             else_expr,
         } => {
-            normalize_expr_omitted(condition, Some(&TypeSchema::Bool), structs);
-            normalize_expr_omitted(then_expr, expected, structs);
-            normalize_expr_omitted(else_expr, expected, structs);
+            normalize_expr_omitted(condition, Some(&TypeSchema::Bool), env);
+            normalize_expr_omitted(then_expr, expected, env);
+            normalize_expr_omitted(else_expr, expected, env);
         }
         Expr::Match {
             value,
@@ -976,26 +1027,92 @@ fn normalize_expr_omitted(
             default,
             ..
         } => {
-            normalize_expr_omitted(value, None, structs);
+            normalize_expr_omitted(value, None, env);
             for (_, arm) in arms {
-                normalize_expr_omitted(arm, expected, structs);
+                normalize_expr_omitted(arm, expected, env);
             }
-            normalize_expr_omitted(default, expected, structs);
+            normalize_expr_omitted(default, expected, env);
         }
-        Expr::Call(_, _, args, _, _)
-        | Expr::ModuleCall(_, _, args, _)
-        | Expr::LocalCall(_, _, args, _)
-        | Expr::ClosureCall(_, args) => {
-            for arg in args {
-                normalize_expr_omitted(arg, None, structs);
+        Expr::Call(index, type_args, args, resolution, _) => {
+            let expected_args = resolution.as_ref().map(|resolved| {
+                resolved
+                    .params
+                    .iter()
+                    .map(|param| Some(param.schema.clone()))
+                    .collect::<Vec<_>>()
+            });
+            let expected_args = expected_args
+                .or_else(|| {
+                    super::typing::argument_schemas_for_call(
+                        env.function_list,
+                        env.function_impls,
+                        env.struct_schemas,
+                        *index,
+                        type_args,
+                    )
+                })
+                .or_else(|| {
+                    super::typing::expected_container_argument_schemas(
+                        env.function_list,
+                        env.function_impls,
+                        env.struct_schemas,
+                        *index,
+                        args,
+                        expected,
+                    )
+                });
+            for (offset, arg) in args.iter_mut().enumerate() {
+                let expected_arg = expected_args
+                    .as_ref()
+                    .and_then(|schemas| schemas.get(offset))
+                    .and_then(|schema| schema.as_ref());
+                normalize_expr_omitted(arg, expected_arg, env);
             }
         }
-        Expr::Closure(closure) => normalize_expr_omitted(&mut closure.body, expected, structs),
+        Expr::ModuleCall(symbol, type_args, args, _) => {
+            let expected_args = env
+                .function_list
+                .iter()
+                .find(|function| function.symbol.as_ref() == Some(symbol))
+                .and_then(|function| {
+                    super::typing::argument_schemas_for_call(
+                        env.function_list,
+                        env.function_impls,
+                        env.struct_schemas,
+                        function.index,
+                        type_args,
+                    )
+                });
+            for (offset, arg) in args.iter_mut().enumerate() {
+                let expected_arg = expected_args
+                    .as_ref()
+                    .and_then(|schemas| schemas.get(offset))
+                    .and_then(|schema| schema.as_ref());
+                normalize_expr_omitted(arg, expected_arg, env);
+            }
+        }
+        Expr::LocalCall(slot, _, args, _) => {
+            let params = env.slots.get(slot).and_then(|schema| match schema {
+                TypeSchema::Callable { params, .. } => Some(params.clone()),
+                _ => None,
+            });
+            for (offset, arg) in args.iter_mut().enumerate() {
+                let expected_arg = params.as_ref().and_then(|schemas| schemas.get(offset));
+                normalize_expr_omitted(arg, expected_arg, env);
+            }
+        }
+        Expr::ClosureCall(closure, args) => {
+            normalize_closure_omitted(closure, expected, env);
+            for arg in args.iter_mut() {
+                normalize_expr_omitted(arg, None, env);
+            }
+        }
+        Expr::Closure(closure) => normalize_closure_omitted(closure, expected, env),
         Expr::ToOwned(inner)
         | Expr::Borrow(inner)
         | Expr::BorrowMut(inner)
         | Expr::Neg(inner)
-        | Expr::Not(inner) => normalize_expr_omitted(inner, expected, structs),
+        | Expr::Not(inner) => normalize_expr_omitted(inner, expected, env),
         Expr::Add(lhs, rhs)
         | Expr::Sub(lhs, rhs)
         | Expr::Mul(lhs, rhs)
@@ -1006,44 +1123,101 @@ fn normalize_expr_omitted(
         | Expr::Eq(lhs, rhs)
         | Expr::Lt(lhs, rhs)
         | Expr::Gt(lhs, rhs) => {
-            normalize_expr_omitted(lhs, None, structs);
-            normalize_expr_omitted(rhs, None, structs);
+            normalize_expr_omitted(lhs, None, env);
+            normalize_expr_omitted(rhs, None, env);
         }
-        Expr::ResultConstruct { payload, .. }
-        | Expr::OptionConstruct {
-            payload: Some(payload),
+        Expr::ResultConstruct {
+            ok,
+            payload,
+            result_schema,
             ..
-        } => normalize_expr_omitted(payload, None, structs),
+        } => {
+            let active = match result_schema {
+                TypeSchema::Result { ok: ok_branch, err } => Some(if *ok {
+                    ok_branch.as_ref().clone()
+                } else {
+                    err.as_ref().clone()
+                }),
+                _ => expected.and_then(|schema| match schema {
+                    TypeSchema::Result { ok: ok_branch, err } => Some(if *ok {
+                        ok_branch.as_ref().clone()
+                    } else {
+                        err.as_ref().clone()
+                    }),
+                    _ => None,
+                }),
+            };
+            normalize_expr_omitted(payload, active.as_ref(), env);
+        }
+        Expr::OptionConstruct {
+            payload: Some(payload),
+            option_schema,
+            ..
+        } => {
+            let active = match option_schema {
+                TypeSchema::Option(inner) => Some(inner.as_ref().clone()),
+                _ => match expected {
+                    Some(TypeSchema::Option(inner)) => Some(inner.as_ref().clone()),
+                    _ => None,
+                },
+            };
+            normalize_expr_omitted(payload, active.as_ref(), env);
+        }
         Expr::OptionConstruct { payload: None, .. } => {}
         Expr::ResultMatch {
             value,
+            ok_binding,
             ok_expr,
+            err_binding,
             err_expr,
+            scrutinee_schema,
             ..
         } => {
-            normalize_expr_omitted(value, None, structs);
-            normalize_expr_omitted(ok_expr, expected, structs);
-            normalize_expr_omitted(err_expr, expected, structs);
+            normalize_expr_omitted(value, None, env);
+            let saved = env.slots.clone();
+            if let TypeSchema::Result { ok, .. } = scrutinee_schema.clone()
+                && let Some(slot) = *ok_binding
+            {
+                env.slots.insert(slot, ok.as_ref().clone());
+            }
+            normalize_expr_omitted(ok_expr, expected, env);
+            env.slots = saved.clone();
+            if let TypeSchema::Result { err, .. } = scrutinee_schema.clone()
+                && let Some(slot) = *err_binding
+            {
+                env.slots.insert(slot, err.as_ref().clone());
+            }
+            normalize_expr_omitted(err_expr, expected, env);
+            env.slots = saved;
         }
         Expr::OptionMatch {
             value,
+            some_binding,
             some_expr,
             none_expr,
+            scrutinee_schema,
             ..
         } => {
-            normalize_expr_omitted(value, None, structs);
-            normalize_expr_omitted(some_expr, expected, structs);
-            normalize_expr_omitted(none_expr, expected, structs);
+            normalize_expr_omitted(value, None, env);
+            let saved = env.slots.clone();
+            if let TypeSchema::Option(inner) = scrutinee_schema.clone()
+                && let Some(slot) = *some_binding
+            {
+                env.slots.insert(slot, inner.as_ref().clone());
+            }
+            normalize_expr_omitted(some_expr, expected, env);
+            env.slots = saved;
+            normalize_expr_omitted(none_expr, expected, env);
         }
         Expr::OptionalGet { container, key, .. } => {
-            normalize_expr_omitted(container, None, structs);
-            normalize_expr_omitted(key, None, structs);
+            normalize_expr_omitted(container, None, env);
+            normalize_expr_omitted(key, None, env);
         }
         Expr::OptionUnwrapOr {
             value, fallback, ..
         } => {
-            normalize_expr_omitted(value, None, structs);
-            normalize_expr_omitted(fallback, None, structs);
+            normalize_expr_omitted(value, None, env);
+            normalize_expr_omitted(fallback, expected, env);
         }
         Expr::ResultMethod {
             receiver, argument, ..
@@ -1051,13 +1225,13 @@ fn normalize_expr_omitted(
         | Expr::OptionMethod {
             receiver, argument, ..
         } => {
-            normalize_expr_omitted(receiver, None, structs);
-            normalize_expr_omitted(argument, None, structs);
+            normalize_expr_omitted(receiver, None, env);
+            normalize_expr_omitted(argument, None, env);
         }
         Expr::ResultConvert { value, .. } | Expr::ResultTry { value, .. } => {
-            normalize_expr_omitted(value, None, structs);
+            normalize_expr_omitted(value, None, env);
         }
-        Expr::ResultQuery { value, .. } => normalize_expr_omitted(value, None, structs),
+        Expr::ResultQuery { value, .. } => normalize_expr_omitted(value, None, env),
         Expr::Null
         | Expr::Unit
         | Expr::Int(_)
@@ -1075,29 +1249,58 @@ fn normalize_expr_omitted(
     }
 }
 
-fn object_fields_for_normalization(
-    schema: &TypeSchema,
-    structs: &HashMap<String, super::ir::StructDecl>,
-) -> Option<HashMap<String, TypeSchema>> {
-    match schema {
-        TypeSchema::Object(fields) => Some(fields.clone()),
-        TypeSchema::Named(name, args) if args.is_empty() => {
-            let TypeSchema::Object(fields) = &structs.get(name)?.body_schema else {
-                return None;
-            };
-            Some(fields.clone())
+fn normalize_closure_omitted(
+    closure: &mut ClosureExpr,
+    expected: Option<&TypeSchema>,
+    env: &mut NormalizeEnv<'_>,
+) {
+    let (param_schemas, expected_return) = match expected {
+        Some(TypeSchema::Callable { params, result }) => {
+            (Some(params.as_slice()), Some(result.as_ref()))
         }
-        _ => None,
-    }
+        other => (None, other),
+    };
+    let nested = super::typing::contextual_callable_slot_schemas(
+        env.function_list,
+        env.function_impls,
+        env.struct_schemas,
+        &env.slots,
+        &closure.param_slots,
+        param_schemas,
+        &closure.capture_copies,
+    );
+    let saved = std::mem::replace(&mut env.slots, nested);
+    normalize_expr_omitted(&mut closure.body, expected_return, env);
+    env.slots = saved;
 }
 
-fn normalize_map_literal_omitted(expr: &mut Expr, fields: &HashMap<String, TypeSchema>) {
+fn object_fields_for_normalization(
+    expected: &TypeSchema,
+    env: &NormalizeEnv<'_>,
+) -> Option<HashMap<String, TypeSchema>> {
+    super::typing::object_fields_for_schema(
+        env.function_list,
+        env.function_impls,
+        env.struct_schemas,
+        expected,
+    )
+}
+
+fn normalize_map_literal_omitted(
+    expr: &mut Expr,
+    expected: &TypeSchema,
+    env: &mut NormalizeEnv<'_>,
+) -> bool {
+    let Some(fields) = object_fields_for_normalization(expected, env) else {
+        return false;
+    };
     let mut keys = Vec::new();
     if !collect_map_literal_keys(expr, &mut keys) {
-        return;
+        return false;
     }
+    normalize_map_literal_values(expr, &fields, env);
     let mut additions = Vec::new();
-    for (name, schema) in fields {
+    for (name, schema) in &fields {
         if keys.iter().any(|key| key == name) {
             continue;
         }
@@ -1107,8 +1310,9 @@ fn normalize_map_literal_omitted(expr: &mut Expr, fields: &HashMap<String, TypeS
         additions.push((name.clone(), schema.clone()));
     }
     if additions.is_empty() {
-        return;
+        return true;
     }
+    additions.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
     let original = std::mem::replace(expr, Expr::Null);
     let mut out = original;
     for (name, schema) in additions {
@@ -1131,6 +1335,43 @@ fn normalize_map_literal_omitted(expr: &mut Expr, fields: &HashMap<String, TypeS
         );
     }
     *expr = out;
+    true
+}
+
+/// Recurse into the value positions of a recovered `MapNew` + `Set` literal
+/// chain with each field's expected schema. The container positions are not
+/// revisited with the record expectation: the chain has already been matched
+/// at the construction root, and nested records are handled at their value.
+fn normalize_map_literal_values(
+    expr: &mut Expr,
+    fields: &HashMap<String, TypeSchema>,
+    env: &mut NormalizeEnv<'_>,
+) {
+    match expr {
+        Expr::Call(index, _, args, _, _)
+            if crate::BuiltinFunction::from_call_index(*index)
+                == Some(crate::BuiltinFunction::MapNew) =>
+        {
+            if !args.is_empty() {
+                for arg in args {
+                    normalize_expr_omitted(arg, None, env);
+                }
+            }
+        }
+        Expr::Call(index, _, args, _, _)
+            if crate::BuiltinFunction::from_call_index(*index)
+                == Some(crate::BuiltinFunction::Set)
+                && args.len() == 3 =>
+        {
+            normalize_map_literal_values(&mut args[0], fields, env);
+            let expected_value = match &args[1] {
+                Expr::String(key) => fields.get(key).cloned(),
+                _ => None,
+            };
+            normalize_expr_omitted(&mut args[2], expected_value.as_ref(), env);
+        }
+        _ => {}
+    }
 }
 
 /// Recover the string keys of a pure `MapNew` + `Set` literal chain. A map

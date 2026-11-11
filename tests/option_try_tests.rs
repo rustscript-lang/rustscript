@@ -1,6 +1,9 @@
 #![cfg(feature = "runtime")]
 
-use vm::{Value, Vm, VmStatus, compile_source};
+use vm::{
+    CompileSourceFileOptions, SourceFlavor, TypeSchema, Value, Vm, VmStatus,
+    collect_inferred_local_type_hints_with_options, compile_source,
+};
 
 fn eval(source: &str) -> Value {
     let compiled = compile_source(source).expect("Option try source should compile");
@@ -406,5 +409,205 @@ out();"#,
     assert!(
         diagnostic.contains("Option") && diagnostic.contains("Result"),
         "explicit conversion requirement must stay visible: {diagnostic}"
+    );
+}
+
+#[test]
+fn typed_construction_generic_named_omitted_option_field_materializes() {
+    let source = r#"
+        struct Box<T> { value: Option<T> }
+        fn probe() -> int {
+            let item: Box<int> = {};
+            let observed = item.value;
+            match observed {
+                Option::Some(value) => value,
+                Option::None => 7,
+            }
+        }
+        probe();
+    "#;
+    assert_eq!(eval(source), Value::Int(7));
+    let hints = collect_inferred_local_type_hints_with_options(
+        source,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::new(),
+    )
+    .expect("typed construction hints should resolve");
+    let observed = hints
+        .iter()
+        .find(|hint| hint.name == "observed")
+        .expect("observed local hint");
+    assert_eq!(
+        observed.schema,
+        Some(TypeSchema::Option(Box::new(TypeSchema::Int))),
+        "generic field must stay Option<int>, not Unknown"
+    );
+}
+
+#[test]
+fn typed_construction_materialized_generic_field_projects_as_some_none() {
+    let source = r#"
+        struct Box<T> { value: Option<T> }
+        let item: Box<int> = {};
+        let projected = item?.value;
+        match projected {
+            Option::Some(inner) => match inner {
+                Option::Some(value) => value,
+                Option::None => 7,
+            },
+            Option::None => 100,
+        };
+    "#;
+    assert_eq!(eval(source), Value::Int(7));
+}
+
+#[test]
+fn typed_construction_function_argument_omitted_option_field_materializes() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        fn take(entry: Entry) -> int {
+            match entry.note {
+                Option::Some(value) => value,
+                Option::None => 7,
+            }
+        }
+        take({ name: "x" });
+    "#;
+    assert_eq!(eval(source), Value::Int(7));
+}
+
+#[test]
+fn typed_construction_assignment_omitted_option_field_materializes() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        let mut entry: Entry = { name: "first", note: Option::Some(3) };
+        entry = { name: "second" };
+        match entry.note {
+            Option::Some(value) => value,
+            Option::None => 7,
+        };
+    "#;
+    assert_eq!(eval(source), Value::Int(7));
+}
+
+#[test]
+fn typed_construction_nested_record_field_materializes() {
+    let source = r#"
+        struct Inner { note: Option<int> }
+        struct Outer { name: string, inner: Inner }
+        let outer: Outer = { name: "x", inner: {} };
+        match outer.inner.note {
+            Option::Some(value) => value,
+            Option::None => 7,
+        };
+    "#;
+    assert_eq!(eval(source), Value::Int(7));
+}
+
+#[test]
+fn typed_construction_option_and_result_payloads_materialize() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        let maybe: Option<Entry> = Option::Some({ name: "some" });
+        let ok: Result<Entry, string> = Result::Ok({ name: "ok" });
+        let err: Result<string, Entry> = Result::Err({ name: "err" });
+        let a = match maybe {
+            Option::Some(entry) => match entry.note {
+                Option::Some(value) => value,
+                Option::None => 7,
+            },
+            Option::None => 100,
+        };
+        let b = match ok {
+            Result::Ok(entry) => match entry.note {
+                Option::Some(value) => value,
+                Option::None => 7,
+            },
+            Result::Err(_) => 200,
+        };
+        let c = match err {
+            Result::Err(entry) => match entry.note {
+                Option::Some(value) => value,
+                Option::None => 7,
+            },
+            Result::Ok(_) => 300,
+        };
+        a + b + c;
+    "#;
+    assert_eq!(eval(source), Value::Int(21));
+}
+
+#[test]
+fn typed_construction_local_callable_argument_materializes() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        fn take(entry: Entry) -> int {
+            match entry.note {
+                Option::Some(value) => value,
+                Option::None => 7,
+            }
+        }
+        let callable: fn(Entry) -> int = take;
+        callable({ name: "x" });
+    "#;
+    assert_eq!(eval(source), Value::Int(7));
+}
+
+#[test]
+fn typed_construction_array_and_tuple_elements_materialize() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        let entries: [Entry] = [{ name: "array" }];
+        let pair: [int, Entry] = [1, { name: "tuple" }];
+        let from_array = match entries[0].note {
+            Option::Some(value) => value,
+            Option::None => 7,
+        };
+        let from_tuple = match pair[1].note {
+            Option::Some(value) => value,
+            Option::None => 7,
+        };
+        from_array + from_tuple;
+    "#;
+    assert_eq!(eval(source), Value::Int(14));
+}
+
+#[test]
+fn typed_construction_return_branch_and_closure_tails_materialize() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        fn make(flag: bool) -> Entry {
+            if flag => { { name: "first" } } else => { { name: "second" } }
+        }
+        let direct = make(true);
+        let state_a = match direct.note {
+            Option::Some(value) => value,
+            Option::None => 7,
+        };
+        let make_closure: fn() -> Entry = || if true => { { name: "closure" } } else => { { name: "other" } };
+        let state_b = match make_closure().note {
+            Option::Some(value) => value,
+            Option::None => 7,
+        };
+        state_a + state_b;
+    "#;
+    assert_eq!(eval(source), Value::Int(14));
+}
+
+#[test]
+fn typed_construction_required_field_and_wrong_option_payload_still_reject() {
+    let required = reject(
+        r#"struct Box<T> { name: string, value: Option<T> } let item: Box<int> = {}; item.name;"#,
+    );
+    assert!(
+        required.contains("required") && required.contains("name"),
+        "generic required-field check must remain: {required}"
+    );
+    let wrong = reject(
+        r#"struct Box<T> { value: Option<T> } let item: Box<int> = { value: Option::Some("text") }; item.value;"#,
+    );
+    assert!(
+        wrong.contains("Option::Some payload"),
+        "wrong generic Option payload must reject at that obligation: {wrong}"
     );
 }

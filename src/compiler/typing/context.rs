@@ -344,6 +344,9 @@ impl<'a> TypeContext<'a> {
             TypeSchema::Optional(inner) => {
                 TypeSchema::Optional(Box::new(self.substitute_schema_generics(inner)))
             }
+            TypeSchema::Option(inner) => {
+                TypeSchema::Option(Box::new(self.substitute_schema_generics(inner)))
+            }
             TypeSchema::Object(fields) => TypeSchema::Object(
                 fields
                     .iter()
@@ -533,6 +536,11 @@ impl<'a> TypeContext<'a> {
                 let (resolved, trip) =
                     self.resolve_schema_with_seen_tripped(inner, seen, reentries);
                 (TypeSchema::Optional(Box::new(resolved)), trip)
+            }
+            TypeSchema::Option(inner) => {
+                let (resolved, trip) =
+                    self.resolve_schema_with_seen_tripped(inner, seen, reentries);
+                (TypeSchema::Option(Box::new(resolved)), trip)
             }
             TypeSchema::Result { ok, err } => {
                 let (resolved_ok, ok_trip) =
@@ -3509,6 +3517,32 @@ pub(super) fn infer_access_schema(
             schema_label(&other)
         )),
     }
+}
+
+pub(super) fn resolved_named_struct_fields(
+    struct_name: &str,
+    type_args: &[TypeSchema],
+    context: &mut TypeContext<'_>,
+) -> Option<HashMap<String, TypeSchema>> {
+    let declaration = context.struct_schemas.get(struct_name)?.clone();
+    if declaration.type_params.len() != type_args.len() {
+        return None;
+    }
+    let TypeSchema::Object(fields) = declaration.body_schema else {
+        return None;
+    };
+    let bound = !declaration.type_params.is_empty();
+    if bound {
+        context.push_generic_bindings(&declaration.type_params, type_args);
+    }
+    let resolved = fields
+        .iter()
+        .map(|(name, schema)| (name.clone(), context.substitute_schema_generics(schema)))
+        .collect();
+    if bound {
+        context.pop_generic_bindings();
+    }
+    Some(resolved)
 }
 
 pub(super) fn source_named_struct_field_schema(

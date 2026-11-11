@@ -72,6 +72,44 @@ fn compile_source_file_module_override_path_redirects_import_spec() {
 }
 
 #[test]
+fn module_call_omitted_option_field_argument_materializes() {
+    let root = temp_module_root("vm_rustscript_module_omitted_option_test");
+    let module_path = root.join("dep.rss");
+    write_source(
+        &module_path,
+        r#"
+        struct Entry { name: string, note: Option<int> }
+        pub fn take(entry: Entry) -> int {
+            match entry.note {
+                Option::Some(value) => value,
+                Option::None => 7,
+            }
+        }
+    "#,
+        "module source",
+    );
+    let main_path = root.join("main.rss");
+    write_source(
+        &main_path,
+        r#"
+        use self::dep as dep;
+        dep::take({ name: "x" });
+    "#,
+        "main source",
+    );
+
+    let compiled = compile_source_file(&main_path).expect("module argument should compile");
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(
+        vm.run().expect("module argument should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(7)]);
+
+    remove_module_root(&root);
+}
+
+#[test]
 fn nested_module_override_parse_error_preserves_source_text_and_path() {
     let root = temp_module_root("vm_rustscript_nested_override_error_test");
     let main_path = root.join("main.rss");
