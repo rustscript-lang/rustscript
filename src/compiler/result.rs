@@ -825,11 +825,15 @@ fn resolve_method(
                     ),
                 ));
             }
+            let mut contextual = ok_schema.clone();
             if let Some(annotated) = &annotated
                 && !schema_contains_unknown(annotated)
             {
+                require_method_schema(env, annotated, &fallback_schema, span, method, "fallback")?;
                 require_method_schema(env, annotated, &ok_schema, span, method, "result")?;
+                contextual = annotated.clone();
             }
+            let fallback_schema = retain_contextual_eager_schema(fallback_schema, &contextual);
             reject_resource_capturing_closure(&argument, &fallback_schema, span, method, env)?;
             env.slots.insert(slots.receiver, result_schema.clone());
             env.slots.insert(slots.argument, fallback_schema.clone());
@@ -865,7 +869,7 @@ fn resolve_method(
             resolve_expr(&mut argument, Some(&callback_hint), env)?;
             let callback_schema =
                 method_callback_schema(&argument, &err_schema, span, method, env)?;
-            let TypeSchema::Callable { params, result } = &callback_schema else {
+            let TypeSchema::Callable { params, .. } = &callback_schema else {
                 unreachable!("method_callback_schema returns a Callable");
             };
             if params.len() != 1 {
@@ -885,14 +889,18 @@ fn resolve_method(
                 method,
                 "callback parameter",
             )?;
-            let returned = result.as_ref();
-            require_concrete_schema(returned, span, method, "callback return")?;
-            require_method_schema(env, &ok_schema, returned, span, method, "callback result")?;
+            let returned = callback_result_schema(&callback_schema);
+            require_concrete_schema(&returned, span, method, "callback return")?;
+            require_method_schema(env, &ok_schema, &returned, span, method, "callback result")?;
+            let mut contextual = ok_schema.clone();
             if let Some(annotated) = &annotated
                 && !schema_contains_unknown(annotated)
             {
                 require_method_schema(env, annotated, &ok_schema, span, method, "result")?;
+                require_method_schema(env, annotated, &returned, span, method, "callback result")?;
+                contextual = annotated.clone();
             }
+            let callback_schema = retain_contextual_callback_result(callback_schema, &contextual);
             reject_resource_capturing_closure(&argument, &callback_schema, span, method, env)?;
             env.slots.insert(slots.receiver, result_schema.clone());
             env.slots.insert(slots.argument, callback_schema.clone());
@@ -983,8 +991,8 @@ fn resolve_method(
         result: Box::new(callback_result_hint.unwrap_or(TypeSchema::Unknown)),
     };
     resolve_expr(&mut argument, Some(&callback_hint), env)?;
-    let callback_schema = method_callback_schema(&argument, &param, span, method, env)?;
-    let TypeSchema::Callable { params, result } = &callback_schema else {
+    let mut callback_schema = method_callback_schema(&argument, &param, span, method, env)?;
+    let TypeSchema::Callable { params, .. } = &callback_schema else {
         unreachable!("method_callback_schema returns a Callable");
     };
     if params.len() != 1 {
@@ -998,16 +1006,31 @@ fn resolve_method(
         ));
     }
     require_method_schema(env, &param, &params[0], span, method, "callback parameter")?;
-    require_concrete_schema(result, span, method, "callback return")?;
+    require_concrete_schema(
+        &callback_result_schema(&callback_schema),
+        span,
+        method,
+        "callback return",
+    )?;
+    let inferred_result = callback_result_schema(&callback_schema);
     reject_resource_capturing_closure(&argument, &callback_schema, span, method, env)?;
 
     let (ok_expr, err_expr) = match method {
         ResultMethod::Map => {
-            let output_ok = result.as_ref().clone();
+            let mut output_ok = inferred_result.clone();
             if let Some(annotated_result) = &annotated_result {
                 let (annotated_ok, _) =
                     branch_schemas(annotated_result).expect("matched Result annotation");
-                require_method_schema(env, &annotated_ok, &output_ok, span, method, "result")?;
+                require_method_schema(
+                    env,
+                    &annotated_ok,
+                    &inferred_result,
+                    span,
+                    method,
+                    "result",
+                )?;
+                callback_schema = retain_contextual_callback_result(callback_schema, &annotated_ok);
+                output_ok = callback_result_schema(&callback_schema);
             }
             let output = TypeSchema::Result {
                 ok: Box::new(output_ok),
@@ -1033,11 +1056,21 @@ fn resolve_method(
             (ok_expr, err_expr)
         }
         ResultMethod::MapErr => {
-            let output_err = result.as_ref().clone();
+            let mut output_err = inferred_result.clone();
             if let Some(annotated_result) = &annotated_result {
                 let (_, annotated_err) =
                     branch_schemas(annotated_result).expect("matched Result annotation");
-                require_method_schema(env, &annotated_err, &output_err, span, method, "result")?;
+                require_method_schema(
+                    env,
+                    &annotated_err,
+                    &inferred_result,
+                    span,
+                    method,
+                    "result",
+                )?;
+                callback_schema =
+                    retain_contextual_callback_result(callback_schema, &annotated_err);
+                output_err = callback_result_schema(&callback_schema);
             }
             let output = TypeSchema::Result {
                 ok: Box::new(ok_schema.clone()),
@@ -1060,20 +1093,20 @@ fn resolve_method(
         }
         ResultMethod::AndThen => {
             let TypeSchema::Result {
-                ok: output_ok,
+                ok: inferred_ok,
                 err: callback_err,
-            } = result.as_ref()
+            } = &inferred_result
             else {
                 return Err(result_error(
                     span,
                     format!(
                         ".and_then callback must return Result<U, E>, found {}",
-                        render_schema(result)
+                        render_schema(&inferred_result)
                     ),
                 ));
             };
-            let output_ok = output_ok.as_ref().clone();
-            require_concrete_schema(&output_ok, span, method, "callback success type")?;
+            let inferred_ok = inferred_ok.as_ref().clone();
+            require_concrete_schema(&inferred_ok, span, method, "callback success type")?;
             let callback_err = callback_err.as_ref().clone();
             require_method_schema(
                 env,
@@ -1083,10 +1116,11 @@ fn resolve_method(
                 method,
                 "callback error type",
             )?;
+            let mut contextual_ok = inferred_ok;
             if let Some(annotated_result) = &annotated_result {
                 let (annotated_ok, annotated_err) =
                     branch_schemas(annotated_result).expect("matched Result annotation");
-                require_method_schema(env, &annotated_ok, &output_ok, span, method, "result")?;
+                require_method_schema(env, &annotated_ok, &contextual_ok, span, method, "result")?;
                 require_method_schema(
                     env,
                     &annotated_err,
@@ -1095,7 +1129,16 @@ fn resolve_method(
                     method,
                     "result error type",
                 )?;
+                contextual_ok = annotated_ok;
             }
+            callback_schema = retain_contextual_callback_result(
+                callback_schema,
+                &TypeSchema::Result {
+                    ok: Box::new(contextual_ok.clone()),
+                    err: Box::new(err_schema.clone()),
+                },
+            );
+            let output_ok = contextual_ok;
             let output = TypeSchema::Result {
                 ok: Box::new(output_ok),
                 err: Box::new(err_schema.clone()),
@@ -1118,13 +1161,13 @@ fn resolve_method(
             let TypeSchema::Result {
                 ok: callback_ok,
                 err: output_err,
-            } = result.as_ref()
+            } = &inferred_result
             else {
                 return Err(result_error(
                     span,
                     format!(
                         ".or_else callback must return Result<T, F>, found {}",
-                        render_schema(result)
+                        render_schema(&inferred_result)
                     ),
                 ));
             };
@@ -1152,6 +1195,13 @@ fn resolve_method(
                     "result error type",
                 )?;
             }
+            callback_schema = retain_contextual_callback_result(
+                callback_schema,
+                &TypeSchema::Result {
+                    ok: Box::new(ok_schema.clone()),
+                    err: Box::new(output_err.clone()),
+                },
+            );
             let output = TypeSchema::Result {
                 ok: Box::new(ok_schema.clone()),
                 err: Box::new(output_err),
@@ -1436,7 +1486,7 @@ fn resolve_option_method(
                     _ => None,
                 })
                 .unwrap_or(TypeSchema::Unknown);
-            let callback_schema = option_callback_schema(
+            let mut callback_schema = option_callback_schema(
                 &mut argument,
                 vec![inner.clone()],
                 callback_result_hint,
@@ -1444,11 +1494,7 @@ fn resolve_option_method(
                 method_name,
                 env,
             )?;
-            let TypeSchema::Callable { result, .. } = &callback_schema else {
-                unreachable!("option_callback_schema returns a Callable");
-            };
-            let output_payload = result.as_ref().clone();
-            let output = TypeSchema::Option(Box::new(output_payload.clone()));
+            let inferred_payload = callback_result_schema(&callback_schema);
             if let Some(annotated) = &annotated {
                 let TypeSchema::Option(annotated_inner) = annotated else {
                     return Err(result_error(
@@ -1463,13 +1509,17 @@ fn resolve_option_method(
                     super::result::require_method_schema_named(
                         env,
                         annotated_inner,
-                        &output_payload,
+                        &inferred_payload,
                         span,
                         method_name,
                         "result",
                     )?;
+                    callback_schema =
+                        retain_contextual_callback_result(callback_schema, annotated_inner);
                 }
             }
+            let output_payload = callback_result_schema(&callback_schema);
+            let output = TypeSchema::Option(Box::new(output_payload.clone()));
             super::result::reject_resource_capturing_closure_named(
                 &argument,
                 &callback_schema,
@@ -1510,7 +1560,7 @@ fn resolve_option_method(
                     _ => None,
                 })
                 .unwrap_or(TypeSchema::Unknown);
-            let callback_schema = option_callback_schema(
+            let mut callback_schema = option_callback_schema(
                 &mut argument,
                 vec![inner.clone()],
                 callback_result_hint,
@@ -1521,7 +1571,7 @@ fn resolve_option_method(
             let TypeSchema::Callable { result, .. } = &callback_schema else {
                 unreachable!("option_callback_schema returns a Callable");
             };
-            let TypeSchema::Option(output_payload) = result.as_ref() else {
+            let TypeSchema::Option(inferred_payload) = result.as_ref() else {
                 return Err(result_error(
                     span,
                     format!(
@@ -1530,14 +1580,14 @@ fn resolve_option_method(
                     ),
                 ));
             };
-            if matches!(output_payload.as_ref(), TypeSchema::Unknown) {
+            let inferred_payload = inferred_payload.as_ref().clone();
+            if matches!(inferred_payload, TypeSchema::Unknown) {
                 return Err(result_error(
                     span,
                     ".and_then callback Option payload is unresolved; annotate Option<U>"
                         .to_string(),
                 ));
             }
-            let output = TypeSchema::Option(Box::new(output_payload.as_ref().clone()));
             if let Some(annotated) = &annotated {
                 let TypeSchema::Option(annotated_inner) = annotated else {
                     return Err(result_error(
@@ -1552,13 +1602,22 @@ fn resolve_option_method(
                     super::result::require_method_schema_named(
                         env,
                         annotated_inner,
-                        output_payload,
+                        &inferred_payload,
                         span,
                         method_name,
                         "result",
                     )?;
+                    callback_schema = retain_contextual_callback_result(
+                        callback_schema,
+                        &TypeSchema::Option(Box::new((**annotated_inner).clone())),
+                    );
                 }
             }
+            let TypeSchema::Option(output_payload) = callback_result_schema(&callback_schema)
+            else {
+                unreachable!("retained and_then callback result is Option");
+            };
+            let output = TypeSchema::Option(output_payload);
             super::result::reject_resource_capturing_closure_named(
                 &argument,
                 &callback_schema,
@@ -1584,7 +1643,7 @@ fn resolve_option_method(
             )
         }
         OptionMethod::OrElse => {
-            let callback_schema = option_callback_schema(
+            let mut callback_schema = option_callback_schema(
                 &mut argument,
                 Vec::new(),
                 receiver_schema.clone(),
@@ -1613,6 +1672,7 @@ fn resolve_option_method(
                 method_name,
                 "callback result",
             )?;
+            let mut contextual = receiver_schema.clone();
             if let Some(annotated) = &annotated {
                 let TypeSchema::Option(annotated_inner) = annotated else {
                     return Err(result_error(
@@ -1632,8 +1692,10 @@ fn resolve_option_method(
                         method_name,
                         "result",
                     )?;
+                    contextual = annotated.clone();
                 }
             }
+            callback_schema = retain_contextual_callback_result(callback_schema, &contextual);
             super::result::reject_resource_capturing_closure_named(
                 &argument,
                 &callback_schema,
@@ -1689,9 +1751,18 @@ fn resolve_option_method(
                     ),
                 ));
             }
+            let mut contextual = inner.clone();
             if let Some(annotated) = &annotated
                 && !schema_contains_unknown(annotated)
             {
+                super::result::require_method_schema_named(
+                    env,
+                    annotated,
+                    &fallback_schema,
+                    span,
+                    method_name,
+                    "fallback",
+                )?;
                 super::result::require_method_schema_named(
                     env,
                     annotated,
@@ -1700,7 +1771,9 @@ fn resolve_option_method(
                     method_name,
                     "result",
                 )?;
+                contextual = annotated.clone();
             }
+            let fallback_schema = retain_contextual_eager_schema(fallback_schema, &contextual);
             (
                 fallback_schema,
                 Expr::Var(slots.some_binding),
@@ -1709,7 +1782,7 @@ fn resolve_option_method(
         }
         OptionMethod::UnwrapOrElse => {
             let callback_result_hint = annotated.clone().unwrap_or_else(|| inner.clone());
-            let callback_schema = option_callback_schema(
+            let mut callback_schema = option_callback_schema(
                 &mut argument,
                 Vec::new(),
                 callback_result_hint,
@@ -1717,17 +1790,16 @@ fn resolve_option_method(
                 method_name,
                 env,
             )?;
-            let TypeSchema::Callable { result, .. } = &callback_schema else {
-                unreachable!("option_callback_schema returns a Callable");
-            };
+            let result = callback_result_schema(&callback_schema);
             super::result::require_method_schema_named(
                 env,
                 &inner,
-                result,
+                &result,
                 span,
                 method_name,
                 "callback result",
             )?;
+            let mut contextual = inner.clone();
             if let Some(annotated) = &annotated
                 && !schema_contains_unknown(annotated)
             {
@@ -1739,7 +1811,17 @@ fn resolve_option_method(
                     method_name,
                     "result",
                 )?;
+                super::result::require_method_schema_named(
+                    env,
+                    annotated,
+                    &result,
+                    span,
+                    method_name,
+                    "callback result",
+                )?;
+                contextual = annotated.clone();
             }
+            callback_schema = retain_contextual_callback_result(callback_schema, &contextual);
             super::result::reject_resource_capturing_closure_named(
                 &argument,
                 &callback_schema,
@@ -1787,10 +1869,7 @@ fn resolve_option_method(
                     ),
                 ));
             }
-            let output = TypeSchema::Result {
-                ok: Box::new(inner.clone()),
-                err: Box::new(error_schema.clone()),
-            };
+            let mut context_err = error_schema.clone();
             if let Some(annotated) = &annotated
                 && !schema_contains_unknown(annotated)
             {
@@ -1823,9 +1902,15 @@ fn resolve_option_method(
                     method_name,
                     "result Err payload",
                 )?;
+                context_err = (**annotated_err).clone();
             }
+            let output_err = retain_contextual_eager_schema(error_schema.clone(), &context_err);
+            let output = TypeSchema::Result {
+                ok: Box::new(inner.clone()),
+                err: Box::new(output_err.clone()),
+            };
             (
-                error_schema,
+                output_err,
                 Expr::ResultConstruct {
                     ok: true,
                     payload: Box::new(Expr::Var(slots.some_binding)),
@@ -1849,7 +1934,7 @@ fn resolve_option_method(
                 }
                 _ => None,
             });
-            let callback_schema = option_callback_schema(
+            let mut callback_schema = option_callback_schema(
                 &mut argument,
                 Vec::new(),
                 err_hint.unwrap_or(TypeSchema::Unknown),
@@ -1857,10 +1942,7 @@ fn resolve_option_method(
                 method_name,
                 env,
             )?;
-            let TypeSchema::Callable { result, .. } = &callback_schema else {
-                unreachable!("option_callback_schema returns a Callable");
-            };
-            let error_schema = result.as_ref().clone();
+            let error_schema = callback_result_schema(&callback_schema);
             if matches!(error_schema, TypeSchema::Unknown) {
                 return Err(result_error(
                     span,
@@ -1868,10 +1950,7 @@ fn resolve_option_method(
                         .to_string(),
                 ));
             }
-            let output = TypeSchema::Result {
-                ok: Box::new(inner.clone()),
-                err: Box::new(error_schema.clone()),
-            };
+            let mut context_err = error_schema.clone();
             if let Some(annotated) = &annotated
                 && !schema_contains_unknown(annotated)
             {
@@ -1904,7 +1983,14 @@ fn resolve_option_method(
                     method_name,
                     "result Err payload",
                 )?;
+                context_err = (**annotated_err).clone();
             }
+            callback_schema = retain_contextual_callback_result(callback_schema, &context_err);
+            let output_err = callback_result_schema(&callback_schema);
+            let output = TypeSchema::Result {
+                ok: Box::new(inner.clone()),
+                err: Box::new(output_err),
+            };
             super::result::reject_resource_capturing_closure_named(
                 &argument,
                 &callback_schema,
@@ -2234,6 +2320,100 @@ fn schema_contains_unknown(schema: &TypeSchema) -> bool {
             params.iter().any(schema_contains_unknown) || schema_contains_unknown(result)
         }
         _ => false,
+    }
+}
+
+/// Whether a contextual schema is fully resolved, including nested logical
+/// `Option`/payload schemas. `schema_contains_unknown` intentionally keeps the
+/// older `Optional` handling for Result payload checks; method lowering must
+/// not store an unresolved `Option` context on a hidden argument binding.
+fn method_context_schema_is_known(schema: &TypeSchema) -> bool {
+    match schema {
+        TypeSchema::Unknown => false,
+        TypeSchema::Optional(inner)
+        | TypeSchema::Option(inner)
+        | TypeSchema::Array(inner)
+        | TypeSchema::Map(inner) => method_context_schema_is_known(inner),
+        TypeSchema::Result { ok, err } => {
+            method_context_schema_is_known(ok) && method_context_schema_is_known(err)
+        }
+        TypeSchema::ArrayTuple(items) => items.iter().all(method_context_schema_is_known),
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            prefix.iter().all(method_context_schema_is_known)
+                && method_context_schema_is_known(rest)
+        }
+        TypeSchema::Object(fields) => fields.values().all(method_context_schema_is_known),
+        TypeSchema::Named(_, args) => args.iter().all(method_context_schema_is_known),
+        TypeSchema::Callable { params, result } => {
+            params.iter().all(method_context_schema_is_known)
+                && method_context_schema_is_known(result)
+        }
+        _ => true,
+    }
+}
+
+/// Whether the contextual value carries a named/object record shape whose
+/// omitted logical `Option` fields need physical materialization. Scalar-only
+/// contexts keep the actual inferred schema instead of relabelling, for example
+/// a legacy `Optional` annotation over an `int` payload.
+fn contextual_schema_carries_record(schema: &TypeSchema) -> bool {
+    match schema {
+        TypeSchema::Named(_, _) | TypeSchema::Object(_) => true,
+        TypeSchema::Optional(inner)
+        | TypeSchema::Option(inner)
+        | TypeSchema::Array(inner)
+        | TypeSchema::Map(inner) => contextual_schema_carries_record(inner),
+        TypeSchema::Result { ok, err } => {
+            contextual_schema_carries_record(ok) || contextual_schema_carries_record(err)
+        }
+        TypeSchema::Callable { result, .. } => contextual_schema_carries_record(result),
+        TypeSchema::ArrayTuple(items) => items.iter().any(contextual_schema_carries_record),
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            prefix.iter().any(contextual_schema_carries_record)
+                || contextual_schema_carries_record(rest)
+        }
+        _ => false,
+    }
+}
+
+fn callback_result_schema(schema: &TypeSchema) -> TypeSchema {
+    match schema {
+        TypeSchema::Callable { result, .. } => (**result).clone(),
+        _ => unreachable!("method callback schema is Callable"),
+    }
+}
+
+/// Keep the already-validated contextual return schema on a method-lowered
+/// callback. The inferred callback still supplies the actual parameter list and
+/// arity; the closure expression retains its own captures and targets. Only the
+/// checked result branch is replaced, so the hidden argument let and the
+/// compiler-owned normalization walker see the instantiated named/generic
+/// record the surrounding context requires instead of a present-key object.
+fn retain_contextual_callback_result(
+    callback_schema: TypeSchema,
+    contextual: &TypeSchema,
+) -> TypeSchema {
+    if !method_context_schema_is_known(contextual) || !contextual_schema_carries_record(contextual)
+    {
+        return callback_schema;
+    }
+    match callback_schema {
+        TypeSchema::Callable { params, .. } => TypeSchema::Callable {
+            params,
+            result: Box::new(contextual.clone()),
+        },
+        other => other,
+    }
+}
+
+/// Keep the already-validated contextual payload/error schema on a
+/// method-lowered eager argument binding. An unresolved or absent context
+/// keeps the actual inferred schema.
+fn retain_contextual_eager_schema(inferred: TypeSchema, contextual: &TypeSchema) -> TypeSchema {
+    if method_context_schema_is_known(contextual) && contextual_schema_carries_record(contextual) {
+        contextual.clone()
+    } else {
+        inferred
     }
 }
 

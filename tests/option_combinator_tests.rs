@@ -293,10 +293,279 @@ fn option_methods_reject_wrong_callback_shapes_and_return_types() {
 }
 
 #[test]
+fn map_preserves_known_named_return_schema_and_materializes_omitted_option_field() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        let flag: Option<int> = Option::Some(1);
+        let item: Option<Entry> = flag.map(|n| { name: "x" });
+        let out = match item {
+            Option::Some(entry) => match entry.note {
+                Option::Some(value) => value,
+                Option::None => 0,
+            },
+            Option::None => -1,
+        };
+        out;
+    "#;
+    assert_eq!(eval(source), Value::Int(0));
+}
+
+#[test]
+fn unwrap_or_preserves_known_named_payload_schema_and_materializes_omitted_option_field() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        let flag: Option<Entry> = Option::None;
+        let item: Entry = flag.unwrap_or({ name: "x" });
+        let projected = item?.note;
+        let out = match projected {
+            Option::Some(inner) => match inner {
+                Option::Some(value) => value,
+                Option::None => 1,
+            },
+            Option::None => 2,
+        };
+        out;
+    "#;
+    assert_eq!(eval(source), Value::Int(1));
+}
+
+#[test]
 fn methods_on_a_non_option_receiver_report_the_option_requirement() {
     let diagnostic = reject("let value: int = 1; value.map(|item| item + 1);");
     assert!(
         diagnostic.contains("Option") || diagnostic.contains("Result"),
         "non-container receiver must name the required owner: {diagnostic}"
     );
+}
+
+#[test]
+fn map_function_return_known_named_schema_materializes_omitted_option_field() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        fn make(flag: Option<int>) -> Option<Entry> {
+            flag.map(|n| { name: "x" })
+        }
+        let flag: Option<int> = Option::Some(1);
+        let item = make(flag);
+        let out = match item {
+            Option::Some(entry) => match entry.note {
+                Option::Some(value) => value,
+                Option::None => 0,
+            },
+            Option::None => -1,
+        };
+        out;
+    "#;
+    assert_eq!(eval(source), Value::Int(0));
+}
+
+#[test]
+fn map_generic_nested_named_payload_materializes_all_omitted_option_fields() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        struct Box<T> { value: T, note: Option<int> }
+        fn make(flag: Option<int>) -> Option<Box<Entry>> {
+            flag.map(|n| { value: { name: "x" } })
+        }
+        fn observe_note(note: Option<Option<int>>) -> int {
+            match note {
+                Option::Some(inner_note) => match inner_note {
+                    Option::Some(value) => value,
+                    Option::None => 1,
+                },
+                Option::None => -2,
+            }
+        }
+        fn observe_box(item: Option<Box<Entry>>) -> int {
+            match item {
+                Option::Some(inner) => observe_note(inner?.note),
+                Option::None => -1,
+            }
+        }
+        fn entry_note(value: Entry) -> Option<Option<int>> {
+            value?.note
+        }
+        fn observe_entry(item: Option<Box<Entry>>) -> int {
+            match item {
+                Option::Some(inner) => observe_note(entry_note(inner.value)),
+                Option::None => -1,
+            }
+        }
+        observe_box(make(Option::Some(1))) + observe_entry(make(Option::Some(1)));
+    "#;
+    // Both the Box.note and nested Entry.note materialize as tagged None.
+    assert_eq!(eval(source), Value::Int(2));
+}
+
+#[test]
+fn map_conditional_and_block_callbacks_keep_the_named_return_context() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        let flag: Option<int> = Option::Some(1);
+        let item: Option<Entry> = flag.map(if true => {
+            |n| { name: "chosen" }
+        } else => {
+            |n| { name: "other" }
+        });
+        let out = match item {
+            Option::Some(entry) => match entry.note {
+                Option::Some(value) => value,
+                Option::None => 0,
+            },
+            Option::None => -1,
+        };
+        out;
+    "#;
+    assert_eq!(eval(source), Value::Int(0));
+}
+
+#[test]
+fn map_named_function_callback_keeps_its_declared_return_context() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        fn build(n: int) -> Entry {
+            { name: "built" }
+        }
+        let flag: Option<int> = Option::Some(1);
+        let item: Option<Entry> = flag.map(build);
+        let out = match item {
+            Option::Some(entry) => match entry.note {
+                Option::Some(value) => value,
+                Option::None => 0,
+            },
+            Option::None => -1,
+        };
+        out;
+    "#;
+    assert_eq!(eval(source), Value::Int(0));
+}
+
+#[test]
+fn map_prebound_annotated_callback_keeps_its_declared_return_context() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        let callback: fn(int) -> Entry = |n| { name: "bound" };
+        let flag: Option<int> = Option::Some(1);
+        let item: Option<Entry> = flag.map(callback);
+        let out = match item {
+            Option::Some(entry) => match entry.note {
+                Option::Some(value) => value,
+                Option::None => 0,
+            },
+            Option::None => -1,
+        };
+        out;
+    "#;
+    assert_eq!(eval(source), Value::Int(0));
+}
+
+#[test]
+fn map_known_return_schema_preserves_callback_captures_and_single_body_run() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        let mut calls = [0];
+        let flag: Option<int> = Option::Some(1);
+        let item: Option<Entry> = flag.map(|n| if true => {
+            calls[0] = calls[0].copy() + 1;
+            { name: "x" }
+        } else => {
+            { name: "y" }
+        });
+        let out = match item {
+            Option::Some(entry) => match entry.note {
+                Option::Some(value) => value,
+                Option::None => 0,
+            },
+            Option::None => -1,
+        };
+        out + calls[0].copy();
+    "#;
+    assert_eq!(eval(source), Value::Int(1));
+}
+
+#[test]
+fn unwrap_or_else_named_payload_keeps_the_body_lazy_and_materializes_none() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        let mut calls = [0];
+        let present: Option<Entry> = Option::Some({ name: "p", note: Option::Some(1) });
+        let absent: Option<Entry> = Option::None;
+        let a: Entry = present.unwrap_or_else(|| if true => {
+            calls[0] = calls[0].copy() + 1;
+            { name: "a" }
+        } else => {
+            { name: "unused" }
+        });
+        let b: Entry = absent.unwrap_or_else(|| if true => {
+            calls[0] = calls[0].copy() + 1;
+            { name: "b" }
+        } else => {
+            { name: "unused" }
+        });
+        let a_note = match a.note { Option::Some(value) => value, Option::None => -1 };
+        let b_note = match b?.note {
+            Option::Some(inner_note) => match inner_note {
+                Option::Some(value) => value,
+                Option::None => 1,
+            },
+            Option::None => -2,
+        };
+        a_note + b_note + calls[0].copy();
+    "#;
+    // The Some branch keeps its payload and skips the lazy body; the None
+    // branch runs it once and materializes Entry.note as tagged None.
+    assert_eq!(eval(source), Value::Int(3));
+}
+
+#[test]
+fn and_then_and_or_else_named_option_payloads_materialize_omitted_option_fields() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        fn observed(item: Option<Entry>) -> int {
+            match item {
+                Option::Some(entry) => match entry?.note {
+                    Option::Some(inner_note) => match inner_note {
+                        Option::Some(value) => value,
+                        Option::None => 1,
+                    },
+                    Option::None => -2,
+                },
+                Option::None => -1,
+            }
+        }
+        let flag: Option<int> = Option::Some(1);
+        let chained: Option<Entry> = flag.and_then(|n| Option::Some({ name: "x" }));
+        let absent: Option<Entry> = Option::None;
+        let recovered: Option<Entry> = absent.or_else(|| Option::Some({ name: "y" }));
+        observed(chained) + observed(recovered);
+    "#;
+    assert_eq!(eval(source), Value::Int(2));
+}
+
+#[test]
+fn ok_or_and_ok_or_else_named_errors_materialize_omitted_option_fields() {
+    let source = r#"
+        struct Failure { code: int, detail: Option<int> }
+        fn observed(result: Result<int, Failure>) -> int {
+            match result {
+                Result::Ok(value) => -1,
+                Result::Err(error) => match error?.detail {
+                    Option::Some(inner_detail) => match inner_detail {
+                        Option::Some(value) => value,
+                        Option::None => 1,
+                    },
+                    Option::None => -2,
+                },
+            }
+        }
+        let present: Option<int> = Option::Some(1);
+        let absent: Option<int> = Option::None;
+        let eager: Result<int, Failure> = absent.ok_or({ code: 7 });
+        let lazy: Result<int, Failure> = absent.ok_or_else(|| { code: 8 });
+        observed(eager) + observed(lazy) + match present.ok_or({ code: 9 }) {
+            Result::Ok(value) => value,
+            Result::Err(error) => -1,
+        };
+    "#;
+    assert_eq!(eval(source), Value::Int(3));
 }
