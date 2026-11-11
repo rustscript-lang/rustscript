@@ -391,7 +391,7 @@ fn sqlite_value_mismatched_payload_and_limits_are_rejected() {
          let execute_params9: [SqliteValue] = [{ kind: "int", int_value: Option::Some("wrong") }];
          sqlite::execute(db, "SELECT ?", execute_params9);"#;
     let mismatch = match compile_source_with_flavor_and_options(
-        &mismatch_source,
+        mismatch_source,
         vm::compiler::SourceFlavor::RustScript,
         CompileSourceFileOptions::default().with_host_api_catalog(sqlite_host_catalog()),
     ) {
