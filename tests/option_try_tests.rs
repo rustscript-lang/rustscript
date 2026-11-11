@@ -298,8 +298,19 @@ fn optional_projection_preserves_none_some_none_and_some_some() {
         a + b + c;
     "#;
     // Some(Some(0)) keeps two layers, explicit None stays Some(None), and an
-    // omitted permitted Option field normalizes to None.
-    assert_eq!(eval(source), Value::Int(39));
+    // omitted permitted Option field normalizes to an explicit None.
+    assert_eq!(eval(source), Value::Int(38));
+}
+
+#[test]
+fn omitted_option_field_direct_access_observes_explicit_none() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        let entry: Entry = { name: "x" };
+        let note = entry.note;
+        match note { Option::Some(value) => value, Option::None => 7 };
+    "#;
+    assert_eq!(eval(source), Value::Int(7));
 }
 
 #[test]
