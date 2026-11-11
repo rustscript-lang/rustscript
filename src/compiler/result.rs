@@ -11,7 +11,8 @@ use std::sync::Arc;
 use super::CompileError;
 use super::ir::{
     AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot,
-    ResultMethod, ResultMethodSlots, SemanticNodeId, Stmt, TypeSchema,
+    OptionMethod, OptionMethodSlots, ResultMethod, ResultMethodSlots, SemanticNodeId, Stmt,
+    TypeSchema,
 };
 use super::source_map::Span;
 
@@ -345,6 +346,46 @@ fn resolve_expr(
                 "is_ok/is_err",
             )
         }
+        Expr::ResultConvert {
+            ok,
+            value,
+            value_slot,
+            ok_binding,
+            err_binding,
+            span,
+            ..
+        } => {
+            let value = std::mem::replace(value.as_mut(), Expr::Null);
+            let lowered = resolve_convert(
+                *ok,
+                value,
+                ResultConvertSlots {
+                    value: *value_slot,
+                    ok: *ok_binding,
+                    err: *err_binding,
+                },
+                *span,
+                expected,
+                env,
+            )?;
+            *expr = lowered;
+            Ok(())
+        }
+        Expr::OptionMethod {
+            method,
+            receiver,
+            argument,
+            slots,
+            span,
+            ..
+        } => {
+            let receiver = std::mem::replace(receiver.as_mut(), Expr::Null);
+            let argument = std::mem::replace(argument.as_mut(), Expr::Null);
+            let lowered =
+                resolve_option_method(*method, receiver, argument, *slots, *span, expected, env)?;
+            *expr = lowered;
+            Ok(())
+        }
         Expr::ResultMethod {
             method,
             receiver,
@@ -603,6 +644,33 @@ fn resolve_method(
         None | Some(TypeSchema::Unknown) => None,
         Some(schema) => Some(schema.clone()),
     };
+    // Shared combinator names are owned by the receiver's logical type. Peek
+    // the receiver schema before applying a Result-only contextual hint so a
+    // bare `Option::None.unwrap_or(...)` is never typed as a Result constructor.
+    if let Some(option_method) = method.as_option_method() {
+        let static_schema = authoritative_schema(&receiver, env);
+        let syntactic_option = matches!(
+            receiver,
+            Expr::OptionConstruct { .. } | Expr::OptionMatch { .. } | Expr::OptionMethod { .. }
+        );
+        if matches!(static_schema, Some(TypeSchema::Option(_)))
+            || (static_schema.is_none() && syntactic_option)
+        {
+            return resolve_option_method(
+                option_method,
+                receiver,
+                argument,
+                OptionMethodSlots {
+                    receiver: slots.receiver,
+                    argument: slots.argument,
+                    some_binding: slots.ok_binding,
+                },
+                span,
+                expected,
+                env,
+            );
+        }
+    }
     // Propagate the one Result branch the method keeps into the receiver so
     // unannotated chains such as `value.map(..).map_err(..).and_then(..)` can
     // still type callback constructors from the head annotation. A branch the
@@ -613,10 +681,28 @@ fn resolve_method(
     let result_schema = match receiver_schema {
         Some(schema @ TypeSchema::Result { .. }) => schema,
         Some(TypeSchema::Option(_)) => {
+            // A receiver whose schema only became visible after resolution is
+            // still owned by the logical Option lowering. `map_err` stays
+            // Result-only.
+            if let Some(option_method) = method.as_option_method() {
+                return resolve_option_method(
+                    option_method,
+                    receiver,
+                    argument,
+                    OptionMethodSlots {
+                        receiver: slots.receiver,
+                        argument: slots.argument,
+                        some_binding: slots.ok_binding,
+                    },
+                    span,
+                    expected,
+                    env,
+                );
+            }
             return Err(result_error(
                 span,
                 format!(
-                    "logical Option<T> does not support .{}(); Option operations are outside the current contract",
+                    ".{} requires a Result<T, E> receiver, found a logical Option<T>",
                     method.name()
                 ),
             ));
@@ -1112,6 +1198,858 @@ fn resolve_method(
     Ok(lowered)
 }
 
+#[derive(Clone, Copy)]
+struct ResultConvertSlots {
+    value: LocalSlot,
+    ok: LocalSlot,
+    err: LocalSlot,
+}
+
+/// Lower `Result<T, E>.ok()` / `.err()` into an ordinary typed Result match
+/// whose arms construct the logical Option result. The unselected branch
+/// discards its payload, so a resource-bearing or unresolved-generic branch
+/// has no legitimate destination and is rejected statically.
+fn resolve_convert(
+    ok: bool,
+    mut value: Expr,
+    slots: ResultConvertSlots,
+    span: Span,
+    expected: Option<&TypeSchema>,
+    env: &mut Env,
+) -> Result<Expr, CompileError> {
+    resolve_expr(&mut value, None, env)?;
+    let schema = authoritative_schema(&value, env).ok_or_else(|| {
+        result_error(
+            span,
+            format!(
+                ".{} requires a Result<T, E> receiver, found an untyped value",
+                if ok { "ok" } else { "err" }
+            ),
+        )
+    })?;
+    let TypeSchema::Result {
+        ok: ok_schema,
+        err: err_schema,
+    } = &schema
+    else {
+        return Err(result_error(
+            span,
+            format!(
+                ".{} requires a Result<T, E> receiver, found {}",
+                if ok { "ok" } else { "err" },
+                render_schema(&schema)
+            ),
+        ));
+    };
+    let ok_schema = ok_schema.as_ref().clone();
+    let err_schema = err_schema.as_ref().clone();
+    let selected = if ok {
+        ok_schema.clone()
+    } else {
+        err_schema.clone()
+    };
+    let discarded_name = if ok { "Err" } else { "Ok" };
+    let discarded = if ok {
+        err_schema.clone()
+    } else {
+        ok_schema.clone()
+    };
+    if discarded.contains_resource_with_named_types(&env.struct_schemas) {
+        return Err(result_error(
+            span,
+            format!(
+                ".{} on Result<{}, {}> cannot discard the selected {} payload owner: the unselected branch has no destination for resource-typed value {}",
+                if ok { "ok" } else { "err" },
+                render_schema(&ok_schema),
+                render_schema(&err_schema),
+                discarded_name,
+                render_schema(&discarded)
+            ),
+        ));
+    }
+    // A generic parameter is not proven resource-free at this definition:
+    // a later instantiation can bind it to a resource type and the unselected
+    // branch would drop that owner.
+    if schema_contains_generic_param(&discarded) {
+        return Err(result_error(
+            span,
+            format!(
+                ".{} on Result<{}, {}> cannot discard the selected {} payload owner: it contains an unresolved generic parameter that may be instantiated with a resource",
+                if ok { "ok" } else { "err" },
+                render_schema(&ok_schema),
+                render_schema(&err_schema),
+                discarded_name
+            ),
+        ));
+    }
+    let output = TypeSchema::Option(Box::new(selected.clone()));
+    if let Some(annotated) = expected
+        && !schema_contains_unknown(annotated)
+    {
+        let TypeSchema::Option(annotated_inner) = annotated else {
+            return Err(result_error(
+                span,
+                format!(
+                    ".{} produces a logical Option value, not {}",
+                    if ok { "ok" } else { "err" },
+                    render_schema(annotated)
+                ),
+            ));
+        };
+        if !matches!(annotated_inner.as_ref(), TypeSchema::Unknown) {
+            require_method_schema_named(
+                env,
+                annotated_inner,
+                &selected,
+                span,
+                if ok { "ok" } else { "err" },
+                "result payload",
+            )?;
+        }
+    }
+    env.slots.insert(slots.value, schema.clone());
+    env.slots.insert(slots.ok, ok_schema.clone());
+    env.slots.insert(slots.err, err_schema);
+    let selected_construct = |payload: Expr| Expr::OptionConstruct {
+        some: true,
+        payload: Some(Box::new(payload)),
+        option_schema: output.clone(),
+        span,
+        semantic_id: None,
+    };
+    let none_construct = || Expr::OptionConstruct {
+        some: false,
+        payload: None,
+        option_schema: output.clone(),
+        span,
+        semantic_id: None,
+    };
+    let (ok_expr, err_expr) = if ok {
+        (selected_construct(Expr::Var(slots.ok)), none_construct())
+    } else {
+        (none_construct(), selected_construct(Expr::Var(slots.err)))
+    };
+    let mut branch = Expr::ResultMatch {
+        value: Box::new(value),
+        value_slot: slots.value,
+        ok_binding: Some(slots.ok),
+        ok_expr: Box::new(ok_expr),
+        err_binding: Some(slots.err),
+        err_expr: Box::new(err_expr),
+        scrutinee_schema: schema,
+        span,
+        semantic_id: None,
+    };
+    resolve_lowered_result_match(&mut branch, expected, env)?;
+    Ok(branch)
+}
+
+/// The partial logical `Option` expectation propagated into a method receiver.
+/// Only methods whose output reveals the receiver payload constrain it; a
+/// method that replaces the payload (`map`, `and_then`) does not invent one.
+fn option_method_receiver_hint(
+    method: OptionMethod,
+    annotated: Option<&TypeSchema>,
+) -> Option<TypeSchema> {
+    let known = |schema: &TypeSchema| !matches!(schema, TypeSchema::Unknown);
+    match method {
+        OptionMethod::Map | OptionMethod::AndThen => None,
+        OptionMethod::OrElse => annotated.and_then(|schema| match schema {
+            TypeSchema::Option(inner) if known(inner) => Some(schema.clone()),
+            _ => None,
+        }),
+        OptionMethod::UnwrapOr | OptionMethod::UnwrapOrElse => annotated
+            .filter(|schema| known(schema))
+            .map(|schema| TypeSchema::Option(Box::new(schema.clone()))),
+        OptionMethod::OkOr | OptionMethod::OkOrElse => annotated.and_then(|schema| {
+            let TypeSchema::Result { ok, .. } = schema else {
+                return None;
+            };
+            known(ok).then(|| TypeSchema::Option(ok.clone()))
+        }),
+    }
+}
+
+fn option_authoritative_schema(expr: &Expr, env: &Env) -> Option<TypeSchema> {
+    authoritative_schema(expr, env)
+}
+
+/// Resolve one Option combinator/conversion into an ordinary typed Option
+/// match. The receiver and the callback/fallback argument are evaluated once
+/// each, in source order, through parser-assigned hidden locals. Eager
+/// arguments (`unwrap_or`, `ok_or`) are evaluated on both branches; callable
+/// bodies run only on the selected branch.
+fn resolve_option_method(
+    method: OptionMethod,
+    mut receiver: Expr,
+    mut argument: Expr,
+    slots: OptionMethodSlots,
+    span: Span,
+    expected: Option<&TypeSchema>,
+    env: &mut Env,
+) -> Result<Expr, CompileError> {
+    let method_name = method.name();
+    let annotated = match expected {
+        None | Some(TypeSchema::Unknown) => None,
+        Some(schema) => Some(schema.clone()),
+    };
+    let receiver_hint = option_method_receiver_hint(method, annotated.as_ref());
+    resolve_expr(&mut receiver, receiver_hint.as_ref(), env)?;
+    let receiver_schema = option_authoritative_schema(&receiver, env).ok_or_else(|| {
+        result_error(
+            span,
+            format!(
+                ".{} requires a logical Option<T> receiver, found an untyped value",
+                method_name
+            ),
+        )
+    })?;
+    let TypeSchema::Option(inner) = &receiver_schema else {
+        return Err(result_error(
+            span,
+            format!(
+                ".{} requires a logical Option<T> receiver, found {}",
+                method_name,
+                super::result::render_schema(&receiver_schema)
+            ),
+        ));
+    };
+    let inner = inner.as_ref().clone();
+    if matches!(inner, TypeSchema::Unknown) {
+        return Err(result_error(
+            span,
+            format!(
+                ".{} receiver payload type is unresolved; annotate Option<T>",
+                method_name
+            ),
+        ));
+    }
+
+    let (argument_schema, mut some_expr, mut none_expr) = match method {
+        OptionMethod::Map => {
+            let callback_result_hint = annotated
+                .as_ref()
+                .and_then(|schema| match schema {
+                    TypeSchema::Option(inner) if !matches!(inner.as_ref(), TypeSchema::Unknown) => {
+                        Some(inner.as_ref().clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(TypeSchema::Unknown);
+            let callback_schema = option_callback_schema(
+                &mut argument,
+                vec![inner.clone()],
+                callback_result_hint,
+                span,
+                method_name,
+                env,
+            )?;
+            let TypeSchema::Callable { result, .. } = &callback_schema else {
+                unreachable!("option_callback_schema returns a Callable");
+            };
+            let output_payload = result.as_ref().clone();
+            let output = TypeSchema::Option(Box::new(output_payload.clone()));
+            if let Some(annotated) = &annotated {
+                let TypeSchema::Option(annotated_inner) = annotated else {
+                    return Err(result_error(
+                        span,
+                        format!(
+                            ".map produces a logical Option value, not {}",
+                            super::result::render_schema(annotated)
+                        ),
+                    ));
+                };
+                if !matches!(annotated_inner.as_ref(), TypeSchema::Unknown) {
+                    super::result::require_method_schema_named(
+                        env,
+                        annotated_inner,
+                        &output_payload,
+                        span,
+                        method_name,
+                        "result",
+                    )?;
+                }
+            }
+            super::result::reject_resource_capturing_closure_named(
+                &argument,
+                &callback_schema,
+                span,
+                method_name,
+                env,
+            )?;
+            (
+                callback_schema,
+                Expr::OptionConstruct {
+                    some: true,
+                    payload: Some(Box::new(Expr::LocalCall(
+                        slots.argument,
+                        Vec::new(),
+                        vec![Expr::Var(slots.some_binding)],
+                        None,
+                    ))),
+                    option_schema: output.clone(),
+                    span,
+                    semantic_id: None,
+                },
+                Expr::OptionConstruct {
+                    some: false,
+                    payload: None,
+                    option_schema: output,
+                    span,
+                    semantic_id: None,
+                },
+            )
+        }
+        OptionMethod::AndThen => {
+            let callback_result_hint = annotated
+                .as_ref()
+                .and_then(|schema| match schema {
+                    TypeSchema::Option(inner) if !matches!(inner.as_ref(), TypeSchema::Unknown) => {
+                        Some(TypeSchema::Option(inner.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(TypeSchema::Unknown);
+            let callback_schema = option_callback_schema(
+                &mut argument,
+                vec![inner.clone()],
+                callback_result_hint,
+                span,
+                method_name,
+                env,
+            )?;
+            let TypeSchema::Callable { result, .. } = &callback_schema else {
+                unreachable!("option_callback_schema returns a Callable");
+            };
+            let TypeSchema::Option(output_payload) = result.as_ref() else {
+                return Err(result_error(
+                    span,
+                    format!(
+                        ".and_then callback must return Option<U>, found {}",
+                        super::result::render_schema(result)
+                    ),
+                ));
+            };
+            if matches!(output_payload.as_ref(), TypeSchema::Unknown) {
+                return Err(result_error(
+                    span,
+                    ".and_then callback Option payload is unresolved; annotate Option<U>"
+                        .to_string(),
+                ));
+            }
+            let output = TypeSchema::Option(Box::new(output_payload.as_ref().clone()));
+            if let Some(annotated) = &annotated {
+                let TypeSchema::Option(annotated_inner) = annotated else {
+                    return Err(result_error(
+                        span,
+                        format!(
+                            ".and_then produces a logical Option value, not {}",
+                            super::result::render_schema(annotated)
+                        ),
+                    ));
+                };
+                if !matches!(annotated_inner.as_ref(), TypeSchema::Unknown) {
+                    super::result::require_method_schema_named(
+                        env,
+                        annotated_inner,
+                        output_payload,
+                        span,
+                        method_name,
+                        "result",
+                    )?;
+                }
+            }
+            super::result::reject_resource_capturing_closure_named(
+                &argument,
+                &callback_schema,
+                span,
+                method_name,
+                env,
+            )?;
+            (
+                callback_schema,
+                Expr::LocalCall(
+                    slots.argument,
+                    Vec::new(),
+                    vec![Expr::Var(slots.some_binding)],
+                    None,
+                ),
+                Expr::OptionConstruct {
+                    some: false,
+                    payload: None,
+                    option_schema: output,
+                    span,
+                    semantic_id: None,
+                },
+            )
+        }
+        OptionMethod::OrElse => {
+            let callback_schema = option_callback_schema(
+                &mut argument,
+                Vec::new(),
+                receiver_schema.clone(),
+                span,
+                method_name,
+                env,
+            )?;
+            let TypeSchema::Callable { result, .. } = &callback_schema else {
+                unreachable!("option_callback_schema returns a Callable");
+            };
+            let result = result.as_ref().clone();
+            let TypeSchema::Option(payload) = &result else {
+                return Err(result_error(
+                    span,
+                    format!(
+                        ".or_else callback must return Option<T>, found {}",
+                        super::result::render_schema(&result)
+                    ),
+                ));
+            };
+            super::result::require_method_schema_named(
+                env,
+                &receiver_schema,
+                &result,
+                span,
+                method_name,
+                "callback result",
+            )?;
+            if let Some(annotated) = &annotated {
+                let TypeSchema::Option(annotated_inner) = annotated else {
+                    return Err(result_error(
+                        span,
+                        format!(
+                            ".or_else produces a logical Option value, not {}",
+                            super::result::render_schema(annotated)
+                        ),
+                    ));
+                };
+                if !matches!(annotated_inner.as_ref(), TypeSchema::Unknown) {
+                    super::result::require_method_schema_named(
+                        env,
+                        annotated_inner,
+                        payload,
+                        span,
+                        method_name,
+                        "result",
+                    )?;
+                }
+            }
+            super::result::reject_resource_capturing_closure_named(
+                &argument,
+                &callback_schema,
+                span,
+                method_name,
+                env,
+            )?;
+            (
+                callback_schema,
+                Expr::OptionConstruct {
+                    some: true,
+                    payload: Some(Box::new(Expr::Var(slots.some_binding))),
+                    option_schema: receiver_schema.clone(),
+                    span,
+                    semantic_id: None,
+                },
+                Expr::LocalCall(slots.argument, Vec::new(), Vec::new(), None),
+            )
+        }
+        OptionMethod::UnwrapOr => {
+            let fallback_schema = option_eager_argument(
+                &mut argument,
+                Some(&inner),
+                span,
+                method_name,
+                "fallback",
+                env,
+            )?;
+            super::result::require_method_schema_named(
+                env,
+                &inner,
+                &fallback_schema,
+                span,
+                method_name,
+                "fallback",
+            )?;
+            if inner.contains_resource_with_named_types(&env.struct_schemas) {
+                return Err(result_error(
+                    span,
+                    format!(
+                        ".unwrap_or on Option<{}> cannot discard the eager fallback owner: the unselected Some branch has no destination for resource-typed fallback value {}",
+                        super::result::render_schema(&inner),
+                        super::result::render_schema(&fallback_schema)
+                    ),
+                ));
+            }
+            if super::result::schema_contains_generic_param(&inner) {
+                return Err(result_error(
+                    span,
+                    format!(
+                        ".unwrap_or on Option<{}> cannot discard the eager fallback owner: the payload contains an unresolved generic parameter that may be instantiated with a resource",
+                        super::result::render_schema(&inner)
+                    ),
+                ));
+            }
+            if let Some(annotated) = &annotated
+                && !schema_contains_unknown(annotated)
+            {
+                super::result::require_method_schema_named(
+                    env,
+                    annotated,
+                    &inner,
+                    span,
+                    method_name,
+                    "result",
+                )?;
+            }
+            (
+                fallback_schema,
+                Expr::Var(slots.some_binding),
+                Expr::Var(slots.argument),
+            )
+        }
+        OptionMethod::UnwrapOrElse => {
+            let callback_result_hint = annotated.clone().unwrap_or_else(|| inner.clone());
+            let callback_schema = option_callback_schema(
+                &mut argument,
+                Vec::new(),
+                callback_result_hint,
+                span,
+                method_name,
+                env,
+            )?;
+            let TypeSchema::Callable { result, .. } = &callback_schema else {
+                unreachable!("option_callback_schema returns a Callable");
+            };
+            super::result::require_method_schema_named(
+                env,
+                &inner,
+                result,
+                span,
+                method_name,
+                "callback result",
+            )?;
+            if let Some(annotated) = &annotated
+                && !schema_contains_unknown(annotated)
+            {
+                super::result::require_method_schema_named(
+                    env,
+                    annotated,
+                    &inner,
+                    span,
+                    method_name,
+                    "result",
+                )?;
+            }
+            super::result::reject_resource_capturing_closure_named(
+                &argument,
+                &callback_schema,
+                span,
+                method_name,
+                env,
+            )?;
+            (
+                callback_schema,
+                Expr::Var(slots.some_binding),
+                Expr::LocalCall(slots.argument, Vec::new(), Vec::new(), None),
+            )
+        }
+        OptionMethod::OkOr => {
+            let err_hint = annotated.as_ref().and_then(|schema| match schema {
+                TypeSchema::Result { err, .. } if !matches!(err.as_ref(), TypeSchema::Unknown) => {
+                    Some(err.as_ref().clone())
+                }
+                _ => None,
+            });
+            let error_schema = option_eager_argument(
+                &mut argument,
+                err_hint.as_ref(),
+                span,
+                method_name,
+                "error argument",
+                env,
+            )?;
+            if error_schema.contains_resource_with_named_types(&env.struct_schemas) {
+                return Err(result_error(
+                    span,
+                    format!(
+                        ".ok_or on Option<{}> cannot discard the eager error owner: the unselected Some branch has no destination for resource-typed error value {}",
+                        super::result::render_schema(&inner),
+                        super::result::render_schema(&error_schema)
+                    ),
+                ));
+            }
+            if super::result::schema_contains_generic_param(&error_schema) {
+                return Err(result_error(
+                    span,
+                    format!(
+                        ".ok_or on Option<{}> cannot discard the eager error owner: the error type contains an unresolved generic parameter that may be instantiated with a resource",
+                        super::result::render_schema(&inner)
+                    ),
+                ));
+            }
+            let output = TypeSchema::Result {
+                ok: Box::new(inner.clone()),
+                err: Box::new(error_schema.clone()),
+            };
+            if let Some(annotated) = &annotated
+                && !schema_contains_unknown(annotated)
+            {
+                let TypeSchema::Result {
+                    ok: annotated_ok,
+                    err: annotated_err,
+                } = annotated
+                else {
+                    return Err(result_error(
+                        span,
+                        format!(
+                            ".ok_or produces Result<T, E>, not {}",
+                            super::result::render_schema(annotated)
+                        ),
+                    ));
+                };
+                super::result::require_method_schema_named(
+                    env,
+                    annotated_ok,
+                    &inner,
+                    span,
+                    method_name,
+                    "result Ok payload",
+                )?;
+                super::result::require_method_schema_named(
+                    env,
+                    annotated_err,
+                    &error_schema,
+                    span,
+                    method_name,
+                    "result Err payload",
+                )?;
+            }
+            (
+                error_schema,
+                Expr::ResultConstruct {
+                    ok: true,
+                    payload: Box::new(Expr::Var(slots.some_binding)),
+                    result_schema: output.clone(),
+                    span,
+                    semantic_id: None,
+                },
+                Expr::ResultConstruct {
+                    ok: false,
+                    payload: Box::new(Expr::Var(slots.argument)),
+                    result_schema: output,
+                    span,
+                    semantic_id: None,
+                },
+            )
+        }
+        OptionMethod::OkOrElse => {
+            let err_hint = annotated.as_ref().and_then(|schema| match schema {
+                TypeSchema::Result { err, .. } if !matches!(err.as_ref(), TypeSchema::Unknown) => {
+                    Some(err.as_ref().clone())
+                }
+                _ => None,
+            });
+            let callback_schema = option_callback_schema(
+                &mut argument,
+                Vec::new(),
+                err_hint.unwrap_or(TypeSchema::Unknown),
+                span,
+                method_name,
+                env,
+            )?;
+            let TypeSchema::Callable { result, .. } = &callback_schema else {
+                unreachable!("option_callback_schema returns a Callable");
+            };
+            let error_schema = result.as_ref().clone();
+            if matches!(error_schema, TypeSchema::Unknown) {
+                return Err(result_error(
+                    span,
+                    ".ok_or_else callback error type is unresolved; annotate Result<T, E>"
+                        .to_string(),
+                ));
+            }
+            let output = TypeSchema::Result {
+                ok: Box::new(inner.clone()),
+                err: Box::new(error_schema.clone()),
+            };
+            if let Some(annotated) = &annotated
+                && !schema_contains_unknown(annotated)
+            {
+                let TypeSchema::Result {
+                    ok: annotated_ok,
+                    err: annotated_err,
+                } = annotated
+                else {
+                    return Err(result_error(
+                        span,
+                        format!(
+                            ".ok_or_else produces Result<T, E>, not {}",
+                            super::result::render_schema(annotated)
+                        ),
+                    ));
+                };
+                super::result::require_method_schema_named(
+                    env,
+                    annotated_ok,
+                    &inner,
+                    span,
+                    method_name,
+                    "result Ok payload",
+                )?;
+                super::result::require_method_schema_named(
+                    env,
+                    annotated_err,
+                    &error_schema,
+                    span,
+                    method_name,
+                    "result Err payload",
+                )?;
+            }
+            super::result::reject_resource_capturing_closure_named(
+                &argument,
+                &callback_schema,
+                span,
+                method_name,
+                env,
+            )?;
+            (
+                callback_schema,
+                Expr::ResultConstruct {
+                    ok: true,
+                    payload: Box::new(Expr::Var(slots.some_binding)),
+                    result_schema: output.clone(),
+                    span,
+                    semantic_id: None,
+                },
+                Expr::ResultConstruct {
+                    ok: false,
+                    payload: Box::new(Expr::LocalCall(
+                        slots.argument,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    )),
+                    result_schema: output,
+                    span,
+                    semantic_id: None,
+                },
+            )
+        }
+    };
+
+    env.slots.insert(slots.receiver, receiver_schema.clone());
+    env.slots.insert(slots.argument, argument_schema.clone());
+    env.slots.insert(slots.some_binding, inner);
+    resolve_expr(&mut some_expr, expected, env)?;
+    resolve_expr(&mut none_expr, expected, env)?;
+    let branch = Expr::OptionMatch {
+        value: Box::new(Expr::Var(slots.receiver)),
+        value_slot: slots.receiver,
+        some_binding: Some(slots.some_binding),
+        some_expr: Box::new(some_expr),
+        none_expr: Box::new(none_expr),
+        scrutinee_schema: receiver_schema.clone(),
+        span,
+        semantic_id: None,
+    };
+    Ok(Expr::Block {
+        stmts: vec![
+            Stmt::Let {
+                index: slots.receiver,
+                declared_schema: Some(receiver_schema),
+                expr: receiver,
+                line: 1,
+            },
+            Stmt::Let {
+                index: slots.argument,
+                declared_schema: Some(argument_schema),
+                expr: argument,
+                line: 1,
+            },
+        ],
+        expr: Box::new(branch),
+    })
+}
+
+fn option_eager_argument(
+    argument: &mut Expr,
+    expected: Option<&TypeSchema>,
+    span: Span,
+    method_name: &str,
+    position: &str,
+    env: &mut Env,
+) -> Result<TypeSchema, CompileError> {
+    resolve_expr(argument, expected, env)?;
+    let schema = option_authoritative_schema(argument, env).ok_or_else(|| {
+        result_error(
+            span,
+            format!(
+                ".{} {} must have a concrete compile-time type",
+                method_name, position
+            ),
+        )
+    })?;
+    super::result::require_concrete_schema_named(&schema, span, method_name, position)?;
+    Ok(schema)
+}
+
+fn option_callback_schema(
+    argument: &mut Expr,
+    params: Vec<TypeSchema>,
+    result_hint: TypeSchema,
+    span: Span,
+    method_name: &str,
+    env: &mut Env,
+) -> Result<TypeSchema, CompileError> {
+    let hint = TypeSchema::Callable {
+        params: params.clone(),
+        result: Box::new(result_hint),
+    };
+    resolve_expr(argument, Some(&hint), env)?;
+    let callback_schema =
+        super::result::callback_schema_for_params(argument, &params, span, method_name, env)?;
+    let TypeSchema::Callable {
+        params: actual_params,
+        result,
+    } = &callback_schema
+    else {
+        unreachable!("callback_schema_for_params returns a Callable");
+    };
+    let expected_arity = params.len();
+    if actual_params.len() != expected_arity {
+        return Err(result_error(
+            span,
+            if expected_arity == 0 {
+                format!(
+                    ".{} callback must take exactly zero arguments, found {}",
+                    method_name,
+                    actual_params.len()
+                )
+            } else {
+                format!(
+                    ".{} callback must take exactly {} argument{}, found {}",
+                    method_name,
+                    expected_arity,
+                    if expected_arity == 1 { "" } else { "s" },
+                    actual_params.len()
+                )
+            },
+        ));
+    }
+    for (expected, actual) in params.iter().zip(actual_params.iter()) {
+        super::result::require_method_schema_named(
+            env,
+            expected,
+            actual,
+            span,
+            method_name,
+            "callback parameter",
+        )?;
+    }
+    super::result::require_concrete_schema_named(result, span, method_name, "callback return")?;
+    Ok(callback_schema)
+}
+
 /// Resolve the lowered branch exactly once: it validates the typed arms and
 /// payload schemas through the shared ResultMatch owner without re-walking the
 /// already-resolved receiver/callback binder expressions.
@@ -1254,12 +2192,21 @@ fn require_concrete_schema(
     method: ResultMethod,
     position: &str,
 ) -> Result<(), CompileError> {
+    require_concrete_schema_named(schema, span, method.name(), position)
+}
+
+fn require_concrete_schema_named(
+    schema: &TypeSchema,
+    span: Span,
+    method_name: &str,
+    position: &str,
+) -> Result<(), CompileError> {
     if schema_contains_unknown(schema) {
         return Err(result_error(
             span,
             format!(
                 ".{} cannot type {}: callback/fallback schema {} is unresolved",
-                method.name(),
+                method_name,
                 position,
                 render_schema(schema)
             ),
@@ -1293,7 +2240,7 @@ fn schema_contains_unknown(schema: &TypeSchema) -> bool {
 /// Whether a schema still contains an unsubstituted generic parameter. A
 /// branch carrying one cannot be proven resource-free at the generic
 /// definition, because a later instantiation may bind it to a resource type.
-fn schema_contains_generic_param(schema: &TypeSchema) -> bool {
+pub(crate) fn schema_contains_generic_param(schema: &TypeSchema) -> bool {
     match schema {
         TypeSchema::GenericParam(_) => true,
         TypeSchema::Optional(inner) | TypeSchema::Array(inner) | TypeSchema::Map(inner) => {
@@ -1324,6 +2271,18 @@ fn require_method_schema(
     method: ResultMethod,
     position: &str,
 ) -> Result<(), CompileError> {
+    require_method_schema_named(env, expected, actual, span, method.name(), position)
+}
+
+/// Shared assignment check used by both Result and logical Option methods.
+fn require_method_schema_named(
+    env: &Env,
+    expected: &TypeSchema,
+    actual: &TypeSchema,
+    span: Span,
+    method_name: &str,
+    position: &str,
+) -> Result<(), CompileError> {
     let mismatch = super::typing::schema_assignment_mismatch(
         &env.function_list,
         &env.function_impls,
@@ -1336,7 +2295,7 @@ fn require_method_schema(
             span,
             format!(
                 ".{} {} expects {} but found {} ({detail})",
-                method.name(),
+                method_name,
                 position,
                 render_schema(expected),
                 render_schema(actual)
@@ -1356,6 +2315,25 @@ fn method_callback_schema(
     method: ResultMethod,
     env: &Env,
 ) -> Result<TypeSchema, CompileError> {
+    callback_schema_for_params(
+        argument,
+        std::slice::from_ref(param),
+        span,
+        method.name(),
+        env,
+    )
+}
+
+/// Shared contextual callback inference for Result and logical Option
+/// methods. `params` is the exact expected callable parameter list, including
+/// the empty list for zero-argument Option fallbacks.
+fn callback_schema_for_params(
+    argument: &Expr,
+    params: &[TypeSchema],
+    span: Span,
+    method_name: &str,
+    env: &Env,
+) -> Result<TypeSchema, CompileError> {
     // Callable-producing expressions must contribute a callable schema whose
     // closure parameters are the contextually expected ones. Inferring an
     // `if`/`match`/block of closures from the outer state would otherwise
@@ -1369,37 +2347,46 @@ fn method_callback_schema(
                 &env.struct_schemas,
                 &env.slots,
                 &closure.param_slots,
-                Some(std::slice::from_ref(param)),
+                Some(params),
                 &closure.capture_copies,
             ));
-            infer_callable_callback(argument, &nested, span, method, env)
+            infer_callable_callback(argument, &nested, span, method_name, env)
         }
         Expr::IfElse {
             then_expr,
             else_expr,
             ..
         } => {
-            let then_schema = method_callback_schema(then_expr, param, span, method, env)?;
-            let else_schema = method_callback_schema(else_expr, param, span, method, env)?;
-            merge_callable_branches(then_schema, else_schema, span, method)
+            let then_schema =
+                callback_schema_for_params(then_expr, params, span, method_name, env)?;
+            let else_schema =
+                callback_schema_for_params(else_expr, params, span, method_name, env)?;
+            merge_callable_branches_named(then_schema, else_schema, span, method_name)
         }
         Expr::Match { arms, default, .. } => {
             let mut merged: Option<TypeSchema> = None;
             for (_, arm) in arms {
-                let arm_schema = method_callback_schema(arm, param, span, method, env)?;
+                let arm_schema = callback_schema_for_params(arm, params, span, method_name, env)?;
                 merged = Some(match merged {
-                    Some(existing) => merge_callable_branches(existing, arm_schema, span, method)?,
+                    Some(existing) => {
+                        merge_callable_branches_named(existing, arm_schema, span, method_name)?
+                    }
                     None => arm_schema,
                 });
             }
-            let default_schema = method_callback_schema(default, param, span, method, env)?;
+            let default_schema =
+                callback_schema_for_params(default, params, span, method_name, env)?;
             match merged {
-                Some(existing) => merge_callable_branches(existing, default_schema, span, method),
+                Some(existing) => {
+                    merge_callable_branches_named(existing, default_schema, span, method_name)
+                }
                 None => Ok(default_schema),
             }
         }
-        Expr::Block { expr, .. } => method_callback_schema(expr, param, span, method, env),
-        _ => infer_callable_callback(argument, &env.slots, span, method, env),
+        Expr::Block { expr, .. } => {
+            callback_schema_for_params(expr, params, span, method_name, env)
+        }
+        _ => infer_callable_callback(argument, &env.slots, span, method_name, env),
     }
 }
 
@@ -1407,7 +2394,7 @@ fn infer_callable_callback(
     argument: &Expr,
     slots: &HashMap<LocalSlot, TypeSchema>,
     span: Span,
-    method: ResultMethod,
+    method_name: &str,
     env: &Env,
 ) -> Result<TypeSchema, CompileError> {
     let inferred = super::typing::infer_value_schema(
@@ -1422,7 +2409,7 @@ fn infer_callable_callback(
             span,
             format!(
                 ".{} requires a typed callable callback, found an untyped value",
-                method.name()
+                method_name
             ),
         )
     })?;
@@ -1431,7 +2418,7 @@ fn infer_callable_callback(
             span,
             format!(
                 ".{} requires a callable callback, found {}",
-                method.name(),
+                method_name,
                 render_schema(&inferred)
             ),
         ));
@@ -1439,18 +2426,18 @@ fn infer_callable_callback(
     Ok(inferred)
 }
 
-fn merge_callable_branches(
+fn merge_callable_branches_named(
     then_schema: TypeSchema,
     else_schema: TypeSchema,
     span: Span,
-    method: ResultMethod,
+    method_name: &str,
 ) -> Result<TypeSchema, CompileError> {
     if then_schema != else_schema {
         return Err(result_error(
             span,
             format!(
                 ".{} callback branches produce different callable schemas: {} vs {}",
-                method.name(),
+                method_name,
                 render_schema(&then_schema),
                 render_schema(&else_schema)
             ),
@@ -1473,6 +2460,16 @@ fn reject_resource_capturing_closure(
     method: ResultMethod,
     env: &Env,
 ) -> Result<(), CompileError> {
+    reject_resource_capturing_closure_named(argument, argument_schema, span, method.name(), env)
+}
+
+fn reject_resource_capturing_closure_named(
+    argument: &Expr,
+    argument_schema: &TypeSchema,
+    span: Span,
+    method_name: &str,
+    env: &Env,
+) -> Result<(), CompileError> {
     // The inline capture and temporary-factory checks both describe callable
     // callback ownership. A non-callable fallback (`unwrap_or` on a scalar
     // payload) keeps its ordinary ownership rules.
@@ -1484,7 +2481,7 @@ fn reject_resource_capturing_closure(
             span,
             format!(
                 ".{} callback/fallback cannot move a resource value into a closure capture ({}): the unselected branch has no destination for that owner; pass a named function or bind the callable before the method",
-                method.name(),
+                method_name,
                 render_schema(&schema)
             ),
         ));
@@ -1495,7 +2492,7 @@ fn reject_resource_capturing_closure(
             span,
             format!(
                 ".{} callback/fallback cannot use a temporary callable whose factory moves a resource value into its captures ({}): the unselected branch has no destination for that owner; bind the callable before the method",
-                method.name(),
+                method_name,
                 render_schema(&schema)
             ),
         )),
@@ -1503,7 +2500,7 @@ fn reject_resource_capturing_closure(
             span,
             format!(
                 ".{} cannot prove the capture ownership of the temporary callable produced by this call: bind the callable before the method or pass a named function",
-                method.name()
+                method_name
             ),
         )),
     }
@@ -2657,6 +3654,9 @@ fn collect_capture_expr_producers(
         Expr::ResultTry { value, .. } => {
             collect_capture_expr_producers(value, env, written, visiting_functions);
         }
+        Expr::ResultConvert { value, .. } => {
+            collect_capture_expr_producers(value, env, written, visiting_functions);
+        }
         Expr::ResultMatch {
             value,
             ok_expr,
@@ -2668,6 +3668,12 @@ fn collect_capture_expr_producers(
             collect_capture_expr_producers(err_expr, env, written, visiting_functions);
         }
         Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            collect_capture_expr_producers(receiver, env, written, visiting_functions);
+            collect_capture_expr_producers(argument, env, written, visiting_functions);
+        }
+        Expr::OptionMethod {
             receiver, argument, ..
         } => {
             collect_capture_expr_producers(receiver, env, written, visiting_functions);
@@ -2853,6 +3859,7 @@ fn apply_expr_effects(expr: &Expr, walk: &mut CaptureWalk<'_>) {
         Expr::ResultConstruct { payload, .. } => apply_expr_effects(payload, walk),
         Expr::ResultQuery { value, .. } => apply_expr_effects(value, walk),
         Expr::ResultTry { value, .. } => apply_expr_effects(value, walk),
+        Expr::ResultConvert { value, .. } => apply_expr_effects(value, walk),
         Expr::ResultMatch {
             value,
             ok_expr,
@@ -2867,6 +3874,12 @@ fn apply_expr_effects(expr: &Expr, walk: &mut CaptureWalk<'_>) {
             join_branch_walks(walk, &ok_walk, &err_walk);
         }
         Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            apply_expr_effects(receiver, walk);
+            apply_expr_effects(argument, walk);
+        }
+        Expr::OptionMethod {
             receiver, argument, ..
         } => {
             apply_expr_effects(receiver, walk);
@@ -3034,6 +4047,7 @@ fn collect_expr_writes(expr: &Expr, written: &mut HashSet<LocalSlot>) {
         Expr::ResultConstruct { payload, .. } => collect_expr_writes(payload, written),
         Expr::ResultQuery { value, .. } => collect_expr_writes(value, written),
         Expr::ResultTry { value, .. } => collect_expr_writes(value, written),
+        Expr::ResultConvert { value, .. } => collect_expr_writes(value, written),
         Expr::ResultMatch {
             value,
             ok_expr,
@@ -3045,6 +4059,12 @@ fn collect_expr_writes(expr: &Expr, written: &mut HashSet<LocalSlot>) {
             collect_expr_writes(err_expr, written);
         }
         Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            collect_expr_writes(receiver, written);
+            collect_expr_writes(argument, written);
+        }
+        Expr::OptionMethod {
             receiver, argument, ..
         } => {
             collect_expr_writes(receiver, written);
@@ -3128,6 +4148,7 @@ fn find_resource_capturing_closure(expr: &Expr, env: &Env) -> Option<TypeSchema>
         Expr::ResultConstruct { payload, .. } => find_resource_capturing_closure(payload, env),
         Expr::ResultQuery { value, .. } => find_resource_capturing_closure(value, env),
         Expr::ResultTry { value, .. } => find_resource_capturing_closure(value, env),
+        Expr::ResultConvert { value, .. } => find_resource_capturing_closure(value, env),
         Expr::ResultMatch {
             value,
             ok_expr,
@@ -3137,6 +4158,10 @@ fn find_resource_capturing_closure(expr: &Expr, env: &Env) -> Option<TypeSchema>
             .or_else(|| find_resource_capturing_closure(ok_expr, env))
             .or_else(|| find_resource_capturing_closure(err_expr, env)),
         Expr::ResultMethod {
+            receiver, argument, ..
+        } => find_resource_capturing_closure(receiver, env)
+            .or_else(|| find_resource_capturing_closure(argument, env)),
+        Expr::OptionMethod {
             receiver, argument, ..
         } => find_resource_capturing_closure(receiver, env)
             .or_else(|| find_resource_capturing_closure(argument, env)),
@@ -3424,19 +4449,33 @@ fn resolve_try(
     env: &mut Env,
 ) -> Result<(), CompileError> {
     resolve_expr(value, None, env)?;
-    let operand = operand_schema_of(value, env).ok_or_else(|| {
-        result_error(
-            span,
-            "? operand must be Result<T, E>, found an untyped value".to_string(),
-        )
-    })?;
+    let operand = match operand_schema_of(value, env) {
+        Some(operand) => operand,
+        None if is_unresolved_option_producer(value) => {
+            // The Option resolver types Option constructors/matches and
+            // shared combinator methods after this pass.
+            return Ok(());
+        }
+        None => {
+            return Err(result_error(
+                span,
+                "? operand must be Result<T, E> or a logical Option<T>, found an untyped value"
+                    .to_string(),
+            ));
+        }
+    };
     let (operand_ok, operand_err) = match &operand {
         TypeSchema::Result { ok, err } => ((**ok).clone(), (**err).clone()),
+        TypeSchema::Option(_) => {
+            // The Option resolver owns propagation from a logical Option
+            // operand; this pass has only established that it is not Result.
+            return Ok(());
+        }
         other => {
             return Err(result_error(
                 span,
                 format!(
-                    "? operand must be Result<T, E>, found {}",
+                    "? operand must be Result<T, E> or a logical Option<T>, found {}",
                     render_schema(other)
                 ),
             ));
@@ -3476,6 +4515,25 @@ fn resolve_try(
     };
     *return_schema = function_return;
     Ok(())
+}
+
+fn is_unresolved_option_producer(expr: &Expr) -> bool {
+    match expr {
+        Expr::OptionConstruct { .. } | Expr::OptionMatch { .. } | Expr::OptionMethod { .. } => true,
+        Expr::ResultMethod { .. } => true,
+        Expr::Block { expr, .. } => is_unresolved_option_producer(expr),
+        Expr::IfElse {
+            then_expr,
+            else_expr,
+            ..
+        } => is_unresolved_option_producer(then_expr) || is_unresolved_option_producer(else_expr),
+        Expr::Match { arms, default, .. } => {
+            arms.iter()
+                .any(|(_, arm)| is_unresolved_option_producer(arm))
+                || is_unresolved_option_producer(default)
+        }
+        _ => false,
+    }
 }
 
 fn operand_schema_of(expr: &Expr, env: &Env) -> Option<TypeSchema> {
@@ -3569,7 +4627,7 @@ fn substitute_schema_bindings(schema: TypeSchema, bindings: &[(&str, &TypeSchema
     }
 }
 
-fn render_schema(schema: &TypeSchema) -> String {
+pub(crate) fn render_schema(schema: &TypeSchema) -> String {
     super::typing::render_schema_label(schema)
 }
 

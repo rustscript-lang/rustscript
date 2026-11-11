@@ -1438,7 +1438,10 @@ fn find_declared_schema_mismatch_with_recursion(
                 for (name, expected_field) in expected_fields {
                     let field_path = extend_schema_path(&path, name);
                     let Some(actual_field) = actual_fields.get(name) else {
-                        if matches!(expected_field, TypeSchema::Optional(_)) {
+                        if matches!(
+                            expected_field,
+                            TypeSchema::Optional(_) | TypeSchema::Option(_)
+                        ) {
                             continue;
                         }
                         return Some(format!(
@@ -1989,6 +1992,7 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
         }
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
+        | Expr::ResultConvert { .. }
         | Expr::ResultMatch { .. }
         | Expr::ResultTry { .. }) => {
             let mut found = false;
@@ -1997,7 +2001,9 @@ pub(super) fn expr_contains_param_add(expr: &Expr, param_slots: &[LocalSlot]) ->
             });
             found
         }
-        other @ (Expr::OptionConstruct { .. } | Expr::OptionMatch { .. }) => {
+        other @ (Expr::OptionConstruct { .. }
+        | Expr::OptionMatch { .. }
+        | Expr::OptionMethod { .. }) => {
             let mut found = false;
             other.visit_option_children(|child| {
                 found |= expr_contains_param_add(child, param_slots)
@@ -2032,6 +2038,10 @@ pub(super) fn expr_uses_param(expr: &Expr, param_slots: &[LocalSlot]) -> bool {
         Expr::ResultMethod {
             receiver, argument, ..
         } => expr_uses_param(receiver, param_slots) || expr_uses_param(argument, param_slots),
+        Expr::OptionMethod {
+            receiver, argument, ..
+        } => expr_uses_param(receiver, param_slots) || expr_uses_param(argument, param_slots),
+        Expr::ResultConvert { value, .. } => expr_uses_param(value, param_slots),
         Expr::Call(_, _, args, _, _)
         | Expr::LocalCall(_, _, args, _)
         | Expr::ModuleCall(_, _, args, _) => {
@@ -2199,6 +2209,17 @@ pub(super) fn legalize_expr(
             let _ = legalize_expr(value, state, context, site, host_resolution);
             let _ = legalize_expr(fallback, state, context, site, host_resolution);
             context.infer_expr_type(expr, state)
+        }
+        Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            let _ = legalize_expr(receiver, state, context, site, host_resolution);
+            let _ = legalize_expr(argument, state, context, site, host_resolution);
+            BoundType::Unknown
+        }
+        Expr::ResultConvert { value, .. } => {
+            let _ = legalize_expr(value, state, context, site, host_resolution);
+            BoundType::Map
         }
         Expr::FunctionRef(..)
         | Expr::ModuleFunctionRef(..)

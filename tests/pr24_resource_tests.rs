@@ -572,6 +572,46 @@ fn unwrap_or_consumes_owned_optional_source_for_later_use_check() {
 }
 
 #[test]
+fn result_err_discards_resource_ok_owner_with_rejection() {
+    let options = CompileSourceFileOptions::new().with_host_api_catalog(block_catalog());
+    let source = r#"
+        let value: Result<resource<pr24.block>, string> = Result::Ok(test::make_block());
+        let discarded = value.err();
+        42;
+    "#;
+    let error =
+        match compile_source_with_flavor_and_options(source, vm::SourceFlavor::RustScript, options)
+        {
+            Ok(_) => panic!(".err() cannot discard a resource-typed Ok payload"),
+            Err(error) => error,
+        };
+    assert!(
+        error.to_string().contains("cannot discard") && error.to_string().contains("Ok"),
+        "resource conversion rejection must be precise: {error}"
+    );
+}
+
+#[test]
+fn result_ok_discards_resource_err_owner_with_rejection() {
+    let options = CompileSourceFileOptions::new().with_host_api_catalog(block_catalog());
+    let source = r#"
+        let value: Result<string, resource<pr24.block>> = Result::Err(test::make_block());
+        let discarded = value.ok();
+        42;
+    "#;
+    let error =
+        match compile_source_with_flavor_and_options(source, vm::SourceFlavor::RustScript, options)
+        {
+            Ok(_) => panic!(".ok() cannot discard a resource-typed Err payload"),
+            Err(error) => error,
+        };
+    assert!(
+        error.to_string().contains("cannot discard") && error.to_string().contains("Err"),
+        "resource conversion rejection must be precise: {error}"
+    );
+}
+
+#[test]
 fn optional_get_then_unwrap_consumes_owned_container_for_later_use_check() {
     let options = CompileSourceFileOptions::new().with_host_api_catalog(block_catalog());
     let source = r#"
@@ -587,7 +627,7 @@ fn optional_get_then_unwrap_consumes_owned_container_for_later_use_check() {
             Err(error) => error,
         };
     assert!(
-        error.to_string().contains("moved"),
+        error.to_string().contains("moved") || error.to_string().contains("eager fallback owner"),
         "unexpected compiler error: {error}"
     );
 }

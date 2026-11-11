@@ -1815,9 +1815,7 @@ fn resolve_expr_imported_calls(
             field_projection: _,
             container,
             key,
-            container_slot: _,
-            key_slot: _,
-            semantic_id: _,
+            ..
         } => {
             resolve_expr_imported_calls(
                 ctx,
@@ -1885,6 +1883,15 @@ fn resolve_expr_imported_calls(
         } => {
             resolve_expr_imported_calls(ctx, receiver, line, parsed_semantic_index.as_deref_mut())?;
             resolve_expr_imported_calls(ctx, argument, line, parsed_semantic_index.as_deref_mut())?;
+        }
+        Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            resolve_expr_imported_calls(ctx, receiver, line, parsed_semantic_index.as_deref_mut())?;
+            resolve_expr_imported_calls(ctx, argument, line, parsed_semantic_index.as_deref_mut())?;
+        }
+        Expr::ResultConvert { value, .. } => {
+            resolve_expr_imported_calls(ctx, value, line, parsed_semantic_index.as_deref_mut())?;
         }
         Expr::ResultConstruct { payload, .. } => {
             resolve_expr_imported_calls(ctx, payload, line, parsed_semantic_index.as_deref_mut())?;

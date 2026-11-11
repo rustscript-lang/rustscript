@@ -229,7 +229,7 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
             key,
             container_slot,
             key_slot,
-            semantic_id: _,
+            ..
         } => {
             *container_slot == slot
                 || *key_slot == slot
@@ -298,6 +298,7 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
         }
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
+        | Expr::ResultConvert { .. }
         | Expr::ResultMatch { .. }
         | Expr::ResultTry { .. }
         | Expr::ResultMethod { .. }) => {
@@ -313,6 +314,24 @@ pub(super) fn expr_uses_slot(expr: &Expr, slot: LocalSlot) -> bool {
                     || slots.argument == slot
                     || slots.ok_binding == slot
                     || slots.err_binding == Some(slot);
+            }
+            if let Expr::ResultConvert {
+                value_slot,
+                ok_binding,
+                err_binding,
+                ..
+            } = other
+            {
+                used |= *value_slot == slot || *ok_binding == slot || *err_binding == slot;
+            }
+            used
+        }
+        other @ Expr::OptionMethod { .. } => {
+            let mut used = false;
+            other.visit_option_children(|child| used |= expr_uses_slot(child, slot));
+            if let Expr::OptionMethod { slots, .. } = other {
+                used |=
+                    slots.receiver == slot || slots.argument == slot || slots.some_binding == slot;
             }
             used
         }
@@ -704,10 +723,21 @@ pub(super) fn collect_consumed_positions_from_expr(
         }
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
+        | Expr::ResultConvert { .. }
         | Expr::ResultMatch { .. }
         | Expr::ResultTry { .. }
         | Expr::ResultMethod { .. }) => {
             other.visit_result_children(|child| {
+                collect_consumed_positions_from_expr(
+                    child,
+                    function_impl,
+                    known_consumed_positions,
+                    out,
+                );
+            });
+        }
+        other @ Expr::OptionMethod { .. } => {
+            other.visit_option_children(|child| {
                 collect_consumed_positions_from_expr(
                     child,
                     function_impl,

@@ -112,6 +112,15 @@ fn attach_expr_schema(
             attach_expr_schema(value, schemas, structs);
             attach_expr_schema(fallback, schemas, structs);
         }
+        Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            attach_expr_schema(receiver, schemas, structs);
+            attach_expr_schema(argument, schemas, structs);
+        }
+        Expr::ResultConvert { value, .. } => {
+            attach_expr_schema(value, schemas, structs);
+        }
         Expr::Call(_, _, args, _, _)
         | Expr::ModuleCall(_, _, args, _)
         | Expr::LocalCall(_, _, args, _)
@@ -309,6 +318,13 @@ fn rewrite_children(expr: &mut Expr, locals: &mut usize) -> Result<(), ParseErro
             rewrite_expr(value, locals)?;
             rewrite_expr(fallback, locals)
         }
+        Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            rewrite_expr(receiver, locals)?;
+            rewrite_expr(argument, locals)
+        }
+        Expr::ResultConvert { value, .. } => rewrite_expr(value, locals),
         Expr::Call(_, _, args, _, _)
         | Expr::ModuleCall(_, _, args, _)
         | Expr::LocalCall(_, _, args, _)
@@ -568,6 +584,10 @@ fn contains_try(expr: &Expr) -> bool {
         Expr::OptionUnwrapOr {
             value, fallback, ..
         } => contains_try(value) || contains_try(fallback),
+        Expr::OptionMethod {
+            receiver, argument, ..
+        } => contains_try(receiver) || contains_try(argument),
+        Expr::ResultConvert { value, .. } => contains_try(value),
         Expr::Call(_, _, args, _, _)
         | Expr::ModuleCall(_, _, args, _)
         | Expr::LocalCall(_, _, args, _)

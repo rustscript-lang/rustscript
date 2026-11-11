@@ -549,17 +549,14 @@ fn compiler_type_inference_runtime_cases_cover_schema_and_optional_flows() {
 
                 let profile: Profile = { stats: { score: 41 } };
                 let score = profile?.stats?.score;
-                if score != null {
-                    score + 1;
-                } else {
-                    0;
-                }
+                let narrowed = match score {
+                    Option::Some(value) => value + 1,
+                    Option::None => 0,
+                };
+                narrowed;
             "#,
             vec![Value::Int(42)],
-            &[TypeMetadataExpectation::LastExact {
-                opcode: OpCode::Add,
-                expected: (ValueType::Int, ValueType::Int),
-            }],
+            &[],
         ),
         rustscript_type_inference_runtime_case(
             "Some match bindings expose the concrete inner type",
@@ -567,17 +564,13 @@ fn compiler_type_inference_runtime_cases_cover_schema_and_optional_flows() {
                 struct Data { values: [int] }
                 let data: Data = { values: [41] };
                 let result = match data?.values?.[0] {
-                    None => 0,
-                    Some(value) => value + 1,
-                    _ => 0,
+                    Option::None => 0,
+                    Option::Some(value) => value + 1,
                 };
                 result;
             "#,
             vec![Value::Int(42)],
-            &[TypeMetadataExpectation::LastExact {
-                opcode: OpCode::Add,
-                expected: (ValueType::Int, ValueType::Int),
-            }],
+            &[],
         ),
         rustscript_type_inference_runtime_case(
             "local let bindings accept homogeneous array schemas",

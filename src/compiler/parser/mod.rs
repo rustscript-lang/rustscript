@@ -28,9 +28,9 @@ use super::{
         AssignmentKind, CatalogVisibility, ClosureExpr, Expr, FunctionDecl, FunctionDeclSite,
         FunctionImpl, FunctionParam, FunctionRefSite, FunctionRefTarget, HostApiIrMetadata,
         LexerToken, LocalDeclSite, LocalRefSite, LocalSlot, MatchPattern, MatchTypePattern,
-        ModuleNamespaceAlias, ParsedCallSite, ParsedCallTarget, ParsedLexicalScope,
-        ParsedSemanticIndex, ResolvedHostCall, ResultMethod, ResultMethodSlots, ScopeId,
-        SemanticNodeId, Stmt, StmtSpanSite, StructDecl, StructDeclSite, TypeSchema,
+        ModuleNamespaceAlias, OptionMethod, OptionMethodSlots, ParsedCallSite, ParsedCallTarget,
+        ParsedLexicalScope, ParsedSemanticIndex, ResolvedHostCall, ResultMethod, ResultMethodSlots,
+        ScopeId, SemanticNodeId, Stmt, StmtSpanSite, StructDecl, StructDeclSite, TypeSchema,
     },
 };
 

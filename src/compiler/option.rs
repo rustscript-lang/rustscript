@@ -24,6 +24,7 @@ struct Env {
     function_list: Vec<FunctionDecl>,
     function_impls: HashMap<u16, FunctionImpl>,
     struct_schemas: HashMap<String, super::ir::StructDecl>,
+    lexical_return: Option<TypeSchema>,
 }
 
 pub(crate) fn resolve_option_types(
@@ -47,6 +48,7 @@ pub(crate) fn resolve_option_types(
         function_list,
         function_impls: ir.function_impls.clone(),
         struct_schemas: ir.struct_schemas.clone(),
+        lexical_return: None,
     };
     resolve_stmts(&mut ir.stmts, None, &mut env)?;
     let mut impls = std::mem::take(&mut ir.function_impls);
@@ -63,7 +65,9 @@ fn resolve_function(
     env: &mut Env,
 ) -> Result<(), CompileError> {
     let saved = env.slots.clone();
+    let saved_return = env.lexical_return.clone();
     if let Some(function) = env.functions.get(&index).cloned() {
+        env.lexical_return = function.return_schema.clone();
         for (slot, schema) in function_impl
             .param_slots
             .iter()
@@ -84,10 +88,12 @@ fn resolve_function(
             env,
         )?;
     } else {
+        env.lexical_return = None;
         resolve_stmts(&mut function_impl.body_stmts, None, env)?;
         resolve_expr(&mut function_impl.body_expr, None, env)?;
     }
     env.slots = saved;
+    env.lexical_return = saved_return;
     Ok(())
 }
 
@@ -118,7 +124,7 @@ fn resolve_stmt(
             ..
         } => {
             resolve_expr(expr, declared_schema.as_ref(), env)?;
-            if let Some(schema) = declared_schema
+            let inferred = declared_schema
                 .clone()
                 .or_else(|| infer_schema(expr, env))
                 .or_else(|| {
@@ -129,9 +135,8 @@ fn resolve_stmt(
                         expr,
                         &env.slots,
                     )
-                })
-                .filter(|schema| !matches!(schema, TypeSchema::Unknown))
-            {
+                });
+            if let Some(schema) = inferred.filter(|schema| !matches!(schema, TypeSchema::Unknown)) {
                 env.slots.insert(*index, schema);
             }
             Ok(())
@@ -281,13 +286,29 @@ fn resolve_expr(
             Ok(())
         }
         Expr::ResultQuery { value, .. } => resolve_expr(value, None, env),
-        Expr::ResultTry { value, .. } => resolve_expr(value, None, env),
         Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            // The Result pass owns lowering for every local method node. A
+            // residual node is unresolved structural input; keep its children
+            // available to the Option constructor/match resolver.
+            resolve_expr(receiver, None, env)?;
+            resolve_expr(argument, None, env)
+        }
+        Expr::OptionMethod {
             receiver, argument, ..
         } => {
             resolve_expr(receiver, None, env)?;
             resolve_expr(argument, None, env)
         }
+        Expr::ResultTry {
+            value,
+            operand_schema,
+            return_schema,
+            span,
+            ..
+        } => resolve_option_try(value, operand_schema, return_schema, *span, env),
+        Expr::ResultConvert { value, .. } => resolve_expr(value, None, env),
         Expr::Block { stmts, expr } => {
             resolve_stmts(stmts, expected.cloned(), env)?;
             resolve_expr(expr, expected, env)
@@ -313,9 +334,49 @@ fn resolve_expr(
             }
             resolve_expr(default, expected, env)
         }
-        Expr::OptionalGet { container, key, .. } => {
+        Expr::OptionalGet {
+            logical_projection,
+            option_receiver,
+            logical_unit_field,
+            container,
+            key,
+            ..
+        } => {
             resolve_expr(container, None, env)?;
-            resolve_expr(key, None, env)
+            resolve_expr(key, None, env)?;
+            if *logical_projection {
+                match authoritative_schema(container, env) {
+                    Some(TypeSchema::Option(_)) => *option_receiver = true,
+                    Some(_) => *option_receiver = false,
+                    None => {}
+                }
+                let container_schema = match authoritative_schema(container, env) {
+                    Some(TypeSchema::Option(inner)) | Some(TypeSchema::Optional(inner))
+                        if *logical_projection =>
+                    {
+                        Some(inner.as_ref().clone())
+                    }
+                    other => other,
+                };
+                if matches!(key.as_ref(), Expr::String(_))
+                    && matches!(
+                        container_schema,
+                        Some(TypeSchema::Object(_)) | Some(TypeSchema::Named(_, _))
+                    )
+                    && let Some(container_schema) = container_schema
+                    && let Some(access) = super::typing::infer_access_value_schema(
+                        &env.function_list,
+                        &env.function_impls,
+                        &env.struct_schemas,
+                        &container_schema,
+                        key.as_ref(),
+                        &env.slots,
+                    )
+                {
+                    *logical_unit_field = matches!(access, TypeSchema::Unit);
+                }
+            }
+            Ok(())
         }
         Expr::OptionUnwrapOr {
             value, fallback, ..
@@ -622,6 +683,63 @@ fn resolve_match(
     resolve_expr(none_expr, expected, env)
 }
 
+fn resolve_option_try(
+    value: &mut Expr,
+    operand_schema: &mut TypeSchema,
+    return_schema: &mut TypeSchema,
+    span: Span,
+    env: &mut Env,
+) -> Result<(), CompileError> {
+    if matches!(operand_schema, TypeSchema::Result { .. }) {
+        // The Result pass already accepted and typed this operand.
+        return Ok(());
+    }
+    let lexical_option = match env.lexical_return.clone() {
+        Some(schema @ TypeSchema::Option(_)) => Some(schema),
+        _ => None,
+    };
+    resolve_expr(value, lexical_option.as_ref(), env)?;
+    let operand = authoritative_schema(value, env).ok_or_else(|| {
+        option_error(
+            span,
+            "? operand must be a logical Option<T> when the enclosing callable returns Option<U>"
+                .to_string(),
+        )
+    })?;
+    let TypeSchema::Option(_) = &operand else {
+        let lexical_label = env
+            .lexical_return
+            .as_ref()
+            .map(super::result::render_schema)
+            .unwrap_or_else(|| "a non-Option callable".to_string());
+        return Err(option_error(
+            span,
+            format!(
+                "? operand must be a logical Option<T> in an Option-returning callable, found {} with enclosing return {}",
+                super::result::render_schema(&operand),
+                lexical_label
+            ),
+        ));
+    };
+    let Some(return_schema_value) = lexical_option else {
+        let found = env
+            .lexical_return
+            .as_ref()
+            .map(super::result::render_schema)
+            .unwrap_or_else(|| "a non-Option callable".to_string());
+        return Err(option_error(
+            span,
+            format!(
+                "? requires the enclosing function or closure to return Option<U>, found {}; convert with .ok()? before Option propagation",
+                found
+            ),
+        ));
+    };
+    *operand_schema = operand;
+    *return_schema = return_schema_value;
+    Ok(())
+}
+
 fn resolve_closure(
     closure: &mut ClosureExpr,
     expected: Option<&TypeSchema>,
@@ -643,8 +761,11 @@ fn resolve_closure(
         &closure.capture_copies,
     );
     let saved = std::mem::replace(&mut env.slots, nested);
+    let saved_return = env.lexical_return.clone();
+    env.lexical_return = expected_return.cloned();
     let resolved = resolve_expr(&mut closure.body, expected_return, env);
     env.slots = saved;
+    env.lexical_return = saved_return;
     resolved
 }
 
@@ -660,6 +781,10 @@ fn infer_schema(expr: &Expr, env: &Env) -> Option<TypeSchema> {
         Expr::Var(slot) | Expr::MoveVar(slot) => env.slots.get(slot).cloned(),
         Expr::OptionConstruct { option_schema, .. } => Some(option_schema.clone()),
         Expr::ResultConstruct { result_schema, .. } => Some(result_schema.clone()),
+        Expr::ResultTry {
+            operand_schema: TypeSchema::Option(inner),
+            ..
+        } => Some(inner.as_ref().clone()),
         Expr::Add(lhs, rhs) | Expr::Sub(lhs, rhs) | Expr::Mul(lhs, rhs) => {
             match (infer_schema(lhs, env), infer_schema(rhs, env)) {
                 (Some(TypeSchema::Int), Some(TypeSchema::Int)) => Some(TypeSchema::Int),

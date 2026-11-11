@@ -823,7 +823,11 @@ pub(super) fn validate_expr(
                 context,
                 strict_function_add_types,
             )?;
-            if context.expr_is_optional(lhs, state) || context.expr_is_optional(rhs, state) {
+            if context.expr_is_optional(lhs, state)
+                || context.expr_is_optional(rhs, state)
+                || logical_option_operand(context, lhs, state)
+                || logical_option_operand(context, rhs, state)
+            {
                 if matches!(expr, Expr::Eq(_, _)) && comparison_accepts_optional(lhs, rhs) {
                     return Ok(BoundType::Bool);
                 } else {
@@ -1079,6 +1083,38 @@ pub(super) fn validate_expr(
                 strict_function_add_types,
             )?;
             BoundType::Unknown
+        }
+        Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            let _ = validate_expr(
+                receiver,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            let _ = validate_expr(
+                argument,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            BoundType::Unknown
+        }
+        Expr::ResultConvert { value, .. } => {
+            let _ = validate_expr(
+                value,
+                state,
+                line_context,
+                source_name,
+                context,
+                strict_function_add_types,
+            )?;
+            BoundType::Map
         }
         Expr::ResultConstruct { payload, .. } => {
             let _ = validate_expr(
@@ -1537,6 +1573,18 @@ fn validate_optional_get_access(
             detail,
             span,
         })
+}
+
+/// A logical `Option` value is still an unwrapped optional at a binary
+/// operation site: it must be handled with an explicit match/unwrap method.
+fn logical_option_operand(
+    context: &mut TypeContext<'_>,
+    expr: &Expr,
+    state: &LocalTypeState,
+) -> bool {
+    context
+        .infer_expr_schema(expr, state)
+        .is_some_and(|schema| matches!(schema, TypeSchema::Option(_)))
 }
 
 fn optional_usage_error(

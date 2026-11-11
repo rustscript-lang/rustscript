@@ -388,6 +388,15 @@ fn remap_expression_type_names(expression: &mut Expr, names: &HashMap<String, St
             remap_expression_type_names(receiver, names);
             remap_expression_type_names(argument, names);
         }
+        Expr::ResultConvert { value, .. } => {
+            remap_expression_type_names(value, names);
+        }
+        Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            remap_expression_type_names(receiver, names);
+            remap_expression_type_names(argument, names);
+        }
         Expr::OptionConstruct {
             payload,
             option_schema,
@@ -1459,6 +1468,7 @@ fn remap_expr_indices(
             container_slot,
             key_slot,
             semantic_id,
+            ..
         } => {
             *container_slot = remap_local_index(*container_slot, local_base)?;
             *key_slot = remap_local_index(*key_slot, local_base)?;
@@ -1662,6 +1672,52 @@ fn remap_expr_indices(
             )?;
             remap_expr_indices(
                 argument,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+        }
+        Expr::OptionMethod {
+            receiver,
+            argument,
+            slots,
+            semantic_id,
+            ..
+        } => {
+            slots.receiver = remap_local_index(slots.receiver, local_base)?;
+            slots.argument = remap_local_index(slots.argument, local_base)?;
+            slots.some_binding = remap_local_index(slots.some_binding, local_base)?;
+            rebase_semantic_id(semantic_id, node_offset);
+            remap_expr_indices(
+                receiver,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+            remap_expr_indices(
+                argument,
+                local_base,
+                node_offset,
+                function_map,
+                flat_index_by_symbol,
+            )?;
+        }
+        Expr::ResultConvert {
+            value,
+            value_slot,
+            ok_binding,
+            err_binding,
+            semantic_id,
+            ..
+        } => {
+            *value_slot = remap_local_index(*value_slot, local_base)?;
+            *ok_binding = remap_local_index(*ok_binding, local_base)?;
+            *err_binding = remap_local_index(*err_binding, local_base)?;
+            rebase_semantic_id(semantic_id, node_offset);
+            remap_expr_indices(
+                value,
                 local_base,
                 node_offset,
                 function_map,

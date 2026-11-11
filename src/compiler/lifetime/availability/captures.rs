@@ -625,10 +625,16 @@ impl AvailabilityAnalyzer {
             }
             other @ (Expr::ResultConstruct { .. }
             | Expr::ResultQuery { .. }
+            | Expr::ResultConvert { .. }
             | Expr::ResultMatch { .. }
             | Expr::ResultTry { .. }
             | Expr::ResultMethod { .. }) => {
                 other.visit_result_children(|child| {
+                    self.capture_mode_for_expr(child, captured_slot, context, implicit, scan);
+                });
+            }
+            other @ Expr::OptionMethod { .. } => {
+                other.visit_option_children(|child| {
                     self.capture_mode_for_expr(child, captured_slot, context, implicit, scan);
                 });
             }

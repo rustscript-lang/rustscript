@@ -449,7 +449,7 @@ fn resource_record_borrow_and_mutable_borrow_cannot_escape() {
 
 #[test]
 fn native_value_lookup_still_permits_repeated_required_field_reads() {
-    let source = "struct Entry { name: string }\nlet entry: Entry = { name: \"first\" };\nentry?.name;\nentry?.name;";
+    let source = "struct Entry { name: string }\nlet entry: Entry = { name: \"first\" };\nentry?.name.unwrap_or(\"\");\nentry?.name.unwrap_or(\"\");";
     let compiled = compile_source_with_flavor_and_options(
         source,
         SourceFlavor::RustScript,
@@ -491,7 +491,7 @@ fn native_temporary_dynamic_key_value_lookup_evaluates_each_once() {
         vec![],
         vm::HostTypeSchema::String,
     ));
-    let source = "use neutral;\nlet entry: map<int> = { note: 42 };\n(if true => { let ignored = neutral::tick(); entry } else => { entry })?.[neutral::key()];";
+    let source = "use neutral;\nlet entry: map<int> = { note: 42 };\n(if true => { let ignored = neutral::tick(); entry } else => { entry })?.[neutral::key()].unwrap_or(0);";
     let compiled = compile_source_with_flavor_and_options(
         source,
         SourceFlavor::RustScript,
@@ -599,6 +599,33 @@ fn optional_resource_projection_transfers_one_handle_without_record_clone() {
         assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
+}
+
+#[test]
+fn native_logical_projection_moves_one_resource_child_and_closes_once() {
+    let source = "use neutral;\nstruct Entry { note: resource<neutral.projection> }\nlet entry: Entry = { note: neutral::make() };\nlet projected = entry?.note;\nmatch projected { Option::Some(handle) => neutral::close(handle), Option::None => 0 };\n42;";
+    let compiled = compile_source_with_flavor_and_options(
+        source,
+        SourceFlavor::RustScript,
+        CompileSourceFileOptions::new()
+            .with_host_api_catalog(std::sync::Arc::new(resource_catalog())),
+    )
+    .unwrap();
+    let creates = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let closes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut machine = Vm::new(compiled.program.with_local_count(compiled.locals));
+    machine.bind_function(
+        "neutral::make",
+        Box::new(MakeResource {
+            creates: creates.clone(),
+            closes: closes.clone(),
+        }),
+    );
+    machine.bind_function("neutral::close", Box::new(CloseResource));
+    assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+    assert_eq!(machine.stack(), &[Value::Int(42)]);
+    assert_eq!(creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]

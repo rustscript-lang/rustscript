@@ -589,10 +589,61 @@ impl ResultMethod {
         }
     }
 
+    /// The shared combinator names also apply to a logical `Option` receiver.
+    /// `map_err` stays Result-only; Option-only conversions are represented by
+    /// [`OptionMethod`].
+    pub(crate) fn as_option_method(self) -> Option<OptionMethod> {
+        match self {
+            Self::Map => Some(OptionMethod::Map),
+            Self::AndThen => Some(OptionMethod::AndThen),
+            Self::OrElse => Some(OptionMethod::OrElse),
+            Self::UnwrapOr => Some(OptionMethod::UnwrapOr),
+            Self::UnwrapOrElse => Some(OptionMethod::UnwrapOrElse),
+            Self::MapErr => None,
+        }
+    }
+
     /// `unwrap_or` keeps the pre-existing nullable lowering when the receiver
-    /// is not a `Result`.
+    /// is neither a `Result` nor a logical `Option`.
     pub(crate) fn retains_option_lowering_on_non_result(self) -> bool {
         matches!(self, Self::UnwrapOr)
+    }
+}
+
+/// Option-specific combinator and conversion methods. The first five names are
+/// also parsed as [`ResultMethod`] because the receiver schema decides their
+/// owner; `map`, `and_then`, `or_else`, `unwrap_or` and `unwrap_or_else` are
+/// resolved here for logical `Option` receivers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptionMethod {
+    Map,
+    AndThen,
+    OrElse,
+    UnwrapOr,
+    UnwrapOrElse,
+    OkOr,
+    OkOrElse,
+}
+
+impl OptionMethod {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Map => "map",
+            Self::AndThen => "and_then",
+            Self::OrElse => "or_else",
+            Self::UnwrapOr => "unwrap_or",
+            Self::UnwrapOrElse => "unwrap_or_else",
+            Self::OkOr => "ok_or",
+            Self::OkOrElse => "ok_or_else",
+        }
+    }
+
+    pub(crate) fn from_member(member: &str) -> Option<Self> {
+        match member {
+            "ok_or" => Some(Self::OkOr),
+            "ok_or_else" => Some(Self::OkOrElse),
+            _ => None,
+        }
     }
 }
 
@@ -609,6 +660,18 @@ pub struct ResultMethodSlots {
     pub argument: LocalSlot,
     pub ok_binding: LocalSlot,
     pub err_binding: Option<LocalSlot>,
+}
+
+/// Parser-assigned evaluation slots for an [`Expr::OptionMethod`].
+///
+/// `receiver` and `argument` receive the receiver/argument evaluation results
+/// in source order; `some_binding` receives the selected `Some` payload in the
+/// lowered Option match.
+#[derive(Clone, Copy, Debug)]
+pub struct OptionMethodSlots {
+    pub receiver: LocalSlot,
+    pub argument: LocalSlot,
+    pub some_binding: LocalSlot,
 }
 
 #[derive(Clone, Debug)]
@@ -650,6 +713,18 @@ pub enum Expr {
         /// literal String/Int key; borrowed, temporary and dynamic-key
         /// receivers must use value mode. Native `?.` remains value mode.
         field_projection: bool,
+        /// RustScript `?.` produces a logical `Option` of the projected value.
+        /// Other frontends retain their established nullable value contract.
+        logical_projection: bool,
+        /// Set by the Option resolver when the receiver schema is a logical
+        /// `Option<T>`: the projection consumes one and_then-equivalent layer
+        /// before reading the child. A payload `Option` is never flattened
+        /// beyond that explicit receiver layer.
+        option_receiver: bool,
+        /// The projected leaf is a required declared `Unit` field. Its
+        /// canonical physical payload may be omitted from the map, so a
+        /// missing physical key still represents a present Some(Unit).
+        logical_unit_field: bool,
         container: Box<Expr>,
         key: Box<Expr>,
         container_slot: LocalSlot,
@@ -790,13 +865,27 @@ pub enum Expr {
         span: Span,
         semantic_id: Option<SemanticNodeId>,
     },
-    /// A postfix Result combinator method preserved from source until the
-    /// Result type owner resolves the receiver's actual schema.
+    /// `Result<T, E>.ok()` / `.err()`. The Result resolver selects the retained
+    /// branch as `Option<T>` / `Option<E>` and lowers the conversion into an
+    /// ordinary typed Result match; the discarded branch must be resource-free
+    /// or the composition is rejected statically.
+    ResultConvert {
+        ok: bool,
+        value: Box<Expr>,
+        value_slot: LocalSlot,
+        ok_binding: LocalSlot,
+        err_binding: LocalSlot,
+        span: Span,
+        semantic_id: Option<SemanticNodeId>,
+    },
+    /// A postfix combinator method preserved from source until the receiver
+    /// schema decides its owner.
     ///
     /// The parser keeps the receiver and the callback/fallback argument as
     /// structured children plus their evaluation slots; only the Result
     /// resolver decides whether the receiver is a `Result<T, E>` (and lowers
-    /// the call into an ordinary typed `ResultMatch`) or whether
+    /// the call into an ordinary typed `ResultMatch`), whether the shared
+    /// method name belongs to a logical `Option<T>` receiver, or whether
     /// `.unwrap_or(...)` keeps the pre-existing nullable lowering. A
     /// non-Result receiver never has its ordinary member-call semantics
     /// stolen by the method name at parse time.
@@ -805,6 +894,17 @@ pub enum Expr {
         receiver: Box<Expr>,
         argument: Box<Expr>,
         slots: ResultMethodSlots,
+        span: Span,
+        semantic_id: Option<SemanticNodeId>,
+    },
+    /// Option-specific method (`ok_or`, `ok_or_else`). Shared combinator names
+    /// keep the [`Expr::ResultMethod`] carrier because the receiver schema
+    /// decides whether Result or Option owns them.
+    OptionMethod {
+        method: OptionMethod,
+        receiver: Box<Expr>,
+        argument: Box<Expr>,
+        slots: OptionMethodSlots,
         span: Span,
         semantic_id: Option<SemanticNodeId>,
     },
@@ -862,6 +962,7 @@ impl Expr {
                 visit(err_expr);
             }
             Expr::ResultTry { value, .. } => visit(value),
+            Expr::ResultConvert { value, .. } => visit(value),
             Expr::ResultMethod {
                 receiver, argument, ..
             } => {
@@ -888,6 +989,12 @@ impl Expr {
                 visit(value);
                 visit(some_expr);
                 visit(none_expr);
+            }
+            Expr::OptionMethod {
+                receiver, argument, ..
+            } => {
+                visit(receiver);
+                visit(argument);
             }
             _ => {}
         }
@@ -1620,9 +1727,15 @@ fn collect_resolved_calls_in_expr(
         }
         other @ (Expr::ResultConstruct { .. }
         | Expr::ResultQuery { .. }
+        | Expr::ResultConvert { .. }
         | Expr::ResultMatch { .. }
         | Expr::ResultTry { .. }) => {
             other.visit_result_children(|child| {
+                collect_resolved_calls_in_expr(child, by_id, typed, slot_schemas);
+            });
+        }
+        other @ Expr::OptionMethod { .. } => {
+            other.visit_option_children(|child| {
                 collect_resolved_calls_in_expr(child, by_id, typed, slot_schemas);
             });
         }

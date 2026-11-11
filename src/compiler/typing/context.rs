@@ -640,6 +640,7 @@ impl<'a> TypeContext<'a> {
         }
         match schema {
             TypeSchema::Result { ok, .. } => Some(*ok),
+            TypeSchema::Option(inner) => Some(*inner),
             _ => None,
         }
     }
@@ -807,7 +808,9 @@ impl<'a> TypeContext<'a> {
         match expr {
             Expr::Var(slot) | Expr::MoveVar(slot) => state.is_optional(*slot),
             Expr::MoveField { root, .. } | Expr::MoveIndex { root, .. } => state.is_optional(*root),
-            Expr::OptionalGet { .. } => true,
+            Expr::OptionalGet {
+                logical_projection, ..
+            } => !*logical_projection,
             Expr::OptionUnwrapOr { .. } => false,
             Expr::Call(index, _, _, resolution, _) => {
                 resolution
@@ -949,11 +952,30 @@ impl<'a> TypeContext<'a> {
     ) -> Option<TypeSchema> {
         match expr {
             Expr::Var(slot) | Expr::MoveVar(slot) => {
-                state.schema(*slot).map(TypeSchema::clone_inner_if_optional)
+                state.schema(*slot).map(|schema| match schema {
+                    TypeSchema::Option(inner) => inner.as_ref().clone(),
+                    other => other.clone_inner_if_optional(),
+                })
             }
-            Expr::OptionalGet { container, key, .. } => self
-                .infer_expr_schema(container, state)
-                .and_then(|schema| infer_access_schema(&schema, key, self, state).ok()),
+            Expr::OptionalGet {
+                logical_projection,
+                container,
+                key,
+                ..
+            } => {
+                let container_schema =
+                    self.infer_expr_schema(container, state)
+                        .map(|schema| match schema {
+                            TypeSchema::Option(inner) | TypeSchema::Optional(inner)
+                                if *logical_projection =>
+                            {
+                                *inner
+                            }
+                            other => other,
+                        });
+                container_schema
+                    .and_then(|schema| infer_access_schema(&schema, key, self, state).ok())
+            }
             Expr::OptionUnwrapOr {
                 value, fallback, ..
             } => {
@@ -991,6 +1013,10 @@ impl<'a> TypeContext<'a> {
         } else {
             self.infer_expr_schema(container, state)
         };
+        let container_schema = container_schema.map(|schema| match schema {
+            TypeSchema::Option(inner) | TypeSchema::Optional(inner) => *inner,
+            other => other,
+        });
         if let Some(schema) =
             container_schema.and_then(|schema| infer_access_schema(&schema, key, self, state).ok())
         {
@@ -1244,9 +1270,29 @@ impl<'a> TypeContext<'a> {
             Expr::Bool(_) => Some(TypeSchema::Bool),
             Expr::Bytes(_) => Some(TypeSchema::Bytes),
             Expr::String(_) => Some(TypeSchema::String),
-            Expr::OptionalGet { container, key, .. } => self
-                .infer_expr_schema(container, state)
-                .and_then(|schema| infer_access_schema(&schema, key, self, state).ok()),
+            Expr::OptionalGet {
+                logical_projection,
+                container,
+                key,
+                ..
+            } => {
+                let container_schema = self.infer_expr_schema(container, state);
+                let access_schema = container_schema
+                    .map(|schema| match schema {
+                        TypeSchema::Option(inner) | TypeSchema::Optional(inner)
+                            if *logical_projection =>
+                        {
+                            *inner
+                        }
+                        other => other,
+                    })
+                    .and_then(|schema| infer_access_schema(&schema, key, self, state).ok());
+                if *logical_projection {
+                    access_schema.map(|schema| TypeSchema::Option(Box::new(schema)))
+                } else {
+                    access_schema
+                }
+            }
             Expr::OptionUnwrapOr {
                 value, fallback, ..
             } => {
@@ -1684,6 +1730,17 @@ impl<'a> TypeContext<'a> {
                 } else {
                     BoundType::Unknown
                 }
+            }
+            Expr::OptionMethod {
+                receiver, argument, ..
+            } => {
+                let _ = self.infer_expr_type(receiver, state);
+                let _ = self.infer_expr_type(argument, state);
+                BoundType::Unknown
+            }
+            Expr::ResultConvert { value, .. } => {
+                let _ = self.infer_expr_type(value, state);
+                BoundType::Map
             }
             Expr::ResultTry {
                 value,
@@ -3176,7 +3233,10 @@ fn logical_optional_schema(schema: TypeSchema, optional: bool) -> TypeSchema {
     if optional
         && !matches!(
             schema,
-            TypeSchema::Optional(_) | TypeSchema::Unknown | TypeSchema::Null
+            TypeSchema::Optional(_)
+                | TypeSchema::Option(_)
+                | TypeSchema::Unknown
+                | TypeSchema::Null
         )
     {
         TypeSchema::Optional(Box::new(schema))

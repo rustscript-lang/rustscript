@@ -230,24 +230,86 @@ fn empty_blocks_and_no_tail_closures_carry_unit_facts() {
 }
 
 #[test]
-fn unsupported_logical_option_operations_are_rejected_not_nullable_lowered() {
-    let unwrap = reject("let value: Option<int> = Option::Some(1); value.unwrap_or(0);");
+fn option_operations_cover_supported_methods_and_remaining_negatives() {
+    let source = r#"
+        let value: Option<int> = Option::Some(1);
+        let mapped = value.map(|item| item + 1);
+        let unwrapped = value.unwrap_or(0);
+        let a = match mapped { Option::Some(v) => v, Option::None => -1 };
+        a + unwrapped;
+    "#;
+    assert_eq!(eval(source), vm::Value::Int(3));
+
+    let absent = r#"
+        fn relay() -> Option<int> {
+            let value: Option<int> = Option::None;
+            let unwrapped = value?;
+            Option::Some(unwrapped)
+        }
+        match relay() { Option::Some(v) => v, Option::None => 7 };
+    "#;
+    assert_eq!(eval(absent), vm::Value::Int(7));
+
+    let map_err_on_option =
+        reject("let value: Option<int> = Option::Some(1); value.map_err(|error| error);");
     assert!(
-        unwrap.contains("Option") && unwrap.contains("unwrap_or"),
-        "Option unwrap_or error was {unwrap}"
+        map_err_on_option.contains("map_err") && map_err_on_option.contains("Result"),
+        "Option.map_err remains Result-only: {map_err_on_option}"
     );
-    let map = reject("let value: Option<int> = Option::Some(1); value.map(|v| v + 1);");
+    let unwrap = reject("let value: Option<int> = Option::Some(1); value.unwrap();");
     assert!(
-        map.contains("Option") && map.contains("map"),
-        "Option map error was {map}"
+        unwrap.contains("unwrap") && unwrap.contains("not supported"),
+        "bare unwrap remains rejected: {unwrap}"
     );
-    let try_query = reject(
-        "fn relay() -> Option<int> { let value: Option<int> = Option::Some(1); value? } relay();",
+    let mixed = reject(
+        "fn out() -> Result<int, string> { let value: Option<int> = Option::None; let item = value?; Result::Ok(item) } out();",
     );
     assert!(
-        try_query.contains("Option") && (try_query.contains("Result") || try_query.contains("?")),
-        "Option ? error was {try_query}"
+        mixed.contains("Option") && mixed.contains("Result"),
+        "mixed propagation requires an explicit conversion: {mixed}"
     );
+}
+
+#[test]
+fn option_methods_and_projection_format_twice_and_publish_hints() {
+    let source = r#"
+        struct Entry { note: Option<int> }
+        fn relay(flag: bool) -> Option<int> {
+            let value: Option<int> = if flag => { Option::Some(2) } else => { Option::None };
+            let item = value?;
+            Option::Some(item + 1)
+        }
+        let entry: Entry = { note: Option::Some(2) };
+        let projected = entry?.note.unwrap_or(Option::None);
+        let mapped = projected.map(|value| value + 1);
+        let converted = mapped.ok_or("bad");
+        match converted { Result::Ok(value) => value, Result::Err(error) => -1 };
+    "#;
+    let once = vm::format_source(source).expect("Option formatting succeeds");
+    let twice = vm::format_source(&once).expect("second Option formatting succeeds");
+    assert_eq!(once, twice, "Option formatter must be idempotent");
+
+    let options = vm::CompileSourceFileOptions::default();
+    let model =
+        vm::analyze_source_from_string_with_options("main.rss", source, options.clone()).unwrap();
+    assert!(model.diagnostics().is_empty(), "{:?}", model.diagnostics());
+    let hints = vm::collect_inferred_local_type_hints_with_options(
+        source,
+        vm::SourceFlavor::RustScript,
+        options,
+    )
+    .unwrap();
+    let projected = hints
+        .iter()
+        .find(|hint| hint.name == "projected")
+        .expect("projected local hint");
+    let schema = projected.schema.as_ref().expect("projected schema");
+    assert!(
+        format!("{schema:?}").contains("Option"),
+        "logical projection hint must publish Option, found {schema:?}"
+    );
+    let span = projected.span.unwrap();
+    assert_eq!(&source[span.lo..span.hi], "projected");
 }
 
 #[test]
