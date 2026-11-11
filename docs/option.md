@@ -118,9 +118,88 @@ The no-std decoder understands the same current Option and Unit schemas for
 scalar and nested programs. A cleanup plan that owns a resource still exceeds
 the current no-std resource capability and is refused before execution.
 
+## Option methods
+
+`Option<T>` provides `map`, `and_then`, `or_else`, `unwrap_or`,
+`unwrap_or_else`, `ok_or` and `ok_or_else`.
+
+```rust
+let some: Option<int> = Option::Some(2);
+let absent: Option<int> = Option::None;
+
+let mapped = some.map(|value| value + 1);          // Option<int>, wraps U
+let flat = some.and_then(|value| Option::Some(value + 1)); // flattens one layer
+let kept = absent.or_else(|| Option::Some(3));     // zero-argument lazy fallback
+let eager = some.unwrap_or(0);                     // eager fallback, returns int
+let lazy = absent.unwrap_or_else(|| 4);            // lazy body, returns int
+let as_result = absent.ok_or("missing");           // Result<int, string>
+let lazy_error = absent.ok_or_else(|| "missing");  // lazy error callback
+```
+
+`map` wraps its callback result even when it is itself an Option or Result.
+`and_then` flattens exactly the explicitly returned Option; a bare payload or a
+Result return rejects. `or_else` takes a zero-argument callback and keeps the
+receiver payload type; it does not copy the Result error-argument signature.
+`unwrap_or` and `ok_or` evaluate their arguments eagerly; `unwrap_or_else` and
+`ok_or_else` run their callback body lazily only on None. Receiver and argument
+creation follow normal left-to-right order, each exactly once.
+
+`ok_or`/`ok_or_else` produce `Result<T, E>` and do not implicitly convert
+between Option and Result. An eager fallback or error value that may own a
+resource is rejected when the unselected branch has no destination for it. A
+resource-capturing temporary callback is rejected for the same reason.
+
+Result values expose explicit conversions:
+
+```rust
+let value: Result<int, string> = Result::Ok(21);
+let ok_value = value.ok();   // Option<int>
+let err_value = value.err(); // Option<string>
+```
+
+`ok`/`err` retain the selected payload as `Some`; the discarded branch must be
+resource-free or the conversion is rejected statically.
+
+## Lexical Option propagation
+
+`?` on a logical Option passes the Some payload and exits only the current
+Option-returning function or closure on None. Later arguments, statements and
+side effects do not run after a None exit; already-created owners follow their
+declared cleanup. A None inside a closure does not return from its caller.
+
+```rust
+fn relay(flag: bool) -> Option<int> {
+    let value: Option<int> = if flag => { Option::Some(1) } else => { Option::None };
+    let item = value?;
+    Option::Some(item + 1)
+}
+```
+
+Result and Option propagation do not implicitly mix. Use `.ok_or(...)?` or
+`.ok()?` at the boundary; Result `?` keeps its exact error type. Option `?`
+accepts a wider enclosing Option payload because None carries no value, while
+Some continues with its exact payload type.
+
+## Fallible projection (`?.`)
+
+RustScript `?.` produces a logical `Option` of the projected value. A missing
+map key, a missing array index, an out-of-range string index or a None receiver
+becomes None. A present value is Some, including `Some(false)`, `Some(0)`,
+`Some("")`, `Some(())` and a nested `Some(None)`.
+
+A non-optional receiver performs one fallible projection. An Option receiver
+consumes exactly one and_then-equivalent receiver layer; the projected payload
+keeps its own schema, so a declared `Option<int>` leaf produces
+`Option<Option<int>>` rather than an arbitrary flattening. An absent dynamic key
+and a present key holding explicit `Option::None` remain distinct.
+
+Permitted omitted logical Option fields normalize to None at the RustScript
+boundary, while required fields are still checked. An explicit Option::None
+field is a tagged value, not a map deletion; internal raw Null deletion and the
+legacy nullable contract are unchanged until the final no-null boundary work.
+
 ## Deliberate limits
 
-This foundation does not provide Option combinators (`map`, `and_then`, ...) or
-the Option `?` operator, and it does not change Result `ok`/`err`, JSON,
-`type_of` or display rendering. Code that requires an unsupported operation on a
-logical Option is rejected rather than routed through the legacy nullable path.
+This scope does not add `is_some`, `inspect`, `map_or` or other unrequested
+catalogue operations. RSS null literals, legacy nullable annotations, JSON/Core
+admission and standard host migration remain separate later boundary work.

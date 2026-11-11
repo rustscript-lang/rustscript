@@ -158,6 +158,24 @@ The `?` operand has error type `int` after `map_err`; `relay` also returns
 `Result<int, int>`. The original string error becomes `7` before propagation,
 and the final match observes that propagated error.
 
+## Convert Result to Option
+
+`Result<T, E>.ok()` returns `Option<T>` and `Result<T, E>.err()` returns
+`Option<E>`. The selected branch payload is retained as `Some`; the other branch
+becomes `None`.
+
+```rust
+let value: Result<int, string> = Result::Ok(21);
+let ok_value = value.ok();
+let err_value = value.err();
+let selected = match ok_value { Option::Some(inner) => inner, Option::None => -1 };
+selected;
+```
+
+The discarded branch has no destination for an owned payload, so a
+resource-typed or unresolved-generic discarded branch is rejected statically.
+The retained payload keeps its exact schema and ownership state.
+
 ## Ownership and cleanup: explicit normal close, automatic Err cleanup
 
 A Result containing a resource in either parameter is move-only. Construction
