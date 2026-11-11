@@ -49,7 +49,7 @@ explicitly supplies it, including `Some(false)`, `Some(0)`, and `Some("")`. A `p
 | `root` | `Option<string>` | Must match the embedding policy root when `Some` |
 | `limits` | `Option<SqliteLimits>` | Per-connection ceilings; `None` keeps the host ceiling |
 
-Unknown fields are rejected by the named-struct compiler contract.
+Unknown fields are outside the named-struct contract; do not rely on them.
 
 ## Limits (`SqliteLimits`)
 
@@ -69,7 +69,7 @@ that ceiling.
 - `max_transaction_ms`
 - `busy_timeout_ms`
 
-An empty `{}` is valid for a typed `SqliteLimits` local. Extra fields are rejected.
+An empty `{}` is valid for a typed `SqliteLimits` local. Fields outside the named-struct contract are not part of the public schema.
 
 ## Values (`SqliteValue`)
 
