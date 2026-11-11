@@ -745,3 +745,86 @@ fn conditional_callback_with_a_wrong_field_type_is_rejected() {
         "a wrong branch field type must keep the focused schema rejection: {diagnostic}"
     );
 }
+
+#[test]
+fn expression_block_local_sparse_object_cannot_be_a_declared_return() {
+    let diagnostic = reject(
+        r#"
+        struct Entry { name: string, note: Option<int> }
+        fn make(flag: bool) -> Entry {
+            if flag => {
+                let raw = { name: "x" };
+                raw
+            } else => {
+                { name: "y" }
+            }
+        }
+        let item: Entry = make(true);
+        match item.note { Option::Some(value) => value, Option::None => 0 };
+        "#,
+    );
+    assert!(
+        diagnostic.contains("field 'note'") && diagnostic.contains("must be materialized"),
+        "a sparse object bound inside the expression block and returned as a declared record must keep the missing-field obligation: {diagnostic}"
+    );
+}
+
+#[test]
+fn expression_block_local_sparse_alias_cannot_be_a_declared_return() {
+    let diagnostic = reject(
+        r#"
+        struct Entry { name: string, note: Option<int> }
+        fn make(flag: bool) -> Entry {
+            if flag => {
+                let raw = { name: "x" };
+                let alias = raw;
+                alias
+            } else => {
+                { name: "y" }
+            }
+        }
+        let item: Entry = make(true);
+        match item.note { Option::Some(value) => value, Option::None => 0 };
+        "#,
+    );
+    assert!(
+        diagnostic.contains("field 'note'") && diagnostic.contains("must be materialized"),
+        "a block-local alias must not hide the missing-field obligation: {diagnostic}"
+    );
+}
+
+#[test]
+fn expression_block_literal_tail_materializes_the_omitted_option_field() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        fn make(flag: bool) -> Entry {
+            if flag => {
+                let name = "x";
+                { name: name }
+            } else => {
+                { name: "y" }
+            }
+        }
+        let item: Entry = make(true);
+        match item.note { Option::Some(value) => value, Option::None => 0 };
+    "#;
+    assert_eq!(eval(source), Value::Int(0));
+}
+
+#[test]
+fn expression_block_materialized_variable_tail_keeps_the_named_record() {
+    let source = r#"
+        struct Entry { name: string, note: Option<int> }
+        fn make(flag: bool) -> Entry {
+            if flag => {
+                let entry: Entry = { name: "x" };
+                entry
+            } else => {
+                { name: "y" }
+            }
+        }
+        let item: Entry = make(true);
+        match item.note { Option::Some(value) => value, Option::None => 0 };
+    "#;
+    assert_eq!(eval(source), Value::Int(0));
+}

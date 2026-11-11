@@ -1576,14 +1576,16 @@ fn record_omission_admission_detail(
             path,
         );
     }
-    if let Expr::Block { expr: tail, .. } = expr {
-        let tail_actual = inferred_expr_assignment_schema(tail, state, context);
+    if let Expr::Block { stmts, expr: tail } = expr {
+        let mut nested = state.clone();
+        context.apply_stmts(stmts, &mut nested);
+        let tail_actual = inferred_expr_assignment_schema(tail, &nested, context);
         return omission_admission_detail(
             tail,
             expected,
             tail_actual.as_ref(),
             context,
-            state,
+            &nested,
             path,
         );
     }
