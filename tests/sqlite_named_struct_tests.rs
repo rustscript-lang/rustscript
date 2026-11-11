@@ -141,7 +141,7 @@ fn query_result_fields() -> Vec<HostStructField> {
         HostStructField::new("columns", array(HostTypeSchema::String)),
         HostStructField::new("rows", array(named("SqliteRow", row_fields()))),
         HostStructField::new("truncated", HostTypeSchema::Bool),
-        HostStructField::new("next_cursor", opt(HostTypeSchema::Int)),
+        HostStructField::new("next_cursor", option(HostTypeSchema::Int)),
     ]
 }
 
@@ -162,11 +162,11 @@ fn transaction_result_fields() -> Vec<HostStructField> {
         HostStructField::new("kind", HostTypeSchema::String),
         HostStructField::new(
             "execute",
-            opt(named("SqliteExecuteResult", execute_result_fields())),
+            option(named("SqliteExecuteResult", execute_result_fields())),
         ),
         HostStructField::new(
             "query",
-            opt(named("SqliteQueryResult", query_result_fields())),
+            option(named("SqliteQueryResult", query_result_fields())),
         ),
     ]
 }
@@ -211,9 +211,9 @@ fn function_named<'a>(
 fn schema_contains_map(schema: &HostTypeSchema) -> bool {
     match schema {
         HostTypeSchema::Map(_) | HostTypeSchema::Unknown => true,
-        HostTypeSchema::Array(inner) | HostTypeSchema::Optional(inner) => {
-            schema_contains_map(inner)
-        }
+        HostTypeSchema::Array(inner)
+        | HostTypeSchema::Optional(inner)
+        | HostTypeSchema::Option(inner) => schema_contains_map(inner),
         HostTypeSchema::Named { fields, .. } => {
             fields.iter().any(|field| schema_contains_map(&field.ty))
         }
@@ -448,10 +448,11 @@ fn typed_params_rows_and_transaction_results_are_structured() {
         let results = sqlite::transaction(&db, [{ sql: "SELECT a FROM t", query: true }]);
         let first_result = results[0];
         assert(first_result.kind == "query");
-        let query_result = first_result.query;
-        if query_result != null {
-            assert(query_result.rows[0].cells[0].int_value == 7);
-        }
+        let present_value = match first_result.query {
+            Option::Some(query_result) => query_result.rows[0].cells[0].int_value,
+            Option::None => -1,
+        };
+        assert(present_value == 7);
         sqlite::close(db);
         queried.truncated;
         "#,
@@ -487,6 +488,107 @@ fn wrong_nested_sqlite_value_shapes_are_rejected() {
         message.contains("sqlite::query") && message.contains("int_value"),
         "wrong nested payload diagnostic should name the typed field, got {message}"
     );
+}
+
+// ------------------------------------------------- logical Option/Unit RED
+
+fn option(inner: HostTypeSchema) -> HostTypeSchema {
+    HostTypeSchema::Option(Box::new(inner))
+}
+
+#[test]
+fn sqlite_nullable_fields_are_logical_option() {
+    let catalog = sqlite_host_catalog();
+    let query = catalog
+        .struct_named("SqliteQueryResult")
+        .expect("SqliteQueryResult");
+    assert_eq!(
+        query.fields[3].ty,
+        option(HostTypeSchema::Int),
+        "next_cursor must be a logical Option<int>"
+    );
+    let transaction = catalog
+        .struct_named("SqliteTransactionResult")
+        .expect("SqliteTransactionResult");
+    assert_eq!(
+        transaction.fields[1].ty,
+        option(named("SqliteExecuteResult", execute_result_fields())),
+        "the unselected execute branch must be a logical Option"
+    );
+    assert_eq!(
+        transaction.fields[2].ty,
+        option(named("SqliteQueryResult", query_result_fields())),
+        "the unselected query branch must be a logical Option"
+    );
+
+    // SQL NULL cells stay the tagged `kind: "null"` business value with the
+    // existing optional payload entries; they are not folded into Option.
+    let value = catalog.struct_named("SqliteValue").expect("SqliteValue");
+    assert_eq!(
+        value.fields[1].ty,
+        opt(HostTypeSchema::Int),
+        "SqliteValue keeps its tagged SQL NULL payload contract"
+    );
+    let statement = catalog
+        .struct_named("SqliteStatement")
+        .expect("SqliteStatement");
+    assert_eq!(
+        statement.fields[1].ty,
+        opt(array(named("SqliteValue", sqlite_value_fields()))),
+        "SqliteStatement keeps its optional-entry params contract"
+    );
+}
+
+#[test]
+fn sqlite_close_contract_is_logical_unit() {
+    let catalog = sqlite_host_catalog();
+    assert_eq!(
+        function_named(&catalog, "sqlite::close").return_type,
+        HostTypeSchema::Unit,
+        "sqlite::close is a void host call and must expose logical Unit"
+    );
+}
+
+#[test]
+fn logical_option_sqlite_consumer_compiles_and_runs() {
+    let compiled = compile_standard(
+        r#"
+        use sqlite;
+        let db = sqlite::open({ path: ":memory:", mode: "memory", limits: { max_rows: 8 } });
+        sqlite::execute(&db, "CREATE TABLE t (a INTEGER, z TEXT)", []);
+        sqlite::execute(&db, "INSERT INTO t (a, z) VALUES (?1, ?2)", [
+            { kind: "int", int_value: 7, float_value: null, text_value: null, blob_value: null },
+            { kind: "null", int_value: null, float_value: null, text_value: null, blob_value: null }
+        ]);
+        let q = sqlite::query(&db, "SELECT a, z FROM t", [], { max_rows: 8 });
+        let cursor = match q.next_cursor {
+            Option::Some(value) => value,
+            Option::None => -1,
+        };
+        assert(cursor == 7);
+        let cell = q.rows[0].cells[1];
+        assert(cell.kind == "null");
+        assert(cell.text_value == null);
+        let results = sqlite::transaction(&db, [
+            { sql: "INSERT INTO t (a) VALUES (?1)", params: [{ kind: "int", int_value: 8, float_value: null, text_value: null, blob_value: null }] },
+            { sql: "SELECT a FROM t", query: true }
+        ]);
+        let execute_absent = match results[0].query {
+            Option::Some(result) => false,
+            Option::None => true,
+        };
+        assert(execute_absent);
+        let query_present = match results[1].query {
+            Option::Some(result) => true,
+            Option::None => false,
+        };
+        assert(query_present);
+        let closed: () = sqlite::close(db);
+        closed;
+"#,
+    )
+    .expect("logical Option SQLite consumer should compile");
+    run_compiled_sqlite(compiled);
 }
 
 fn noop_waker() -> Waker {
@@ -627,7 +729,11 @@ fn runtime_null_optional_fields_and_next_cursor_field_access() {
         });
         sqlite::execute(&db, "CREATE TABLE t (a INTEGER)", []);
         let empty = sqlite::query(&db, "SELECT a FROM t", [], { max_rows: null });
-        let empty_cursor = empty.next_cursor;
+        let empty_cursor = match empty.next_cursor {
+            Option::Some(value) => value,
+            Option::None => -1,
+        };
+        assert(empty_cursor == -1);
         sqlite::transaction(&db, [{
             sql: "INSERT INTO t VALUES (9)",
             params: null,
@@ -635,10 +741,13 @@ fn runtime_null_optional_fields_and_next_cursor_field_access() {
             limits: null,
         }]);
         let queried = sqlite::query(&db, "SELECT a FROM t", [], {});
-        let cursor = queried.next_cursor;
+        let cursor = match queried.next_cursor {
+            Option::Some(value) => value,
+            Option::None => -2,
+        };
+        assert(cursor == 9);
         sqlite::close(db);
-        empty_cursor;
-        cursor;
+        empty_cursor + cursor;
         "#,
     )
     .expect("null optional fields and next_cursor access should compile");

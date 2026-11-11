@@ -108,6 +108,20 @@ selected payload, multiple non-null payloads, and a selected payload with the wr
 `"null"` carries no payload. SQLite TEXT that is not valid UTF-8 is returned as `kind: "blob"`
 with its original bytes.
 
+## Absence boundary
+
+SQLite exposes three distinct absence forms and they are not interchangeable:
+
+- Optional configuration entries (`SqliteOpenOptions`, `SqliteLimits`, and the
+  `params`/`query`/`limits` fields of `SqliteStatement`) are omission entries:
+  a missing field or `null` keeps the documented default. They are not logical
+  `Option::None` values.
+- A SQL `NULL` result cell remains the tagged `SqliteValue { kind: "null", ... }`
+  business value with no payload. It is not rewritten to `Option::None`.
+- Result-value absence uses logical `Option`: `SqliteQueryResult.next_cursor` and
+  the unselected `SqliteTransactionResult` branch are `Option::Some`/`Option::None`
+  values, matched with `match` rather than a sentinel.
+
 ## Execute (`SqliteExecuteResult`)
 
 `sqlite::execute` takes an `array<SqliteValue>` and returns a `SqliteExecuteResult`:
@@ -154,13 +168,21 @@ if first_cell.kind == "int" {
 | `columns` | array of string |
 | `rows` | array of `SqliteRow` |
 | `truncated` | bool |
-| `next_cursor` | optional int |
+| `next_cursor` | `Option<int>` |
 
 Each `SqliteRow` has one field, `cells`, an array of `SqliteValue` in column order. Result
 limits are charged from the underlying column names and cell payloads, without counting the
 named-struct wrapper fields. `max_rows`, `max_columns`, and `max_result_bytes` can truncate a
-query; already accepted rows remain in the result. `next_cursor` is the first-column integer
-from the last accepted row, or `null` when no such value was accepted.
+query; already accepted rows remain in the result. `next_cursor` is
+`Option::Some(first-column integer)` from the last accepted row, or `Option::None`
+when no such value was accepted:
+
+```rust
+let next = match queried.next_cursor {
+    Option::Some(cursor) => cursor,
+    Option::None => -1,
+};
+```
 
 ## Transactions (`SqliteStatement` and `SqliteTransactionResult`)
 
@@ -193,21 +215,29 @@ The return value is an `array<SqliteTransactionResult>` in statement order:
 ```text
 SqliteTransactionResult {
     kind: string,
-    execute: optional<SqliteExecuteResult>,
-    query: optional<SqliteQueryResult>,
+    execute: Option<SqliteExecuteResult>,
+    query: Option<SqliteQueryResult>,
 }
 ```
 
-An execute statement produces `{ kind: "execute", execute: ... }`; a query statement produces
-`{ kind: "query", query: ... }`. The unselected envelope field is `null`. Discriminate with
-`kind` before using `execute` or `query`. The transaction remains atomic: statement order,
+An execute statement produces `{ kind: "execute", execute: Option::Some(...) }`; a query statement
+produces `{ kind: "query", query: Option::Some(...) }`. The unselected envelope field is
+`Option::None`. Discriminate with `kind` before matching `execute` or `query`:
+
+```rust
+let result = results[0];
+let executed = match result.execute {
+    Option::Some(value) => value.rows_affected,
+    Option::None => -1,
+};
+``` The transaction remains atomic: statement order,
 rollback on failure, transaction deadlines, and result limits are preserved. A SQLite progress
 handler interrupts a transaction after its configured deadline so the transaction rolls back.
 
 ## Resource lifecycle
 
-`sqlite::close(db)` consumes the connection, begins adapter close before suspension, and removes
-the VM resource after close completes. Cancelling a blocked close leaves its resource-owned close
+`sqlite::close(db)` consumes the connection, begins adapter close before suspension,
+returns the guest `()` value, and removes the VM resource after close completes. Cancelling a blocked close leaves its resource-owned close
 lifecycle available for a later close call to poll to completion.
 VM reset interrupts active SQLite work and remains pending while the resource polls
 `tokio-rusqlite`'s `Connection::close`; the connection permit is released only after the adapter
