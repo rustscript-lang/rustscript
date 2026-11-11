@@ -858,6 +858,305 @@ fn schema_contains_unknown(schema: &TypeSchema) -> bool {
     }
 }
 
+/// Materialize permitted omitted logical Option fields as explicit `None` map
+/// entries at construction sites. This runs before the typed resolvers so the
+/// synthesized `Option::None` constructor is resolved by the ordinary Option
+/// owner. Required fields and legacy nullable fields are untouched.
+pub(crate) fn normalize_omitted_option_fields(ir: &mut FrontendIr) {
+    let structs = ir.struct_schemas.clone();
+    let returns: HashMap<u16, Option<TypeSchema>> = ir
+        .functions
+        .iter()
+        .map(|function| (function.index, function.return_schema.clone()))
+        .collect();
+    for stmt in &mut ir.stmts {
+        normalize_stmt_omitted(stmt, None, &structs);
+    }
+    let mut impls = std::mem::take(&mut ir.function_impls);
+    for (index, implementation) in impls.iter_mut() {
+        let expected = returns.get(index).cloned().flatten();
+        for stmt in &mut implementation.body_stmts {
+            normalize_stmt_omitted(stmt, expected.clone(), &structs);
+        }
+        normalize_expr_omitted(&mut implementation.body_expr, expected.as_ref(), &structs);
+    }
+    ir.function_impls = impls;
+}
+
+fn normalize_stmt_omitted(
+    stmt: &mut Stmt,
+    expected_tail: Option<TypeSchema>,
+    structs: &HashMap<String, super::ir::StructDecl>,
+) {
+    match stmt {
+        Stmt::Let {
+            declared_schema,
+            expr,
+            ..
+        } => normalize_expr_omitted(expr, declared_schema.as_ref(), structs),
+        Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+            normalize_expr_omitted(expr, None, structs)
+        }
+        Stmt::ClosureLet { closure, .. } => {
+            normalize_expr_omitted(&mut closure.body, None, structs)
+        }
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            normalize_expr_omitted(condition, Some(&TypeSchema::Bool), structs);
+            for nested in then_branch {
+                normalize_stmt_omitted(nested, expected_tail.clone(), structs);
+            }
+            for nested in else_branch {
+                normalize_stmt_omitted(nested, expected_tail.clone(), structs);
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            normalize_stmt_omitted(init, None, structs);
+            normalize_expr_omitted(condition, Some(&TypeSchema::Bool), structs);
+            normalize_stmt_omitted(post, None, structs);
+            for nested in body {
+                normalize_stmt_omitted(nested, None, structs);
+            }
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            normalize_expr_omitted(condition, Some(&TypeSchema::Bool), structs);
+            for nested in body {
+                normalize_stmt_omitted(nested, None, structs);
+            }
+        }
+        Stmt::Noop { .. }
+        | Stmt::FuncDecl { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Drop { .. } => {}
+    }
+}
+
+fn normalize_expr_omitted(
+    expr: &mut Expr,
+    expected: Option<&TypeSchema>,
+    structs: &HashMap<String, super::ir::StructDecl>,
+) {
+    if let Some(expected) = expected
+        && let Some(fields) = object_fields_for_normalization(expected, structs)
+    {
+        normalize_map_literal_omitted(expr, &fields);
+    }
+    match expr {
+        Expr::Block { stmts, expr } => {
+            for stmt in stmts {
+                normalize_stmt_omitted(stmt, expected.cloned(), structs);
+            }
+            normalize_expr_omitted(expr, expected, structs);
+        }
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            normalize_expr_omitted(condition, Some(&TypeSchema::Bool), structs);
+            normalize_expr_omitted(then_expr, expected, structs);
+            normalize_expr_omitted(else_expr, expected, structs);
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            normalize_expr_omitted(value, None, structs);
+            for (_, arm) in arms {
+                normalize_expr_omitted(arm, expected, structs);
+            }
+            normalize_expr_omitted(default, expected, structs);
+        }
+        Expr::Call(_, _, args, _, _)
+        | Expr::ModuleCall(_, _, args, _)
+        | Expr::LocalCall(_, _, args, _)
+        | Expr::ClosureCall(_, args) => {
+            for arg in args {
+                normalize_expr_omitted(arg, None, structs);
+            }
+        }
+        Expr::Closure(closure) => normalize_expr_omitted(&mut closure.body, expected, structs),
+        Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner)
+        | Expr::Neg(inner)
+        | Expr::Not(inner) => normalize_expr_omitted(inner, expected, structs),
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs) => {
+            normalize_expr_omitted(lhs, None, structs);
+            normalize_expr_omitted(rhs, None, structs);
+        }
+        Expr::ResultConstruct { payload, .. }
+        | Expr::OptionConstruct {
+            payload: Some(payload),
+            ..
+        } => normalize_expr_omitted(payload, None, structs),
+        Expr::OptionConstruct { payload: None, .. } => {}
+        Expr::ResultMatch {
+            value,
+            ok_expr,
+            err_expr,
+            ..
+        } => {
+            normalize_expr_omitted(value, None, structs);
+            normalize_expr_omitted(ok_expr, expected, structs);
+            normalize_expr_omitted(err_expr, expected, structs);
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            normalize_expr_omitted(value, None, structs);
+            normalize_expr_omitted(some_expr, expected, structs);
+            normalize_expr_omitted(none_expr, expected, structs);
+        }
+        Expr::OptionalGet { container, key, .. } => {
+            normalize_expr_omitted(container, None, structs);
+            normalize_expr_omitted(key, None, structs);
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            normalize_expr_omitted(value, None, structs);
+            normalize_expr_omitted(fallback, None, structs);
+        }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        }
+        | Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            normalize_expr_omitted(receiver, None, structs);
+            normalize_expr_omitted(argument, None, structs);
+        }
+        Expr::ResultConvert { value, .. } | Expr::ResultTry { value, .. } => {
+            normalize_expr_omitted(value, None, structs);
+        }
+        Expr::ResultQuery { value, .. } => normalize_expr_omitted(value, None, structs),
+        Expr::Null
+        | Expr::Unit
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::Bytes(_)
+        | Expr::FunctionRef(_, _)
+        | Expr::ModuleFunctionRef(_, _)
+        | Expr::UnresolvedFunctionRef { .. }
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. } => {}
+    }
+}
+
+fn object_fields_for_normalization(
+    schema: &TypeSchema,
+    structs: &HashMap<String, super::ir::StructDecl>,
+) -> Option<HashMap<String, TypeSchema>> {
+    match schema {
+        TypeSchema::Object(fields) => Some(fields.clone()),
+        TypeSchema::Named(name, args) if args.is_empty() => {
+            let TypeSchema::Object(fields) = &structs.get(name)?.body_schema else {
+                return None;
+            };
+            Some(fields.clone())
+        }
+        _ => None,
+    }
+}
+
+fn normalize_map_literal_omitted(expr: &mut Expr, fields: &HashMap<String, TypeSchema>) {
+    let mut keys = Vec::new();
+    if !collect_map_literal_keys(expr, &mut keys) {
+        return;
+    }
+    let mut additions = Vec::new();
+    for (name, schema) in fields {
+        if keys.iter().any(|key| key == name) {
+            continue;
+        }
+        let TypeSchema::Option(_) = schema else {
+            continue;
+        };
+        additions.push((name.clone(), schema.clone()));
+    }
+    if additions.is_empty() {
+        return;
+    }
+    let original = std::mem::replace(expr, Expr::Null);
+    let mut out = original;
+    for (name, schema) in additions {
+        out = Expr::Call(
+            crate::BuiltinFunction::Set.call_index(),
+            Vec::new(),
+            vec![
+                out,
+                Expr::String(name),
+                Expr::OptionConstruct {
+                    some: false,
+                    payload: None,
+                    option_schema: schema,
+                    span: super::source_map::Span::new(0, 0, 0),
+                    semantic_id: None,
+                },
+            ],
+            None,
+            None,
+        );
+    }
+    *expr = out;
+}
+
+/// Recover the string keys of a pure `MapNew` + `Set` literal chain. A map
+/// variable or any non-literal root is not normalized.
+fn collect_map_literal_keys(expr: &Expr, keys: &mut Vec<String>) -> bool {
+    match expr {
+        Expr::Call(index, _, args, _, _)
+            if crate::BuiltinFunction::from_call_index(*index)
+                == Some(crate::BuiltinFunction::MapNew) =>
+        {
+            args.is_empty()
+        }
+        Expr::Call(index, _, args, _, _)
+            if crate::BuiltinFunction::from_call_index(*index)
+                == Some(crate::BuiltinFunction::Set)
+                && args.len() == 3 =>
+        {
+            if let Expr::String(key) = &args[1] {
+                keys.push(key.clone());
+            }
+            collect_map_literal_keys(&args[0], keys)
+        }
+        _ => false,
+    }
+}
+
 fn ctor_name(some: bool) -> &'static str {
     if some { "Some" } else { "None" }
 }
