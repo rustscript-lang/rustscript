@@ -54,15 +54,20 @@ let values = http::response::header_values(&response, "set-cookie");
 ```
 
 A request builder accepts `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, or
-`OPTIONS`. `set_body_bytes` takes bytes; `set_body_text` takes a string. Mutators
-retain the builder's configured limits, and sending revalidates against the
-current HTTP policy. Headers are ordered entries, preserving duplicates and
-within-name value order. `Host`, `Content-Length`, `Transfer-Encoding`, and
-`Connection` are client-managed request headers. Response header names are
-normalized and canonically sorted. Each accessor string maps one raw octet to
-one Unicode scalar U+0000..U+00FF; encoding those scalars back to octets recovers
-the original bytes, including non-UTF-8 headers. The request and response bodies,
-response head, redirects, concurrency, and elapsed phases are bounded.
+`OPTIONS`. `set_body_bytes` takes bytes; `set_body_text` takes a string. The
+three request mutators return the logical Unit `()`; no HTTP or SSE public
+parameter, result, or callback member publishes a nullable schema. `set_header`,
+`set_body_text`, and `set_body_bytes` retain the builder's configured limits,
+and sending revalidates against the current HTTP policy. Headers are ordered
+entries, preserving duplicates and within-name value order. `Host`,
+`Content-Length`, `Transfer-Encoding`, and `Connection` are client-managed
+request headers. Response header names are normalized and canonically sorted.
+A missing response header lookup returns `[]`; a present header with an empty
+value returns `[""]`, so absence and present-empty stay distinct without an
+Option result. Each accessor string maps one raw octet to one Unicode scalar
+U+0000..U+00FF; encoding those scalars back to octets recovers the original
+bytes, including non-UTF-8 headers. The request and response bodies, response
+head, redirects, concurrency, and elapsed phases are bounded.
 
 ## Server-sent events
 
