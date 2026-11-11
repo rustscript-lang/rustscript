@@ -16,6 +16,7 @@ use std::sync::Arc;
 use regex::Regex;
 
 use super::VmArray;
+use crate::IntoVmValue;
 use crate::vm::{HostStateMut, Value, Vm, VmError, VmResult};
 use pd_host_function::pd_host_function;
 
@@ -55,14 +56,20 @@ pub(crate) fn native_re_match(vm: &mut Vm, pattern: &str, text: &str) -> VmResul
 }
 
 /// Returns the first substring matched by a regular expression.
+///
+/// The guest result is a logical `Option<String>`: a missing match is
+/// `Option::None`, while an empty match stays `Option::Some("")`.
 #[pd_host_function(name = "re::find")]
 pub(super) fn builtin_re_find(
     mut cache: HostStateMut<'_, RegexCache>,
     pattern: &str,
     text: &str,
-) -> VmResult<Option<String>> {
+) -> VmResult<crate::GuestOption<String>> {
     let regex = cached_regex(&mut cache, "re_find", pattern)?;
-    Ok(regex.find(text).map(|matched| matched.as_str().to_string()))
+    Ok(regex
+        .find(text)
+        .map(|matched| matched.as_str().to_string())
+        .into())
 }
 
 /// Replaces all regular-expression matches in a string.
@@ -88,8 +95,25 @@ pub(crate) fn native_re_replace(
     })
 }
 
+/// Guest contract for `re::split`.
+///
+/// The native producer returns string elements; the declared contract carries
+/// that element type into the installed descriptor because a raw `VmArray`
+/// signature alone can only advertise an unknown element.
+fn re_split_contract() -> crate::host_api::HostFunctionSchema {
+    use crate::host_api::{HostFunctionSchema, HostParamSchema, HostTypeSchema};
+    HostFunctionSchema::with_return(
+        "re::split",
+        vec![
+            HostParamSchema::value("pattern", HostTypeSchema::String),
+            HostParamSchema::value("text", HostTypeSchema::String),
+        ],
+        HostTypeSchema::Array(Box::new(HostTypeSchema::String)),
+    )
+}
+
 /// Splits a string on regular-expression matches.
-#[pd_host_function(name = "re::split")]
+#[pd_host_function(name = "re::split", contract = re_split_contract)]
 pub(super) fn builtin_re_split(
     mut cache: HostStateMut<'_, RegexCache>,
     pattern: &str,
@@ -102,8 +126,30 @@ pub(super) fn builtin_re_split(
         .collect::<Vec<_>>())
 }
 
+/// Guest contract for `re::captures`.
+///
+/// Group 0 and every present group are `Some`, unmatched groups are `None`.
+/// A missing match stays an empty array rather than an Option of the array.
+fn re_captures_contract() -> crate::host_api::HostFunctionSchema {
+    use crate::host_api::{HostFunctionSchema, HostParamSchema, HostTypeSchema};
+    HostFunctionSchema::with_return(
+        "re::captures",
+        vec![
+            HostParamSchema::value("pattern", HostTypeSchema::String),
+            HostParamSchema::value("text", HostTypeSchema::String),
+        ],
+        HostTypeSchema::Array(Box::new(HostTypeSchema::Option(Box::new(
+            HostTypeSchema::String,
+        )))),
+    )
+}
+
 /// Returns the capture groups produced by the first regular-expression match.
-#[pd_host_function(name = "re::captures")]
+///
+/// Each entry is a logical `Option<String>`: a present group (including an
+/// empty one) is `Some`, an unmatched optional group is `None`. A missing
+/// match returns an empty array.
+#[pd_host_function(name = "re::captures", contract = re_captures_contract)]
 pub(super) fn builtin_re_captures(
     mut cache: HostStateMut<'_, RegexCache>,
     pattern: &str,
@@ -117,8 +163,8 @@ pub(super) fn builtin_re_captures(
     let mut groups = Vec::with_capacity(captures.len());
     for index in 0..captures.len() {
         let group_value = match captures.get(index) {
-            Some(group) => Value::string(group.as_str().to_string()),
-            None => Value::Null,
+            Some(group) => crate::GuestOption::Some(group.as_str().to_string()).into_vm_value(),
+            None => crate::GuestOption::<String>::None.into_vm_value(),
         };
         groups.push(group_value);
     }
@@ -165,7 +211,7 @@ mod tests {
                 "FoO"
             ))
             .expect("find should work"),
-            Some("FoO".to_string())
+            crate::GuestOption::Some("FoO".to_string())
         );
 
         assert_eq!(vm.regex_cache_entry_count(), 1);

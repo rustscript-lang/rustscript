@@ -205,7 +205,7 @@ fn rustscript_builtin_and_namespace_runtime_cases_work() {
                 if d.length == 2 && d[0] == "a" && d[1] == "b" {
                     score = score + 1;
                 }
-                if e.length == 3 && e[1] == "FoO" && e[2] == "42" {
+                if e.length == 3 && e[1].unwrap_or("") == "FoO" && e[2].unwrap_or("") == "42" {
                     score = score + 1;
                 }
                 score;
