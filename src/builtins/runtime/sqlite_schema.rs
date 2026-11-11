@@ -29,6 +29,12 @@ fn sqlite_optional_type(inner: HostTypeSchema) -> HostTypeSchema {
     HostTypeSchema::Optional(Box::new(inner))
 }
 
+/// A result value whose absence is logical, not a tagged SQL NULL cell or an
+/// optional configuration entry.
+fn sqlite_option_type(inner: HostTypeSchema) -> HostTypeSchema {
+    HostTypeSchema::Option(Box::new(inner))
+}
+
 fn sqlite_limits_struct() -> HostStructSchema {
     HostStructSchema::new(
         "SqliteLimits",
@@ -110,7 +116,7 @@ fn sqlite_query_result_struct(row: &HostStructSchema) -> HostStructSchema {
             HostStructField::new("columns", sqlite_array_type(HostTypeSchema::String)),
             HostStructField::new("rows", sqlite_array_type(row.as_type())),
             HostStructField::new("truncated", HostTypeSchema::Bool),
-            HostStructField::new("next_cursor", sqlite_optional_type(HostTypeSchema::Int)),
+            HostStructField::new("next_cursor", sqlite_option_type(HostTypeSchema::Int)),
         ],
     )
     .with_description("Query result envelope with typed rows; next_cursor is omitted when absent.")
@@ -143,8 +149,8 @@ fn sqlite_transaction_result_struct(
         "SqliteTransactionResult",
         vec![
             HostStructField::new("kind", HostTypeSchema::String),
-            HostStructField::new("execute", sqlite_optional_type(execute.as_type())),
-            HostStructField::new("query", sqlite_optional_type(query.as_type())),
+            HostStructField::new("execute", sqlite_option_type(execute.as_type())),
+            HostStructField::new("query", sqlite_option_type(query.as_type())),
         ],
     )
     .with_description("A tagged ordered SQLite transaction result envelope.")
@@ -257,7 +263,7 @@ pub(super) fn sqlite_close_contract() -> HostFunctionSchema {
             HostTypeSchema::Resource(sqlite_connection_key()),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
     )
 }
 

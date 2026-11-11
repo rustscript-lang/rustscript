@@ -1372,8 +1372,8 @@ fn query_with_connection(
     entries.push((
         Value::string("next_cursor"),
         match next_cursor {
-            Some(next_cursor) => Value::Int(next_cursor),
-            None => Value::Null,
+            Some(next_cursor) => crate::option::some_carrier(Value::Int(next_cursor)),
+            None => crate::option::none_carrier(),
         },
     ));
     Ok(VmMap::from_entries(entries))
@@ -1400,16 +1400,17 @@ fn execute_with_connection(
 }
 
 fn transaction_result_value(kind: &str, execute: Option<VmMap>, query: Option<VmMap>) -> Value {
+    fn opt_map(value: Option<VmMap>) -> Value {
+        match value {
+            Some(value) => crate::option::some_carrier(Value::Map(Arc::new(value))),
+            None => crate::option::none_carrier(),
+        }
+    }
+
     Value::Map(Arc::new(VmMap::from_entries(vec![
         (Value::string("kind"), Value::string(kind)),
-        (
-            Value::string("execute"),
-            execute.map_or(Value::Null, |value| Value::Map(Arc::new(value))),
-        ),
-        (
-            Value::string("query"),
-            query.map_or(Value::Null, |value| Value::Map(Arc::new(value))),
-        ),
+        (Value::string("execute"), opt_map(execute)),
+        (Value::string("query"), opt_map(query)),
     ])))
 }
 

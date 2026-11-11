@@ -245,7 +245,11 @@ fn sqlite_round_trip_supports_typed_values_and_ordered_transactions() {
         let truncated = rowset.truncated;
         let next_cursor = rowset.next_cursor;
         assert(truncated == false);
-        assert(next_cursor == 7);
+        let cursor_value = match next_cursor {
+            Option::Some(value) => value,
+            Option::None => -1,
+        };
+        assert(cursor_value == 7);
         let columns = rowset.columns;
         assert(columns == {"n", "r", "s", "b", "z"});
         let row = rowset.rows[0];
@@ -285,16 +289,32 @@ fn sqlite_round_trip_supports_typed_values_and_ordered_transactions() {
         let first_result = results[0];
         let first_kind = first_result.kind;
         assert(first_kind == "execute");
-        assert(first_result.execute.rows_affected == 1);
-        assert(first_result.query == null);
+        let first_affected = match first_result.execute {
+            Option::Some(value) => value.rows_affected,
+            Option::None => -1,
+        };
+        assert(first_affected == 1);
+        let first_query_absent = match first_result.query {
+            Option::Some(value) => false,
+            Option::None => true,
+        };
+        assert(first_query_absent);
         let second_result = results[1];
         let second_kind = second_result.kind;
         assert(second_kind == "execute");
         let third_result = results[2];
         let third_kind = third_result.kind;
         assert(third_kind == "query");
-        assert(third_result.execute == null);
-        assert(third_result.query.rows[0].cells[0].int_value == 7);
+        let third_execute_absent = match third_result.execute {
+            Option::Some(value) => false,
+            Option::None => true,
+        };
+        assert(third_execute_absent);
+        let third_query_value = match third_result.query {
+            Option::Some(value) => value.rows[0].cells[0].int_value,
+            Option::None => -1,
+        };
+        assert(third_query_value == 7);
         let count = sqlite::query(&db, "SELECT count(*) AS count FROM values_table", [], { max_rows: 8, max_result_bytes: 65536 });
         let count_row = count.rows[0];
         let count_cells = count_row.cells;
