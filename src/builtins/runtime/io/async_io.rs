@@ -279,6 +279,13 @@ pub(crate) fn io_file_resource() -> crate::host_extension::HostResourceTypeMeta 
 }
 
 impl HostResource for IoResource {
+    fn resource_type_key() -> Option<crate::host_api::ResourceTypeKey> {
+        Some(
+            crate::host_api::ResourceTypeKey::new(super::IO_FILE_KEY)
+                .expect("the io.file resource key is a valid static key"),
+        )
+    }
+
     fn begin_close(&mut self, _reason: ResourceCloseReason) -> ResourceResult<CloseProgress> {
         self.begin_close_after_operations_quiesce()
     }
