@@ -824,13 +824,11 @@ impl<'a> TypeContext<'a> {
                 resolution
                     .as_ref()
                     .is_some_and(|resolved| resolved.return_type.is_optional())
-                    || BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::ReFind)
                     || self.function_returns_optional(*index)
             }
             Expr::LocalCall(slot, _, _, _) => match state.callable(*slot) {
                 Some(InferredCallable::Function(index, _)) => {
-                    BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::ReFind)
-                        || self.function_returns_optional(*index)
+                    self.function_returns_optional(*index)
                 }
                 _ => false,
             },
@@ -1951,7 +1949,9 @@ impl<'a> TypeContext<'a> {
             BuiltinFunction::Get if args.len() == 2 => {
                 self.infer_get_return_type(&args[0], &args[1], state)
             }
-            BuiltinFunction::ReFind => BoundType::String,
+            BuiltinFunction::ReFind => {
+                self.bound_type_for_schema(&TypeSchema::Option(Box::new(TypeSchema::String)))
+            }
             BuiltinFunction::Keys if args.len() == 1 => {
                 self.infer_keys_return_type(&args[0], state)
             }
@@ -2009,7 +2009,11 @@ impl<'a> TypeContext<'a> {
             BuiltinFunction::Get if args.len() == 2 => self
                 .infer_expr_schema(&args[0], state)
                 .and_then(|schema| infer_access_schema(&schema, &args[1], self, state).ok()),
-            BuiltinFunction::ReFind => Some(TypeSchema::String),
+            BuiltinFunction::ReFind => Some(TypeSchema::Option(Box::new(TypeSchema::String))),
+            BuiltinFunction::ReSplit => Some(TypeSchema::Array(Box::new(TypeSchema::String))),
+            BuiltinFunction::ReCaptures => Some(TypeSchema::Array(Box::new(TypeSchema::Option(
+                Box::new(TypeSchema::String),
+            )))),
             BuiltinFunction::Slice if args.len() == 3 => {
                 match self.infer_expr_schema(&args[0], state) {
                     Some(schema) if schema.array_prefix_and_rest().is_some() => schema
