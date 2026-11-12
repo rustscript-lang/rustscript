@@ -527,6 +527,385 @@ fn typed_json_encode_override_drops_private_descriptor() {
 }
 
 #[test]
+fn typed_public_json_encode_override_yield_restores_hidden_descriptor() {
+    struct YieldThenReturn {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl HostFunction for YieldThenReturn {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::string("request_body")]);
+            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                Ok(CallOutcome::Yield)
+            } else {
+                Ok(CallOutcome::Return(
+                    vec![Value::string("\"override\"")].into(),
+                ))
+            }
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let compiled = compile_source(json_encode_request_source()).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_function(
+        "json::encode",
+        Box::new(YieldThenReturn {
+            calls: Arc::clone(&calls),
+        }),
+    );
+
+    let status = vm.run().expect("first typed override call should yield");
+    assert_eq!(status, VmStatus::Yielded);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        vm.stack().len() >= 2 && matches!(vm.stack().last(), Some(Value::Bytes(_))),
+        "yield retry must keep the hidden descriptor, stack={:?}",
+        vm.stack()
+    );
+    assert_eq!(
+        vm.stack()[vm.stack().len() - 2],
+        Value::string("request_body")
+    );
+
+    let status = vm
+        .resume()
+        .expect("resume should replay the same typed call");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("\"override\"")]);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        vm.jit_native_exec_count(),
+        0,
+        "typed override yield stays off the native specialization path"
+    );
+}
+
+#[test]
+fn typed_public_json_encode_override_repeated_yield_keeps_lower_sentinel() {
+    struct YieldTwice {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl HostFunction for YieldTwice {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::string("request_body")]);
+            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            if count < 2 {
+                Ok(CallOutcome::Yield)
+            } else {
+                Ok(CallOutcome::Return(vec![Value::string("done")].into()))
+            }
+        }
+    }
+
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.ldc(1);
+    bc.ldc(2);
+    bc.call(vm::BuiltinFunction::JsonEncodeTyped.call_index(), 2);
+    bc.ret();
+    let program = Program::new(
+        vec![
+            Value::Int(7),
+            Value::string("request_body"),
+            Value::bytes(vec![9, 9]),
+        ],
+        bc.finish(),
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut vm = Vm::new(program);
+    vm.bind_function(
+        "json::encode",
+        Box::new(YieldTwice {
+            calls: Arc::clone(&calls),
+        }),
+    );
+
+    for expected_calls in 1..=2 {
+        let status = if expected_calls == 1 {
+            vm.run().expect("first yield")
+        } else {
+            vm.resume().expect("second yield")
+        };
+        assert_eq!(status, VmStatus::Yielded);
+        assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+        assert_eq!(
+            vm.stack(),
+            &[
+                Value::Int(7),
+                Value::string("request_body"),
+                Value::bytes(vec![9, 9])
+            ]
+        );
+    }
+
+    let status = vm.resume().expect("third entry should return");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(7), Value::string("done")]);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn typed_public_json_encode_override_yield_evaluates_source_argument_once() {
+    struct YieldThenReturn {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl HostFunction for YieldThenReturn {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::string("request_body")]);
+            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                Ok(CallOutcome::Yield)
+            } else {
+                Ok(CallOutcome::Return(vec![Value::string("once")].into()))
+            }
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let compiled = compile_source(
+        "use json;\nlet mut n = 0;\nfn bump() -> string { n = n + 1; \"request_body\"; }\nlet encoded = json::encode(bump());\nencoded;\nn;\n",
+    )
+    .expect("argument expression should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_function(
+        "json::encode",
+        Box::new(YieldThenReturn {
+            calls: Arc::clone(&calls),
+        }),
+    );
+
+    assert_eq!(vm.run().expect("yield"), VmStatus::Yielded);
+    assert_eq!(vm.resume().expect("resume"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("once"), Value::Int(1)]);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn typed_public_json_encode_args_override_yield_restores_hidden_descriptor() {
+    struct YieldThenReturn {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl HostArgsFunction for YieldThenReturn {
+        fn call(&mut self, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::string("request_body")]);
+            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                Ok(CallOutcome::Yield)
+            } else {
+                Ok(CallOutcome::Return(vec![Value::string("args")].into()))
+            }
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let compiled = compile_source(json_encode_request_source()).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_args_function(
+        "json::encode",
+        Box::new(YieldThenReturn {
+            calls: Arc::clone(&calls),
+        }),
+    );
+
+    assert_eq!(vm.run().expect("args yield"), VmStatus::Yielded);
+    assert!(matches!(vm.stack().last(), Some(Value::Bytes(_))));
+    assert_eq!(vm.resume().expect("args resume"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("args")]);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn typed_public_json_encode_override_yield_survives_vmbc_roundtrip() {
+    struct YieldThenReturn {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl HostFunction for YieldThenReturn {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::string("request_body")]);
+            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                Ok(CallOutcome::Yield)
+            } else {
+                Ok(CallOutcome::Return(vec![Value::string("vmbc")].into()))
+            }
+        }
+    }
+
+    let compiled = compile_source(json_encode_request_source()).expect("source should compile");
+    let bytes = vm::encode_program(&compiled.program).expect("vmbc encode");
+    let program = vm::decode_program(&bytes).expect("vmbc decode");
+    assert_eq!(
+        bytecode_calls(&program.code),
+        vec![(vm::BuiltinFunction::JsonEncodeTyped.call_index(), 2)]
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut vm = Vm::new(program);
+    vm.bind_function(
+        "json::encode",
+        Box::new(YieldThenReturn {
+            calls: Arc::clone(&calls),
+        }),
+    );
+
+    assert_eq!(vm.run().expect("vmbc yield"), VmStatus::Yielded);
+    assert!(matches!(vm.stack().last(), Some(Value::Bytes(_))));
+    assert_eq!(vm.resume().expect("vmbc resume"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("vmbc")]);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn typed_public_json_encode_override_pending_does_not_replay() {
+    struct PendingOnce {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl HostFunction for PendingOnce {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::string("request_body")]);
+            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                Ok(CallOutcome::Pending(99))
+            } else {
+                Err(vm::VmError::HostError(
+                    "pending override must not replay".to_string(),
+                ))
+            }
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let compiled = compile_source(json_encode_request_source()).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_function(
+        "json::encode",
+        Box::new(PendingOnce {
+            calls: Arc::clone(&calls),
+        }),
+    );
+
+    assert_eq!(vm.run().expect("pending"), VmStatus::Waiting(99));
+    assert!(
+        vm.stack()
+            .iter()
+            .all(|value| !matches!(value, Value::Bytes(_))),
+        "pending consumes the hidden descriptor, stack={:?}",
+        vm.stack()
+    );
+    vm.complete_host_op(99, vec![Value::string("pending")])
+        .expect("completion");
+    assert_eq!(vm.resume().expect("resume after pending"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("pending")]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn typed_public_json_encode_override_halt_consumes_hidden_descriptor() {
+    struct HaltEncode {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl HostFunction for HaltEncode {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::string("request_body")]);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CallOutcome::Halt)
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let compiled = compile_source(json_encode_request_source()).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_function(
+        "json::encode",
+        Box::new(HaltEncode {
+            calls: Arc::clone(&calls),
+        }),
+    );
+
+    assert_eq!(vm.run().expect("halt"), VmStatus::Halted);
+    assert!(vm.stack().is_empty(), "halt leaves no call operands");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn typed_public_json_encode_override_release_skips_guest_drop_contract() {
+    struct ReturnEncode;
+
+    impl HostFunction for ReturnEncode {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::string("request_body")]);
+            Ok(CallOutcome::Return(vec![Value::string("kept")].into()))
+        }
+    }
+
+    let compiled = compile_source(json_encode_request_source()).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_drop_contract_events_enabled(true);
+    vm.bind_function("json::encode", Box::new(ReturnEncode));
+
+    assert_eq!(vm.run().expect("return"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("kept")]);
+    assert_eq!(
+        vm.drop_contract_event_count(),
+        0,
+        "compiler-owned descriptor release must not emit a guest drop event"
+    );
+}
+
+#[test]
+fn typed_public_json_encode_override_yield_keeps_aot_without_native_specialization() {
+    struct YieldThenReturn {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl HostFunction for YieldThenReturn {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::string("request_body")]);
+            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                Ok(CallOutcome::Yield)
+            } else {
+                Ok(CallOutcome::Return(vec![Value::string("aot")].into()))
+            }
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let compiled = compile_source(json_encode_request_source()).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(vm::JitConfig {
+        enabled: false,
+        hot_loop_threshold: 1,
+        max_trace_len: 64,
+    });
+    vm.compile_aot().expect("aot compile should succeed");
+    vm.bind_function(
+        "json::encode",
+        Box::new(YieldThenReturn {
+            calls: Arc::clone(&calls),
+        }),
+    );
+
+    assert_eq!(vm.run().expect("aot yield"), VmStatus::Yielded);
+    assert!(matches!(vm.stack().last(), Some(Value::Bytes(_))));
+    assert_eq!(vm.resume().expect("aot resume"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("aot")]);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(vm.jit_native_exec_count(), 0);
+    assert!(
+        vm.aot_exec_count() > 0,
+        "compiled aot still runs; the override yield stays on the host redirect"
+    );
+}
+
+#[test]
 fn low_level_public_json_encode_override_receives_original_value() {
     struct PublicOverride;
 
