@@ -22,10 +22,10 @@ const MAGIC: [u8; 4] = *b"VMBC";
 const VERSION_V14: u16 = 14;
 const FLAGS: u16 = 0;
 const MAX_WIRE_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
-const MAX_WIRE_BLOB_BYTES: usize = 16 * 1024 * 1024;
-const MAX_WIRE_COUNT: usize = 1_000_000;
-const MAX_WIRE_AGGREGATE_ITEMS: usize = 1_000_000;
-const MAX_SCHEMA_DEPTH: usize = 64;
+use crate::compiler::type_schema_codec::{
+    self, MAX_SCHEMA_DEPTH, MAX_WIRE_AGGREGATE_ITEMS, MAX_WIRE_BLOB_BYTES, MAX_WIRE_COUNT,
+    SchemaCodecError, SchemaReader,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
@@ -2158,201 +2158,103 @@ fn next_host_schema_depth(depth: usize) -> Result<usize, WireError> {
 }
 
 pub(crate) fn encode_type_schema_bytes(schema: &TypeSchema) -> Result<Vec<u8>, WireError> {
-    let mut out = Vec::new();
-    write_schema(schema, &mut out)?;
-    Ok(out)
+    type_schema_codec::encode_type_schema_bytes(schema).map_err(schema_codec_error)
 }
 
 pub(crate) fn decode_type_schema_bytes(bytes: &[u8]) -> Result<TypeSchema, WireError> {
-    let mut cursor = Cursor::new(bytes);
-    let schema = read_schema(&mut cursor, 0)?;
-    if cursor.remaining() != 0 {
-        return Err(WireError::TrailingBytes);
-    }
-    Ok(schema)
+    type_schema_codec::decode_type_schema_bytes(bytes).map_err(schema_codec_error)
 }
 
 fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(), WireError> {
-    match schema {
-        TypeSchema::Unknown => out.push(0),
-        TypeSchema::Null => out.push(1),
-        TypeSchema::Unit => out.push(20),
-        TypeSchema::Int => out.push(2),
-        TypeSchema::Float => out.push(3),
-        TypeSchema::Number => out.push(4),
-        TypeSchema::Bool => out.push(5),
-        TypeSchema::String => out.push(6),
-        TypeSchema::Bytes => out.push(7),
-        TypeSchema::Optional(inner) => {
-            out.push(16);
-            write_schema(inner, out)?;
-        }
-        TypeSchema::Option(inner) => {
-            out.push(19);
-            write_schema(inner, out)?;
-        }
-        TypeSchema::GenericParam(name) => {
-            out.push(8);
-            write_string("schema generic", name, out)?;
-        }
-        TypeSchema::Named(name, type_args) => {
-            out.push(9);
-            write_string("schema name", name, out)?;
-            write_u32_count("schema type args", type_args.len(), out)?;
-            for type_arg in type_args {
-                write_schema(type_arg, out)?;
-            }
-        }
-        TypeSchema::Array(item) => {
-            out.push(10);
-            write_schema(item, out)?;
-        }
-        TypeSchema::ArrayTuple(items) => {
-            out.push(11);
-            write_u32_count("schema tuple items", items.len(), out)?;
-            for item in items {
-                write_schema(item, out)?;
-            }
-        }
-        TypeSchema::ArrayTupleRest { prefix, rest } => {
-            out.push(12);
-            write_u32_count("schema tuple prefix", prefix.len(), out)?;
-            for item in prefix {
-                write_schema(item, out)?;
-            }
-            write_schema(rest, out)?;
-        }
-        TypeSchema::Map(item) => {
-            out.push(13);
-            write_schema(item, out)?;
-        }
-        TypeSchema::Object(fields) => {
-            out.push(14);
-            let mut entries = fields.iter().collect::<Vec<_>>();
-            entries.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-            write_u32_count("schema object fields", entries.len(), out)?;
-            for (name, value) in entries {
-                write_string("schema object field", name, out)?;
-                write_schema(value, out)?;
-            }
-        }
-        TypeSchema::Callable { params, result } => {
-            out.push(15);
-            write_u32_count("schema callable params", params.len(), out)?;
-            for param in params {
-                write_schema(param, out)?;
-            }
-            write_schema(result, out)?;
-        }
-        TypeSchema::Resource(key) => {
-            out.push(17);
-            write_string("schema resource key", key.as_str(), out)?;
-        }
-        TypeSchema::Result { ok, err } => {
-            out.push(18);
-            write_schema(ok, out)?;
-            write_schema(err, out)?;
-        }
-    }
-    Ok(())
+    type_schema_codec::write_schema(schema, out).map_err(schema_codec_error)
 }
 
 fn read_schema(cursor: &mut Cursor<'_>, depth: usize) -> Result<TypeSchema, WireError> {
-    if depth >= MAX_SCHEMA_DEPTH {
-        return Err(WireError::LengthTooLarge("schema nesting depth", depth));
+    type_schema_codec::read_schema(&mut InlineSchemaCursor { cursor }, depth)
+        .map_err(schema_codec_error)
+}
+
+struct InlineSchemaCursor<'a, 'b> {
+    cursor: &'a mut Cursor<'b>,
+}
+
+impl SchemaReader for InlineSchemaCursor<'_, '_> {
+    fn read_u8(&mut self) -> Result<u8, SchemaCodecError> {
+        self.cursor.read_u8().map_err(schema_codec_from_wire)
     }
-    cursor.debit_count("schema nodes", 1)?;
-    let nested_depth = depth
-        .checked_add(1)
-        .ok_or(WireError::LengthTooLarge("schema nesting depth", depth))?;
-    match cursor.read_u8()? {
-        0 => Ok(TypeSchema::Unknown),
-        1 => Ok(TypeSchema::Null),
-        2 => Ok(TypeSchema::Int),
-        3 => Ok(TypeSchema::Float),
-        4 => Ok(TypeSchema::Number),
-        5 => Ok(TypeSchema::Bool),
-        6 => Ok(TypeSchema::String),
-        7 => Ok(TypeSchema::Bytes),
-        16 => Ok(TypeSchema::Optional(Box::new(read_schema(
-            cursor,
-            nested_depth,
-        )?))),
-        8 => Ok(TypeSchema::GenericParam(cursor.read_string()?)),
-        9 => {
-            let name = cursor.read_string()?;
-            let count = cursor.read_count("schema type args", 1)?;
-            let mut type_args = Vec::new();
-            reserve_vec(&mut type_args, "schema type args", count)?;
-            for _ in 0..count {
-                type_args.push(read_schema(cursor, nested_depth)?);
-            }
-            Ok(TypeSchema::Named(name, type_args))
-        }
-        10 => Ok(TypeSchema::Array(Box::new(read_schema(
-            cursor,
-            nested_depth,
-        )?))),
-        11 => {
-            let count = cursor.read_count("schema tuple items", 1)?;
-            let mut items = Vec::new();
-            reserve_vec(&mut items, "schema tuple items", count)?;
-            for _ in 0..count {
-                items.push(read_schema(cursor, nested_depth)?);
-            }
-            Ok(TypeSchema::ArrayTuple(items))
-        }
-        12 => {
-            let count = cursor.read_count_with_overhead("schema tuple prefix", 1, 1)?;
-            let mut prefix = Vec::new();
-            reserve_vec(&mut prefix, "schema tuple prefix", count)?;
-            for _ in 0..count {
-                prefix.push(read_schema(cursor, nested_depth)?);
-            }
-            let rest = Box::new(read_schema(cursor, nested_depth)?);
-            Ok(TypeSchema::ArrayTupleRest { prefix, rest })
-        }
-        13 => Ok(TypeSchema::Map(Box::new(read_schema(
-            cursor,
-            nested_depth,
-        )?))),
-        14 => {
-            let count = cursor.read_count("schema object fields", 5)?;
-            let mut fields = HashMap::new();
-            reserve_map(&mut fields, "schema object fields", count)?;
-            for _ in 0..count {
-                let name = cursor.read_string()?;
-                let value = read_schema(cursor, nested_depth)?;
-                fields.insert(name, value);
-            }
-            Ok(TypeSchema::Object(fields))
-        }
-        15 => {
-            let count = cursor.read_count_with_overhead("schema callable params", 1, 1)?;
-            let mut params = Vec::new();
-            reserve_vec(&mut params, "schema callable params", count)?;
-            for _ in 0..count {
-                params.push(read_schema(cursor, nested_depth)?);
-            }
-            let result = Box::new(read_schema(cursor, nested_depth)?);
-            Ok(TypeSchema::Callable { params, result })
-        }
-        17 => {
-            let key_text = cursor.read_string()?;
-            let key = ResourceTypeKey::new(key_text)
-                .map_err(|err| WireError::InvalidResourceKey(err.to_string()))?;
-            Ok(TypeSchema::Resource(key))
-        }
-        18 => Ok(TypeSchema::Result {
-            ok: Box::new(read_schema(cursor, nested_depth)?),
-            err: Box::new(read_schema(cursor, nested_depth)?),
-        }),
-        19 => Ok(TypeSchema::Option(Box::new(read_schema(
-            cursor,
-            nested_depth,
-        )?))),
-        20 => Ok(TypeSchema::Unit),
-        other => Err(WireError::InvalidValueType(other)),
+
+    fn read_string(&mut self) -> Result<String, SchemaCodecError> {
+        self.cursor.read_string().map_err(schema_codec_from_wire)
+    }
+
+    fn read_count(
+        &mut self,
+        field: &'static str,
+        min_item_bytes: usize,
+    ) -> Result<usize, SchemaCodecError> {
+        self.cursor
+            .read_count(field, min_item_bytes)
+            .map_err(schema_codec_from_wire)
+    }
+
+    fn read_count_with_overhead(
+        &mut self,
+        field: &'static str,
+        min_item_bytes: usize,
+        fixed_bytes: usize,
+    ) -> Result<usize, SchemaCodecError> {
+        self.cursor
+            .read_count_with_overhead(field, min_item_bytes, fixed_bytes)
+            .map_err(schema_codec_from_wire)
+    }
+
+    fn debit_count(&mut self, field: &'static str, count: usize) -> Result<(), SchemaCodecError> {
+        self.cursor
+            .debit_count(field, count)
+            .map_err(schema_codec_from_wire)
+    }
+
+    fn remaining(&self) -> usize {
+        self.cursor.remaining()
+    }
+}
+
+fn schema_codec_error(err: SchemaCodecError) -> WireError {
+    match err {
+        SchemaCodecError::UnexpectedEof => WireError::UnexpectedEof,
+        SchemaCodecError::InvalidValueType(tag) => WireError::InvalidValueType(tag),
+        SchemaCodecError::InvalidResourceKey(reason) => WireError::InvalidResourceKey(reason),
+        SchemaCodecError::InvalidUtf8 => WireError::InvalidUtf8,
+        SchemaCodecError::LengthTooLarge(field, len) => WireError::LengthTooLarge(field, len),
+        SchemaCodecError::TrailingBytes => WireError::TrailingBytes,
+    }
+}
+
+fn schema_codec_from_wire(err: WireError) -> SchemaCodecError {
+    match err {
+        WireError::UnexpectedEof => SchemaCodecError::UnexpectedEof,
+        WireError::InvalidUtf8 => SchemaCodecError::InvalidUtf8,
+        WireError::LengthTooLarge(field, len) => SchemaCodecError::LengthTooLarge(field, len),
+        WireError::InvalidValueType(tag) => SchemaCodecError::InvalidValueType(tag),
+        WireError::InvalidResourceKey(reason) => SchemaCodecError::InvalidResourceKey(reason),
+        WireError::TrailingBytes => SchemaCodecError::TrailingBytes,
+        WireError::InvalidMagic(_)
+        | WireError::UnsupportedVersion(_)
+        | WireError::UnsupportedFlags(_)
+        | WireError::InvalidConstantTag(_)
+        | WireError::InvalidBool(_)
+        | WireError::InvalidTypeMapFlag(_)
+        | WireError::InvalidDebugFlag(_)
+        | WireError::InvalidCaptureBindingMode(_)
+        | WireError::InvalidHostSchemaTag(_)
+        | WireError::InvalidHostParamPassing(_)
+        | WireError::InvalidHostResourceKey
+        | WireError::HostSchemaImportMismatch
+        | WireError::InvalidHostSchemaComplexity(_)
+        | WireError::StringTooLong(_)
+        | WireError::CodeTooLong(_)
+        | WireError::UnsupportedConstantType(_)
+        | WireError::InvalidRetCleanup(_) => SchemaCodecError::UnexpectedEof,
     }
 }
 
@@ -3027,6 +2929,20 @@ mod ret_cleanup_wire_tests {
         assert_eq!(
             encode_program(&cycle),
             Err(WireError::InvalidRetCleanup("named cleanup schema cycle"))
+        );
+    }
+
+    #[test]
+    fn schema_forward_bytes_match_the_pure_codec() {
+        let schema = TypeSchema::Option(Box::new(TypeSchema::Unit));
+        let forwarded = encode_type_schema_bytes(&schema).expect("vmbc forward should encode");
+        let owned = crate::compiler::type_schema_codec::encode_type_schema_bytes(&schema)
+            .expect("pure codec should encode");
+        assert_eq!(forwarded, owned);
+        assert_eq!(forwarded, vec![19, 20]);
+        assert_eq!(
+            decode_type_schema_bytes(&forwarded).expect("vmbc forward should decode"),
+            schema
         );
     }
 }

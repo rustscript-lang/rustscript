@@ -336,14 +336,13 @@ fn rewrite_typed_json(
     schema: crate::compiler::ir::TypeSchema,
     builtin: BuiltinFunction,
 ) -> Result<(), CompileError> {
-    let descriptor = crate::vmbc::encode_type_schema_bytes(&schema).map_err(|err| {
-        CompileError::HostCallResolve {
+    let descriptor = crate::compiler::type_schema_codec::encode_type_schema_bytes(&schema)
+        .map_err(|err| CompileError::HostCallResolve {
             line: None,
             source_name: None,
             detail: format!("typed JSON descriptor: {err}"),
             span: None,
-        }
-    })?;
+        })?;
     let Expr::Call(_, _, args, _, semantic_id) = expr else {
         unreachable!("typed json rewrite requires a call");
     };
@@ -1500,7 +1499,7 @@ fn next_fact(
 }
 
 fn encode_descriptor(schema: &TypeSchema) -> Result<Vec<u8>, CompileError> {
-    crate::vmbc::encode_type_schema_bytes(schema)
+    crate::compiler::type_schema_codec::encode_type_schema_bytes(schema)
         .map_err(|err| presentation_error(&format!("logical render descriptor: {err}")))
 }
 
