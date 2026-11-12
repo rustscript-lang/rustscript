@@ -2,6 +2,7 @@
 mod common;
 use common::*;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use vm::OpCode;
 use vm::{HostImport, RegexCacheVmExt, StandardSurfaceComposition};
 
@@ -362,6 +363,329 @@ fn namespaced_builtin_json_encode_call_can_be_overridden_by_host_binding() {
     assert_eq!(vm.stack(), &[Value::string("\"override\"")]);
 }
 
+struct RecordingJsonEncode {
+    seen: Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
+    label: &'static str,
+}
+
+impl HostFunction for RecordingJsonEncode {
+    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+        self.seen.lock().expect("override args").push(args.to_vec());
+        Ok(CallOutcome::Return(vec![Value::string(self.label)].into()))
+    }
+}
+
+struct FailingJsonEncode {
+    calls: Arc<AtomicUsize>,
+}
+
+impl HostFunction for FailingJsonEncode {
+    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+        assert_eq!(args, &[Value::string("request_body")]);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(vm::VmError::HostError(
+            "encode override rejected".to_string(),
+        ))
+    }
+}
+
+fn json_encode_request_source() -> &'static str {
+    "use json;\njson::encode(\"request_body\");\n"
+}
+
+fn bytecode_calls(code: &[u8]) -> Vec<(u16, u8)> {
+    let mut calls = Vec::new();
+    let mut ip = 0;
+    while ip < code.len() {
+        let opcode = OpCode::try_from(code[ip]).expect("opcode");
+        if opcode == OpCode::Call {
+            let index = u16::from_le_bytes([code[ip + 1], code[ip + 2]]);
+            calls.push((index, code[ip + 3]));
+        }
+        ip += 1 + opcode.operand_len();
+    }
+    calls
+}
+
+fn public_json_encode_program(value: Value) -> Program {
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.call(vm::BuiltinFunction::JsonEncode.call_index(), 1);
+    bc.ret();
+    Program::new(vec![value], bc.finish())
+}
+
+fn typed_json_encode_program(value: Value, descriptor: Vec<u8>) -> Program {
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.ldc(1);
+    bc.call(vm::BuiltinFunction::JsonEncodeTyped.call_index(), 2);
+    bc.ret();
+    Program::new(vec![value, Value::bytes(descriptor)], bc.finish())
+}
+
+#[test]
+fn public_json_encode_override_is_cold_warm_reset_and_rebind_stable() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let compiled = compile_source(json_encode_request_source()).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_function(
+        "json::encode",
+        Box::new(RecordingJsonEncode {
+            seen: Arc::clone(&seen),
+            label: "cold",
+        }),
+    );
+
+    let status = vm.run().expect("cold override should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("cold")]);
+    assert_eq!(
+        seen.lock().expect("cold args").as_slice(),
+        &[vec![Value::string("request_body")]]
+    );
+
+    vm.reset_for_reuse().expect("warm reset should succeed");
+    let status = vm.run().expect("warm override should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("cold")]);
+    assert_eq!(seen.lock().expect("warm args").len(), 2);
+
+    vm.bind_function(
+        "json::encode",
+        Box::new(RecordingJsonEncode {
+            seen: Arc::clone(&seen),
+            label: "rebind",
+        }),
+    );
+    vm.reset_for_reuse().expect("rebind reset should succeed");
+    let status = vm.run().expect("rebound override should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("rebind")]);
+    let seen = seen.lock().expect("rebind args");
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[2], vec![Value::string("request_body")]);
+}
+
+#[test]
+fn public_json_encode_override_reports_structured_host_failure_once() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let compiled = compile_source(json_encode_request_source()).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_function(
+        "json::encode",
+        Box::new(FailingJsonEncode {
+            calls: Arc::clone(&calls),
+        }),
+    );
+
+    let err = vm.run().expect_err("override host failure should surface");
+    match err {
+        vm::VmError::HostError(message) => {
+            assert_eq!(message, "encode override rejected");
+        }
+        other => panic!("unexpected vm error: {other}"),
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn typed_json_encode_without_override_keeps_descriptor_validation() {
+    let program = typed_json_encode_program(Value::string("request_body"), vec![99]);
+    let mut vm = Vm::new(program);
+    let err = vm
+        .run()
+        .expect_err("invalid descriptor must fail when no override is installed");
+    match err {
+        vm::VmError::HostError(message) => {
+            assert!(message.contains("typed json descriptor"), "{message}");
+        }
+        other => panic!("unexpected vm error: {other}"),
+    }
+}
+
+#[test]
+fn typed_json_encode_override_drops_private_descriptor() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let program = typed_json_encode_program(Value::string("request_body"), vec![99]);
+    let mut vm = Vm::new(program);
+    vm.bind_function(
+        "json::encode",
+        Box::new(RecordingJsonEncode {
+            seen: Arc::clone(&seen),
+            label: "descriptor-hidden",
+        }),
+    );
+
+    let status = vm.run().expect("override should ignore the descriptor");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("descriptor-hidden")]);
+    assert_eq!(
+        seen.lock().expect("descriptor args").as_slice(),
+        &[vec![Value::string("request_body")]]
+    );
+}
+
+#[test]
+fn low_level_public_json_encode_override_receives_original_value() {
+    struct PublicOverride;
+
+    impl HostFunction for PublicOverride {
+        fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            assert_eq!(args, &[Value::string("request_body")]);
+            Ok(CallOutcome::Return(
+                vec![Value::string("\"override\"")].into(),
+            ))
+        }
+    }
+
+    let mut vm = Vm::new(public_json_encode_program(Value::string("request_body")));
+    vm.bind_function("json::encode", Box::new(PublicOverride));
+
+    let status = vm.run().expect("public call override should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("\"override\"")]);
+}
+
+#[test]
+fn private_json_encode_helper_is_not_source_bindable() {
+    struct Unused;
+
+    impl HostFunction for Unused {
+        fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
+            Err(vm::VmError::HostError(
+                "private helper must not be called".to_string(),
+            ))
+        }
+    }
+
+    let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+    let err = vm
+        .bind_builtin_override("__json_encode_typed", Box::new(Unused))
+        .expect_err("private helper name must not resolve");
+    assert!(matches!(err, vm::VmError::HostError(_)));
+
+    let compiled = compile_source(json_encode_request_source()).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_function("__json_encode_typed", Box::new(Unused));
+    let status = vm.run().expect("private name must not intercept encode");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("\"request_body\"")]);
+}
+
+#[test]
+fn public_json_encode_override_runs_on_aot_and_survives_rebind() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let compiled = compile_source(json_encode_request_source()).expect("source should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.set_jit_config(vm::JitConfig {
+        enabled: false,
+        hot_loop_threshold: 1,
+        max_trace_len: 64,
+    });
+    vm.compile_aot().expect("aot compile should succeed");
+    vm.bind_function(
+        "json::encode",
+        Box::new(RecordingJsonEncode {
+            seen: Arc::clone(&seen),
+            label: "aot",
+        }),
+    );
+
+    let status = vm.run().expect("aot override should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("aot")]);
+    assert!(
+        vm.aot_exec_count() > 0,
+        "aot should execute the encode call"
+    );
+    assert_eq!(vm.jit_native_exec_count(), 0);
+
+    vm.bind_function(
+        "json::encode",
+        Box::new(RecordingJsonEncode {
+            seen: Arc::clone(&seen),
+            label: "aot-rebind",
+        }),
+    );
+    vm.reset_for_reuse().expect("aot reset should succeed");
+    let status = vm.run().expect("rebound aot override should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("aot-rebind")]);
+    assert!(
+        vm.has_aot_program(),
+        "reset must retain the compiled aot program"
+    );
+    assert!(
+        vm.aot_exec_count() > 1,
+        "rebind must not require a fresh aot compile"
+    );
+}
+
+#[test]
+fn public_json_encode_override_disables_jit_and_still_dispatches() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let compiled = compile_source(
+        r#"
+        use json;
+        let mut i = 0;
+        let mut text = "";
+        while i < 8 {
+            text = json::encode("request_body");
+            i = i + 1;
+        }
+        text;
+    "#,
+    )
+    .expect("looping encode should compile");
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_function(
+        "json::encode",
+        Box::new(RecordingJsonEncode {
+            seen: Arc::clone(&seen),
+            label: "jit-disabled",
+        }),
+    );
+
+    let status = vm.run().expect("override loop should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("jit-disabled")]);
+    assert_eq!(seen.lock().expect("jit args").len(), 8);
+    assert!(
+        vm.jit_snapshot().traces.is_empty(),
+        "builtin override disables trace compilation"
+    );
+    assert_eq!(vm.jit_native_exec_count(), 0);
+}
+
+#[test]
+fn public_json_encode_override_survives_vmbc_roundtrip() {
+    let compiled = compile_source(json_encode_request_source()).expect("source should compile");
+    let bytes = vm::encode_program(&compiled.program).expect("vmbc encode");
+    let program = vm::decode_program(&bytes).expect("vmbc decode");
+    assert_eq!(
+        bytecode_calls(&program.code),
+        vec![(vm::BuiltinFunction::JsonEncodeTyped.call_index(), 2)]
+    );
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut vm = Vm::new(program);
+    vm.bind_function(
+        "json::encode",
+        Box::new(RecordingJsonEncode {
+            seen: Arc::clone(&seen),
+            label: "vmbc",
+        }),
+    );
+    let status = vm.run().expect("decoded override should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("vmbc")]);
+    assert_eq!(
+        seen.lock().expect("vmbc args").as_slice(),
+        &[vec![Value::string("request_body")]]
+    );
+}
+
 #[test]
 fn namespaced_builtin_math_call_can_be_overridden_by_host_binding() {
     struct MathSqrtOverride;
@@ -493,18 +817,13 @@ fn host_function_registry_includes_default_runtime_exit() {
 
 #[test]
 fn json_encode_rejects_non_string_map_keys() {
-    // Non-string keys are not representable in `TypeSchema::Map`, so the
-    // compiler admits the map and the runtime encoder rejects the key.
-    let compiled = compile_source(
-        r#"
-        use json;
-        let payload = { 1: "one" };
-        json::encode(payload);
-    "#,
-    )
-    .expect("non-string-key maps must compile; runtime must reject them");
-
-    let mut vm = Vm::new(compiled.program);
+    let program =
+        public_json_encode_program(Value::map(vec![(Value::Int(1), Value::string("one"))]));
+    assert_eq!(
+        bytecode_calls(&program.code),
+        vec![(vm::BuiltinFunction::JsonEncode.call_index(), 1)]
+    );
+    let mut vm = Vm::new(program);
     let err = vm
         .run()
         .expect_err("json::encode must reject non-string map keys");
@@ -521,19 +840,12 @@ fn json_encode_rejects_non_string_map_keys() {
 
 #[test]
 fn json_encode_rejects_nan_at_runtime() {
-    // NaN has no JSON representation. The compiler cannot prove the value
-    // non-finite, so the runtime encoder must reject it.
-    let compiled = compile_source(
-        r#"
-        use json;
-        use math;
-        let payload: float = math::nan();
-        json::encode(payload);
-    "#,
-    )
-    .expect("nan float must compile; runtime must reject it");
-
-    let mut vm = Vm::new(compiled.program);
+    let program = public_json_encode_program(Value::Float(f64::NAN));
+    assert_eq!(
+        bytecode_calls(&program.code),
+        vec![(vm::BuiltinFunction::JsonEncode.call_index(), 1)]
+    );
+    let mut vm = Vm::new(program);
     let err = vm.run().expect_err("json::encode must reject NaN");
     match err {
         vm::VmError::HostError(message) => {
@@ -548,25 +860,13 @@ fn json_encode_rejects_nan_at_runtime() {
 
 #[test]
 fn json_encode_rejects_infinite_floats_at_runtime() {
-    // Positive and negative infinity have no JSON representation; the
-    // runtime encoder must reject both.
-    for source in [
-        r#"
-        use json;
-        use math;
-        let payload: float = math::inf();
-        json::encode(payload);
-    "#,
-        r#"
-        use json;
-        use math;
-        let payload: float = math::neg_inf();
-        json::encode(payload);
-    "#,
-    ] {
-        let compiled =
-            compile_source(source).expect("infinite float must compile; runtime must reject it");
-        let mut vm = Vm::new(compiled.program);
+    for value in [f64::INFINITY, f64::NEG_INFINITY] {
+        let program = public_json_encode_program(Value::Float(value));
+        assert_eq!(
+            bytecode_calls(&program.code),
+            vec![(vm::BuiltinFunction::JsonEncode.call_index(), 1)]
+        );
+        let mut vm = Vm::new(program);
         let err = vm.run().expect_err("json::encode must reject infinity");
         match err {
             vm::VmError::HostError(message) => {
@@ -586,16 +886,12 @@ fn json_encode_uses_last_duplicate_map_entry_from_constructor() {
         (Value::string("k"), Value::Int(1)),
         (Value::string("k"), Value::Int(2)),
     ]);
-    let mut compiled = compile_source(
-        r#"
-        use json;
-        json::encode("placeholder");
-    "#,
-    )
-    .expect("source should compile");
-    compiled.program.constants = vec![duplicate_map];
-
-    let mut vm = Vm::new(compiled.program);
+    let program = public_json_encode_program(duplicate_map);
+    assert_eq!(
+        bytecode_calls(&program.code),
+        vec![(vm::BuiltinFunction::JsonEncode.call_index(), 1)]
+    );
+    let mut vm = Vm::new(program);
     let status = vm.run().expect("json::encode should succeed");
     assert_eq!(status, VmStatus::Halted);
     assert_eq!(vm.stack(), &[Value::string("{\"k\":2}")]);

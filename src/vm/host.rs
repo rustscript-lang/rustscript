@@ -3471,6 +3471,11 @@ impl Vm {
                     got: argc_u8,
                 });
             }
+            if let Some(outcome) =
+                self.try_redirect_typed_json_encode_to_public_override(builtin, argc_u8, call_ip)?
+            {
+                return Ok(outcome);
+            }
             if self.host.builtin_overrides.contains_key(&index) {
                 return self.execute_builtin_override_call(index, argc_u8, call_ip);
             }
@@ -3560,6 +3565,38 @@ impl Vm {
                 expected_return_schema.as_ref(),
             )
         }
+    }
+
+    /// Typed `json::encode` lowering calls the private helper. A host override is
+    /// installed only on the public call index and must still receive the value.
+    fn try_redirect_typed_json_encode_to_public_override(
+        &mut self,
+        builtin: BuiltinFunction,
+        argc_u8: u8,
+        call_ip: usize,
+    ) -> VmResult<Option<HostCallExecOutcome>> {
+        if builtin != BuiltinFunction::JsonEncodeTyped {
+            return Ok(None);
+        }
+        let public_index = BuiltinFunction::JsonEncode.call_index();
+        if !self.host.builtin_overrides.contains_key(&public_index) {
+            return Ok(None);
+        }
+        let value_argc = BuiltinFunction::JsonEncode.arity();
+        if argc_u8 < value_argc {
+            return Err(VmError::InvalidCallArity {
+                import: BuiltinFunction::JsonEncode.name().to_string(),
+                expected: value_argc,
+                got: argc_u8,
+            });
+        }
+        let extra = usize::from(argc_u8 - value_argc);
+        for _ in 0..extra {
+            let descriptor = self.pop_value()?;
+            self.drop_value_with_contract(descriptor);
+        }
+        self.execute_builtin_override_call(public_index, value_argc, call_ip)
+            .map(Some)
     }
 
     pub(super) fn execute_builtin_override_call(
