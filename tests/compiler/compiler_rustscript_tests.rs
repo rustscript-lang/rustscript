@@ -1138,7 +1138,7 @@ fn closure_mut_capture_is_visible_after_callback_returns() {
         r#"
             fn invoke(cb, x) {
                 let _ = cb(x);
-                null
+                ()
             }
             let mut state: string = "";
             let sink = |delta| if true => {
@@ -1285,9 +1285,9 @@ fn closure_mut_capture_compound_and_write_only_modes_stay_shared() {
                 let mut state: int = 0;
                 let bump = |delta| if true => {
                     state += delta;
-                    null
+                    ()
                 } else => {
-                    null
+                    ()
                 };
                 let _ = bump(1);
                 state;
@@ -1299,9 +1299,9 @@ fn closure_mut_capture_compound_and_write_only_modes_stay_shared() {
                 let mut state: string = "initial";
                 let reset = |value| if true => {
                     state = value;
-                    null
+                    ()
                 } else => {
-                    null
+                    ()
                 };
                 let _ = reset("after");
                 state;
@@ -1485,19 +1485,17 @@ fn rustscript_move_and_alias_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
-            name: "bool fields are copy by default and null object entries are omitted",
+            name: "bool fields are copy by default and unit object entries stay present",
             source: r#"
-                let p = { b: true, n: null };
+                let p = { b: true, n: () };
                 let b1 = p.b;
                 let b2 = p.b;
-                if b1 && b2 && !p.has("n") {
-                    1;
-                } else {
-                    0;
-                }
+                let copied = if b1 && b2 => { 1 } else => { 0 };
+                let present = if p.has("n") => { 1 } else => { 0 };
+                copied + present;
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::Int(1)],
+            expected_stack: vec![Value::Int(2)],
             expected_locals: None,
         },
         RuntimeCase {
@@ -3745,7 +3743,7 @@ fn rustscript_optional_chain_requires_declared_schema_and_explicit_handling() {
             struct Profile { stats: Stats }
 
             let present: Profile = { stats: { score: 41 } };
-            let missing: Profile? = null;
+            let missing: Option<Profile> = Option::None;
 
             let present_score = present?.stats?.score.unwrap_or(0);
             let missing_score = missing?.stats?.score.unwrap_or(0);
@@ -3964,10 +3962,10 @@ fn rustscript_explicit_optional_type_annotations_work() {
         rustscript_runtime_case(
             "optional local and return annotations preserve concrete inner typing",
             r#"
-                fn maybe_score(text: string) -> int? {
-                    let mut out: int? = null;
+                fn maybe_score(text: string) -> Option<int> {
+                    let mut out: Option<int> = Option::None;
                     if text == "ok" {
-                        out = 41;
+                        out = Option::Some(41);
                     }
                     out
                 }
@@ -3995,10 +3993,8 @@ fn rustscript_explicit_optional_type_annotations_work() {
                 value;
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
-            expected_contains_all: &[
-                "local is declared as schema type 'int' but was assigned null",
-            ],
+            expected_kind: SourceErrorKind::Parse,
+            expected_contains_all: &["RSS rejects null literals; use Option::None or ()"],
         },
         SourceErrorCase {
             name: "non optional return rejects null result",
@@ -4010,10 +4006,8 @@ fn rustscript_explicit_optional_type_annotations_work() {
                 bad();
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_kind: SourceErrorKind::Compile(CompileErrorKind::StrictTypingRequired),
-            expected_contains_all: &[
-                "function 'bad' is declared to return 'int' but produced null",
-            ],
+            expected_kind: SourceErrorKind::Parse,
+            expected_contains_all: &["RSS rejects null literals; use Option::None or ()"],
         },
         SourceErrorCase {
             name: "typed callable locals reject mismatched closure results",

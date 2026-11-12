@@ -970,6 +970,15 @@ pub(super) fn validate_expr(
                 context.infer_expr_schema(else_expr, &else_state),
                 context.stmt_span(line_context.unwrap_or_default()),
             )?;
+            ensure_compatible_logical_schemas(
+                line_context,
+                source_name,
+                "if/else expression result",
+                context.infer_expr_schema(then_expr, &then_state),
+                context.infer_expr_schema(else_expr, &else_state),
+                context.is_strict(),
+                context.stmt_span(line_context.unwrap_or_default()),
+            )?;
             if then_ty == else_ty || matches!(static_condition, Some(true)) {
                 then_ty
             } else if matches!(static_condition, Some(false)) {
@@ -1032,6 +1041,15 @@ pub(super) fn validate_expr(
                     schema.clone(),
                     context.stmt_span(line_context.unwrap_or_default()),
                 )?;
+                ensure_compatible_logical_schemas(
+                    line_context,
+                    source_name,
+                    "match arm result",
+                    arm_schema.clone(),
+                    schema.clone(),
+                    context.is_strict(),
+                    context.stmt_span(line_context.unwrap_or_default()),
+                )?;
                 arm_schema = arm_schema.or(schema);
                 arm_type = Some(match arm_type {
                     None => ty,
@@ -1075,8 +1093,17 @@ pub(super) fn validate_expr(
                     line_context,
                     source_name,
                     "match result",
+                    arm_schema.clone(),
+                    default_schema.clone(),
+                    context.stmt_span(line_context.unwrap_or_default()),
+                )?;
+                ensure_compatible_logical_schemas(
+                    line_context,
+                    source_name,
+                    "match result",
                     arm_schema,
                     default_schema,
+                    context.is_strict(),
                     context.stmt_span(line_context.unwrap_or_default()),
                 )?;
                 merge_bound_types(arm_type, default_ty)
@@ -1772,6 +1799,45 @@ fn eval_static_bool(expr: &Expr) -> Option<bool> {
         },
         _ => None,
     }
+}
+
+fn ensure_compatible_logical_schemas(
+    line: Option<u32>,
+    source_name: Option<&str>,
+    context: &str,
+    lhs: Option<TypeSchema>,
+    rhs: Option<TypeSchema>,
+    strict: bool,
+    span: Option<Span>,
+) -> Result<(), CompileError> {
+    if !strict {
+        return Ok(());
+    }
+    let (Some(lhs), Some(rhs)) = (lhs, rhs) else {
+        return Ok(());
+    };
+    if are_compatible_schemas(&lhs, &rhs) {
+        return Ok(());
+    }
+    let logical = |schema: &TypeSchema| {
+        matches!(
+            schema,
+            TypeSchema::Option(_) | TypeSchema::Result { .. } | TypeSchema::Named(_, _)
+        )
+    };
+    if !logical(&lhs) && !logical(&rhs) {
+        return Ok(());
+    }
+    Err(CompileError::StrictTypingRequired {
+        line,
+        source_name: owned_source_name(source_name),
+        detail: format!(
+            "{context} joined incompatible schemas: {} vs {}",
+            render_schema_label(&lhs),
+            render_schema_label(&rhs)
+        ),
+        span,
+    })
 }
 
 fn ensure_compatible_if_else_types(
