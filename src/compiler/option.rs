@@ -20,6 +20,9 @@ pub(crate) const OPTION_PAYLOAD_KEY: &str = "payload";
 
 struct Env {
     slots: HashMap<LocalSlot, TypeSchema>,
+    /// Schemas frozen at the declaring Let or parameter. Later assignments
+    /// update `slots` only, so a capture does not observe a future reassignment.
+    declaration_schemas: HashMap<LocalSlot, TypeSchema>,
     functions: HashMap<u16, FunctionDecl>,
     function_list: Vec<FunctionDecl>,
     function_impls: HashMap<u16, FunctionImpl>,
@@ -43,6 +46,7 @@ pub(crate) fn resolve_option_types(
         }
     }
     let mut env = Env {
+        declaration_schemas: slots.clone(),
         slots,
         functions,
         function_list,
@@ -52,9 +56,7 @@ pub(crate) fn resolve_option_types(
     };
     resolve_stmts(&mut ir.stmts, None, &mut env)?;
     let mut impls = std::mem::take(&mut ir.function_impls);
-    for (index, function_impl) in impls.iter_mut() {
-        resolve_function(*index, function_impl, &mut env)?;
-    }
+    resolve_function_impls(&mut impls, &mut env)?;
     ir.function_impls = impls;
     Ok(())
 }
@@ -75,8 +77,12 @@ fn resolve_function(
         {
             if let Some(schema) = schema {
                 env.slots.insert(*slot, schema.clone());
+                env.declaration_schemas
+                    .entry(*slot)
+                    .or_insert(schema.clone());
             }
         }
+        seed_captured_schemas(function_impl, env);
         resolve_stmts(
             &mut function_impl.body_stmts,
             function.return_schema.clone(),
@@ -89,12 +95,179 @@ fn resolve_function(
         )?;
     } else {
         env.lexical_return = None;
+        seed_captured_schemas(function_impl, env);
         resolve_stmts(&mut function_impl.body_stmts, None, env)?;
         resolve_expr(&mut function_impl.body_expr, None, env)?;
     }
     env.slots = saved;
     env.lexical_return = saved_return;
     Ok(())
+}
+
+/// Copy declaration-position schemas onto the function's captured slots.
+///
+/// The payload checker reads `Var(captured)`, not the outer source slot.
+/// Seeding uses the schema already recorded for that source; it does not
+/// invent a type or consult a later aggregate slot.
+fn seed_captured_schemas(function_impl: &FunctionImpl, env: &mut Env) {
+    for (source, captured) in &function_impl.capture_copies {
+        let Some(schema) = env
+            .declaration_schemas
+            .get(source)
+            .cloned()
+            .or_else(|| env.slots.get(source).cloned())
+        else {
+            continue;
+        };
+        env.slots.insert(*captured, schema.clone());
+        env.declaration_schemas.entry(*captured).or_insert(schema);
+    }
+}
+
+fn resolve_function_impls(
+    impls: &mut HashMap<u16, FunctionImpl>,
+    env: &mut Env,
+) -> Result<(), CompileError> {
+    let owners = local_slot_owners(impls);
+    let mut pending: Vec<u16> = impls.keys().copied().collect();
+    while !pending.is_empty() {
+        let ready = pending.iter().position(|index| {
+            capture_sources_ready(
+                *index,
+                &impls[index],
+                &pending,
+                &owners,
+                &env.declaration_schemas,
+            )
+        });
+        let index = match ready {
+            Some(position) => pending.remove(position),
+            None => pending.remove(0),
+        };
+        let function_impl = impls.get_mut(&index).expect("pending function impl");
+        resolve_function(index, function_impl, env)?;
+    }
+    Ok(())
+}
+
+fn capture_sources_ready(
+    index: u16,
+    function_impl: &FunctionImpl,
+    pending: &[u16],
+    owners: &HashMap<LocalSlot, u16>,
+    declarations: &HashMap<LocalSlot, TypeSchema>,
+) -> bool {
+    function_impl.capture_copies.iter().all(|(source, _)| {
+        if declarations.contains_key(source) {
+            return true;
+        }
+        match owners.get(source) {
+            Some(owner) if *owner != index && pending.contains(owner) => false,
+            _ => true,
+        }
+    })
+}
+
+pub(super) fn local_slot_owners(impls: &HashMap<u16, FunctionImpl>) -> HashMap<LocalSlot, u16> {
+    let mut owners = HashMap::new();
+    for (index, function_impl) in impls {
+        for slot in &function_impl.param_slots {
+            owners.insert(*slot, *index);
+        }
+        let mut slots = Vec::new();
+        collect_declared_slots(&function_impl.body_stmts, &mut slots);
+        collect_declared_slots_expr(&function_impl.body_expr, &mut slots);
+        for slot in slots {
+            owners.insert(slot, *index);
+        }
+    }
+    owners
+}
+
+fn collect_declared_slots(stmts: &[Stmt], slots: &mut Vec<LocalSlot>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Let { index, expr, .. } => {
+                slots.push(*index);
+                collect_declared_slots_expr(expr, slots);
+            }
+            Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+                collect_declared_slots_expr(expr, slots);
+            }
+            Stmt::IfElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_declared_slots_expr(condition, slots);
+                collect_declared_slots(then_branch, slots);
+                collect_declared_slots(else_branch, slots);
+            }
+            Stmt::For {
+                init,
+                condition,
+                post,
+                body,
+                ..
+            } => {
+                collect_declared_slots(std::slice::from_ref(init.as_ref()), slots);
+                collect_declared_slots_expr(condition, slots);
+                collect_declared_slots(std::slice::from_ref(post.as_ref()), slots);
+                collect_declared_slots(body, slots);
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                collect_declared_slots_expr(condition, slots);
+                collect_declared_slots(body, slots);
+            }
+            Stmt::ClosureLet { closure, .. } => collect_declared_slots_expr(&closure.body, slots),
+            Stmt::Noop { .. }
+            | Stmt::FuncDecl { .. }
+            | Stmt::Break { .. }
+            | Stmt::Continue { .. }
+            | Stmt::Drop { .. } => {}
+        }
+    }
+}
+
+fn collect_declared_slots_expr(expr: &Expr, slots: &mut Vec<LocalSlot>) {
+    match expr {
+        Expr::Block { stmts, expr } => {
+            collect_declared_slots(stmts, slots);
+            collect_declared_slots_expr(expr, slots);
+        }
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            collect_declared_slots_expr(condition, slots);
+            collect_declared_slots_expr(then_expr, slots);
+            collect_declared_slots_expr(else_expr, slots);
+        }
+        Expr::Closure(closure) => collect_declared_slots_expr(&closure.body, slots),
+        Expr::ClosureCall(closure, args) => {
+            collect_declared_slots_expr(&closure.body, slots);
+            for arg in args {
+                collect_declared_slots_expr(arg, slots);
+            }
+        }
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            collect_declared_slots_expr(value, slots);
+            for (_, arm) in arms {
+                collect_declared_slots_expr(arm, slots);
+            }
+            collect_declared_slots_expr(default, slots);
+        }
+        _ => {}
+    }
 }
 
 fn resolve_stmts(
@@ -137,6 +310,9 @@ fn resolve_stmt(
                     )
                 });
             if let Some(schema) = inferred.filter(|schema| !matches!(schema, TypeSchema::Unknown)) {
+                env.declaration_schemas
+                    .entry(*index)
+                    .or_insert_with(|| schema.clone());
                 env.slots.insert(*index, schema);
             }
             Ok(())
@@ -1000,12 +1176,34 @@ pub(crate) fn normalize_omitted_option_fields(ir: &mut FrontendIr) {
     for stmt in &mut ir.stmts {
         normalize_stmt_omitted(stmt, None, &mut env);
     }
+    let root_slots = env.slots.clone();
     let mut targets = std::mem::take(&mut ir.function_impls);
-    for (index, implementation) in targets.iter_mut() {
-        let Some(function) = functions.iter().find(|function| function.index == *index) else {
+    let owners = local_slot_owners(&targets);
+    let mut pending = targets.keys().copied().collect::<Vec<_>>();
+    pending.sort_unstable();
+    let mut resolved = root_slots.clone();
+    while !pending.is_empty() {
+        // A capture is ready when its source schema is already resolved, or
+        // its owner is this function or a function that is no longer pending.
+        // Declarations keep their first checked schema; later assignments do
+        // not replace the captured fact.
+        let ready = pending.iter().position(|index| {
+            targets[index].capture_copies.iter().all(|(source, _)| {
+                resolved.contains_key(source)
+                    || owners
+                        .get(source)
+                        .is_none_or(|owner| *owner == *index || !pending.contains(owner))
+            })
+        });
+        let index = pending.remove(ready.unwrap_or(0));
+        let Some(function) = functions.iter().find(|function| function.index == index) else {
             continue;
         };
-        env.slots.clear();
+        let expected = function.return_schema.clone();
+        let Some(implementation) = targets.get_mut(&index) else {
+            continue;
+        };
+        env.slots = root_slots.clone();
         for (slot, schema) in implementation
             .param_slots
             .iter()
@@ -1015,11 +1213,18 @@ pub(crate) fn normalize_omitted_option_fields(ir: &mut FrontendIr) {
                 env.slots.insert(*slot, schema.clone());
             }
         }
-        let expected = function.return_schema.clone();
+        for (source, captured) in &implementation.capture_copies {
+            if let Some(schema) = env.slots.get(source).cloned() {
+                env.slots.insert(*captured, schema);
+            }
+        }
         for stmt in &mut implementation.body_stmts {
             normalize_stmt_omitted(stmt, expected.clone(), &mut env);
         }
         normalize_expr_omitted(&mut implementation.body_expr, expected.as_ref(), &mut env);
+        for (slot, schema) in &env.slots {
+            resolved.entry(*slot).or_insert_with(|| schema.clone());
+        }
     }
     ir.function_impls = targets;
 }
