@@ -394,6 +394,10 @@ fn prepare_owned_typed_ir(
     }
     // Legalization and inference do not impose the root's language policy on
     // dependencies. Admission below uses each producer's own descriptor.
+    // Omitted Option fields must be materialized before host admission.
+    // Legalizing first turns a lawful `{}` into a host error, and the
+    // host_error gate below would then skip this normalization entirely.
+    super::option::normalize_omitted_option_fields(&mut parsed);
     let (mut legalized, host_error, rejections) =
         typing::legalize_for_admission(parsed, TypingMode::DynamicHints, entry.types);
     // Host-call resolutions and merged module formals exist only after
