@@ -4,10 +4,12 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use vm::compiler::ir::{ParsedCallSite, ParsedCallTarget, ParsedSemanticIndex, SemanticNodeId};
 use vm::{
     CompileSourceFileOptions, Expr, FrontendId, FrontendIr, FrontendTypingPolicy, ParseError,
-    ParsePhase, SourceFlavor, SourceFrontendContext, SourceFrontendDescriptor, SourcePlugin, Stmt,
-    Value, Vm, VmStatus, compile_source_file_with_options, compile_source_with_flavor_and_options,
+    ParsePhase, SourceFlavor, SourceFrontendContext, SourceFrontendDescriptor, SourcePlugin, Span,
+    Stmt, Value, Vm, VmStatus, compile_source, compile_source_file_with_options,
+    compile_source_with_flavor_and_options,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1348,7 +1350,11 @@ fn plugin_null_store_stays_set_and_deletes_key() {
     let set_index = vm::BuiltinFunction::Set.call_index().to_le_bytes();
     let edit_index = vm::BuiltinFunction::MapEdit.call_index().to_le_bytes();
     assert!(
-        compiled.program.code.windows(2).any(|pair| pair == set_index),
+        compiled
+            .program
+            .code
+            .windows(2)
+            .any(|pair| pair == set_index),
         "plugin null store must remain a Set call"
     );
     assert!(
@@ -1365,4 +1371,131 @@ fn plugin_null_store_stays_set_and_deletes_key() {
         VmStatus::Halted
     );
     assert_eq!(vm.stack(), &[Value::Bool(false)]);
+}
+
+struct ProvenanceNullDeletePlugin;
+
+impl SourcePlugin for ProvenanceNullDeletePlugin {
+    fn descriptor(&self) -> SourceFrontendDescriptor {
+        SourceFrontendDescriptor {
+            id: FrontendId::new("plugin-null-provenance"),
+            extensions: &["nullown"],
+            typing_policy: FrontendTypingPolicy::Dynamic,
+            supports_ownership_checking: false,
+        }
+    }
+
+    fn parse_source(
+        &self,
+        _source: &str,
+        context: &SourceFrontendContext<'_>,
+    ) -> Result<FrontendIr, ParseError> {
+        let call_id = SemanticNodeId(1);
+        let span = Span::new(context.source_id, 1, 8);
+        let stored = Expr::Call(
+            vm::BuiltinFunction::Set.call_index(),
+            Vec::new(),
+            vec![
+                Expr::Call(
+                    vm::BuiltinFunction::MapNew.call_index(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                Expr::String("k".to_string()),
+                Expr::Null,
+            ],
+            None,
+            Some(call_id),
+        );
+        let present = Expr::Call(
+            vm::BuiltinFunction::Has.call_index(),
+            Vec::new(),
+            vec![stored, Expr::String("k".to_string())],
+            None,
+            None,
+        );
+        let parsed = FrontendIr {
+            stmts: vec![Stmt::Expr {
+                expr: present,
+                line: 1,
+            }],
+            locals: 0,
+            local_bindings: Vec::new(),
+            struct_schemas: Default::default(),
+            unknown_type_spans: Vec::new(),
+            functions: Vec::new(),
+            function_impls: Default::default(),
+            stmt_sources: Vec::new(),
+            function_sources: Default::default(),
+            use_declarations: Vec::new(),
+            implicit_extern_names: Vec::new(),
+            host_api_metadata: None,
+            semantic_index: None,
+            parsed_semantic_index: Some(ParsedSemanticIndex {
+                call_sites: vec![ParsedCallSite {
+                    id: call_id,
+                    callee_span: span,
+                    expr_span: span,
+                    target: ParsedCallTarget::Function(vm::BuiltinFunction::Set.call_index()),
+                    name: "set".to_string(),
+                    scope_id: 0,
+                    is_namespace_call: false,
+                }],
+                next_node_id: 2,
+                ..ParsedSemanticIndex::default()
+            }),
+            catalog_visibility: None,
+            lexer_tokens: Vec::new(),
+        };
+        Ok(parsed)
+    }
+}
+
+fn builtin_call_count(program: &vm::Program, builtin: vm::BuiltinFunction) -> usize {
+    let index = builtin.call_index().to_le_bytes();
+    program
+        .code
+        .windows(3)
+        .filter(|window| window[0] == vm::OpCode::Call as u8 && window[1..3] == index)
+        .count()
+}
+
+#[test]
+fn plugin_provenance_keeps_null_set_while_rss_unit_store_rewrites() {
+    let path = plugin_source_path("nullown");
+    let plugin = compile_source_file_with_options(
+        &path,
+        CompileSourceFileOptions::new().with_source_plugin(&ProvenanceNullDeletePlugin),
+    )
+    .expect("provenanced plugin null store must compile");
+    assert!(
+        builtin_call_count(&plugin.program, vm::BuiltinFunction::Set) >= 1,
+        "plugin null store must remain Set"
+    );
+    assert_eq!(
+        builtin_call_count(&plugin.program, vm::BuiltinFunction::MapEdit),
+        0,
+        "plugin source id must stay outside RustScript map-store policy"
+    );
+    let mut plugin_vm = Vm::new(plugin.program);
+    assert_eq!(
+        plugin_vm.run().expect("plugin null delete should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(plugin_vm.stack(), &[Value::Bool(false)]);
+
+    let rss = compile_source(r#"let mut values = {}; values["k"] = (); values.has("k");"#)
+        .expect("rss unit store must compile");
+    assert!(
+        builtin_call_count(&rss.program, vm::BuiltinFunction::MapEdit) >= 1,
+        "rss unit store must be rewritten to MapEdit"
+    );
+    let mut rss_vm = Vm::new(rss.program.with_local_count(rss.locals));
+    assert_eq!(
+        rss_vm.run().expect("rss unit store should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(rss_vm.stack().last().cloned(), Some(Value::Bool(true)));
 }

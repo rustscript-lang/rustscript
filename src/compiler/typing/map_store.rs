@@ -14,9 +14,9 @@ use super::super::ir::{
 };
 use super::super::source_map::{SourceId, Span};
 use super::super::{CompileError, ParseError};
+use super::EntryLocalType;
 use super::context::{MapStoreAction, TypeContext};
 use super::state::LocalTypeState;
-use super::EntryLocalType;
 
 pub(crate) enum MapAdmissionError {
     Compile(CompileError),
@@ -109,10 +109,13 @@ fn decide_edit(
         };
     }
     if is_logical_carrier(receiver.as_ref()) {
-        Some(MapStoreAction::RejectCarrier)
-    } else {
-        None
+        return Some(MapStoreAction::RejectCarrier);
     }
+    let value = context.infer_expr_schema(&args[2], state);
+    if is_map_object_or_named(receiver.as_ref()) && !value_may_be_unit(value.as_ref()) {
+        return Some(MapStoreAction::NormalizeSet);
+    }
+    None
 }
 
 fn apply_function(
@@ -141,7 +144,11 @@ fn apply_stmt(
 ) -> Result<(), MapAdmissionError> {
     let line = super::helpers::stmt_line(stmt);
     match stmt {
-        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Drop { .. } => {}
+        Stmt::Noop { .. }
+        | Stmt::FuncDecl { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Drop { .. } => {}
         Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
             apply_expr(expr, decisions, sites, scope, line)?;
         }
@@ -207,7 +214,9 @@ fn apply_expr(
             }
             apply_call(expr, decisions, sites, scope, line)?;
         }
-        Expr::ModuleCall(_, _, args, _) | Expr::LocalCall(_, _, args, _) | Expr::ClosureCall(_, args) => {
+        Expr::ModuleCall(_, _, args, _)
+        | Expr::LocalCall(_, _, args, _)
+        | Expr::ClosureCall(_, args) => {
             for arg in args {
                 apply_expr(arg, decisions, sites, scope, line)?;
             }
@@ -226,7 +235,11 @@ fn apply_expr(
             apply_expr(lhs, decisions, sites, scope, line)?;
             apply_expr(rhs, decisions, sites, scope, line)?;
         }
-        Expr::Neg(inner) | Expr::Not(inner) | Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => {
             apply_expr(inner, decisions, sites, scope, line)?;
         }
         Expr::IfElse {
@@ -239,7 +252,10 @@ fn apply_expr(
             apply_expr(else_expr, decisions, sites, scope, line)?;
         }
         Expr::Match {
-            value, arms, default, ..
+            value,
+            arms,
+            default,
+            ..
         } => {
             apply_expr(value, decisions, sites, scope, line)?;
             for (_, arm) in arms {
@@ -257,7 +273,9 @@ fn apply_expr(
             apply_expr(container, decisions, sites, scope, line)?;
             apply_expr(key, decisions, sites, scope, line)?;
         }
-        Expr::OptionUnwrapOr { value, fallback, .. } => {
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
             apply_expr(value, decisions, sites, scope, line)?;
             apply_expr(fallback, decisions, sites, scope, line)?;
         }
@@ -347,6 +365,13 @@ fn apply_call(
             args.push(Expr::Bool(false));
             Ok(())
         }
+        MapStoreAction::NormalizeSet => {
+            *index = BuiltinFunction::Set.call_index();
+            if args.len() == 4 {
+                args.pop();
+            }
+            Ok(())
+        }
         MapStoreAction::RejectCarrier => Err(MapAdmissionError::Compile(
             CompileError::InvalidFieldAccess {
                 line: Some(line),
@@ -380,8 +405,9 @@ fn scope_allows(
     match scope {
         MapStoreScope::Legacy => false,
         MapStoreScope::RustScript => true,
-        MapStoreScope::Sources(ids) => span_for(sites, id)
-            .is_some_and(|span| ids.contains(&span.source_id)),
+        MapStoreScope::Sources(ids) => {
+            span_for(sites, id).is_some_and(|span| ids.contains(&span.source_id))
+        }
     }
 }
 
@@ -425,10 +451,10 @@ fn value_may_be_unit(schema: Option<&TypeSchema>) -> bool {
         None
         | Some(
             TypeSchema::Unit
-                | TypeSchema::Null
-                | TypeSchema::GenericParam(_)
-                | TypeSchema::Unknown
-                | TypeSchema::Optional(_),
+            | TypeSchema::Null
+            | TypeSchema::GenericParam(_)
+            | TypeSchema::Unknown
+            | TypeSchema::Optional(_),
         ) => true,
         Some(_) => false,
     }
