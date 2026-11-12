@@ -195,11 +195,17 @@ and a present key holding explicit `Option::None` remain distinct.
 
 Permitted omitted logical Option fields normalize to None at the RustScript
 boundary, while required fields are still checked. An explicit Option::None
-field is a tagged value, not a map deletion; internal raw Null deletion and the
-legacy nullable contract are unchanged until the final no-null boundary work.
+field is a tagged value, not a map deletion. The internal VM keeps its raw Null
+value and other frontends keep their legacy nullable contracts; RustScript
+itself rejects explicit null literals and legacy `T?` annotations.
 
 ## Deliberate limits
 
 This scope does not add `is_some`, `inspect`, `map_or` or other unrequested
-catalogue operations. RSS null literals, legacy nullable annotations, JSON/Core
-admission and standard host migration remain separate later boundary work.
+catalogue operations. RustScript source JSON calls use the typed boundary: a
+decode needs an explicit concrete type argument and an encode is lowered from
+its checked argument schema, or the call fails at compile time. The untyped
+public `json::decode`/`json::encode` API stays available only to the internal
+VM and other frontends. Standard typed hosts publish logical `GuestOption` and
+Unit under their declared schemas, and value-position JSON that cannot
+distinguish Unit from None is still rejected.
