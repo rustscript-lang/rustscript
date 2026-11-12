@@ -434,6 +434,47 @@ pub(super) fn infer_types_with_root_projection(
     (facts, roots)
 }
 
+/// Checked schema of the last root expression statement, taken before callee
+/// slot aggregation. `None` means the snippet has no expression result. An
+/// unknown expression stays unknown and is never reported as Unit.
+pub(super) fn root_expression_result_schema(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+) -> Option<TypeSchema> {
+    let function_names = build_function_names(&ir.functions);
+    let function_decls = build_function_decl_map(&ir.functions);
+    let host_import_return_types =
+        build_host_import_return_types(&ir.functions, &ir.function_impls);
+    let host_import_signatures = build_host_import_signatures(&ir.functions, &ir.function_impls);
+    let mut root_state = LocalTypeState::default();
+    seed_entry_local_state(&mut root_state, entry_local_types);
+    let mut root_context = TypeContext::new(
+        &ir.function_impls,
+        &function_decls,
+        &ir.struct_schemas,
+        &function_names,
+        &host_import_return_types,
+        &host_import_signatures,
+        typing_mode,
+        ir.parsed_semantic_index.as_ref(),
+    );
+    let entry_slots = entry_local_types
+        .iter()
+        .map(|entry| entry.slot)
+        .collect::<Vec<_>>();
+    let value = collect::collect_root_expression_result(
+        &ir.stmts,
+        &mut root_state,
+        &entry_slots,
+        &mut root_context,
+    )?;
+    root_context
+        .infer_expr_schema(&Expr::Var(0), &value)
+        .or_else(|| scalar_schema_from_bound_type(value.get(0)))
+        .filter(|schema| !matches!(schema, TypeSchema::Unknown))
+}
+
 pub(super) fn infer_types_with_capture_origins(
     ir: &FrontendIr,
     typing_mode: TypingMode,
@@ -1264,6 +1305,20 @@ pub(crate) fn expected_container_argument_schemas(
                 &args[1],
             );
             Some(vec![Some(expected.clone()), None, value])
+        }
+        crate::builtins::BuiltinFunction::MapEdit if args.len() == 4 => {
+            if matches!(args.get(3), Some(Expr::Bool(true))) {
+                Some(vec![Some(expected.clone()), None, None, None])
+            } else {
+                let value = expected_named_or_container_field_schema(
+                    functions,
+                    function_impls,
+                    struct_schemas,
+                    expected,
+                    &args[1],
+                );
+                Some(vec![Some(expected.clone()), None, value, None])
+            }
         }
         _ => None,
     }

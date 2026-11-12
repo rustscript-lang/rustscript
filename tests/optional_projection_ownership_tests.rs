@@ -420,7 +420,7 @@ fn resource_catalog() -> vm::HostApiCatalog {
             HostTypeSchema::Resource(key),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
     ));
     builder.build().unwrap()
 }
@@ -484,7 +484,7 @@ fn native_temporary_dynamic_key_value_lookup_evaluates_each_once() {
     builder.function(vm::HostFunctionSchema::with_return(
         "neutral::tick",
         vec![],
-        vm::HostTypeSchema::Null,
+        vm::HostTypeSchema::Unit,
     ));
     builder.function(vm::HostFunctionSchema::with_return(
         "neutral::key",
@@ -703,7 +703,7 @@ fn imported_projection_preserves_intent_through_linking_and_slot_compaction() {
 fn native_borrowed_resource_receiver_still_rejects_escape_in_value_mode() {
     for receiver in ["(&entry)", "(&mut entry)"] {
         let source = format!(
-            "use neutral;\nstruct Entry {{ note: resource<neutral.projection>? }}\nlet mut entry: Entry = {{ note: neutral::make() }};\n{receiver}?.note;"
+            "use neutral;\nstruct Entry {{ note: Option<resource<neutral.projection>> }}\nlet mut entry: Entry = {{ note: Option::Some(neutral::make()) }};\n{receiver}.note;"
         );
         let error = compile_source_with_flavor_and_options(
             &source,

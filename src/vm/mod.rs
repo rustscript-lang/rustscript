@@ -552,6 +552,17 @@ impl<'a> NamedStructLookup<'a> {
     }
 }
 
+pub(crate) fn resolve_named_struct_body(
+    host: &HashMap<String, crate::compiler::TypeSchema>,
+    guest: &HashMap<String, crate::compiler::StructDecl>,
+    name: &str,
+    args: &[crate::compiler::TypeSchema],
+) -> Option<crate::compiler::TypeSchema> {
+    NamedStructLookup { host, guest }
+        .body(name, args)
+        .map(|(body, _origin)| body)
+}
+
 fn substitute_named_struct_schema(
     schema: &crate::compiler::TypeSchema,
     bindings: &HashMap<String, crate::compiler::TypeSchema>,

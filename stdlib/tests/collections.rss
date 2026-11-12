@@ -30,14 +30,15 @@ assert(has::<string, int>(merged, "missing") == false);
 assert(get_or::<string, int>(merged, "y", 0) == 20);
 assert(get_or::<string, int>(merged, "missing", 9) == 9);
 
-let mut sparse = {keep: 1, drop: null};
+let mut sparse = {keep: 1, drop: 2};
+sparse = sparse.remove("drop");
 assert(has::<string, int>(sparse, "keep"));
 assert(has::<string, int>(sparse, "drop") == false);
-sparse.keep = null;
+sparse = sparse.remove("keep");
 assert(has::<string, int>(sparse, "keep") == false);
 
 let mut pruned = {x: 1, y: 2};
-pruned.y = null;
+pruned = pruned.remove("y");
 let mut merged_without = merge::<int>(pruned, {z: 3});
 assert(has::<string, int>(merged_without, "x"));
 assert(has::<string, int>(merged_without, "y") == false);

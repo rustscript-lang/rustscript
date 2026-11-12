@@ -4665,7 +4665,7 @@ fn json_encode_runtime_map_rejects_non_string_key() {
     match err {
         vm::VmError::HostError(message) => {
             assert!(
-                message.contains("json_encode map keys must be strings"),
+                message.contains("map keys must be strings"),
                 "{message}"
             );
         }
@@ -5262,8 +5262,8 @@ fn json_encode_accepts_wrapped_recursion_in_concrete_map() {
         let compiled = match compile_source(
             r#"
             use json;
-            struct Node<T> { child: Node<[T]>?, data: int }
-            let payload: map<Node<int>> = { "x": { child: null, data: 1 } };
+            struct Node<T> { child: Option<Node<[T]>>, data: int }
+            let payload: map<Node<int>> = { "x": { child: Option::None, data: 1 } };
             json::encode(payload);
             "#,
         ) {

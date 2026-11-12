@@ -138,9 +138,9 @@ pub fn is_int_literal(value: string) -> bool {
 }
 
 // Parses an integer literal for the given base and returns null on failure.
-pub fn try_parse_int_base(value: string, base: int) -> int? {
+pub fn try_parse_int_base(value: string, base: int) -> Option<int> {
     let text = trim(value);
-    let mut out: int? = null;
+    let mut out: Option<int> = Option::None;
     if is_int_literal_base(text, base) {
         let mut sign = 1;
         let mut index = 0;
@@ -156,34 +156,30 @@ pub fn try_parse_int_base(value: string, base: int) -> int? {
             parsed = parsed * base + digit_value((&text)[index:(index + 1)]);
             index = index + 1;
         }
-        out = parsed * sign;
+        out = Option::Some(parsed * sign);
     }
     out
 }
 
 // Parses a base-10 integer literal and returns null on failure.
-pub fn try_parse_int(value: string) -> int? {
+pub fn try_parse_int(value: string) -> Option<int> {
     try_parse_int_base(value, 10)
 }
 
 // Parses an integer literal for the given base or returns a fallback.
 pub fn parse_int_base_or(value: string, base: int, fallback: int) -> int {
-    let out = try_parse_int_base(value, base);
-    let mut parsed = fallback;
-    if type(out) == "int" {
-        parsed = out;
+    match try_parse_int_base(value, base) {
+        Option::Some(value) => value,
+        Option::None => fallback,
     }
-    parsed
 }
 
 // Parses a base-10 integer literal or returns a fallback.
 pub fn parse_int_or(value: string, fallback: int) -> int {
-    let out = try_parse_int(value);
-    let mut parsed = fallback;
-    if type(out) == "int" {
-        parsed = out;
+    match try_parse_int(value) {
+        Option::Some(value) => value,
+        Option::None => fallback,
     }
-    parsed
 }
 
 // Returns whether a string is a boolean literal.
@@ -193,21 +189,19 @@ pub fn is_bool_literal(value: string) -> bool {
 }
 
 // Parses a boolean literal and returns null on failure.
-pub fn try_parse_bool(value: string) -> bool? {
+pub fn try_parse_bool(value: string) -> Option<bool> {
     let text = trim(value);
     match text {
-        "true" => true,
-        "false" => false,
-        _ => null,
+        "true" => Option::Some(true),
+        "false" => Option::Some(false),
+        _ => Option::None,
     }
 }
 
 // Parses a boolean literal or returns a fallback.
 pub fn parse_bool_or(value: string, fallback: bool) -> bool {
-    let out = try_parse_bool(value);
-    let mut parsed = fallback;
-    if type(out) == "bool" {
-        parsed = out;
+    match try_parse_bool(value) {
+        Option::Some(value) => value,
+        Option::None => fallback,
     }
-    parsed
 }

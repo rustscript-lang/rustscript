@@ -78,6 +78,7 @@ impl AvailabilityAnalyzer {
         let builtin = BuiltinFunction::from_call_index(call_index)?;
         let expected_arity = match builtin {
             BuiltinFunction::Set => 3,
+            BuiltinFunction::MapEdit => 4,
             BuiltinFunction::ArrayPush => 2,
             _ => return None,
         };
@@ -535,6 +536,18 @@ impl AvailabilityAnalyzer {
                 }
                 Some(keys)
             }
+            BuiltinFunction::MapEdit if args.len() == 4 => {
+                let mut keys = self.collect_copyable_fields_for_expr(&args[0], state)?;
+                let key = self.extract_literal_moved_field_key(&args[1])?;
+                if matches!(args.get(3), Some(Expr::Bool(true)))
+                    || !self.is_definitely_copyable_expr(&args[2], state)
+                {
+                    keys.remove(&key);
+                } else {
+                    keys.insert(key);
+                }
+                Some(keys)
+            }
             _ => None,
         }
     }
@@ -543,7 +556,7 @@ impl AvailabilityAnalyzer {
         match expr {
             // RustScript models string values as move-by-default. String-specific ergonomics
             // (for example `p.a + p.a`) are handled by `analyze_expr_to_owned`.
-            Expr::Null | Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) => true,
+            Expr::Null | Expr::Unit | Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) => true,
             Expr::Neg(inner)
             | Expr::ToOwned(inner)
             | Expr::Borrow(inner)
@@ -605,6 +618,9 @@ impl AvailabilityAnalyzer {
                 Some(BuiltinFunction::MapNew) => args.is_empty(),
                 Some(BuiltinFunction::ArrayNew) => args.is_empty(),
                 Some(BuiltinFunction::Set) if args.len() == 3 => {
+                    self.is_definitely_collection_expr(&args[0], state)
+                }
+                Some(BuiltinFunction::MapEdit) if args.len() == 4 => {
                     self.is_definitely_collection_expr(&args[0], state)
                 }
                 Some(BuiltinFunction::ArrayPush) if args.len() == 2 => {

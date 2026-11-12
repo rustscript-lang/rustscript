@@ -474,9 +474,9 @@ fn validate_json_schema_with_seen(
         TypeSchema::Optional(inner) => {
             validate_json_schema_with_seen(inner, context, path, seen, reentries)
         }
-        TypeSchema::Option(_) => Err(format!(
-            "{path} is Option, which json::encode does not support"
-        )),
+        TypeSchema::Option(inner) => {
+            validate_json_schema_with_seen(inner, context, path, seen, reentries)
+        }
         TypeSchema::Callable { .. } => Err(format!(
             "{path} is callable, which json::encode does not support"
         )),

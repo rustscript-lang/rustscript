@@ -36,6 +36,10 @@ impl ParserDialect for RustScriptDialect {
     fn allow_result_try(&self) -> bool {
         true
     }
+
+    fn reject_legacy_null(&self) -> bool {
+        true
+    }
 }
 
 static RUSTSCRIPT_DIALECT: RustScriptDialect = RustScriptDialect;

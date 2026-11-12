@@ -2157,6 +2157,21 @@ fn next_host_schema_depth(depth: usize) -> Result<usize, WireError> {
     ))
 }
 
+pub(crate) fn encode_type_schema_bytes(schema: &TypeSchema) -> Result<Vec<u8>, WireError> {
+    let mut out = Vec::new();
+    write_schema(schema, &mut out)?;
+    Ok(out)
+}
+
+pub(crate) fn decode_type_schema_bytes(bytes: &[u8]) -> Result<TypeSchema, WireError> {
+    let mut cursor = Cursor::new(bytes);
+    let schema = read_schema(&mut cursor, 0)?;
+    if cursor.remaining() != 0 {
+        return Err(WireError::TrailingBytes);
+    }
+    Ok(schema)
+}
+
 fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(), WireError> {
     match schema {
         TypeSchema::Unknown => out.push(0),

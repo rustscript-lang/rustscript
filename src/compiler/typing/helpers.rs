@@ -17,7 +17,7 @@ use super::collect::{
     observed_function_param_schema_slice, observed_function_param_slice,
     seed_function_capture_state, seed_function_param_state,
 };
-use super::context::{TypeContext, render_schema_label};
+use super::context::{TypeContext, bound_type_from_schema, render_schema_label};
 use super::infer_expr_type;
 use super::state::{
     BoundType, HostCallableSignature, LocalTypeState, merge_bound_types,
@@ -1614,8 +1614,14 @@ fn map_literal_entries<'a>(expr: &'a Expr, entries: &mut Vec<(&'a str, &'a Expr)
             args.is_empty()
         }
         Expr::Call(index, _, args, _, _)
-            if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::Set)
-                && args.len() == 3 =>
+            if matches!(
+                BuiltinFunction::from_call_index(*index),
+                Some(BuiltinFunction::Set)
+            ) && args.len() == 3
+                || matches!(
+                    BuiltinFunction::from_call_index(*index),
+                    Some(BuiltinFunction::MapEdit)
+                ) && args.len() == 4 =>
         {
             if let Expr::String(key) = &args[1] {
                 entries.push((key.as_str(), &args[2]));
@@ -2141,10 +2147,22 @@ pub(super) fn refine_state_for_match_pattern(
 ) -> LocalTypeState {
     let mut refined = state.clone();
     if let Some(binding_slot) = pattern.binding_slot() {
+        // Option::Some binds the payload, not the Option carrier. The carrier's
+        // bound type is Map; projecting only that type makes `v + 1` untyped.
+        let (ty, schema) = match (pattern, state.schema(value_slot)) {
+            (MatchPattern::SomeBinding(_), Some(TypeSchema::Option(inner))) => (
+                bound_type_from_schema(inner),
+                Some(inner.as_ref().clone()),
+            ),
+            _ => (
+                state.get(value_slot),
+                state.schema(value_slot).cloned(),
+            ),
+        };
         refined.set_with_optional_schema_origin(
             binding_slot,
-            state.get(value_slot),
-            state.schema(value_slot).cloned(),
+            ty,
+            schema,
             state.has_declared_schema(value_slot),
             false,
         );
@@ -2930,6 +2948,7 @@ pub(super) fn infer_static_len(expr: &Expr) -> Option<usize> {
                     infer_static_len(&args[0]).map(|base| base.saturating_add(1))
                 }
                 BuiltinFunction::Set if args.len() == 3 => infer_static_len(&args[0]),
+                BuiltinFunction::MapEdit if args.len() == 4 => infer_static_len(&args[0]),
                 _ => None,
             }
         }

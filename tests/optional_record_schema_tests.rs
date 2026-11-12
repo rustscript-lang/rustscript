@@ -9,7 +9,11 @@ use vm::{
 };
 
 struct RecordDialect;
-impl ParserDialect for RecordDialect {}
+impl ParserDialect for RecordDialect {
+    fn allow_option_syntax(&self) -> bool {
+        true
+    }
+}
 
 struct RecordPlugin {
     id: &'static str,
@@ -74,7 +78,7 @@ fn source_path(plugin: Option<&'static RecordPlugin>) -> String {
 }
 
 const OMITTED: &str =
-    "struct Entry { count: int, note: string? }\nlet entry: Entry = { count: 42 };\nentry.count;\n";
+    "struct Entry { count: int, note: Option<string> }\nlet entry: Entry = { count: 42 };\nentry.count;\n";
 
 fn assert_checked_run(source: &str, plugin: Option<&'static RecordPlugin>) {
     let compiled = compile_source_with_flavor_and_options(source, flavor(plugin), options(plugin))
@@ -124,7 +128,7 @@ fn all_frontends() -> [Option<&'static RecordPlugin>; 3] {
 
 #[test]
 fn present_valid_optional_record_field_runs_across_frontends() {
-    let source = OMITTED.replace("{ count: 42 }", "{ count: 42, note: \"ready\" }");
+    let source = OMITTED.replace("{ count: 42 }", "{ count: 42, note: Option::Some(\"ready\") }");
     for plugin in all_frontends() {
         assert_checked_run(&source, plugin);
     }
@@ -132,7 +136,7 @@ fn present_valid_optional_record_field_runs_across_frontends() {
 
 #[test]
 fn present_null_optional_record_field_runs_across_frontends() {
-    let source = OMITTED.replace("{ count: 42 }", "{ count: 42, note: null }");
+    let source = OMITTED.replace("{ count: 42 }", "{ count: 42, note: Option::None }");
     for plugin in all_frontends() {
         assert_checked_run(&source, plugin);
     }
@@ -140,7 +144,7 @@ fn present_null_optional_record_field_runs_across_frontends() {
 
 #[test]
 fn nested_named_generic_optional_fields_run_across_frontends() {
-    let source = "struct Parcel<T> { value: T, extra: T? }\nstruct Entry { parcel: Parcel<int>, note: string? }\nlet entry: Entry = { parcel: { value: 42 } };\nentry.parcel.value;\n";
+    let source = "struct Parcel<T> { value: T, extra: Option<T> }\nstruct Entry { parcel: Parcel<int>, note: Option<string> }\nlet entry: Entry = { parcel: { value: 42 } };\nentry.parcel.value;\n";
     for plugin in all_frontends() {
         assert_checked_run(source, plugin);
     }
@@ -148,7 +152,7 @@ fn nested_named_generic_optional_fields_run_across_frontends() {
 
 #[test]
 fn optional_record_omission_in_function_return_and_argument_runs_across_frontends() {
-    let source = "struct Entry { count: int, note: string? }\nfn make() -> Entry { { count: 42 } }\nfn read(value: Entry) -> int { value.count }\nlet entry: Entry = make();\nread({ count: entry.count });\n";
+    let source = "struct Entry { count: int, note: Option<string> }\nfn make() -> Entry { { count: 42 } }\nfn read(value: Entry) -> int { value.count }\nlet entry: Entry = make();\nread({ count: entry.count });\n";
     for plugin in all_frontends() {
         assert_checked_run(source, plugin);
     }
@@ -172,7 +176,7 @@ fn assert_rejected(source: &str, detail: &str, plugin: Option<&'static RecordPlu
 
 #[test]
 fn omitted_required_record_field_remains_rejected_across_frontends() {
-    let source = OMITTED.replace("{ count: 42 }", "{ note: null }");
+    let source = OMITTED.replace("{ count: 42 }", "{ note: Option::None }");
     for plugin in all_frontends() {
         assert_rejected(
             &source,
@@ -188,7 +192,7 @@ fn wrong_present_optional_field_remains_rejected_across_frontends() {
     for plugin in all_frontends() {
         assert_rejected(
             &source,
-            "field 'note' is declared as schema type 'string' but was assigned int",
+            "field 'note' is declared as schema type 'Option<string>' but was assigned int",
             plugin,
         );
     }
@@ -196,7 +200,7 @@ fn wrong_present_optional_field_remains_rejected_across_frontends() {
 
 #[test]
 fn nested_required_generic_field_remains_rejected_across_frontends() {
-    let source = "struct Parcel<T> { value: T, extra: T? }\nstruct Entry { parcel: Parcel<int>, note: string? }\nlet entry: Entry = { parcel: { extra: 7 } };\nentry.parcel.value;\n";
+    let source = "struct Parcel<T> { value: T, extra: Option<T> }\nstruct Entry { parcel: Parcel<int>, note: Option<string> }\nlet entry: Entry = { parcel: { extra: Option::Some(7) } };\nentry.parcel.value;\n";
     for plugin in all_frontends() {
         assert_rejected(
             source,
@@ -208,11 +212,11 @@ fn nested_required_generic_field_remains_rejected_across_frontends() {
 
 #[test]
 fn nested_wrong_present_generic_optional_field_remains_rejected_across_frontends() {
-    let source = "struct Parcel<T> { value: T, extra: T? }\nstruct Entry { parcel: Parcel<int>, note: string? }\nlet entry: Entry = { parcel: { value: 42, extra: \"wrong\" } };\nentry.parcel.value;\n";
+    let source = "struct Parcel<T> { value: T, extra: Option<T> }\nstruct Entry { parcel: Parcel<int>, note: Option<string> }\nlet entry: Entry = { parcel: { value: 42, extra: Option::Some(\"wrong\") } };\nentry.parcel.value;\n";
     for plugin in all_frontends() {
         assert_rejected(
             source,
-            "field 'parcel.extra' is declared as schema type 'int' but was assigned string",
+            "Option::Some payload: value is declared as schema type 'int' but was assigned string",
             plugin,
         );
     }
@@ -220,7 +224,7 @@ fn nested_wrong_present_generic_optional_field_remains_rejected_across_frontends
 
 #[test]
 fn omitted_required_resource_field_remains_rejected_across_frontends() {
-    let source = "struct Entry { handle: resource<neutral.handle>, note: string? }\nlet entry: Entry = { note: null };\n42;\n";
+    let source = "struct Entry { handle: resource<neutral.handle>, note: Option<string> }\nlet entry: Entry = { note: Option::None };\n42;\n";
     for plugin in all_frontends() {
         assert_rejected(
             source,
@@ -244,7 +248,7 @@ fn independent_strict_unknown_rejection_survives_optional_omission() {
 
 #[test]
 fn optional_field_does_not_make_callable_argument_optional() {
-    let source = "struct Entry { count: int, note: string? }\nfn read(value: Entry) -> int { value.count }\nread();\n";
+    let source = "struct Entry { count: int, note: Option<string> }\nfn read(value: Entry) -> int { value.count }\nread();\n";
     for plugin in all_frontends() {
         assert_rejected(source, "argument", plugin);
     }

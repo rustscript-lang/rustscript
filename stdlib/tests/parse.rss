@@ -1,21 +1,11 @@
 use super::rss::parse::{is_bool_literal, is_int_literal, is_int_literal_base, parse_bool_or, parse_int_base_or, parse_int_or, try_parse_bool, try_parse_int, try_parse_int_base};
 
-fn assert_some_int(actual: int?, expected: int) -> bool {
-    let out = if type(actual) == "int" => {
-        actual == expected
-    } else => {
-        false
-    };
-    out
+fn assert_some_int(actual: Option<int>, expected: int) -> bool {
+    actual.unwrap_or(expected + 1) == expected
 }
 
-fn assert_some_bool(actual: bool?, expected: bool) -> bool {
-    let out = if type(actual) == "bool" => {
-        actual == expected
-    } else => {
-        false
-    };
-    out
+fn assert_some_bool(actual: Option<bool>, expected: bool) -> bool {
+    actual.unwrap_or(expected == false) == expected
 }
 
 assert(is_int_literal("0"));
@@ -31,7 +21,7 @@ assert(assert_some_int(try_parse_int("0"), 0));
 assert(assert_some_int(try_parse_int(" 42 "), 42));
 assert(assert_some_int(try_parse_int("-17"),-17));
 assert(assert_some_int(try_parse_int("+9"), 9));
-assert(type(try_parse_int("nope")) == "null");
+assert(try_parse_int("nope").unwrap_or(1) == 1);
 assert(parse_int_or("nope", 7) == 7);
 
 assert(is_int_literal_base("1011", 2));
@@ -45,7 +35,7 @@ assert(assert_some_int(try_parse_int_base("1011", 2), 11));
 assert(assert_some_int(try_parse_int_base("7f", 16), 127));
 assert(assert_some_int(try_parse_int_base("zz", 36), 1295));
 assert(assert_some_int(try_parse_int_base(" -1A ", 16),-26));
-assert(type(try_parse_int_base("19", 8)) == "null");
+assert(try_parse_int_base("19", 8).unwrap_or(1) == 1);
 assert(parse_int_base_or("19", 8, 99) == 99);
 
 assert(is_bool_literal("true"));
@@ -53,6 +43,6 @@ assert(is_bool_literal(" false "));
 assert(is_bool_literal("TRUE") == false);
 assert(assert_some_bool(try_parse_bool("true"), true));
 assert(assert_some_bool(try_parse_bool(" false "), false));
-assert(type(try_parse_bool("yes")) == "null");
+assert(try_parse_bool("yes").unwrap_or(false) == false);
 assert(parse_bool_or("yes", true));
 assert(parse_bool_or("yes", false) == false);

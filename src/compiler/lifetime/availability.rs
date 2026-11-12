@@ -1125,7 +1125,10 @@ impl AvailabilityAnalyzer {
                 } else if let Some(root_slot) = self.extract_collection_mutation_root(*index, args)
                 {
                     let mut out =
-                        if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::Set) {
+                        if matches!(
+                            BuiltinFunction::from_call_index(*index),
+                            Some(BuiltinFunction::Set | BuiltinFunction::MapEdit)
+                        ) {
                             self.analyze_projection_args(args, state, line)?
                         } else {
                             self.analyze_args(args, state, line)?
@@ -1768,6 +1771,11 @@ impl AvailabilityAnalyzer {
         }
         let value_position = match BuiltinFunction::from_call_index(call_index) {
             Some(BuiltinFunction::Set) if args.len() == 3 => Some(2),
+            Some(BuiltinFunction::MapEdit)
+                if args.len() == 4 && !matches!(args.get(3), Some(Expr::Bool(true))) =>
+            {
+                Some(2)
+            }
             Some(BuiltinFunction::ArrayPush) if args.len() == 2 => Some(1),
             _ => None,
         };
@@ -2203,7 +2211,7 @@ impl AvailabilityAnalyzer {
                         && position == 0
                         && matches!(
                             BuiltinFunction::from_call_index(*index),
-                            Some(BuiltinFunction::Get | BuiltinFunction::Set)
+                            Some(BuiltinFunction::Get | BuiltinFunction::Set | BuiltinFunction::MapEdit)
                         ) {
                         // A projection may read an available remaining child
                         // of a partially moved root; it is not a whole read.
@@ -2227,6 +2235,11 @@ impl AvailabilityAnalyzer {
                 if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                     let value_position = match builtin {
                         BuiltinFunction::Set if args.len() == 3 => Some(2),
+                        BuiltinFunction::MapEdit
+                            if args.len() == 4 && !matches!(args.get(3), Some(Expr::Bool(true))) =>
+                        {
+                            Some(2)
+                        }
                         BuiltinFunction::ArrayPush if args.len() == 2 => Some(1),
                         _ => None,
                     };

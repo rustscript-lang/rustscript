@@ -2058,7 +2058,7 @@ mod tests {
                     HostTypeSchema::Resource(database_key),
                     HostParamPassing::TakeOwned,
                 )],
-                HostTypeSchema::Null,
+                HostTypeSchema::Unit,
             )
             .with_description("close the adapter database"),
         );
@@ -2124,7 +2124,7 @@ mod tests {
                     HostTypeSchema::Resource(database_key),
                     HostParamPassing::TakeOwned,
                 )],
-                HostTypeSchema::Null,
+                HostTypeSchema::Unit,
             )
             .with_description("close the adapter database"),
         );

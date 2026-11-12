@@ -72,4 +72,4 @@ let mut total = reduce::<int, int>([1, 2, 3, 4], 0, |acc, value| acc + value);
 assert(total == 10);
 
 let mut each_result = each::<int, int>([7, 8], |value| value + 1);
-assert(type(each_result) == "null");
+assert(each_result == ());

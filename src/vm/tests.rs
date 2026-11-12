@@ -4910,7 +4910,7 @@ fn sol_lifecycle_vm(source: &str, stats: &Arc<SolLifecycleStats>) -> Vm {
             crate::HostTypeSchema::Resource(key.clone()),
             crate::HostParamPassing::TakeOwned,
         )],
-        crate::HostTypeSchema::Null,
+        crate::HostTypeSchema::Unit,
     ));
     catalog.function(crate::HostFunctionSchema::with_return(
         "test::fail",

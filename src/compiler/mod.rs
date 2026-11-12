@@ -18,6 +18,7 @@ mod host_call_resolve;
 mod host_conversion;
 pub mod ir;
 mod lifetime;
+mod logical_boundary;
 mod linker;
 mod materialization;
 mod modules;
@@ -683,6 +684,9 @@ impl CompiledProgram {
 pub struct CompiledReplProgram {
     pub compiled: CompiledProgram,
     pub bindings: Vec<ReplLocalBinding>,
+    /// Checked schema of the snippet's root expression result.
+    /// `None` is absence, not Unit and not a value-equality guess.
+    pub result_schema: Option<crate::compiler::ir::TypeSchema>,
 }
 
 #[derive(Clone, Default)]

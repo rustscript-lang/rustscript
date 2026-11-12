@@ -46,7 +46,7 @@ fn catalog() -> Arc<vm::HostApiCatalog> {
             HostTypeSchema::Resource(key()),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
     ));
     b.function(HostFunctionSchema::with_return(
         "neutral::bits",

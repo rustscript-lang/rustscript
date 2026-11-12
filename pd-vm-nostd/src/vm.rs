@@ -812,7 +812,8 @@ impl<C> Vm<C> {
         use super::generated_builtin_ids::{
             ARRAY_NEW_CALL_INDEX, ARRAY_PUSH_CALL_INDEX, BIND_CALLABLE_CALL_INDEX,
             CONCAT_CALL_INDEX, DETACH_LOCAL_CALL_INDEX, GET_CALL_INDEX, HAS_CALL_INDEX,
-            MAP_NEW_CALL_INDEX, SET_CALL_INDEX,
+            JSON_DECODE_TYPED_CALL_INDEX, JSON_ENCODE_TYPED_CALL_INDEX, LOGICAL_RENDER_CALL_INDEX,
+            MAP_EDIT_CALL_INDEX, MAP_NEW_CALL_INDEX, SET_CALL_INDEX,
         };
 
         Some(match index {
@@ -946,6 +947,42 @@ impl<C> Vm<C> {
                 self.stack.push(Value::Map(entries));
                 Ok(())
             }
+            MAP_EDIT_CALL_INDEX => {
+                if let Err(error) = self.require_builtin_arity("__map_edit", arity, 4) {
+                    return Some(Err(error));
+                }
+                let start = match self.stack.len().checked_sub(4) {
+                    Some(start) => start,
+                    None => return Some(Err(VmError::StackUnderflow)),
+                };
+                let key = self.stack[start + 1].clone();
+                let value = self.stack[start + 2].clone();
+                let remove = match &self.stack[start + 3] {
+                    Value::Bool(flag) => *flag,
+                    _ => return Some(Err(VmError::TypeMismatch("bool"))),
+                };
+                if matches!(key, Value::Callable(_)) {
+                    return Some(Err(VmError::HostError(
+                        "callable values are not supported as map keys",
+                    )));
+                }
+                let Value::Map(mut entries) = self.stack[start].clone() else {
+                    return Some(Err(VmError::TypeMismatch("map")));
+                };
+                let mutable = Rc::make_mut(&mut entries);
+                if remove {
+                    mutable.retain(|(current, _)| current != &key);
+                } else if let Some((_, current)) =
+                    mutable.iter_mut().find(|(current, _)| current == &key)
+                {
+                    *current = value;
+                } else {
+                    mutable.push((key, value));
+                }
+                self.stack.truncate(start);
+                self.stack.push(Value::Map(entries));
+                Ok(())
+            }
             DETACH_LOCAL_CALL_INDEX => {
                 if let Err(error) = self.require_builtin_arity("__detach_local", arity, 1) {
                     return Some(Err(error));
@@ -998,6 +1035,9 @@ impl<C> Vm<C> {
                 self.stack.truncate(start);
                 self.stack.push(callable);
                 Ok(())
+            }
+            JSON_DECODE_TYPED_CALL_INDEX | JSON_ENCODE_TYPED_CALL_INDEX | LOGICAL_RENDER_CALL_INDEX => {
+                return Some(Err(VmError::InvalidCall(index)));
             }
             _ => return None,
         })

@@ -18,19 +18,25 @@ fn parse_log_line(line) {
     );
     assert(groups.length == 5);
     let entry: LogEntry = {
-        level: groups[1],
-        route: groups[2],
-        latency_ms: groups[3],
-        message: groups[4]
+        level: string_or_empty(groups[1]),
+        route: string_or_empty(groups[2]),
+        latency_ms: string_or_empty(groups[3]),
+        message: string_or_empty(groups[4])
     };
     entry
 }
 
-fn is_some_string_equal(actual: string?, expected: string) -> bool {
-    if type(actual) == "string" => {
-        actual == expected
-    } else => {
-        false
+fn is_some_string_equal(actual: Option<string>, expected: string) -> bool {
+    match actual {
+        Option::Some(value) => value == expected,
+        Option::None => false
+    }
+}
+
+fn string_or_empty(value: Option<string>) -> string {
+    match value {
+        Option::Some(text) => text,
+        Option::None => ""
     }
 }
 
@@ -66,12 +72,12 @@ let rewritten_warn: string = string::replace(warn_message, "cache", "edge-cache"
 let rewritten_route = re::replace("^feed/", warn_route, "rss::");
 let error_words = re::split("\\s+", &error_message);
 let error_word_count = error_words.length;
-let id_groups: [string] = re::captures("id=([0-9]+)", error_message);
-let error_id: string = if id_groups.length == 2 => {
+let id_groups = re::captures("id=([0-9]+)", error_message);
+let error_id: string = string_or_empty(if id_groups.length == 2 => {
     id_groups[1]
 } else => {
-    "none"
-};
+    Option::None
+});
 let levels = [first_level, warn_level, error_level];
 let slow_routes = [rewritten_route, string::replace(error_route, "/", "::")];
 

@@ -21,10 +21,10 @@ use std::collections::HashMap;
 use vm::{BUILTIN_CATALOG, builtin_call_index};
 
 /// Documented call-index blocks; must match `src/builtins/catalog.rs`.
-/// Extension block: 0x0000..=0xFF8F (reserved for future builtins and host
+/// Extension block: 0x0000..=0xFF8B (reserved for future builtins and host
 /// imports).
-const EXTENSION_BLOCK_END: u16 = 0xFF8F;
-const SPECIAL_CALL_BLOCK_START: u16 = 0xFF90;
+const EXTENSION_BLOCK_END: u16 = 0xFF8B;
+const SPECIAL_CALL_BLOCK_START: u16 = 0xFF8C;
 const SPECIAL_CALL_BLOCK_END: u16 = 0xFFA1;
 const ORDINARY_BLOCK_START: u16 = 0xFFA2;
 #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]

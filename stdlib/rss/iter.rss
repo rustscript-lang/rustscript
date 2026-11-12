@@ -154,9 +154,9 @@ pub fn reduce<T, U>(values: [T], init: U, func: fn(U, T) -> U) -> U {
 }
 
 // Calls a function for each value in an array and returns null.
-pub fn each<T, U>(values: [T], func: fn(T) -> U) -> null {
+pub fn each<T, U>(values: [T], func: fn(T) -> U) -> () {
     for index in 0..values.length {
         let each_result = func(values[index]);
     }
-    null
+    ()
 }

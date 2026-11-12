@@ -869,6 +869,12 @@ impl Parser {
         }
 
         let mut schema = self.parse_declared_type_schema()?;
+        if self.check(&TokenKind::Question) && self.dialect.reject_legacy_null() {
+            return Err(super::legacy_null_error(
+                self,
+                "RSS rejects T?; rewrite it as Option<T>",
+            ));
+        }
         if self.match_kind(&TokenKind::Question) {
             schema = TypeSchema::Optional(Box::new(schema));
         }
@@ -988,6 +994,11 @@ impl Parser {
                 params,
                 result: Box::new(result),
             }
+        } else if self.check(&TokenKind::Null) && self.dialect.reject_legacy_null() {
+            return Err(super::legacy_null_error(
+                self,
+                "RSS rejects the null type; rewrite it as Option<T> or ()",
+            ));
         } else if self.match_kind(&TokenKind::Null) {
             TypeSchema::Null
         } else {
@@ -1114,6 +1125,12 @@ impl Parser {
             schema = TypeSchema::Array(Box::new(schema));
         }
 
+        if self.check(&TokenKind::Question) && self.dialect.reject_legacy_null() {
+            return Err(super::legacy_null_error(
+                self,
+                "RSS rejects T?; rewrite it as Option<T>",
+            ));
+        }
         if self.match_kind(&TokenKind::Question) {
             schema = TypeSchema::Optional(Box::new(schema));
         }

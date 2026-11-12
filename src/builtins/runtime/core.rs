@@ -440,6 +440,44 @@ pub(super) fn builtin_type_of_impl(value: VmValueRef<'_>) -> String {
     .to_string()
 }
 
+/// Compiler-private typed JSON decode. Not language-visible.
+#[pd_host_function(name = "__json_decode_typed")]
+pub(crate) fn builtin_json_decode_typed_impl(
+    vm: &mut crate::vm::Vm,
+    text: &str,
+    descriptor: super::typed::VmBytesRef<'_>,
+) -> VmResult<Value> {
+    let raw = super::json::decode_json_text(text)?;
+    super::logical_json::project_decoded(&raw, descriptor, json_names(vm))
+}
+
+/// Compiler-private typed JSON encode. Not language-visible.
+#[pd_host_function(name = "__json_encode_typed")]
+pub(crate) fn builtin_json_encode_typed_impl(
+    vm: &mut crate::vm::Vm,
+    value: VmValueRef<'_>,
+    descriptor: super::typed::VmBytesRef<'_>,
+) -> VmResult<String> {
+    super::logical_json::encode_typed(value, descriptor, json_names(vm))
+}
+
+/// Compiler-private logical display. Not language-visible.
+#[pd_host_function(name = "__logical_render")]
+pub(crate) fn builtin_logical_render_impl(
+    vm: &mut crate::vm::Vm,
+    value: VmValueRef<'_>,
+    descriptor: super::typed::VmBytesRef<'_>,
+) -> VmResult<String> {
+    super::logical_json::render_typed(value, descriptor, json_names(vm))
+}
+
+fn json_names(vm: &crate::vm::Vm) -> super::logical_json::JsonNames<'_> {
+    super::logical_json::JsonNames {
+        host: vm.host.named_struct_schemas.as_ref(),
+        guest: &vm.program().named_struct_decls,
+    }
+}
+
 /// Convert a value into a display string.
 #[pd_host_function(name = "__to_string")]
 pub(crate) fn builtin_to_string_impl(value: VmValueRef<'_>) -> String {
@@ -742,6 +780,52 @@ pub(super) fn builtin_set(args: &mut [Value]) -> VmResult<CallReturn> {
     builtin_set_owned(container, key, value).map(return_one)
 }
 
+/// Insert or remove one map entry and return the updated map.
+///
+/// `remove` is the only deletion signal. A null value is stored when
+/// `remove` is false, so Unit data is not mistaken for a missing key.
+pub(crate) fn builtin_map_edit_owned(
+    mut entries: SharedMap,
+    key: AnyValue,
+    value: AnyValue,
+    remove: bool,
+) -> VmResult<SharedMap> {
+    ensure_supported_map_key(&key)?;
+    let entries_mut = Arc::make_mut(&mut entries);
+    if remove {
+        entries_mut.remove(&key);
+    } else {
+        entries_mut.insert(key, value);
+    }
+    Ok(entries)
+}
+
+/// Compiler-private map insert or removal. Not language-visible.
+#[pd_host_function(name = "__map_edit")]
+pub(crate) fn builtin_map_edit_impl(
+    entries: VmMapHandle,
+    key: VmValueOwned,
+    value: VmValueOwned,
+    remove: bool,
+) -> VmResult<VmMapHandle> {
+    builtin_map_edit_owned(entries, key, value, remove)
+}
+
+pub(super) fn execute_map_edit(args: &mut [Value]) -> VmResult<CallReturn> {
+    let container = take_arg(args, 0, "map edit container")?;
+    let key = take_arg(args, 1, "map edit key")?;
+    let value = take_arg(args, 2, "map edit value")?;
+    let remove = take_arg(args, 3, "map edit remove")?;
+    let Value::Map(entries) = container else {
+        return Err(VmError::TypeMismatch("map"));
+    };
+    let Value::Bool(remove) = remove else {
+        return Err(VmError::TypeMismatch("bool"));
+    };
+    builtin_map_edit_owned(entries, key, value, remove)
+        .map(|entries| return_one(Value::Map(entries)))
+}
+
 /// Return an array of container keys or indices.
 #[pd_host_function(name = "keys")]
 pub(super) fn builtin_keys_array_impl(items: VmArrayRef<'_>) -> VmArray {
@@ -921,6 +1005,7 @@ pub(super) fn core_host_module() -> super::host_modules::StandardHostModule {
         builtin_format_template_descriptor,
         builtin_set_array_descriptor,
         builtin_set_map_descriptor,
+        builtin_map_edit_descriptor,
         builtin_keys_array_descriptor,
         builtin_keys_map_descriptor,
         builtin_count_array_descriptor,
@@ -955,6 +1040,7 @@ mod tests {
             (BuiltinFunction::MapIterClose, 0xFF95),
             (BuiltinFunction::BindCallable, 0xFF94),
             (BuiltinFunction::DetachLocal, 0xFF93),
+            (BuiltinFunction::MapEdit, 0xFF8F),
         ];
         for (builtin, index) in reserved {
             assert_eq!(builtin.call_index(), index);

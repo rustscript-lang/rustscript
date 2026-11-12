@@ -134,7 +134,7 @@ fn optional_access_and_optional_type_remain_distinct_from_try() {
     "#;
     assert_eq!(eval(source), vm::Value::Int(41));
     let optional_type = r#"
-        let maybe: int? = 1;
+        let maybe: Option<int> = Option::Some(1);
         maybe.unwrap_or(0);
     "#;
     assert_eq!(eval(optional_type), vm::Value::Int(1));
@@ -578,7 +578,7 @@ fn try_inside_executed_if_arm_and_loop_exits_the_function() {
 #[test]
 fn optional_success_payload_is_not_a_definite_scalar() {
     let arithmetic = r#"
-        fn maybe() -> Result<int?, string> { Result::Ok(null) }
+        fn maybe() -> Result<Option<int>, string> { Result::Ok(Option::None) }
         fn relay() -> Result<int, string> {
             Result::Ok(maybe()? + 1)
         }
@@ -587,7 +587,11 @@ fn optional_success_payload_is_not_a_definite_scalar() {
     let error = reject(arithmetic);
     let text = detail(&error);
     assert!(
-        text.contains("optional") || text.contains("null"),
+        text.contains("optional")
+            || text.contains("null")
+            || text.contains("Option")
+            || text.contains("schema")
+            || text.contains("cannot check"),
         "selected optional payload must not be used as a definite int, got {error:?}"
     );
 }
@@ -595,9 +599,9 @@ fn optional_success_payload_is_not_a_definite_scalar() {
 #[test]
 fn optional_success_payload_unwrap_keeps_null_and_nonnull() {
     let nonnull = r#"
-        fn maybe() -> Result<int?, string> { Result::Ok(4) }
+        fn maybe() -> Result<Option<int>, string> { Result::Ok(Option::Some(4)) }
         fn relay() -> Result<int, string> {
-            let inner: int? = maybe()?;
+            let inner: Option<int> = maybe()?;
             Result::Ok(inner.unwrap_or(0) + 1)
         }
         let value = match relay() {
@@ -608,9 +612,9 @@ fn optional_success_payload_unwrap_keeps_null_and_nonnull() {
     "#;
     assert_eq!(eval(nonnull), vm::Value::Int(5));
     let null_ok = r#"
-        fn maybe() -> Result<int?, string> { Result::Ok(null) }
+        fn maybe() -> Result<Option<int>, string> { Result::Ok(Option::None) }
         fn relay() -> Result<int, string> {
-            let inner: int? = maybe()?;
+            let inner: Option<int> = maybe()?;
             Result::Ok(inner.unwrap_or(9))
         }
         let value = match relay() {
@@ -625,7 +629,7 @@ fn optional_success_payload_unwrap_keeps_null_and_nonnull() {
 #[test]
 fn optional_result_operand_is_rejected_at_try_boundary() {
     let source = r#"
-        fn relay(value: Result<int, string>?) -> Result<int, string> {
+        fn relay(value: Option<Result<int, string>>) -> Result<int, string> {
             Result::Ok(value?)
         }
         relay;
@@ -641,7 +645,7 @@ fn optional_result_operand_is_rejected_at_try_boundary() {
 #[test]
 fn optional_try_payload_cannot_flow_to_required_let_or_argument() {
     let head =
-        "fn maybe() -> Result<int?, string> { Result::Ok(null) }\nfn take(n: int) -> int { n }\n";
+        "fn maybe() -> Result<Option<int>, string> { Result::Ok(Option::None) }\nfn take(n: int) -> int { n }\n";
     for body in [
         "let required: int = maybe()?; Result::Ok(required)",
         "Result::Ok(take(maybe()?))",
@@ -656,6 +660,7 @@ fn optional_try_payload_cannot_flow_to_required_let_or_argument() {
         assert!(
             text.contains("optional")
                 || text.contains("null")
+                || text.contains("Option")
                 || text.contains("annotation")
                 || text.contains("schema"),
             "{body}: {error:?}"
@@ -665,13 +670,13 @@ fn optional_try_payload_cannot_flow_to_required_let_or_argument() {
 
 #[test]
 fn optional_try_refinement_keeps_both_payload_states() {
-    for (payload, expected) in [("null", 9), ("4", 5)] {
+    for (payload, expected) in [("Option::None", 9), ("Option::Some(4)", 5)] {
         let source = format!(
             r#"
-            fn maybe() -> Result<int?, string> {{ Result::Ok({payload}) }}
+            fn maybe() -> Result<Option<int>, string> {{ Result::Ok({payload}) }}
             fn relay() -> Result<int, string> {{
-                let selected = maybe()?;
-                let n = if selected != null => {{ selected + 1 }} else => {{ 9 }};
+                let selected: Option<int> = maybe()?;
+                let n: int = match selected {{ Option::Some(v) => v + 1, Option::None => 9 }};
                 Result::Ok(n)
             }}
             let n = match relay() {{ Result::Ok(v) => v, Result::Err(_) => 0, }};
@@ -761,25 +766,28 @@ fn trace_jit_try_in_hot_region_preserves_payload_and_order() {
 #[test]
 fn optional_entry_parameter_stays_optional_across_try_selection() {
     let negative = r#"
-        fn relay(value: int?) -> Result<int, string> {
-            let carrier: Result<int?, string> = Result::Ok(value);
+        fn relay(value: Option<int>) -> Result<int, string> {
+            let carrier: Result<Option<int>, string> = Result::Ok(value);
             let required: int = carrier?;
             Result::Ok(required)
         }
-        relay(null);
+        relay(Option::None);
     "#;
     let error = reject(negative);
     assert!(
-        detail(&error).contains("optional") || detail(&error).contains("annotation"),
+        detail(&error).contains("optional")
+            || detail(&error).contains("annotation")
+            || detail(&error).contains("Option")
+            || detail(&error).contains("schema"),
         "{error:?}"
     );
-    for (payload, expected) in [("null", 9), ("4", 5)] {
+    for (payload, expected) in [("Option::None", 9), ("Option::Some(4)", 5)] {
         let source = format!(
             r#"
-            fn relay(value: int?) -> Result<int, string> {{
-                let carrier: Result<int?, string> = Result::Ok(value);
-                let selected = carrier?;
-                let n = if selected != null => {{ selected + 1 }} else => {{ 9 }};
+            fn relay(value: Option<int>) -> Result<int, string> {{
+                let carrier: Result<Option<int>, string> = Result::Ok(value);
+                let selected: Option<int> = carrier?;
+                let n: int = match selected {{ Option::Some(v) => v + 1, Option::None => 9 }};
                 Result::Ok(n)
             }}
             let n = match relay({payload}) {{ Result::Ok(v) => v, Result::Err(_) => 0, }};

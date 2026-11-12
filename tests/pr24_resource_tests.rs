@@ -152,7 +152,7 @@ fn standard_catalog_resolves_open_then_close_with_nominal_ownership() {
             )
             .expect("standard sqlite::close resolves");
         assert_eq!(sqlite_close.passing, vec![HostParamPassing::TakeOwned]);
-        assert_eq!(sqlite_close.return_type, TypeSchema::Null);
+        assert_eq!(sqlite_close.return_type, TypeSchema::Unit);
     }
     #[cfg(not(all(feature = "sqlite", not(target_family = "wasm"))))]
     assert!(
@@ -402,7 +402,7 @@ fn closure_catalog() -> Arc<HostApiCatalog> {
             HostTypeSchema::Resource(resource_key.clone()),
             HostParamPassing::Borrow,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
     ));
     builder.function(HostFunctionSchema::with_return(
         "test::close_closure",
@@ -411,7 +411,7 @@ fn closure_catalog() -> Arc<HostApiCatalog> {
             HostTypeSchema::Resource(resource_key),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
     ));
     Arc::new(builder.build().expect("closure catalog should build"))
 }
@@ -430,12 +430,12 @@ fn block_catalog() -> Arc<HostApiCatalog> {
     builder.function(HostFunctionSchema::with_return(
         "test::make_optional",
         Vec::new(),
-        HostTypeSchema::Optional(Box::new(HostTypeSchema::Resource(resource_key.clone()))),
+        HostTypeSchema::Option(Box::new(HostTypeSchema::Resource(resource_key.clone()))),
     ));
     builder.function(HostFunctionSchema::with_return(
         "test::make_optional_map",
         Vec::new(),
-        HostTypeSchema::Optional(Box::new(HostTypeSchema::Map(Box::new(
+        HostTypeSchema::Option(Box::new(HostTypeSchema::Map(Box::new(
             HostTypeSchema::Resource(resource_key.clone()),
         )))),
     ));
@@ -446,7 +446,7 @@ fn block_catalog() -> Arc<HostApiCatalog> {
             HostTypeSchema::Resource(resource_key),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
     ));
     Arc::new(builder.build().expect("catalog should build"))
 }
@@ -555,7 +555,7 @@ fn unwrap_or_consumes_owned_optional_source_for_later_use_check() {
     let options = CompileSourceFileOptions::new().with_host_api_catalog(block_catalog());
     let source = r#"
         let maybe = test::make_optional();
-        let handle = maybe.unwrap_or(test::make_block());
+        let handle = maybe.unwrap_or_else(|| test::make_block());
         test::close_block(handle);
         maybe;
     "#;
@@ -615,8 +615,11 @@ fn result_ok_discards_resource_err_owner_with_rejection() {
 fn optional_get_then_unwrap_consumes_owned_container_for_later_use_check() {
     let options = CompileSourceFileOptions::new().with_host_api_catalog(block_catalog());
     let source = r#"
-        let maybe: map<resource<pr24.block>>? = test::make_optional_map();
-        let handle = maybe?.["resource"].unwrap_or(test::make_block());
+        let maybe: Option<map<resource<pr24.block>>> = test::make_optional_map();
+        let handle = match maybe {
+            Option::Some(items) => items["resource"],
+            Option::None => test::make_block(),
+        };
         test::close_block(handle);
         maybe;
     "#;
@@ -638,8 +641,8 @@ fn match_consumes_owned_scrutinee_for_later_use_check() {
     let source = r#"
         let maybe = test::make_optional();
         let handle = match maybe {
-            Some(value) => value,
-            _ => test::make_block(),
+            Option::Some(value) => value,
+            Option::None => test::make_block(),
         };
         test::close_block(handle);
         maybe;
@@ -750,7 +753,7 @@ fn result_resource_catalog() -> Arc<HostApiCatalog> {
             HostTypeSchema::Resource(resource_key.clone()),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
     ));
     builder.function(HostFunctionSchema::with_return(
         "test::use_owned",
@@ -815,7 +818,7 @@ fn result_resource_catalog() -> Arc<HostApiCatalog> {
             HostTypeSchema::Resource(resource_key),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Optional(Box::new(HostTypeSchema::Int)),
+        HostTypeSchema::Option(Box::new(HostTypeSchema::Int)),
     ));
     builder.function(HostFunctionSchema::with_return(
         "test::make_err_int",
@@ -1014,7 +1017,7 @@ impl HostFunction for TakeNull {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         POLEX_EVENTS.lock().unwrap().push("close");
         CloseClosureResource.call(vm, args)?;
-        Ok(CallOutcome::Return(CallReturn::one(Value::Null)))
+        Ok(CallOutcome::Return(CallReturn::one(vm::option::none_carrier())))
     }
 }
 
@@ -1311,7 +1314,7 @@ fn assert_polex_err_backends(
 #[test]
 fn observation_statement_if_keeps_owner_for_explicit_close() {
     let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let source = "fn relay() -> int { let owned: resource<pr24.closure> = test::make_local(); let mut observed = 0; if owned == null { observed = 99; } else { observed = 1; } test::close_closure(owned); observed } relay();";
+    let source = "fn relay() -> int { let owned: resource<pr24.closure> = test::make_local(); let mut observed = 0; if test::touch_borrow(owned) == 0 { observed = 99; } else { observed = 1; } test::close_closure(owned); observed } relay();";
     for backend in [0, 1] {
         reset_exit_observers();
         let mut vm = run_result_source_backend(source, backend);
@@ -1331,7 +1334,7 @@ fn observation_statement_if_keeps_owner_for_explicit_close() {
 #[test]
 fn observation_while_keeps_owner_across_multiple_condition_checks() {
     let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let source = "fn relay() -> int { let owned: resource<pr24.closure> = test::make_local(); let mut n = 0; while owned != null && n < 2 { n = n + 1; } test::close_closure(owned); n } relay();";
+    let source = "fn relay() -> int { let owned: resource<pr24.closure> = test::make_local(); let mut n = 0; while test::touch_borrow(owned) != 0 && n < 2 { n = n + 1; } test::close_closure(owned); n } relay();";
     for backend in [0, 1] {
         reset_exit_observers();
         let mut vm = run_result_source_backend(source, backend);
@@ -1352,9 +1355,9 @@ fn observation_while_keeps_owner_across_multiple_condition_checks() {
 fn observation_expression_if_and_nested_logical_keep_err_cleanup_owner() {
     let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     for body in [
-        "let observed = if owned == null => { 99 } else => { 1 }; let v = test::make_err_result()?;",
-        "if (owned != null && true) || owned == null { test::later_arg(); } let v = test::make_err_result()?;",
-        "for i in 0..(if owned != null => { 2 } else => { 0 }) { test::later_arg(); } let v = test::make_err_result()?;",
+        "let observed = if test::touch_borrow(owned) == 0 => { 99 } else => { 1 }; let v = test::make_err_result()?;",
+        "if (test::touch_borrow(owned) != 0 && true) || test::touch_borrow(owned) == 0 { test::later_arg(); } let v = test::make_err_result()?;",
+        "for i in 0..(if test::touch_borrow(owned) != 0 => { 2 } else => { 0 }) { test::later_arg(); } let v = test::make_err_result()?;",
     ] {
         // Resource-vs-Null Ceq remains outside the admitted AOT instruction set.
         assert_polex_err_backends(body, 1, 1, &[0, 1]);
@@ -1366,7 +1369,7 @@ fn polex_reached_and_rhs_uses_post_lhs_owner_state() {
     let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     reset_exit_observers();
     assert_polex_err(
-        "let flag = test::close_closure(owned) == null && test::make_err_result()? == 9;",
+        "let flag = test::close_closure(owned) == () && test::make_err_result()? == 9;",
         1,
         1,
     );
@@ -1406,7 +1409,7 @@ macro_rules! polex_position_test {
 
 polex_position_test!(
     polex_reached_or_rhs,
-    "let flag = !(test::close_closure(owned) == null) || test::make_err_result()? == 9;"
+    "let flag = !(test::close_closure(owned) == ()) || test::make_err_result()? == 9;"
 );
 polex_position_test!(
     polex_eager_add_rhs,
@@ -1414,7 +1417,7 @@ polex_position_test!(
 );
 polex_position_test!(
     polex_nested_expression_if,
-    "let x = 1 + (if test::close_closure(owned) == null => { test::make_err_result()? } else => { 0 });"
+    "let x = 1 + (if test::close_closure(owned) == () => { test::make_err_result()? } else => { 0 });"
 );
 #[test]
 fn polex_unwrap_fallback() {
@@ -1433,7 +1436,7 @@ fn polex_aot_optional_null_baseline_probe() {
     let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     reset_exit_observers();
     let mut vm = run_result_source_backend(
-        "fn absent() -> int? { null } fn relay() -> Result<int,int> { let x = absent().unwrap_or(test::make_err_int()?); Result::Ok(0) } let carried = relay(); carried;",
+        "fn absent() -> Option<int> { Option::None } fn relay() -> Result<int,int> { let x = absent().unwrap_or(test::make_err_int()?); Result::Ok(0) } let carried = relay(); carried;",
         2,
     );
     assert_eq!(err_payload_raw(vm.stack().last().unwrap()), 9);
@@ -1454,7 +1457,7 @@ fn aotnull_exact_scalar_interpreter_and_decoded_control() {
     for backend in [0, 1] {
         reset_exit_observers();
         let mut vm = run_result_source_backend(
-            "fn absent() -> int? { null } fn relay() -> Result<int,int> { let x = absent().unwrap_or(test::make_err_int()?); Result::Ok(0) } let carried = relay(); carried;",
+            "fn absent() -> Option<int> { Option::None } fn relay() -> Result<int,int> { let x = absent().unwrap_or(test::make_err_int()?); Result::Ok(0) } let carried = relay(); carried;",
             backend,
         );
         assert_eq!(err_payload_raw(vm.stack().last().unwrap()), 9);
@@ -1496,28 +1499,33 @@ fn aotnull_nullable_payloads_and_fallback_effects() {
             Value::Float(2.5),
         ),
     ] {
+        let absent = expression == "null";
+        let rss_value = if absent {
+            "Option::None".to_string()
+        } else {
+            format!("Option::Some({expression})")
+        };
+        let present = if absent {
+            match ty {
+                "int" => "0",
+                "bool" => "false",
+                "float" => "0.0",
+                _ => unreachable!(),
+            }
+        } else {
+            expression
+        };
         for backend in [0, 1, 2] {
             for source in [
-                format!("fn pick() -> {ty}? {{ {expression} }} pick().unwrap_or({fallback});"),
+                format!("fn pick() -> Option<{ty}> {{ {rss_value} }} pick().unwrap_or_else(|| {fallback});"),
                 format!(
-                    "fn relay(x:{ty}?) -> {ty} {{ x.unwrap_or({fallback}) }} relay({expression});"
+                    "fn relay(x: Option<{ty}>) -> {ty} {{ x.unwrap_or_else(|| {fallback}) }} relay({rss_value});"
                 ),
                 format!(
-                    "fn pick() -> {ty}? {{ {expression} }} let f = pick; f().unwrap_or({fallback});"
+                    "fn pick() -> Option<{ty}> {{ {rss_value} }} let f = pick; f().unwrap_or_else(|| {fallback});"
                 ),
                 format!(
-                    "let f: fn() -> {ty}? = || if {} => {{ null }} else => {{ {} }}; let value: {ty}? = f(); value.unwrap_or({fallback});",
-                    expression == "null",
-                    if expression == "null" {
-                        match ty {
-                            "int" => "0",
-                            "bool" => "false",
-                            "float" => "0.0",
-                            _ => unreachable!(),
-                        }
-                    } else {
-                        expression
-                    }
+                    "let f: fn() -> Option<{ty}> = || if {absent} => {{ Option::None }} else => {{ Option::Some({present}) }}; let value: Option<{ty}> = f(); value.unwrap_or_else(|| {fallback});"
                 ),
             ] {
                 reset_exit_observers();
@@ -1551,10 +1559,15 @@ fn aotnull_fatal_fallback_is_not_guest_err() {
         }
     }
     for expression in ["null", "0", "7"] {
+        let rss_value = if expression == "null" {
+            "Option::None".to_string()
+        } else {
+            format!("Option::Some({expression})")
+        };
         for backend in [0, 1, 2] {
             reset_exit_observers();
             let source = format!(
-                "fn pick() -> int? {{ {expression} }} fn relay() -> Result<int,int> {{ let x = pick().unwrap_or(test::make_err_int()?); Result::Ok(x) }} relay();"
+                "fn pick() -> Option<int> {{ {rss_value} }} fn relay() -> Result<int,int> {{ let x = match pick() {{ Option::Some(v) => v, Option::None => test::make_err_int()?, }}; Result::Ok(x) }} relay();"
             );
             let options =
                 CompileSourceFileOptions::new().with_host_api_catalog(result_resource_catalog());
@@ -1606,7 +1619,7 @@ fn aotnull_fatal_fallback_is_not_guest_err() {
 #[test]
 fn aotnull_loop_jit_and_aot_fallback_effect_parity() {
     let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let source = "fn pick(i:int) -> int? { if i < 50 => { null } else => { 0 } } fn relay() -> int { let mut total = 0; for i in 0..100 { total = total + pick(i).unwrap_or(test::later_arg()); } total } relay();";
+    let source = "fn pick(i:int) -> Option<int> { if i < 50 => { Option::None } else => { Option::Some(0) } } fn relay() -> int { let mut total = 0; for i in 0..100 { total = total + pick(i).unwrap_or_else(|| test::later_arg()); } total } relay();";
     for backend in [0, 1, 2, 4] {
         reset_exit_observers();
         let vm = run_result_source_backend(source, backend);
@@ -1625,8 +1638,8 @@ fn aotnull_loop_jit_and_aot_fallback_effect_parity() {
             assert!(vm.jit_snapshot().traces.iter().any(|trace| {
                 let ssa = trace.ssa_text();
                 trace.executions > 0
-                    && ssa.contains("type_of")
-                    && ssa.contains("String(\"null\")")
+                    && ssa.contains("String(\"tag\")")
+                    && ssa.contains("map_get")
                     && ssa.contains("branch_bool")
             }));
         }
@@ -1638,7 +1651,7 @@ fn polex_optional_index() {
     let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // AOT does not support this Optional index's Get(String) instruction.
     assert_polex_err_backends(
-        "let arr: array<int>? = [1]; let x = arr?.[(if test::close_closure(owned) == null => { test::make_err_result()? } else => { 0 })];",
+        "let arr: Option<array<int>> = Option::Some([1]); let items: array<int> = match arr { Option::Some(value) => value, Option::None => [0] }; let x = items[(if test::close_closure(owned) == () => { test::make_err_result()? } else => { 0 })];",
         1,
         1,
         &[0, 1],
@@ -1658,7 +1671,7 @@ fn polex_nested_match() {
     let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // Optional-pattern Ceq is outside AOT's admitted instruction set.
     assert_polex_err_backends(
-        "let x = 1 + (match test::take_null(owned) { Some(v) => v, _ => test::make_err_result()?, });",
+        "let x = 1 + (match test::take_null(owned) { Option::Some(v) => v, Option::None => test::make_err_result()?, });",
         1,
         1,
         &[0, 1],
@@ -1695,7 +1708,7 @@ fn polex_reached_and_skipped_try_both_operators() {
         for flag in [false, true] {
             assert_polex_err(
                 &format!(
-                    "let x = ((test::close_closure(owned) == null) == {flag}) {op} (test::make_err_result()? == 9); test::later_arg(); let v = test::make_err_result()?;"
+                    "let x = ((test::close_closure(owned) == ()) == {flag}) {op} (test::make_err_result()? == 9); test::later_arg(); let v = test::make_err_result()?;"
                 ),
                 1,
                 1,
@@ -1730,7 +1743,7 @@ fn polex_optional_fallback_skipped_owner_is_not_definitely_moved() {
     for flag in [false, true] {
         assert_polex_err(
             &format!(
-                "let maybe: int? = if {flag} => {{ 1 }} else => {{ null }}; let x = maybe.unwrap_or(if test::close_closure(owned) == null => {{ 2 }} else => {{ 3 }}); let v = test::make_err_result()?;"
+                "let maybe: Option<int> = if {flag} => {{ Option::Some(1) }} else => {{ Option::None }}; let x = match maybe {{ Option::Some(v) => v, Option::None => if test::close_closure(owned) == () => {{ 2 }} else => {{ 3 }} }}; let v = test::make_err_result()?;"
             ),
             1,
             1,
@@ -1752,7 +1765,7 @@ fn polex_short_circuit_skipped_rhs_retains_owner_for_later_try() {
             reset_exit_observers();
             assert_polex_err(
                 &format!(
-                    "let flag = {flag} {op} (test::close_closure(owned) == null); let value = test::make_err_result()?;"
+                    "let flag = {flag} {op} (test::close_closure(owned) == ()); let value = test::make_err_result()?;"
                 ),
                 1,
                 1,
@@ -1784,7 +1797,7 @@ fn polex_loop_backedge_fresh_owner_is_in_condition_cleanup() {
 fn polex_scalar_error_conditions_close_before_vm_drop() {
     let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     for body in [
-        "let x = test::close_closure(owned) == null && test::make_err_int()? == 9;",
+        "let x = test::close_closure(owned) == () && test::make_err_int()? == 9;",
         "if test::make_err_int()? == 9 { 1; } else { 0; }",
         "while test::make_err_int()? == 9 { break; }",
         "for i in 0..test::make_err_int()? { break; }",
@@ -1893,9 +1906,8 @@ fn run_result_source_backend(source: &str, backend: u8) -> Vm {
     vm.set_fuel(100_000);
     bind_result_hosts(&mut vm);
     if backend < 3 {
-        // The legacy fixture's Null host returns zero values. These tests bind
-        // its explicit Null value so a let consumes exactly one value and the
-        // AOT branch shapes match the host signature.
+        // Unit close returns one internal Null carrier so a let consumes exactly
+        // one value and AOT branch shapes match the host signature.
         struct ExplicitClose;
         impl HostFunction for ExplicitClose {
             fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {

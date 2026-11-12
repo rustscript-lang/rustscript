@@ -74,7 +74,7 @@ impl HostBindingKind {
 pub(crate) const SQLITE_RESERVED_TOP_START: u16 = 0xFFFC;
 pub(crate) const SQLITE_RESERVED_TOP_END: u16 = u16::MAX;
 pub(crate) const ORDINARY_BLOCK_START: u16 = 0xFFA2;
-pub(crate) const SPECIAL_CALL_BLOCK_START: u16 = 0xFF90;
+pub(crate) const SPECIAL_CALL_BLOCK_START: u16 = 0xFF8C;
 pub(crate) const SPECIAL_CALL_BLOCK_END: u16 = 0xFFA1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1794,6 +1794,10 @@ fn appended_builtin_order() -> &'static [&'static str] {
         "__map_iter_close",
         "__bind_callable",
         "__detach_local",
+        "__json_decode_typed",
+        "__json_encode_typed",
+        "__logical_render",
+        "__map_edit",
     ]
 }
 

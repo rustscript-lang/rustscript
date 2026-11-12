@@ -204,7 +204,7 @@ fn callback_store() -> vm::Store {
         pub fn fresh_return(value: Result<resource<result.success>, resource<result.failure>>, flag: bool) -> Result<resource<result.success>, resource<result.failure>> { result_resource::observe(); result_resource::make(flag) }
         pub fn return_first_three(first: Result<resource<result.success>, resource<result.failure>>, second: Result<resource<result.success>, resource<result.failure>>, third: Result<resource<result.success>, resource<result.failure>>) -> Result<resource<result.success>, resource<result.failure>> { result_resource::observe(); first }
         pub fn retain_success(value: Result<resource<result.success>, resource<result.failure>>) -> int { result_resource::retain(value) }
-        pub fn nullable(value: Result<resource<result.success>?, resource<result.failure>>) -> Result<resource<result.success>?, resource<result.failure>> { result_resource::observe(); value }
+        pub fn nullable(value: Result<Option<resource<result.success>>, resource<result.failure>>) -> Result<Option<resource<result.success>>, resource<result.failure>> { result_resource::observe(); value }
         pub fn map_echo(value: Result<resource<result.success>, resource<result.failure>>) -> Result<resource<result.success>, resource<result.failure>> { result_resource::observe(); let mapped = value.map(|item| item); result_resource::observe(); mapped }
         pub fn map_err_echo(value: Result<resource<result.success>, resource<result.failure>>) -> Result<resource<result.success>, resource<result.failure>> { result_resource::observe(); let mapped = value.map_err(|error| error); result_resource::observe(); mapped }
         pub fn and_then_echo(value: Result<resource<result.success>, resource<result.failure>>) -> Result<resource<result.success>, resource<result.failure>> { result_resource::observe(); let mapped = value.and_then(|item| Result::Ok(item)); result_resource::observe(); mapped }
@@ -530,23 +530,23 @@ fn vm_aware_owned_callback_fatal_transport_after_take_is_not_guest_err() {
 #[test]
 fn vm_aware_nullable_owned_callback_allocates_only_present_selected_payload() {
     let _lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    type Nullable = GuestResult<Option<ResourceOwned<Success>>, ResourceOwned<Failure>>;
+    type Nullable = GuestResult<vm::GuestOption<ResourceOwned<Success>>, ResourceOwned<Failure>>;
     let mut store = callback_store();
     let callback = store
         .vm_script_callback_by_name::<(Nullable,), Nullable>("nullable")
         .unwrap();
     let returned = callback
-        .call_with_vm(&mut store, (GuestResult::Ok(None),))
+        .call_with_vm(&mut store, (GuestResult::Ok(vm::GuestOption::None),))
         .unwrap();
-    assert!(matches!(returned, GuestResult::Ok(None)));
+    assert!(matches!(returned, GuestResult::Ok(vm::GuestOption::None)));
     assert_eq!(OBSERVED_RESOURCE_COUNT.load(Ordering::SeqCst), 0);
     for value in [
-        GuestResult::Ok(Some(ResourceOwned::new(Success(81)))),
+        GuestResult::Ok(vm::GuestOption::Some(ResourceOwned::new(Success(81)))),
         GuestResult::Err(ResourceOwned::new(Failure(93))),
     ] {
         let returned = callback.call_with_vm(&mut store, (value,)).unwrap();
         assert!(
-            matches!(returned, GuestResult::Ok(Some(ref resource)) if resource.as_ref().0 == 81)
+            matches!(returned, GuestResult::Ok(vm::GuestOption::Some(ref resource)) if resource.as_ref().0 == 81)
                 || matches!(returned, GuestResult::Err(ref resource) if resource.as_ref().0 == 93)
         );
         assert_eq!(OBSERVED_RESOURCE_COUNT.load(Ordering::SeqCst), 1);

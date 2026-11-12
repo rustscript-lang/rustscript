@@ -493,7 +493,7 @@ mod tests {
                 HostTypeSchema::Resource(key()),
                 HostParamPassing::TakeOwned,
             )],
-            HostTypeSchema::Null,
+            HostTypeSchema::Unit,
         ));
         let catalog = Arc::new(b.build().unwrap());
         let options = CompileSourceFileOptions::new().with_host_api_catalog(catalog.clone());

@@ -327,6 +327,12 @@ impl Parser {
         if self.match_kind(&TokenKind::False) {
             return Ok(Expr::Bool(false));
         }
+        if self.check(&TokenKind::Null) && self.dialect.reject_legacy_null() {
+            return Err(super::legacy_null_error(
+                self,
+                "RSS rejects null literals; use Option::None or ()",
+            ));
+        }
         if self.match_kind(&TokenKind::Null) {
             return Ok(Expr::Null);
         }
@@ -1378,6 +1384,12 @@ impl Parser {
         if let Some(value) = self.match_bytes() {
             return Ok((Some(MatchPattern::Bytes(value)), None));
         }
+        if self.check(&TokenKind::Null) && self.dialect.reject_legacy_null() {
+            return Err(super::legacy_null_error(
+                self,
+                "RSS rejects null patterns; use Option::None or ()",
+            ));
+        }
         if self.match_kind(&TokenKind::Null) {
             return Ok((Some(MatchPattern::Null), None));
         }
@@ -1700,6 +1712,26 @@ impl Parser {
                         expr_span,
                         "has".to_string(),
                     )?;
+                } else if self.dialect.reject_legacy_null()
+                    && member == "remove"
+                    && self.check(&TokenKind::LParen)
+                {
+                    self.reject_record_map_removal(&expr)?;
+                    self.expect(&TokenKind::LParen, "expected '(' after '.remove'")?;
+                    let key = self.parse_expr()?;
+                    self.expect(&TokenKind::RParen, "expected ')' after map remove key")?;
+                    let expr_span = Span::new(
+                        chain_start.source_id,
+                        chain_start.lo,
+                        self.tokens[self.pos - 1].span.hi,
+                    );
+                    expr = self.build_postfix_builtin_call(
+                        BuiltinFunction::MapEdit,
+                        vec![expr, key, Expr::Unit, Expr::Bool(true)],
+                        member_span,
+                        expr_span,
+                        "remove".to_string(),
+                    )?;
                 } else if member == "keys" {
                     let expr_span =
                         Span::new(chain_start.source_id, chain_start.lo, member_span.hi);
@@ -1799,6 +1831,116 @@ impl Parser {
             break;
         }
         Ok(expr)
+    }
+
+    fn map_store_call(
+        &mut self,
+        container: Expr,
+        key: Expr,
+        value: Expr,
+    ) -> Result<Expr, ParseError> {
+        let builtin = self.map_store_builtin(&container, &value);
+        let args = if builtin == BuiltinFunction::MapEdit {
+            vec![container, key, value, Expr::Bool(false)]
+        } else {
+            vec![container, key, value]
+        };
+        self.build_builtin_call_expr(builtin, args)
+    }
+
+    /// RSS map stores keep Unit and other possibly-null data. Proven non-null
+    /// values stay on the existing three-argument set path.
+    fn map_store_builtin(&self, container: &Expr, value: &Expr) -> BuiltinFunction {
+        if !self.dialect.reject_legacy_null() || !self.container_is_map(container) {
+            return BuiltinFunction::Set;
+        }
+        if self.value_proven_physical_non_null(value) {
+            BuiltinFunction::Set
+        } else {
+            BuiltinFunction::MapEdit
+        }
+    }
+
+    fn container_is_map(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Var(slot) => self.local_schemas.get(slot).is_some_and(|schema| {
+                matches!(
+                    schema,
+                    TypeSchema::Map(_)
+                        | TypeSchema::Object(_)
+                        | TypeSchema::Named(_, _)
+                        | TypeSchema::Option(_)
+                        | TypeSchema::Result { .. }
+                )
+            }),
+            Expr::Call(index, _, args, _, _) => match BuiltinFunction::from_call_index(*index) {
+                Some(BuiltinFunction::MapNew) => true,
+                Some(BuiltinFunction::Set | BuiltinFunction::MapEdit) => args
+                    .first()
+                    .is_some_and(|container| self.container_is_map(container)),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn value_proven_physical_non_null(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Int(_) | Expr::Bool(_) | Expr::String(_) | Expr::Float(_) | Expr::Bytes(_) => true,
+            Expr::Unit | Expr::Null => false,
+            Expr::Var(slot) => self.local_schemas.get(slot).is_some_and(|schema| {
+                !matches!(
+                    schema,
+                    TypeSchema::Null
+                        | TypeSchema::Unit
+                        | TypeSchema::GenericParam(_)
+                        | TypeSchema::Unknown
+                        | TypeSchema::Optional(_)
+                )
+            }),
+            Expr::OptionConstruct { .. } | Expr::ResultConstruct { .. } => true,
+            Expr::Call(index, _, _, _, _) => matches!(
+                BuiltinFunction::from_call_index(*index),
+                Some(
+                    BuiltinFunction::ArrayNew
+                        | BuiltinFunction::MapNew
+                        | BuiltinFunction::ArrayPush
+                        | BuiltinFunction::Set
+                        | BuiltinFunction::MapEdit
+                        | BuiltinFunction::Len
+                        | BuiltinFunction::Has
+                        | BuiltinFunction::Keys
+                        | BuiltinFunction::Count
+                        | BuiltinFunction::TypeOf
+                )
+            ),
+            _ => false,
+        }
+    }
+
+    fn reject_record_map_removal(&self, receiver: &Expr) -> Result<(), ParseError> {
+        let Expr::Var(slot) = receiver else {
+            return Ok(());
+        };
+        let Some(schema) = self.local_schemas.get(slot) else {
+            return Ok(());
+        };
+        if matches!(
+            schema,
+            TypeSchema::Named(_, _)
+                | TypeSchema::Object(_)
+                | TypeSchema::Option(_)
+                | TypeSchema::Result { .. }
+        ) {
+            return Err(ParseError {
+                span: Some(self.current_span()),
+                code: Some("E_MAP_REMOVE_RECORD".to_string()),
+                line: self.current_line(),
+                message: "cannot remove a field from a record, object, Option, or Result"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Build a postfix-source builtin call (index get, `.length`, `.has`,
@@ -2198,15 +2340,11 @@ impl Parser {
             for entry in entries {
                 match entry {
                     BraceLiteralEntry::Array(value) => {
-                        out = self.build_builtin_call_expr(
-                            BuiltinFunction::Set,
-                            vec![out, Expr::Int(next_array_index), value],
-                        )?;
+                        out = self.map_store_call(out, Expr::Int(next_array_index), value)?;
                         next_array_index = next_array_index.saturating_add(1);
                     }
                     BraceLiteralEntry::Map { key, value } => {
-                        out = self
-                            .build_builtin_call_expr(BuiltinFunction::Set, vec![out, key, value])?;
+                        out = self.map_store_call(out, key, value)?;
                     }
                 }
             }
@@ -2247,6 +2385,12 @@ impl Parser {
         }
         if self.match_kind(&TokenKind::False) {
             return Ok(Expr::Bool(false));
+        }
+        if self.check(&TokenKind::Null) && self.dialect.reject_legacy_null() {
+            return Err(super::legacy_null_error(
+                self,
+                "RSS rejects null map keys; use Option::None or ()",
+            ));
         }
         if self.match_kind(&TokenKind::Null) {
             return Ok(Expr::Null);
@@ -3113,8 +3257,7 @@ impl Parser {
         self.require_local_mutable_for_operation(index, Some(name.as_str()), line, "mutate")?;
         // Record the indexed-assignment root as a local reference site.
         self.record_local_ref(ident_span, index, name);
-        let expr =
-            self.build_builtin_call_expr(BuiltinFunction::Set, vec![Expr::Var(index), key, value])?;
+        let expr = self.map_store_call(Expr::Var(index), key, value)?;
         Ok(Stmt::Assign {
             kind: AssignmentKind::Set,
             index,
@@ -3506,6 +3649,10 @@ fn builtin_generic_type_arg_arity(builtin: BuiltinFunction) -> GenericCallableTy
             display_name: "json::decode",
             arity: Some(1),
         },
+        BuiltinFunction::JsonEncode => GenericCallableTypeArgSpec {
+            display_name: "json::encode",
+            arity: Some(1),
+        },
         _ => GenericCallableTypeArgSpec {
             display_name: builtin.name(),
             arity: None,
@@ -3515,7 +3662,7 @@ fn builtin_generic_type_arg_arity(builtin: BuiltinFunction) -> GenericCallableTy
 
 pub(crate) fn host_generic_type_arg_arity(host_name: &str) -> Option<usize> {
     match host_name {
-        "json::decode" => Some(1),
+        "json::decode" | "json::encode" => Some(1),
         _ => None,
     }
 }

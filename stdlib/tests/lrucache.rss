@@ -20,7 +20,7 @@ assert(initial_keys[1] == "b");
 
 let mut peeked = peek::<string, int>(cache, "a");
 assert(peeked.found);
-let peeked_value: int = peeked.value;
+let peeked_value: int = peeked.value.unwrap_or(0);
 assert(peeked_value == 1);
 let mut still_initial = keys::<string, int>(cache);
 assert(still_initial[0] == "a");
@@ -28,7 +28,7 @@ assert(still_initial[1] == "b");
 
 let mut accessed = get::<string, int>(cache, "a");
 assert(accessed.found);
-let accessed_value: int = accessed.value;
+let accessed_value: int = accessed.value.unwrap_or(0);
 assert(accessed_value == 1);
 cache = accessed.cache;
 let mut after_get = keys::<string, int>(cache);
@@ -37,13 +37,13 @@ assert(after_get[1] == "a");
 
 let mut lru_entry = oldest::<string, int>(cache);
 assert(lru_entry.found);
-assert(lru_entry.key == "b");
-assert(lru_entry.value == 2);
+assert(lru_entry.key.unwrap_or("") == "b");
+assert(lru_entry.value.unwrap_or(0) == 2);
 
 let mut mru_entry = newest::<string, int>(cache);
 assert(mru_entry.found);
-assert(mru_entry.key == "a");
-assert(mru_entry.value == 1);
+assert(mru_entry.key.unwrap_or("") == "a");
+assert(mru_entry.value.unwrap_or(0) == 1);
 
 cache = put::<string, int>(cache, "c", 3);
 let mut after_evict = keys::<string, int>(cache);
@@ -64,7 +64,7 @@ assert(after_update[0] == "c");
 assert(after_update[1] == "a");
 let mut updated = peek::<string, int>(cache, "a");
 assert(updated.found);
-assert(updated.value == 10);
+assert(updated.value.unwrap_or(0) == 10);
 
 let mut missed = get::<string, int>(cache, "missing");
 assert(missed.found == false);
@@ -115,13 +115,13 @@ feed_cache = put::<int, FeedItem>(feed_cache, 8, {slug: "beta", score: 20});
 
 let mut cached_feed = peek::<int, FeedItem>(feed_cache, 7);
 assert(cached_feed.found);
-let cached_feed_value = cached_feed.value.copy();
+let cached_feed_value = cached_feed.value.unwrap_or({slug: "", score: 0}).copy();
 assert(cached_feed_value.slug == "alpha");
 assert(cached_feed_value.score == 10);
 
 let mut accessed_feed = get::<int, FeedItem>(feed_cache, 7);
 assert(accessed_feed.found);
-let accessed_feed_value = accessed_feed.value.copy();
+let accessed_feed_value = accessed_feed.value.unwrap_or({slug: "", score: 0}).copy();
 assert(accessed_feed_value.slug == "alpha");
 feed_cache = accessed_feed.cache;
 
@@ -139,12 +139,12 @@ assert(second_feed_row.value.score == 10);
 
 let mut feed_oldest = oldest::<int, FeedItem>(feed_cache);
 assert(feed_oldest.found);
-assert(feed_oldest.key == 8);
-let feed_oldest_value = feed_oldest.value.copy();
+assert(feed_oldest.key.unwrap_or(0) == 8);
+let feed_oldest_value = feed_oldest.value.unwrap_or({slug: "", score: 0}).copy();
 assert(feed_oldest_value.slug == "beta");
 
 let mut feed_newest = newest::<int, FeedItem>(feed_cache);
 assert(feed_newest.found);
-assert(feed_newest.key == 7);
-let feed_newest_value = feed_newest.value.copy();
+assert(feed_newest.key.unwrap_or(0) == 7);
+let feed_newest_value = feed_newest.value.unwrap_or({slug: "", score: 0}).copy();
 assert(feed_newest_value.score == 10);

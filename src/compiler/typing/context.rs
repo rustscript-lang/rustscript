@@ -689,6 +689,7 @@ impl<'a> TypeContext<'a> {
             Expr::Call(index, _, args, _, _) => match BuiltinFunction::from_call_index(*index) {
                 Some(BuiltinFunction::Get)
                 | Some(BuiltinFunction::Set)
+                | Some(BuiltinFunction::MapEdit)
                 | Some(BuiltinFunction::Slice)
                 | Some(BuiltinFunction::Keys)
                 | Some(BuiltinFunction::Len) => args
@@ -762,6 +763,7 @@ impl<'a> TypeContext<'a> {
             Expr::Call(index, _, args, _, _) => match BuiltinFunction::from_call_index(*index) {
                 Some(BuiltinFunction::Get)
                 | Some(BuiltinFunction::Set)
+                | Some(BuiltinFunction::MapEdit)
                 | Some(BuiltinFunction::Slice)
                 | Some(BuiltinFunction::Keys)
                 | Some(BuiltinFunction::Len) => args
@@ -1946,6 +1948,13 @@ impl<'a> TypeContext<'a> {
             BuiltinFunction::Set if args.len() == 3 => {
                 self.infer_set_return_type(&args[0], &args[2], state)
             }
+            BuiltinFunction::MapEdit if args.len() == 4 => {
+                if matches!(args.get(3), Some(Expr::Bool(true))) {
+                    self.infer_expr_type(&args[0], state)
+                } else {
+                    self.infer_set_return_type(&args[0], &args[2], state)
+                }
+            }
             BuiltinFunction::Get if args.len() == 2 => {
                 self.infer_get_return_type(&args[0], &args[1], state)
             }
@@ -2005,6 +2014,17 @@ impl<'a> TypeContext<'a> {
                     .infer_expr_schema(&args[2], state)
                     .or_else(|| schema_from_bound_type(self.infer_expr_type(&args[2], state)));
                 infer_set_schema(container_schema, &args[1], value_schema)
+            }
+            BuiltinFunction::MapEdit if args.len() == 4 => {
+                if matches!(args.get(3), Some(Expr::Bool(true))) {
+                    self.infer_expr_schema(&args[0], state)
+                } else {
+                    let container_schema = self.infer_expr_schema(&args[0], state);
+                    let value_schema = self
+                        .infer_expr_schema(&args[2], state)
+                        .or_else(|| schema_from_bound_type(self.infer_expr_type(&args[2], state)));
+                    infer_set_schema(container_schema, &args[1], value_schema)
+                }
             }
             BuiltinFunction::Get if args.len() == 2 => self
                 .infer_expr_schema(&args[0], state)
@@ -2705,6 +2725,7 @@ impl<'a> TypeContext<'a> {
                 if let Some(builtin) = BuiltinFunction::from_call_index(*index) {
                     self.validate_builtin_argument_types(
                         builtin,
+                        type_args,
                         args,
                         state,
                         line_context,
@@ -2752,6 +2773,7 @@ impl<'a> TypeContext<'a> {
                     if let Some(builtin) = BuiltinFunction::from_call_index(index) {
                         self.validate_builtin_argument_types(
                             builtin,
+                            type_args,
                             args,
                             state,
                             line_context,
@@ -2825,13 +2847,14 @@ impl<'a> TypeContext<'a> {
     pub(super) fn validate_builtin_argument_types(
         &mut self,
         builtin: BuiltinFunction,
+        type_args: &[crate::compiler::ir::TypeSchema],
         args: &[Expr],
         state: &LocalTypeState,
         line_context: Option<u32>,
         source_name: Option<&str>,
         span: Option<Span>,
     ) -> Result<(), CompileError> {
-        if builtin == BuiltinFunction::JsonEncode {
+        if builtin == BuiltinFunction::JsonEncode && type_args.is_empty() {
             let arg = args.first().expect("json::encode arity is fixed");
             return validate_json_encode_argument(
                 arg,
@@ -3716,7 +3739,11 @@ fn builtin_generic_return_schema(
     type_args: &[TypeSchema],
 ) -> Option<TypeSchema> {
     match builtin {
-        BuiltinFunction::JsonDecode if type_args.len() == 1 => Some(type_args[0].clone()),
+        BuiltinFunction::JsonDecode | BuiltinFunction::JsonDecodeTyped
+            if type_args.len() == 1 =>
+        {
+            Some(type_args[0].clone())
+        }
         _ => None,
     }
 }
