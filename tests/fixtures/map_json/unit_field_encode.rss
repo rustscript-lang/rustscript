@@ -1,0 +1,2 @@
+use json;
+struct UnitField { value: () } let payload: UnitField = {value: ()}; json::encode(payload) == "{\"value\":null}";
