@@ -17,14 +17,15 @@ re-exported at the crate root, and an embedding can install different
 
 The callback parameter is typed `fn(bool) -> unknown`: the callback observes the
 `premature` flag and its **return value is discarded**, so the declared result
-is `unknown` — any `int`/`string`/`map`/`bool`/`null` body compiles and runs,
+is `unknown` — an `int`/`string`/`map`/`bool`/`()` body compiles and runs,
 and the value is dropped instead of accumulating. This is the one deliberate
 dynamic occurrence in the public timer surface, and the typed-catalog guard
 (`tests/typed_host_no_dynamic_contract_tests.rs`) records it as its narrow
-discarded-callable-result policy exception. A callback body may therefore end
-with any expression — for example `timer::at(25, |premature| null)`,
-`timer::at(25, |premature| 1)`, or
-`timer::at(25, |premature| if true => { work(); null } else => { null })`.
+discarded-callable-result policy exception. RSS rejects a `null` literal in a
+callback body; use `()` when the callback has nothing to return. A callback body
+may therefore end with any accepted expression — for example
+`timer::at(25, |premature| ())`, `timer::at(25, |premature| 1)`, or
+`timer::at(25, |premature| if true => { work(); () } else => { () })`.
 
 ## Installation
 

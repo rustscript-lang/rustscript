@@ -131,3 +131,56 @@ fn repl_result_distinguishes_absence_unit_and_option() {
         trailing.result_schema
     );
 }
+
+#[test]
+fn print_operand_keeps_checked_source_position_schema() {
+    let source = "\
+let value: Option<int> = Option::Some(1);
+print(value);
+let plain = { tag: false };
+print(plain);
+fn show(item: Option<int>) { print(item); }
+show(value);
+";
+    let model = vm::analyze_source_from_string_with_options(
+        "main.rss",
+        source,
+        vm::CompileSourceFileOptions::default(),
+    )
+    .unwrap_or_else(|error| panic!("presentation source should analyze: {error}"));
+    assert!(
+        model.diagnostics().is_empty(),
+        "checked presentation source has diagnostics: {:?}",
+        model.diagnostics()
+    );
+    let parsed = model
+        .ir()
+        .parsed_semantic_index
+        .as_ref()
+        .expect("parser semantic index");
+    for name in ["value", "plain", "item"] {
+        let site = parsed
+            .local_refs
+            .iter()
+            .find(|site| site.name == name)
+            .unwrap_or_else(|| panic!("missing source ref for {name}"));
+        assert_eq!(
+            &source[site.ident_span.lo..site.ident_span.hi],
+            name,
+            "{name} source span must be the identifier"
+        );
+        let schema = model
+            .inferred_schema_at(vm::SourcePosition::new(0, site.ident_span.lo))
+            .unwrap_or_else(|| panic!("missing checked schema at {name}"));
+        match name {
+            "plain" => assert!(
+                matches!(schema, TypeSchema::Object(_)),
+                "ordinary object must stay an object at its source position, got {schema:?}"
+            ),
+            _ => assert!(
+                matches!(schema, TypeSchema::Option(_)),
+                "{name} must stay Option at its print source position, got {schema:?}"
+            ),
+        }
+    }
+}

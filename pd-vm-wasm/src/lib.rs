@@ -1516,6 +1516,20 @@ mod runtime_tests {
     }
 
     #[test]
+    fn playground_rss_examples_compile_with_embedded_stdlib() {
+        for (name, source) in rss_playground_examples() {
+            compile_source_with_flavor_and_options(
+                source,
+                SourceFlavor::RustScript,
+                embedded_stdlib_compile_options(),
+            )
+            .unwrap_or_else(|err| {
+                panic!("playground example '{name}' should compile with the bundled stdlib: {err}")
+            });
+        }
+    }
+
+    #[test]
     fn playground_rss_examples_are_formatted_lint_clean_and_runnable() {
         let options = embedded_stdlib_compile_options();
 
