@@ -22,6 +22,79 @@ fn native_cache_test_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+struct PublicJsonEncodeOverride {
+    seen: Arc<Mutex<Vec<Vec<Value>>>>,
+}
+
+impl HostFunction for PublicJsonEncodeOverride {
+    fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
+        self.seen.lock().expect("override args").push(args.to_vec());
+        Ok(CallOutcome::Return(CallReturn::one(Value::string(
+            "override",
+        ))))
+    }
+}
+
+fn json_encode_override_source() -> &'static str {
+    "use json;\njson::encode(\"request_body\");\n"
+}
+
+fn builtin_call_sites(code: &[u8]) -> Vec<(u16, u8, Option<&'static str>)> {
+    let mut calls = Vec::new();
+    let mut ip = 0;
+    while ip < code.len() {
+        let opcode = crate::OpCode::try_from(code[ip]).expect("opcode");
+        if opcode == crate::OpCode::Call {
+            let index = u16::from_le_bytes([code[ip + 1], code[ip + 2]]);
+            let argc = code[ip + 3];
+            let name = BuiltinFunction::from_call_index(index).map(|builtin| builtin.name());
+            calls.push((index, argc, name));
+        }
+        ip += 1 + opcode.operand_len();
+    }
+    calls
+}
+
+#[test]
+fn typed_json_encode_honors_public_override_slot_with_value_only() {
+    let compiled = crate::compile_source(json_encode_override_source())
+        .expect("json encode source should compile");
+    let calls = builtin_call_sites(&compiled.program.code);
+    assert_eq!(
+        calls,
+        vec![(
+            BuiltinFunction::JsonEncodeTyped.call_index(),
+            2,
+            Some(BuiltinFunction::JsonEncodeTyped.name())
+        )],
+        "typed lowering must keep the private encode call"
+    );
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut vm = Vm::new(compiled.program);
+    vm.bind_function(
+        "json::encode",
+        Box::new(PublicJsonEncodeOverride {
+            seen: Arc::clone(&seen),
+        }),
+    );
+    let mut override_keys: Vec<u16> = vm.host.builtin_overrides.keys().copied().collect();
+    override_keys.sort_unstable();
+    assert_eq!(
+        override_keys,
+        vec![BuiltinFunction::JsonEncode.call_index()],
+        "public bind installs only the json::encode slot"
+    );
+
+    let status = vm.run().expect("overridden encode should run");
+    assert_eq!(status, VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::string("override")]);
+    assert_eq!(
+        seen.lock().expect("override args").as_slice(),
+        &[vec![Value::string("request_body")]]
+    );
+}
+
 #[test]
 fn program_cache_key_includes_full_host_import_schema() {
     let function =
