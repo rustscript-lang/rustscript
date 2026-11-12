@@ -18,8 +18,8 @@ mod host_call_resolve;
 mod host_conversion;
 pub mod ir;
 mod lifetime;
-mod logical_boundary;
 mod linker;
+mod logical_boundary;
 mod materialization;
 mod modules;
 mod option;
@@ -30,6 +30,7 @@ mod semantic_model;
 mod source_loader;
 pub mod source_map;
 mod try_anf;
+pub(crate) mod type_schema_codec;
 mod typing;
 
 #[cfg(test)]
