@@ -27,9 +27,18 @@ fn parse_log_line(line) {
 }
 
 fn is_some_string_equal(actual: Option<string>, expected: string) -> bool {
-    match actual {
-        Option::Some(value) => value == expected,
-        Option::None => false
+    let missing = match actual {
+        Option::Some(_) => false,
+        Option::None => true
+    };
+    if missing => {
+        false
+    } else => {
+        let text = match actual {
+            Option::Some(value) => value,
+            Option::None => ""
+        };
+        text == expected
     }
 }
 
@@ -77,7 +86,8 @@ let error_id: string = string_or_empty(if id_groups.length == 2 => {
     id_groups[1]
 } else => {
     Option::None
-});
+}
+);
 let levels = [first_level, warn_level, error_level];
 let slow_routes = [rewritten_route, string::replace(error_route, "/", "::")];
 

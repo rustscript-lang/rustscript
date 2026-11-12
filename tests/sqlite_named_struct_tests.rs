@@ -1056,7 +1056,6 @@ fn legacy_scalar_and_physical_null_public_fields_are_rejected() {
         r#"use sqlite; sqlite::open({ path: ":memory:", mode: Option::Some("memory") });"#,
         r#"use sqlite; sqlite::open({ path: Option::Some(":memory:"), mode: ":memory:" });"#,
         r#"use sqlite; let db = sqlite::open({ path: Option::Some(":memory:"), mode: Option::Some("memory") }); sqlite::execute(&db, "SELECT ?", [{ kind: "int", int_value: 7, float_value: Option::None, text_value: Option::None, blob_value: Option::None }]);"#,
-        r#"use sqlite; let db = sqlite::open({ path: Option::Some(":memory:"), mode: Option::Some("memory") }); sqlite::execute(&db, "SELECT ?", [{ kind: "int", int_value: null, float_value: Option::None, text_value: Option::None, blob_value: Option::None }]);"#,
         r#"use sqlite; let db = sqlite::open({ path: Option::Some(":memory:"), mode: Option::Some("memory") }); sqlite::query(&db, "SELECT 1", [], { max_rows: 8 });"#,
     ] {
         let message = compile_err(source);
@@ -1065,6 +1064,12 @@ fn legacy_scalar_and_physical_null_public_fields_are_rejected() {
             "legacy field reading must be rejected, got {message}"
         );
     }
+    let null_literal = r#"use sqlite; let db = sqlite::open({ path: Option::Some(":memory:"), mode: Option::Some("memory") }); sqlite::execute(&db, "SELECT ?", [{ kind: "int", int_value: null, float_value: Option::None, text_value: Option::None, blob_value: Option::None }]);"#;
+    let null_message = compile_err(null_literal);
+    assert!(
+        null_message.contains("RSS rejects null literals"),
+        "a null literal is rejected before a legacy sqlite field, got {null_message}"
+    );
 }
 
 #[test]
@@ -1086,4 +1091,12 @@ fn logical_option_limit_zero_is_a_provided_invalid_value() {
         message.contains("max_rows must be positive"),
         "Some(0) must be a provided invalid limit rather than the default, got {message}"
     );
+}
+
+#[test]
+fn bundled_sqlite_named_struct_example_compiles_with_standard_catalog() {
+    let source = include_str!("../examples/sqlite_named_structs.rss");
+    compile_standard(source).unwrap_or_else(|error| {
+        panic!("examples/sqlite_named_structs.rss should compile with the sqlite catalog: {error}")
+    });
 }

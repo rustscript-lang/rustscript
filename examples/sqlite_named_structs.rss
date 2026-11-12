@@ -1,42 +1,50 @@
 use sqlite;
 use bytes;
 
-fn main() {
-    let db = sqlite::open({
-        path: ":memory:",
-        mode: "memory",
-        limits: { max_rows: 32 },
-    });
+let limits: SqliteLimits = { max_rows: Option::Some(32) };
+let options: SqliteOpenOptions = {
+    path: Option::Some(":memory:"),
+    mode: Option::Some("memory"),
+    limits: Option::Some(limits)
+};
+let db = sqlite::open(options);
 
-    sqlite::execute(&db, "CREATE TABLE t (value, payload)", []);
-    let blob_payload = bytes::from_hex("000102");
-    sqlite::execute(&db, "INSERT INTO t VALUES (?1, ?2)", [
-        { kind: "int", int_value: 7 },
-        { kind: "blob", blob_value: blob_payload },
-    ]);
+let empty: [SqliteValue] = [];
+sqlite::execute(&db, "CREATE TABLE t (value, payload)", empty);
+let blob_payload = bytes::from_hex("000102");
+let inserted = sqlite::execute(&db, "INSERT INTO t VALUES (?1, ?2)", [
+    { kind: "int", int_value: Option::Some(7) },
+    { kind: "blob", blob_value: Option::Some(blob_payload) }
+]);
+let affected = inserted.rows_affected;
+assert(affected == 1);
 
-    let queried = sqlite::query(&db, "SELECT value, payload FROM t", [], {});
-    let first = queried.rows[0].cells[0];
-    assert(first.kind == "int");
-    assert(first.int_value == 7);
+let queried = sqlite::query(&db, "SELECT value, payload FROM t", empty, limits);
+let first_row = queried.rows[0];
+let first = first_row.cells[0];
+assert(first.kind == "int");
+let first_value = first.int_value.unwrap_or(-1);
+assert(first_value == 7);
 
-    let results = sqlite::transaction(&db, [
-        {
-            sql: "INSERT INTO t VALUES (?1, ?2)",
-            params: [
-                { kind: "text", text_value: "hello" },
-                { kind: "null" },
-            ],
-        },
-        {
-            sql: "SELECT value, payload FROM t ORDER BY rowid",
-            query: true,
-            limits: { max_rows: 32 },
-        },
-    ]);
-    assert(results[0].kind == "execute");
-    assert(results[1].kind == "query");
-    assert(results[1].query.rows[0].cells[0].int_value == 7);
+let insert_params: [SqliteValue] = [
+    { kind: "text", text_value: Option::Some("hello") },
+    { kind: "null" }
+];
+let statements: [SqliteStatement] = [
+    {
+        sql: "INSERT INTO t VALUES (?1, ?2)",
+        params: Option::Some(insert_params)
+    },
+    {
+        sql: "SELECT value, payload FROM t ORDER BY rowid",
+        query: Option::Some(true),
+        limits: Option::Some(limits)
+    }
+];
+let results = sqlite::transaction(&db, statements);
+let execute_result = results[0];
+assert(execute_result.kind == "execute");
+let query_result = results[1];
+assert(query_result.kind == "query");
 
-    sqlite::close(db);
-}
+sqlite::close(db);

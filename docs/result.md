@@ -64,8 +64,8 @@ use the same lexical boundary. The enclosing Ok type may differ from the operand
 Ok type; the error type must match without implicit conversion.
 
 Root scripts, non-Result-returning functions, non-Result operands, optional Result
-operands, and incompatible error types reject `?`. `T?` remains an optional type,
-and `object?.field` remains optional access. Other parser dialects do not gain
+operands, and incompatible error types reject `?`. RSS rejects type-position `T?`;
+rewrite it as `Option<T>`. `object?.field` remains optional access. Other parser dialects do not gain
 this syntax unless they enable the Result dialect capability. There is no implicit
 error conversion, generic Try trait, or guest throw/catch/finally.
 
