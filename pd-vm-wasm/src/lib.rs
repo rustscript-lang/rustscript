@@ -1328,8 +1328,8 @@ mod lint_tests {
             struct Stats { score: int }
             struct Profile { stats: Stats }
 
-            let payload_json = json::encode({});
-            let payload_decoded: Profile = json::decode(payload_json);
+            let payload_json = json::encode::<Profile>(json::decode::<Profile>("{\"stats\":{\"score\":41}}"));
+            let payload_decoded: Profile = json::decode::<Profile>(payload_json);
             payload_decoded.stats.score;
         "#;
 
