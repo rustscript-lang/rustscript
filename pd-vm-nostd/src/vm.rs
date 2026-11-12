@@ -1036,7 +1036,9 @@ impl<C> Vm<C> {
                 self.stack.push(callable);
                 Ok(())
             }
-            JSON_DECODE_TYPED_CALL_INDEX | JSON_ENCODE_TYPED_CALL_INDEX | LOGICAL_RENDER_CALL_INDEX => {
+            JSON_DECODE_TYPED_CALL_INDEX
+            | JSON_ENCODE_TYPED_CALL_INDEX
+            | LOGICAL_RENDER_CALL_INDEX => {
                 return Some(Err(VmError::InvalidCall(index)));
             }
             _ => return None,
@@ -1345,7 +1347,9 @@ mod tests {
             panic!("map edit should return a map");
         };
         assert!(
-            entries.iter().any(|(key, value)| key == &Value::string("present") && value == &Value::Null),
+            entries
+                .iter()
+                .any(|(key, value)| key == &Value::string("present") && value == &Value::Null),
             "no-std MapEdit must keep a null entry when remove is false"
         );
     }

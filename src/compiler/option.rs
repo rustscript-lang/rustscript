@@ -1288,7 +1288,8 @@ fn overlay_host_argument_schemas(
     host: Option<&HostApiIrMetadata>,
     index: u16,
 ) -> Option<Vec<Option<TypeSchema>>> {
-    let Some(host_args) = host.and_then(|metadata| host_candidate_argument_schemas(metadata, index))
+    let Some(host_args) =
+        host.and_then(|metadata| host_candidate_argument_schemas(metadata, index))
     else {
         return existing;
     };
@@ -1310,7 +1311,10 @@ fn host_candidate_argument_schemas(
 ) -> Option<Vec<Option<TypeSchema>>> {
     let candidates = metadata.candidates(index)?;
     let arity = candidates.first()?.params.len();
-    if candidates.iter().any(|candidate| candidate.params.len() != arity) {
+    if candidates
+        .iter()
+        .any(|candidate| candidate.params.len() != arity)
+    {
         return None;
     }
     let mut schemas = Vec::with_capacity(arity);

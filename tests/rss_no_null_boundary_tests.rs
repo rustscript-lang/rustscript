@@ -78,12 +78,14 @@ fn rss_rejects_null_map_key_with_span() {
 }
 
 fn eval(source: &str) -> vm::Value {
-    let compiled = compile_source(source).unwrap_or_else(|error| {
-        panic!("RSS JSON source should compile: {source}\n{error}")
-    });
+    let compiled = compile_source(source)
+        .unwrap_or_else(|error| panic!("RSS JSON source should compile: {source}\n{error}"));
     let mut vm = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
     vm.set_fuel(100_000);
-    assert_eq!(vm.run().expect("JSON program should run"), vm::VmStatus::Halted);
+    assert_eq!(
+        vm.run().expect("JSON program should run"),
+        vm::VmStatus::Halted
+    );
     vm.stack()
         .last()
         .cloned()
@@ -123,9 +125,8 @@ fn println_option_returns_original_and_renders_none() {
         let printed = println(decoded);
         match printed { Option::None => 0, Option::Some(value) => 1 + value };
     "#;
-    let compiled = compile_source(source).unwrap_or_else(|error| {
-        panic!("logical print should compile: {source}\n{error}")
-    });
+    let compiled = compile_source(source)
+        .unwrap_or_else(|error| panic!("logical print should compile: {source}\n{error}"));
     let mut vm = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
     vm.set_fuel(100_000);
     let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -174,10 +175,7 @@ fn rss_rejects_custom_host_unknown_return() {
         Ok(_) => panic!("unknown host return must be rejected"),
         Err(error) => error.to_string(),
     };
-    assert!(
-        message.contains("dynamic or legacy-null"),
-        "{message}"
-    );
+    assert!(message.contains("dynamic or legacy-null"), "{message}");
     vm::compile_source_with_flavor_and_options(
         "use demo; demo::flag();",
         vm::SourceFlavor::RustScript,
@@ -193,9 +191,8 @@ fn format_template_renders_option_from_checked_schema() {
         println("{}", value);
         1;
     "#;
-    let compiled = compile_source(source).unwrap_or_else(|error| {
-        panic!("format template should compile: {source}\n{error}")
-    });
+    let compiled = compile_source(source)
+        .unwrap_or_else(|error| panic!("format template should compile: {source}\n{error}"));
     let mut vm = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
     vm.set_fuel(100_000);
     let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));

@@ -1017,7 +1017,9 @@ impl HostFunction for TakeNull {
     fn call(&mut self, vm: &mut Vm, args: &[Value]) -> VmResult<CallOutcome> {
         POLEX_EVENTS.lock().unwrap().push("close");
         CloseClosureResource.call(vm, args)?;
-        Ok(CallOutcome::Return(CallReturn::one(vm::option::none_carrier())))
+        Ok(CallOutcome::Return(CallReturn::one(
+            vm::option::none_carrier(),
+        )))
     }
 }
 
@@ -1517,7 +1519,9 @@ fn aotnull_nullable_payloads_and_fallback_effects() {
         };
         for backend in [0, 1, 2] {
             for source in [
-                format!("fn pick() -> Option<{ty}> {{ {rss_value} }} pick().unwrap_or_else(|| {fallback});"),
+                format!(
+                    "fn pick() -> Option<{ty}> {{ {rss_value} }} pick().unwrap_or_else(|| {fallback});"
+                ),
                 format!(
                     "fn relay(x: Option<{ty}>) -> {ty} {{ x.unwrap_or_else(|| {fallback}) }} relay({rss_value});"
                 ),

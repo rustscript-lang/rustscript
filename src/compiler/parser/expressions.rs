@@ -1903,7 +1903,9 @@ impl Parser {
 
     fn value_proven_physical_non_null(&self, expr: &Expr) -> bool {
         match expr {
-            Expr::Int(_) | Expr::Bool(_) | Expr::String(_) | Expr::Float(_) | Expr::Bytes(_) => true,
+            Expr::Int(_) | Expr::Bool(_) | Expr::String(_) | Expr::Float(_) | Expr::Bytes(_) => {
+                true
+            }
             Expr::Unit | Expr::Null => false,
             Expr::Var(slot) => self.local_schemas.get(slot).is_some_and(|schema| {
                 !matches!(
@@ -3280,8 +3282,13 @@ impl Parser {
         // Record the indexed-assignment root as a local reference site.
         self.record_local_ref(ident_span, index, name);
         let expr_span = Span::new(ident_span.source_id, ident_span.lo, expr_hi);
-        let expr =
-            self.map_store_call_with_provenance(Expr::Var(index), key, value, ident_span, expr_span)?;
+        let expr = self.map_store_call_with_provenance(
+            Expr::Var(index),
+            key,
+            value,
+            ident_span,
+            expr_span,
+        )?;
         Ok(Stmt::Assign {
             kind: AssignmentKind::Set,
             index,
