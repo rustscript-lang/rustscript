@@ -1,248 +1,218 @@
-//! Classify map stores from checked schemas before ownership and codegen.
+//! Classify map stores from the checked walk, then rewrite by semantic id.
 //!
-//! Parser `local_schemas` only sees declared annotations. Inferred maps, factory
-//! results, and generic parameters are known only after typing. This pass
-//! rewrites those stores onto the private MapEdit insert path so Unit data is
-//! kept. Proven non-null values and arrays stay on Set. An unresolved receiver
-//! is not guessed: a possibly-null store is rejected instead of deleted.
+//! The decision uses the state already bound by collection: closure parameters,
+//! match bindings, branch merges and loop stabilization. This pass does not
+//! solve schemas again and does not read final slot aggregates as source
+//! position types.
+
+use std::collections::{HashMap, HashSet};
 
 use crate::BuiltinFunction;
 
-use super::super::ir::{Expr, FrontendIr, Stmt, TypeSchema};
+use super::super::ir::{
+    ClosureExpr, Expr, FrontendIr, FunctionImpl, SemanticNodeId, Stmt, TypeSchema,
+};
+use super::super::source_map::{SourceId, Span};
 use super::super::{CompileError, ParseError};
-use super::context::TypeContext;
+use super::context::{MapStoreAction, TypeContext};
 use super::state::LocalTypeState;
-use super::{EntryLocalType, bound_type_from_schema};
+use super::EntryLocalType;
 
 pub(crate) enum MapAdmissionError {
     Compile(CompileError),
     Parse(ParseError),
 }
 
+/// Which producers receive RustScript map-store policy.
+#[derive(Clone, Debug)]
+pub(crate) enum MapStoreScope {
+    /// Every spanned call in this IR belongs to one RustScript producer.
+    RustScript,
+    /// Only these source ids are RustScript. Other producers keep Set.
+    Sources(HashSet<SourceId>),
+    /// Leave legacy Set deletion unchanged.
+    Legacy,
+}
+
 pub(crate) fn classify_map_stores(
     ir: &mut FrontendIr,
     typing_mode: super::super::TypingMode,
     entry_local_types: &[EntryLocalType],
+    scope: MapStoreScope,
 ) -> Result<(), MapAdmissionError> {
-    let functions = ir.functions.clone();
-    let function_impls = std::mem::take(&mut ir.function_impls);
-    let struct_schemas = std::mem::take(&mut ir.struct_schemas);
-    let parsed_index = ir.parsed_semantic_index.take();
-    let function_names = super::helpers::build_function_names(&functions);
-    let function_decls = super::helpers::build_function_decl_map(&functions);
-    let host_import_return_types =
-        super::helpers::build_host_import_return_types(&functions, &function_impls);
-    let host_import_signatures =
-        super::helpers::build_host_import_signatures(&functions, &function_impls);
-    let mut context = TypeContext::new(
-        &function_impls,
-        &function_decls,
-        &struct_schemas,
-        &function_names,
-        &host_import_return_types,
-        &host_import_signatures,
-        typing_mode,
-        parsed_index.as_ref(),
-    );
-    let sites = parsed_index
+    let decisions = super::collect_checked_map_store_decisions(ir, typing_mode, entry_local_types);
+    let sites = ir
+        .parsed_semantic_index
         .as_ref()
-        .map(|index| index.call_sites.as_slice())
-        .unwrap_or(&[]);
-    let mut root = LocalTypeState::default();
-    for entry in entry_local_types {
-        bind_schema(&mut root, entry.slot, entry.schema.clone(), true);
-    }
+        .map(|index| index.call_sites.clone())
+        .unwrap_or_default();
     for stmt in &mut ir.stmts {
-        walk_stmt(stmt, &mut root, &mut context, sites)?;
+        apply_stmt(stmt, &decisions, &sites, &scope)?;
     }
-    let mut rewritten = Vec::new();
-    for decl in &functions {
-        let Some(mut function) = function_impls.get(&decl.index).cloned() else {
-            continue;
-        };
-        let mut state = LocalTypeState::default();
-        for (source, dest) in &function.capture_copies {
-            if let Some(schema) = root.schema(*source).cloned() {
-                bind_schema(&mut state, *dest, Some(schema), false);
-            }
-        }
-        for (slot, schema) in function.param_slots.iter().zip(decl.arg_schemas.iter()) {
-            if let Some(schema) = schema.clone() {
-                bind_schema(&mut state, *slot, Some(schema), true);
-            }
-        }
-        for stmt in &mut function.body_stmts {
-            walk_stmt(stmt, &mut state, &mut context, sites)?;
-        }
-        walk_expr(
-            &mut function.body_expr,
-            &mut state,
-            &mut context,
-            sites,
-            function.body_expr_line,
-        )?;
-        rewritten.push((decl.index, function));
+    for function in ir.function_impls.values_mut() {
+        apply_function(function, &decisions, &sites, &scope)?;
     }
-    drop(context);
-    ir.function_impls = function_impls;
-    for (index, function) in rewritten {
-        ir.function_impls.insert(index, function);
-    }
-    ir.struct_schemas = struct_schemas;
-    ir.parsed_semantic_index = parsed_index;
     Ok(())
 }
 
-fn bind_schema(
-    state: &mut LocalTypeState,
-    slot: super::super::ir::LocalSlot,
-    schema: Option<TypeSchema>,
-    declared: bool,
+pub(super) fn note_checked_map_store(
+    expr: &Expr,
+    state: &LocalTypeState,
+    context: &mut TypeContext<'_>,
 ) {
-    let Some(schema) = schema else {
+    let Expr::Call(index, _, args, _, Some(id)) = expr else {
         return;
     };
-    if matches!(schema, TypeSchema::Unknown) {
-        return;
+    let action = match BuiltinFunction::from_call_index(*index) {
+        Some(BuiltinFunction::MapEdit) if args.len() == 4 => decide_edit(args, state, context),
+        Some(BuiltinFunction::Set) if args.len() == 3 => decide_set(args, state, context),
+        _ => None,
+    };
+    if let Some(action) = action {
+        context.map_store_decisions.insert(*id, action);
     }
-    state.set_with_schema_origin(
-        slot,
-        bound_type_from_schema(&schema),
-        Some(schema),
-        declared,
-    );
 }
 
-fn walk_stmt(
-    stmt: &mut Stmt,
-    state: &mut LocalTypeState,
+fn decide_set(
+    args: &[Expr],
+    state: &LocalTypeState,
     context: &mut TypeContext<'_>,
+) -> Option<MapStoreAction> {
+    let receiver = context.infer_expr_schema(&args[0], state);
+    if is_logical_carrier(receiver.as_ref()) {
+        return Some(MapStoreAction::RejectCarrier);
+    }
+    let value = context.infer_expr_schema(&args[2], state);
+    if !value_may_be_unit(value.as_ref()) {
+        return None;
+    }
+    if is_map_object_or_named(receiver.as_ref()) {
+        return Some(MapStoreAction::RewriteInsert);
+    }
+    if receiver_kind_unresolved(receiver.as_ref()) {
+        return Some(MapStoreAction::RejectUnresolved);
+    }
+    None
+}
+
+fn decide_edit(
+    args: &[Expr],
+    state: &LocalTypeState,
+    context: &mut TypeContext<'_>,
+) -> Option<MapStoreAction> {
+    let receiver = context.infer_expr_schema(&args[0], state);
+    if matches!(args.get(3), Some(Expr::Bool(true))) {
+        return if matches!(receiver, Some(TypeSchema::Map(_))) {
+            None
+        } else {
+            Some(MapStoreAction::RejectRemove)
+        };
+    }
+    if is_logical_carrier(receiver.as_ref()) {
+        Some(MapStoreAction::RejectCarrier)
+    } else {
+        None
+    }
+}
+
+fn apply_function(
+    function: &mut FunctionImpl,
+    decisions: &HashMap<SemanticNodeId, MapStoreAction>,
     sites: &[super::super::ir::ParsedCallSite],
+    scope: &MapStoreScope,
 ) -> Result<(), MapAdmissionError> {
+    for stmt in &mut function.body_stmts {
+        apply_stmt(stmt, decisions, sites, scope)?;
+    }
+    apply_expr(
+        &mut function.body_expr,
+        decisions,
+        sites,
+        scope,
+        function.body_expr_line,
+    )
+}
+
+fn apply_stmt(
+    stmt: &mut Stmt,
+    decisions: &HashMap<SemanticNodeId, MapStoreAction>,
+    sites: &[super::super::ir::ParsedCallSite],
+    scope: &MapStoreScope,
+) -> Result<(), MapAdmissionError> {
+    let line = super::helpers::stmt_line(stmt);
     match stmt {
-        Stmt::Let {
-            index,
-            declared_schema,
-            expr,
-            line,
-        } => {
-            walk_expr(expr, state, context, sites, *line)?;
-            let schema = declared_schema
-                .clone()
-                .or_else(|| context.infer_expr_schema(expr, state));
-            bind_schema(state, *index, schema, declared_schema.is_some());
-            Ok(())
+        Stmt::Noop { .. } | Stmt::FuncDecl { .. } | Stmt::Break { .. } | Stmt::Continue { .. } | Stmt::Drop { .. } => {}
+        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
+            apply_expr(expr, decisions, sites, scope, line)?;
         }
-        Stmt::Assign {
-            index, expr, line, ..
-        } => {
-            walk_expr(expr, state, context, sites, *line)?;
-            if !state.has_declared_schema(*index)
-                && let Some(schema) = context.infer_expr_schema(expr, state)
-            {
-                bind_schema(state, *index, Some(schema), false);
-            }
-            Ok(())
-        }
-        Stmt::Expr { expr, line } => walk_expr(expr, state, context, sites, *line),
-        Stmt::ClosureLet { closure, line, .. } => {
-            walk_closure(closure, state, context, sites, *line)
-        }
+        Stmt::ClosureLet { closure, .. } => apply_closure(closure, decisions, sites, scope, line)?,
         Stmt::IfElse {
             condition,
             then_branch,
             else_branch,
-            line,
+            ..
         } => {
-            walk_expr(condition, state, context, sites, *line)?;
-            let mut then_state = state.clone();
-            let mut else_state = state.clone();
-            for stmt in then_branch {
-                walk_stmt(stmt, &mut then_state, context, sites)?;
+            apply_expr(condition, decisions, sites, scope, line)?;
+            for stmt in then_branch.iter_mut().chain(else_branch.iter_mut()) {
+                apply_stmt(stmt, decisions, sites, scope)?;
             }
-            for stmt in else_branch {
-                walk_stmt(stmt, &mut else_state, context, sites)?;
-            }
-            Ok(())
         }
         Stmt::For {
             init,
             condition,
             post,
             body,
-            line,
+            ..
         } => {
-            walk_stmt(init, state, context, sites)?;
-            walk_expr(condition, state, context, sites, *line)?;
-            walk_stmt(post, state, context, sites)?;
-            let mut nested = state.clone();
+            apply_stmt(init, decisions, sites, scope)?;
+            apply_expr(condition, decisions, sites, scope, line)?;
+            apply_stmt(post, decisions, sites, scope)?;
             for stmt in body {
-                walk_stmt(stmt, &mut nested, context, sites)?;
+                apply_stmt(stmt, decisions, sites, scope)?;
             }
-            Ok(())
         }
         Stmt::While {
-            condition, body, line, ..
+            condition, body, ..
         } => {
-            walk_expr(condition, state, context, sites, *line)?;
-            let mut nested = state.clone();
+            apply_expr(condition, decisions, sites, scope, line)?;
             for stmt in body {
-                walk_stmt(stmt, &mut nested, context, sites)?;
+                apply_stmt(stmt, decisions, sites, scope)?;
             }
-            Ok(())
         }
-        Stmt::Noop { .. }
-        | Stmt::FuncDecl { .. }
-        | Stmt::Break { .. }
-        | Stmt::Continue { .. }
-        | Stmt::Drop { .. } => Ok(()),
     }
+    Ok(())
 }
 
-fn walk_closure(
-    closure: &mut super::super::ir::ClosureExpr,
-    state: &LocalTypeState,
-    context: &mut TypeContext<'_>,
+fn apply_closure(
+    closure: &mut ClosureExpr,
+    decisions: &HashMap<SemanticNodeId, MapStoreAction>,
     sites: &[super::super::ir::ParsedCallSite],
+    scope: &MapStoreScope,
     line: u32,
 ) -> Result<(), MapAdmissionError> {
-    let mut nested = state.clone();
-    for (source, dest) in &closure.capture_copies {
-        if let Some(schema) = state.schema(*source).cloned() {
-            bind_schema(&mut nested, *dest, Some(schema), false);
-        }
-    }
-    walk_expr(&mut closure.body, &mut nested, context, sites, line)
+    apply_expr(&mut closure.body, decisions, sites, scope, line)
 }
 
-fn walk_expr(
+fn apply_expr(
     expr: &mut Expr,
-    state: &mut LocalTypeState,
-    context: &mut TypeContext<'_>,
+    decisions: &HashMap<SemanticNodeId, MapStoreAction>,
     sites: &[super::super::ir::ParsedCallSite],
+    scope: &MapStoreScope,
     line: u32,
 ) -> Result<(), MapAdmissionError> {
     match expr {
         Expr::Call(_, _, args, _, _) => {
             for arg in args.iter_mut() {
-                walk_expr(arg, state, context, sites, line)?;
+                apply_expr(arg, decisions, sites, scope, line)?;
             }
-            classify_store(expr, state, context, sites, line)
+            apply_call(expr, decisions, sites, scope, line)?;
         }
-        Expr::ModuleCall(_, _, args, _) | Expr::LocalCall(_, _, args, _) => {
+        Expr::ModuleCall(_, _, args, _) | Expr::LocalCall(_, _, args, _) | Expr::ClosureCall(_, args) => {
             for arg in args {
-                walk_expr(arg, state, context, sites, line)?;
+                apply_expr(arg, decisions, sites, scope, line)?;
             }
-            Ok(())
         }
-        Expr::Closure(closure) => walk_closure(closure, state, context, sites, line),
-        Expr::ClosureCall(closure, args) => {
-            walk_closure(closure, state, context, sites, line)?;
-            for arg in args {
-                walk_expr(arg, state, context, sites, line)?;
-            }
-            Ok(())
-        }
+        Expr::Closure(closure) => apply_closure(closure, decisions, sites, scope, line)?,
         Expr::Add(lhs, rhs)
         | Expr::Sub(lhs, rhs)
         | Expr::Mul(lhs, rhs)
@@ -253,78 +223,48 @@ fn walk_expr(
         | Expr::Eq(lhs, rhs)
         | Expr::Lt(lhs, rhs)
         | Expr::Gt(lhs, rhs) => {
-            walk_expr(lhs, state, context, sites, line)?;
-            walk_expr(rhs, state, context, sites, line)
+            apply_expr(lhs, decisions, sites, scope, line)?;
+            apply_expr(rhs, decisions, sites, scope, line)?;
         }
-        Expr::Neg(inner)
-        | Expr::Not(inner)
-        | Expr::ToOwned(inner)
-        | Expr::Borrow(inner)
-        | Expr::BorrowMut(inner) => walk_expr(inner, state, context, sites, line),
+        Expr::Neg(inner) | Expr::Not(inner) | Expr::ToOwned(inner) | Expr::Borrow(inner) | Expr::BorrowMut(inner) => {
+            apply_expr(inner, decisions, sites, scope, line)?;
+        }
         Expr::IfElse {
             condition,
             then_expr,
             else_expr,
         } => {
-            walk_expr(condition, state, context, sites, line)?;
-            walk_expr(then_expr, state, context, sites, line)?;
-            walk_expr(else_expr, state, context, sites, line)
+            apply_expr(condition, decisions, sites, scope, line)?;
+            apply_expr(then_expr, decisions, sites, scope, line)?;
+            apply_expr(else_expr, decisions, sites, scope, line)?;
         }
         Expr::Match {
-            value,
-            arms,
-            default,
-            ..
+            value, arms, default, ..
         } => {
-            walk_expr(value, state, context, sites, line)?;
+            apply_expr(value, decisions, sites, scope, line)?;
             for (_, arm) in arms {
-                walk_expr(arm, state, context, sites, line)?;
+                apply_expr(arm, decisions, sites, scope, line)?;
             }
-            walk_expr(default, state, context, sites, line)
+            apply_expr(default, decisions, sites, scope, line)?;
         }
         Expr::Block { stmts, expr } => {
-            let mut nested = state.clone();
             for stmt in stmts {
-                walk_stmt(stmt, &mut nested, context, sites)?;
+                apply_stmt(stmt, decisions, sites, scope)?;
             }
-            walk_expr(expr, &mut nested, context, sites, line)
+            apply_expr(expr, decisions, sites, scope, line)?;
         }
         Expr::OptionalGet { container, key, .. } => {
-            walk_expr(container, state, context, sites, line)?;
-            walk_expr(key, state, context, sites, line)
+            apply_expr(container, decisions, sites, scope, line)?;
+            apply_expr(key, decisions, sites, scope, line)?;
         }
         Expr::OptionUnwrapOr { value, fallback, .. } => {
-            walk_expr(value, state, context, sites, line)?;
-            walk_expr(fallback, state, context, sites, line)
-        }
-        Expr::ResultConstruct { payload, .. } => walk_expr(payload, state, context, sites, line),
-        Expr::ResultMatch {
-            value,
-            ok_expr,
-            err_expr,
-            ..
-        } => {
-            walk_expr(value, state, context, sites, line)?;
-            walk_expr(ok_expr, state, context, sites, line)?;
-            walk_expr(err_expr, state, context, sites, line)
-        }
-        Expr::ResultQuery { value, .. }
-        | Expr::ResultTry { value, .. }
-        | Expr::ResultConvert { value, .. } => walk_expr(value, state, context, sites, line),
-        Expr::ResultMethod {
-            receiver, argument, ..
-        }
-        | Expr::OptionMethod {
-            receiver, argument, ..
-        } => {
-            walk_expr(receiver, state, context, sites, line)?;
-            walk_expr(argument, state, context, sites, line)
+            apply_expr(value, decisions, sites, scope, line)?;
+            apply_expr(fallback, decisions, sites, scope, line)?;
         }
         Expr::OptionConstruct { payload, .. } => {
             if let Some(payload) = payload {
-                walk_expr(payload, state, context, sites, line)?;
+                apply_expr(payload, decisions, sites, scope, line)?;
             }
-            Ok(())
         }
         Expr::OptionMatch {
             value,
@@ -332,9 +272,36 @@ fn walk_expr(
             none_expr,
             ..
         } => {
-            walk_expr(value, state, context, sites, line)?;
-            walk_expr(some_expr, state, context, sites, line)?;
-            walk_expr(none_expr, state, context, sites, line)
+            apply_expr(value, decisions, sites, scope, line)?;
+            apply_expr(some_expr, decisions, sites, scope, line)?;
+            apply_expr(none_expr, decisions, sites, scope, line)?;
+        }
+        Expr::OptionMethod {
+            receiver, argument, ..
+        }
+        | Expr::ResultMethod {
+            receiver, argument, ..
+        } => {
+            apply_expr(receiver, decisions, sites, scope, line)?;
+            apply_expr(argument, decisions, sites, scope, line)?;
+        }
+        Expr::ResultConstruct { payload, .. } => {
+            apply_expr(payload, decisions, sites, scope, line)?;
+        }
+        Expr::ResultMatch {
+            value,
+            ok_expr,
+            err_expr,
+            ..
+        } => {
+            apply_expr(value, decisions, sites, scope, line)?;
+            apply_expr(ok_expr, decisions, sites, scope, line)?;
+            apply_expr(err_expr, decisions, sites, scope, line)?;
+        }
+        Expr::ResultQuery { value, .. }
+        | Expr::ResultTry { value, .. }
+        | Expr::ResultConvert { value, .. } => {
+            apply_expr(value, decisions, sites, scope, line)?;
         }
         Expr::Null
         | Expr::Unit
@@ -349,82 +316,80 @@ fn walk_expr(
         | Expr::Var(_)
         | Expr::MoveVar(_)
         | Expr::MoveField { .. }
-        | Expr::MoveIndex { .. } => Ok(()),
+        | Expr::MoveIndex { .. } => {}
     }
+    Ok(())
 }
 
-fn classify_store(
+fn apply_call(
     expr: &mut Expr,
-    state: &LocalTypeState,
-    context: &mut TypeContext<'_>,
+    decisions: &HashMap<SemanticNodeId, MapStoreAction>,
     sites: &[super::super::ir::ParsedCallSite],
+    scope: &MapStoreScope,
     line: u32,
 ) -> Result<(), MapAdmissionError> {
     let Expr::Call(index, _, args, _, semantic_id) = expr else {
         return Ok(());
     };
-    if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::MapEdit)
-        && args.len() == 4
-        && matches!(args.get(3), Some(Expr::Bool(true)))
-    {
-        return classify_remove(args, *semantic_id, state, context, sites, line);
-    }
-    if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::Set) || args.len() != 3 {
+    let Some(id) = *semantic_id else {
+        return Ok(());
+    };
+    let Some(action) = decisions.get(&id).copied() else {
+        return Ok(());
+    };
+    if !scope_allows(scope, sites, id) {
         return Ok(());
     }
-    let receiver = context.infer_expr_schema(&args[0], state);
-    let value = context.infer_expr_schema(&args[2], state);
-    if !value_may_be_unit(value.as_ref()) {
-        return Ok(());
-    }
-    if receiver_is_map_backed(receiver.as_ref()) {
-        *index = BuiltinFunction::MapEdit.call_index();
-        args.push(Expr::Bool(false));
-        return Ok(());
-    }
-    if receiver_kind_unresolved(receiver.as_ref()) {
-        let span = semantic_id.and_then(|id| {
-            sites
-                .iter()
-                .find(|site| site.id == id)
-                .map(|site| site.expr_span)
-        });
-        return Err(MapAdmissionError::Compile(CompileError::InvalidFieldAccess {
-            line: Some(line),
-            source_name: None,
-            detail: "map store receiver schema is unresolved; a Unit or other possibly-null value cannot use set, which deletes null keys. Declare the receiver as map<T>, an object, or a named record".to_string(),
-            span,
-        }));
-    }
-    Ok(())
-}
-
-fn classify_remove(
-    args: &[Expr],
-    semantic_id: Option<super::super::ir::SemanticNodeId>,
-    state: &LocalTypeState,
-    context: &mut TypeContext<'_>,
-    sites: &[super::super::ir::ParsedCallSite],
-    line: u32,
-) -> Result<(), MapAdmissionError> {
-    let receiver = context.infer_expr_schema(&args[0], state);
-    if matches!(receiver, Some(TypeSchema::Map(_))) {
-        return Ok(());
-    }
-    let span = semantic_id.and_then(|id| {
-        sites
-            .iter()
-            .find(|site| site.id == id)
-            .map(|site| site.expr_span)
-    });
-    Err(MapAdmissionError::Parse(
-        ParseError {
+    let span = span_for(sites, id);
+    match action {
+        MapStoreAction::RewriteInsert => {
+            *index = BuiltinFunction::MapEdit.call_index();
+            args.push(Expr::Bool(false));
+            Ok(())
+        }
+        MapStoreAction::RejectCarrier => Err(MapAdmissionError::Compile(
+            CompileError::InvalidFieldAccess {
+                line: Some(line),
+                source_name: None,
+                detail: "cannot store into an Option or Result by index or field; use Option/Result methods, or store into a map<T>, object, or named record".to_string(),
+                span,
+            },
+        )),
+        MapStoreAction::RejectUnresolved => Err(MapAdmissionError::Compile(
+            CompileError::InvalidFieldAccess {
+                line: Some(line),
+                source_name: None,
+                detail: "map store receiver schema is unresolved; a Unit or other possibly-null value cannot use set, which deletes null keys. Declare the receiver as map<T>, an object, or a named record".to_string(),
+                span,
+            },
+        )),
+        MapStoreAction::RejectRemove => Err(MapAdmissionError::Parse(ParseError {
             line: usize::try_from(line).unwrap_or(1),
             message: "E_MAP_REMOVE_RECORD: cannot remove a field from a record, object, Option, or Result; removal requires an explicit map<T>".to_string(),
             span,
             code: Some("E_MAP_REMOVE_RECORD".to_string()),
-        },
-    ))
+        })),
+    }
+}
+
+fn scope_allows(
+    scope: &MapStoreScope,
+    sites: &[super::super::ir::ParsedCallSite],
+    id: SemanticNodeId,
+) -> bool {
+    match scope {
+        MapStoreScope::Legacy => false,
+        MapStoreScope::RustScript => true,
+        MapStoreScope::Sources(ids) => span_for(sites, id)
+            .is_some_and(|span| ids.contains(&span.source_id)),
+    }
+}
+
+fn span_for(sites: &[super::super::ir::ParsedCallSite], id: SemanticNodeId) -> Option<Span> {
+    sites
+        .iter()
+        .find(|site| site.id == id)
+        .map(|site| site.expr_span)
 }
 
 pub(crate) fn map_admission_source_error(error: MapAdmissionError) -> super::super::SourceError {
@@ -434,16 +399,17 @@ pub(crate) fn map_admission_source_error(error: MapAdmissionError) -> super::sup
     }
 }
 
-fn receiver_is_map_backed(schema: Option<&TypeSchema>) -> bool {
+fn is_logical_carrier(schema: Option<&TypeSchema>) -> bool {
     matches!(
         schema,
-        Some(
-            TypeSchema::Map(_)
-                | TypeSchema::Object(_)
-                | TypeSchema::Named(_, _)
-                | TypeSchema::Option(_)
-                | TypeSchema::Result { .. }
-        )
+        Some(TypeSchema::Option(_) | TypeSchema::Result { .. })
+    )
+}
+
+fn is_map_object_or_named(schema: Option<&TypeSchema>) -> bool {
+    matches!(
+        schema,
+        Some(TypeSchema::Map(_) | TypeSchema::Object(_) | TypeSchema::Named(_, _))
     )
 }
 
