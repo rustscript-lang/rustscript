@@ -1773,6 +1773,10 @@ fn format_logical_value(value: &Value, schema: &crate::TypeSchema) -> String {
             Ok((true, Some(payload))) => {
                 format!("Some({})", format_logical_value(payload, inner))
             }
+            // A canonical host writer may omit the Null-valued Unit payload.
+            Ok((true, None)) if matches!(inner.as_ref(), crate::TypeSchema::Unit) => {
+                "Some(())".to_string()
+            }
             _ => format_value(value),
         },
         crate::TypeSchema::Unit if matches!(value, Value::Null) => "()".to_string(),
@@ -1933,6 +1937,27 @@ mod tests {
             &crate::TypeSchema::Option(Box::new(crate::TypeSchema::Int)),
         );
         assert_eq!(rendered, "None");
+    }
+
+    #[test]
+    fn logical_display_restores_canonical_tag_only_some_unit() {
+        let tag_only = crate::Value::map(vec![(
+            crate::Value::string("tag"),
+            crate::Value::Bool(true),
+        )]);
+        let rendered = super::format_logical_value(
+            &tag_only,
+            &crate::TypeSchema::Option(Box::new(crate::TypeSchema::Unit)),
+        );
+        assert_eq!(rendered, "Some(())");
+        let non_unit = super::format_logical_value(
+            &tag_only,
+            &crate::TypeSchema::Option(Box::new(crate::TypeSchema::Int)),
+        );
+        assert!(
+            !non_unit.contains("Some("),
+            "tag-only Some must not satisfy a non-Unit schema: {non_unit}"
+        );
     }
 
     #[test]
