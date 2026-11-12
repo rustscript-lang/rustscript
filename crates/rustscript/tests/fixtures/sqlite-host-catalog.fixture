@@ -12,92 +12,92 @@
         {
           "name": "path",
           "ty": {
-            "Optional": "String"
+            "Option": "String"
           }
         },
         {
           "name": "mode",
           "ty": {
-            "Optional": "String"
+            "Option": "String"
           }
         },
         {
           "name": "root",
           "ty": {
-            "Optional": "String"
+            "Option": "String"
           }
         },
         {
           "name": "limits",
           "ty": {
-            "Optional": {
+            "Option": {
               "Named": {
                 "name": "SqliteLimits",
                 "fields": [
                   {
                     "name": "max_connections",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_statements",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_rows",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_columns",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_result_bytes",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_statement_bytes",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_parameters",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_parameter_bytes",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_pending_operations",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_transaction_ms",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "busy_timeout_ms",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   }
                 ]
@@ -114,67 +114,67 @@
         {
           "name": "max_connections",
           "ty": {
-            "Optional": "Int"
+            "Option": "Int"
           }
         },
         {
           "name": "max_statements",
           "ty": {
-            "Optional": "Int"
+            "Option": "Int"
           }
         },
         {
           "name": "max_rows",
           "ty": {
-            "Optional": "Int"
+            "Option": "Int"
           }
         },
         {
           "name": "max_columns",
           "ty": {
-            "Optional": "Int"
+            "Option": "Int"
           }
         },
         {
           "name": "max_result_bytes",
           "ty": {
-            "Optional": "Int"
+            "Option": "Int"
           }
         },
         {
           "name": "max_statement_bytes",
           "ty": {
-            "Optional": "Int"
+            "Option": "Int"
           }
         },
         {
           "name": "max_parameters",
           "ty": {
-            "Optional": "Int"
+            "Option": "Int"
           }
         },
         {
           "name": "max_parameter_bytes",
           "ty": {
-            "Optional": "Int"
+            "Option": "Int"
           }
         },
         {
           "name": "max_pending_operations",
           "ty": {
-            "Optional": "Int"
+            "Option": "Int"
           }
         },
         {
           "name": "max_transaction_ms",
           "ty": {
-            "Optional": "Int"
+            "Option": "Int"
           }
         },
         {
           "name": "busy_timeout_ms",
           "ty": {
-            "Optional": "Int"
+            "Option": "Int"
           }
         }
       ],
@@ -190,25 +190,25 @@
         {
           "name": "int_value",
           "ty": {
-            "Optional": "Int"
+            "Option": "Int"
           }
         },
         {
           "name": "float_value",
           "ty": {
-            "Optional": "Float"
+            "Option": "Float"
           }
         },
         {
           "name": "text_value",
           "ty": {
-            "Optional": "String"
+            "Option": "String"
           }
         },
         {
           "name": "blob_value",
           "ty": {
-            "Optional": "Bytes"
+            "Option": "Bytes"
           }
         }
       ],
@@ -258,25 +258,25 @@
                             {
                               "name": "int_value",
                               "ty": {
-                                "Optional": "Int"
+                                "Option": "Int"
                               }
                             },
                             {
                               "name": "float_value",
                               "ty": {
-                                "Optional": "Float"
+                                "Option": "Float"
                               }
                             },
                             {
                               "name": "text_value",
                               "ty": {
-                                "Optional": "String"
+                                "Option": "String"
                               }
                             },
                             {
                               "name": "blob_value",
                               "ty": {
-                                "Optional": "Bytes"
+                                "Option": "Bytes"
                               }
                             }
                           ]
@@ -296,7 +296,7 @@
         {
           "name": "next_cursor",
           "ty": {
-            "Optional": "Int"
+            "Option": "Int"
           }
         }
       ],
@@ -319,25 +319,25 @@
                   {
                     "name": "int_value",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "float_value",
                     "ty": {
-                      "Optional": "Float"
+                      "Option": "Float"
                     }
                   },
                   {
                     "name": "text_value",
                     "ty": {
-                      "Optional": "String"
+                      "Option": "String"
                     }
                   },
                   {
                     "name": "blob_value",
                     "ty": {
-                      "Optional": "Bytes"
+                      "Option": "Bytes"
                     }
                   }
                 ]
@@ -358,7 +358,7 @@
         {
           "name": "params",
           "ty": {
-            "Optional": {
+            "Option": {
               "Array": {
                 "Named": {
                   "name": "SqliteValue",
@@ -370,25 +370,25 @@
                     {
                       "name": "int_value",
                       "ty": {
-                        "Optional": "Int"
+                        "Option": "Int"
                       }
                     },
                     {
                       "name": "float_value",
                       "ty": {
-                        "Optional": "Float"
+                        "Option": "Float"
                       }
                     },
                     {
                       "name": "text_value",
                       "ty": {
-                        "Optional": "String"
+                        "Option": "String"
                       }
                     },
                     {
                       "name": "blob_value",
                       "ty": {
-                        "Optional": "Bytes"
+                        "Option": "Bytes"
                       }
                     }
                   ]
@@ -400,80 +400,80 @@
         {
           "name": "query",
           "ty": {
-            "Optional": "Bool"
+            "Option": "Bool"
           }
         },
         {
           "name": "limits",
           "ty": {
-            "Optional": {
+            "Option": {
               "Named": {
                 "name": "SqliteLimits",
                 "fields": [
                   {
                     "name": "max_connections",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_statements",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_rows",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_columns",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_result_bytes",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_statement_bytes",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_parameters",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_parameter_bytes",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_pending_operations",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "max_transaction_ms",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "busy_timeout_ms",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   }
                 ]
@@ -494,7 +494,7 @@
         {
           "name": "execute",
           "ty": {
-            "Optional": {
+            "Option": {
               "Named": {
                 "name": "SqliteExecuteResult",
                 "fields": [
@@ -514,7 +514,7 @@
         {
           "name": "query",
           "ty": {
-            "Optional": {
+            "Option": {
               "Named": {
                 "name": "SqliteQueryResult",
                 "fields": [
@@ -545,25 +545,25 @@
                                       {
                                         "name": "int_value",
                                         "ty": {
-                                          "Optional": "Int"
+                                          "Option": "Int"
                                         }
                                       },
                                       {
                                         "name": "float_value",
                                         "ty": {
-                                          "Optional": "Float"
+                                          "Option": "Float"
                                         }
                                       },
                                       {
                                         "name": "text_value",
                                         "ty": {
-                                          "Optional": "String"
+                                          "Option": "String"
                                         }
                                       },
                                       {
                                         "name": "blob_value",
                                         "ty": {
-                                          "Optional": "Bytes"
+                                          "Option": "Bytes"
                                         }
                                       }
                                     ]
@@ -583,7 +583,7 @@
                   {
                     "name": "next_cursor",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   }
                 ]
@@ -608,92 +608,92 @@
                 {
                   "name": "path",
                   "ty": {
-                    "Optional": "String"
+                    "Option": "String"
                   }
                 },
                 {
                   "name": "mode",
                   "ty": {
-                    "Optional": "String"
+                    "Option": "String"
                   }
                 },
                 {
                   "name": "root",
                   "ty": {
-                    "Optional": "String"
+                    "Option": "String"
                   }
                 },
                 {
                   "name": "limits",
                   "ty": {
-                    "Optional": {
+                    "Option": {
                       "Named": {
                         "name": "SqliteLimits",
                         "fields": [
                           {
                             "name": "max_connections",
                             "ty": {
-                              "Optional": "Int"
+                              "Option": "Int"
                             }
                           },
                           {
                             "name": "max_statements",
                             "ty": {
-                              "Optional": "Int"
+                              "Option": "Int"
                             }
                           },
                           {
                             "name": "max_rows",
                             "ty": {
-                              "Optional": "Int"
+                              "Option": "Int"
                             }
                           },
                           {
                             "name": "max_columns",
                             "ty": {
-                              "Optional": "Int"
+                              "Option": "Int"
                             }
                           },
                           {
                             "name": "max_result_bytes",
                             "ty": {
-                              "Optional": "Int"
+                              "Option": "Int"
                             }
                           },
                           {
                             "name": "max_statement_bytes",
                             "ty": {
-                              "Optional": "Int"
+                              "Option": "Int"
                             }
                           },
                           {
                             "name": "max_parameters",
                             "ty": {
-                              "Optional": "Int"
+                              "Option": "Int"
                             }
                           },
                           {
                             "name": "max_parameter_bytes",
                             "ty": {
-                              "Optional": "Int"
+                              "Option": "Int"
                             }
                           },
                           {
                             "name": "max_pending_operations",
                             "ty": {
-                              "Optional": "Int"
+                              "Option": "Int"
                             }
                           },
                           {
                             "name": "max_transaction_ms",
                             "ty": {
-                              "Optional": "Int"
+                              "Option": "Int"
                             }
                           },
                           {
                             "name": "busy_timeout_ms",
                             "ty": {
-                              "Optional": "Int"
+                              "Option": "Int"
                             }
                           }
                         ]
@@ -741,25 +741,25 @@
                   {
                     "name": "int_value",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "float_value",
                     "ty": {
-                      "Optional": "Float"
+                      "Option": "Float"
                     }
                   },
                   {
                     "name": "text_value",
                     "ty": {
-                      "Optional": "String"
+                      "Option": "String"
                     }
                   },
                   {
                     "name": "blob_value",
                     "ty": {
-                      "Optional": "Bytes"
+                      "Option": "Bytes"
                     }
                   }
                 ]
@@ -815,25 +815,25 @@
                   {
                     "name": "int_value",
                     "ty": {
-                      "Optional": "Int"
+                      "Option": "Int"
                     }
                   },
                   {
                     "name": "float_value",
                     "ty": {
-                      "Optional": "Float"
+                      "Option": "Float"
                     }
                   },
                   {
                     "name": "text_value",
                     "ty": {
-                      "Optional": "String"
+                      "Option": "String"
                     }
                   },
                   {
                     "name": "blob_value",
                     "ty": {
-                      "Optional": "Bytes"
+                      "Option": "Bytes"
                     }
                   }
                 ]
@@ -851,67 +851,67 @@
                 {
                   "name": "max_connections",
                   "ty": {
-                    "Optional": "Int"
+                    "Option": "Int"
                   }
                 },
                 {
                   "name": "max_statements",
                   "ty": {
-                    "Optional": "Int"
+                    "Option": "Int"
                   }
                 },
                 {
                   "name": "max_rows",
                   "ty": {
-                    "Optional": "Int"
+                    "Option": "Int"
                   }
                 },
                 {
                   "name": "max_columns",
                   "ty": {
-                    "Optional": "Int"
+                    "Option": "Int"
                   }
                 },
                 {
                   "name": "max_result_bytes",
                   "ty": {
-                    "Optional": "Int"
+                    "Option": "Int"
                   }
                 },
                 {
                   "name": "max_statement_bytes",
                   "ty": {
-                    "Optional": "Int"
+                    "Option": "Int"
                   }
                 },
                 {
                   "name": "max_parameters",
                   "ty": {
-                    "Optional": "Int"
+                    "Option": "Int"
                   }
                 },
                 {
                   "name": "max_parameter_bytes",
                   "ty": {
-                    "Optional": "Int"
+                    "Option": "Int"
                   }
                 },
                 {
                   "name": "max_pending_operations",
                   "ty": {
-                    "Optional": "Int"
+                    "Option": "Int"
                   }
                 },
                 {
                   "name": "max_transaction_ms",
                   "ty": {
-                    "Optional": "Int"
+                    "Option": "Int"
                   }
                 },
                 {
                   "name": "busy_timeout_ms",
                   "ty": {
-                    "Optional": "Int"
+                    "Option": "Int"
                   }
                 }
               ]
@@ -951,25 +951,25 @@
                                 {
                                   "name": "int_value",
                                   "ty": {
-                                    "Optional": "Int"
+                                    "Option": "Int"
                                   }
                                 },
                                 {
                                   "name": "float_value",
                                   "ty": {
-                                    "Optional": "Float"
+                                    "Option": "Float"
                                   }
                                 },
                                 {
                                   "name": "text_value",
                                   "ty": {
-                                    "Optional": "String"
+                                    "Option": "String"
                                   }
                                 },
                                 {
                                   "name": "blob_value",
                                   "ty": {
-                                    "Optional": "Bytes"
+                                    "Option": "Bytes"
                                   }
                                 }
                               ]
@@ -989,7 +989,7 @@
             {
               "name": "next_cursor",
               "ty": {
-                "Optional": "Int"
+                "Option": "Int"
               }
             }
           ]
@@ -1021,7 +1021,7 @@
                   {
                     "name": "params",
                     "ty": {
-                      "Optional": {
+                      "Option": {
                         "Array": {
                           "Named": {
                             "name": "SqliteValue",
@@ -1033,25 +1033,25 @@
                               {
                                 "name": "int_value",
                                 "ty": {
-                                  "Optional": "Int"
+                                  "Option": "Int"
                                 }
                               },
                               {
                                 "name": "float_value",
                                 "ty": {
-                                  "Optional": "Float"
+                                  "Option": "Float"
                                 }
                               },
                               {
                                 "name": "text_value",
                                 "ty": {
-                                  "Optional": "String"
+                                  "Option": "String"
                                 }
                               },
                               {
                                 "name": "blob_value",
                                 "ty": {
-                                  "Optional": "Bytes"
+                                  "Option": "Bytes"
                                 }
                               }
                             ]
@@ -1063,80 +1063,80 @@
                   {
                     "name": "query",
                     "ty": {
-                      "Optional": "Bool"
+                      "Option": "Bool"
                     }
                   },
                   {
                     "name": "limits",
                     "ty": {
-                      "Optional": {
+                      "Option": {
                         "Named": {
                           "name": "SqliteLimits",
                           "fields": [
                             {
                               "name": "max_connections",
                               "ty": {
-                                "Optional": "Int"
+                                "Option": "Int"
                               }
                             },
                             {
                               "name": "max_statements",
                               "ty": {
-                                "Optional": "Int"
+                                "Option": "Int"
                               }
                             },
                             {
                               "name": "max_rows",
                               "ty": {
-                                "Optional": "Int"
+                                "Option": "Int"
                               }
                             },
                             {
                               "name": "max_columns",
                               "ty": {
-                                "Optional": "Int"
+                                "Option": "Int"
                               }
                             },
                             {
                               "name": "max_result_bytes",
                               "ty": {
-                                "Optional": "Int"
+                                "Option": "Int"
                               }
                             },
                             {
                               "name": "max_statement_bytes",
                               "ty": {
-                                "Optional": "Int"
+                                "Option": "Int"
                               }
                             },
                             {
                               "name": "max_parameters",
                               "ty": {
-                                "Optional": "Int"
+                                "Option": "Int"
                               }
                             },
                             {
                               "name": "max_parameter_bytes",
                               "ty": {
-                                "Optional": "Int"
+                                "Option": "Int"
                               }
                             },
                             {
                               "name": "max_pending_operations",
                               "ty": {
-                                "Optional": "Int"
+                                "Option": "Int"
                               }
                             },
                             {
                               "name": "max_transaction_ms",
                               "ty": {
-                                "Optional": "Int"
+                                "Option": "Int"
                               }
                             },
                             {
                               "name": "busy_timeout_ms",
                               "ty": {
-                                "Optional": "Int"
+                                "Option": "Int"
                               }
                             }
                           ]
@@ -1163,7 +1163,7 @@
               {
                 "name": "execute",
                 "ty": {
-                  "Optional": {
+                  "Option": {
                     "Named": {
                       "name": "SqliteExecuteResult",
                       "fields": [
@@ -1183,7 +1183,7 @@
               {
                 "name": "query",
                 "ty": {
-                  "Optional": {
+                  "Option": {
                     "Named": {
                       "name": "SqliteQueryResult",
                       "fields": [
@@ -1214,25 +1214,25 @@
                                             {
                                               "name": "int_value",
                                               "ty": {
-                                                "Optional": "Int"
+                                                "Option": "Int"
                                               }
                                             },
                                             {
                                               "name": "float_value",
                                               "ty": {
-                                                "Optional": "Float"
+                                                "Option": "Float"
                                               }
                                             },
                                             {
                                               "name": "text_value",
                                               "ty": {
-                                                "Optional": "String"
+                                                "Option": "String"
                                               }
                                             },
                                             {
                                               "name": "blob_value",
                                               "ty": {
-                                                "Optional": "Bytes"
+                                                "Option": "Bytes"
                                               }
                                             }
                                           ]
@@ -1252,7 +1252,7 @@
                         {
                           "name": "next_cursor",
                           "ty": {
-                            "Optional": "Int"
+                            "Option": "Int"
                           }
                         }
                       ]
@@ -1277,7 +1277,7 @@
           "passing": "TakeOwned"
         }
       ],
-      "return_type": "Null",
+      "return_type": "Unit",
       "description": ""
     }
   ]
