@@ -217,6 +217,10 @@ pub(super) struct Parser {
 struct ClosureCaptureContext {
     by_name: HashMap<String, LocalSlot>,
     capture_copies: Vec<(LocalSlot, LocalSlot)>,
+    /// Index of this frame's scope in `closure_scopes`. Scopes at or after
+    /// this index are the same function or closure frame. A match-arm binding
+    /// scope is one of those scopes, not a capture boundary.
+    scope_base: usize,
 }
 
 pub(super) fn legacy_null_error(parser: &Parser, message: &str) -> ParseError {

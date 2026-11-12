@@ -136,13 +136,31 @@ impl Parser {
             return Ok(index);
         }
 
+        // Match-arm binding scopes sit inside the enclosing function or
+        // closure frame. Names bound in that same frame, including its
+        // parameters and lets, are direct locals. Only a name bound outside
+        // this capture context is copied into the current frame.
+        let same_frame_base = self
+            .closure_capture_contexts
+            .last()
+            .map(|context| context.scope_base)
+            .unwrap_or(0);
         if self.closure_scopes.len() > 1 {
-            for scope in self.closure_scopes[..self.closure_scopes.len() - 1]
+            let outer_end = self.closure_scopes.len() - 1;
+            let same_frame_start = same_frame_base.min(outer_end);
+            for scope in self.closure_scopes[same_frame_start..outer_end]
                 .iter()
                 .rev()
             {
-                if let Some(&source_index) = scope.get(name) {
-                    return self.capture_or_direct_local(name, source_index);
+                if let Some(&index) = scope.get(name) {
+                    return Ok(index);
+                }
+            }
+            if same_frame_base > 0 {
+                for scope in self.closure_scopes[..same_frame_base].iter().rev() {
+                    if let Some(&source_index) = scope.get(name) {
+                        return self.capture_or_direct_local(name, source_index);
+                    }
                 }
             }
         }

@@ -3607,6 +3607,7 @@ impl Parser {
         self.closure_capture_contexts.push(ClosureCaptureContext {
             by_name: HashMap::new(),
             capture_copies: Vec::new(),
+            scope_base: self.closure_scopes.len() - 1,
         });
         let body_open = self.current_span();
         let body_result = self.with_scope(body_open, |parser| {
