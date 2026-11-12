@@ -103,6 +103,7 @@ fn schema_mentions_generic_param(schema: &TypeSchema, name: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MapStoreAction {
     RewriteInsert,
+    NormalizeSet,
     RejectCarrier,
     RejectUnresolved,
     RejectRemove,

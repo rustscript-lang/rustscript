@@ -158,3 +158,35 @@ fn invalid_jump_and_local_are_reported() {
         Err(VmError::InvalidLocal(9))
     );
 }
+
+#[test]
+fn std_encoded_json_programs_fail_nostd_at_intended_ids() {
+    let cases = [
+        (
+            "use json; let n: int = json::decode::<int>(\"7\"); n;",
+            vm::BuiltinFunction::JsonDecodeTyped.call_index(),
+        ),
+        (
+            "use json; json::encode::<int>(7);",
+            vm::BuiltinFunction::JsonEncodeTyped.call_index(),
+        ),
+        (
+            "use json; struct Payload { value: Option<()> } let payload: Payload = {value: Option::Some(())}; json::encode(payload);",
+            vm::BuiltinFunction::JsonEncodeTyped.call_index(),
+        ),
+    ];
+    for (source, index) in cases {
+        let compiled = vm::compile_source(source).expect("std json source should compile");
+        let bytes = vm::encode_program(&compiled.program.with_local_count(compiled.locals))
+            .expect("std encoder should emit v14");
+        let program = decode_program(&bytes).expect("nostd decoder should accept std json wire");
+        let mut vm = EmbeddedVm::new(program);
+        let error = vm
+            .run()
+            .expect_err("nostd must refuse the typed json builtin");
+        assert!(
+            matches!(error, VmError::InvalidCall(got) if got == index),
+            "expected InvalidCall({index:#x}) for {source}, got {error:?}"
+        );
+    }
+}
