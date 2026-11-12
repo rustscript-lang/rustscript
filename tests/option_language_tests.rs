@@ -329,8 +329,11 @@ fn explicit_null_does_not_become_logical_unit_or_option() {
         unit_int.contains("()") || unit_int.contains("int"),
         "unit as int error was {unit_int}"
     );
-    compile_source("let value: int? = null; value;")
-        .expect("legacy nullable values remain their own contract");
+    let legacy = reject("let value: int? = null; value;");
+    assert!(
+        legacy.contains("RSS rejects T?") && legacy.contains("Option<T>"),
+        "legacy nullable annotation must give an actionable migration diagnostic, got {legacy}"
+    );
 }
 
 #[test]

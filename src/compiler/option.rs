@@ -319,8 +319,20 @@ fn resolve_expr(
             else_expr,
         } => {
             resolve_expr(condition, Some(&TypeSchema::Bool), env)?;
-            resolve_expr(then_expr, expected, env)?;
-            resolve_expr(else_expr, expected, env)
+            let hint = agree_option_schemas([
+                branch_option_hint(then_expr, env),
+                branch_option_hint(else_expr, env),
+            ]);
+            resolve_expr(
+                then_expr,
+                branch_expected(then_expr, expected, hint.as_ref()),
+                env,
+            )?;
+            resolve_expr(
+                else_expr,
+                branch_expected(else_expr, expected, hint.as_ref()),
+                env,
+            )
         }
         Expr::Match {
             value,
@@ -329,10 +341,19 @@ fn resolve_expr(
             ..
         } => {
             resolve_expr(value, None, env)?;
-            for (_, arm) in arms {
-                resolve_expr(arm, expected, env)?;
+            let hint = agree_option_schemas(
+                arms.iter()
+                    .map(|(_, arm)| branch_option_hint(arm, env))
+                    .chain(std::iter::once(branch_option_hint(default, env))),
+            );
+            for (_, arm) in arms.iter_mut() {
+                resolve_expr(arm, branch_expected(arm, expected, hint.as_ref()), env)?;
             }
-            resolve_expr(default, expected, env)
+            resolve_expr(
+                default,
+                branch_expected(default, expected, hint.as_ref()),
+                env,
+            )
         }
         Expr::OptionalGet {
             logical_projection,
@@ -767,6 +788,99 @@ fn resolve_closure(
     env.slots = saved;
     env.lexical_return = saved_return;
     resolved
+}
+
+fn concrete_option_schema(schema: &TypeSchema) -> Option<TypeSchema> {
+    match schema {
+        TypeSchema::Option(inner)
+            if !matches!(
+                inner.as_ref(),
+                TypeSchema::Unknown | TypeSchema::GenericParam(_)
+            ) && !schema_contains_unknown(inner) =>
+        {
+            Some(schema.clone())
+        }
+        _ => None,
+    }
+}
+
+fn branch_option_hint(expr: &Expr, env: &Env) -> Option<TypeSchema> {
+    if is_bare_option_none(expr) {
+        return None;
+    }
+    match expr {
+        Expr::Block { expr, .. } => branch_option_hint(expr, env),
+        Expr::IfElse {
+            then_expr,
+            else_expr,
+            ..
+        } => agree_option_schemas([
+            branch_option_hint(then_expr, env),
+            branch_option_hint(else_expr, env),
+        ]),
+        Expr::OptionConstruct {
+            some: true,
+            option_schema,
+            payload,
+            ..
+        } => concrete_option_schema(option_schema).or_else(|| {
+            payload.as_deref().and_then(|payload| {
+                infer_schema(payload, env)
+                    .filter(|schema| {
+                        !schema_contains_unknown(schema)
+                            && !matches!(schema, TypeSchema::GenericParam(_))
+                    })
+                    .map(|inner| TypeSchema::Option(Box::new(inner)))
+            })
+        }),
+        other => {
+            authoritative_schema(other, env).and_then(|schema| concrete_option_schema(&schema))
+        }
+    }
+}
+
+fn is_bare_option_none(expr: &Expr) -> bool {
+    match expr {
+        Expr::OptionConstruct {
+            some: false,
+            option_schema,
+            ..
+        } => !matches!(option_schema, TypeSchema::Option(_)),
+        Expr::Block { expr, .. } => is_bare_option_none(expr),
+        Expr::IfElse {
+            then_expr,
+            else_expr,
+            ..
+        } => is_bare_option_none(then_expr) && is_bare_option_none(else_expr),
+        Expr::Match { arms, default, .. } => {
+            arms.iter().all(|(_, arm)| is_bare_option_none(arm)) && is_bare_option_none(default)
+        }
+        _ => false,
+    }
+}
+
+fn agree_option_schemas(hints: impl IntoIterator<Item = Option<TypeSchema>>) -> Option<TypeSchema> {
+    let mut agreed = None;
+    for hint in hints.into_iter().flatten() {
+        match &agreed {
+            None => agreed = Some(hint),
+            Some(current) if current == &hint => {}
+            Some(_) => return None,
+        }
+    }
+    agreed
+}
+
+fn branch_expected<'a>(
+    branch: &Expr,
+    expected: Option<&'a TypeSchema>,
+    hint: Option<&'a TypeSchema>,
+) -> Option<&'a TypeSchema> {
+    if expected.is_some() || !is_bare_option_none(branch) {
+        expected
+    } else {
+        hint
+    }
 }
 
 fn infer_schema(expr: &Expr, env: &Env) -> Option<TypeSchema> {

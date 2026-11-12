@@ -4,7 +4,7 @@ use vm::{ReplLocalBinding, ReplLocalState, compile_source_for_repl_with_state};
 #[test]
 fn root_result_join_optional_float_uses_expression_schema() {
     let compiled = vm::compile_source_for_repl_with_state_and_options(
-        "let maybe: float? = 2.5; let y = if true => { maybe } else => { null };",
+        "let maybe: Option<float> = Option::Some(2.5); let y = if true => { maybe } else => { Option::None };",
         &[],
         vm::CompileSourceFileOptions::default(),
     )
@@ -16,14 +16,20 @@ fn root_result_join_optional_float_uses_expression_schema() {
         let mut machine = vm::Vm::new(compiled.compiled.program.clone());
         assert_eq!(machine.run().unwrap(), vm::VmStatus::Halted);
         let slot = machine.debug_info().unwrap().local_index("y").unwrap();
-        assert_eq!(machine.locals()[slot as usize], vm::Value::Float(2.5));
+        assert_eq!(
+            machine.locals()[slot as usize],
+            vm::option::some_carrier(vm::Value::Float(2.5))
+        );
         println!(
             "root result join: runtime y={:?}",
             machine.locals()[slot as usize]
         );
     }
-    assert_eq!(binding.schema, Some(TypeSchema::Float));
-    assert!(binding.optional);
+    assert_eq!(
+        binding.schema,
+        Some(TypeSchema::Option(Box::new(TypeSchema::Float)))
+    );
+    assert!(!binding.optional);
     let states = compiled
         .bindings
         .into_iter()
@@ -43,18 +49,21 @@ fn root_result_join_optional_float_uses_expression_schema() {
         .iter()
         .find(|b| b.name == "following")
         .unwrap();
-    assert_eq!(following.schema, Some(TypeSchema::Float));
-    assert!(following.optional);
+    assert_eq!(
+        following.schema,
+        Some(TypeSchema::Option(Box::new(TypeSchema::Float)))
+    );
+    assert!(!following.optional);
     #[cfg(feature = "runtime")]
     assert_eq!(
         execute_persistent_snippets(
             &[
-                "let maybe: float? = 2.5; let y = if true => { maybe } else => { null };",
+                "let maybe: Option<float> = Option::Some(2.5); let y = if true => { maybe } else => { Option::None };",
                 "let following = y; following;",
             ],
             vm::CompileSourceFileOptions::default(),
         ),
-        vec![vm::Value::Float(2.5)]
+        vec![vm::option::some_carrier(vm::Value::Float(2.5))]
     );
 }
 
@@ -64,7 +73,7 @@ fn root_result_join_optional_named_retains_checked_host_identity() {
         "ResultJoinRoot",
         vec![vm::HostStructField::new("value", vm::HostTypeSchema::Int)],
     );
-    let optional_named = vm::HostTypeSchema::Optional(Box::new(named.as_type()));
+    let optional_named = vm::HostTypeSchema::Option(Box::new(named.as_type()));
     let mut builder = vm::HostApiBuilder::new();
     builder.named_struct(named.clone());
     builder.function(vm::HostFunctionSchema::with_return(
@@ -78,9 +87,12 @@ fn root_result_join_optional_named_retains_checked_host_identity() {
     #[cfg(feature = "runtime")]
     let registry = {
         fn origin(_: &mut vm::Vm, _: &[vm::Value]) -> vm::VmResult<vm::CallOutcome> {
-            Ok(vm::CallOutcome::Return(vm::return_one(vm::Value::map(
-                vec![(vm::Value::string("value"), vm::Value::Int(42))],
-            ))))
+            Ok(vm::CallOutcome::Return(vm::return_one(
+                vm::option::some_carrier(vm::Value::map(vec![(
+                    vm::Value::string("value"),
+                    vm::Value::Int(42),
+                )])),
+            )))
         }
         let mut registry = vm::HostFunctionRegistry::new();
         registry
@@ -92,17 +104,17 @@ fn root_result_join_optional_named_retains_checked_host_identity() {
         registry
     };
     for (expression, flag, expected) in [
-        ("if flag => { maybe } else => { null }", true, 42),
-        ("if flag => { null } else => { maybe }", false, 42),
-        ("if flag => { maybe } else => { null }", false, 0),
-        ("if flag => { null } else => { maybe }", true, 0),
-        ("match choice { 1 => maybe, _ => null }", true, 42),
-        ("match choice { 1 => null, _ => maybe }", false, 42),
-        ("match choice { 1 => maybe, _ => null }", false, 0),
-        ("match choice { 1 => null, _ => maybe }", true, 0),
+        ("if flag => { maybe } else => { Option::None }", true, 42),
+        ("if flag => { Option::None } else => { maybe }", false, 42),
+        ("if flag => { maybe } else => { Option::None }", false, 0),
+        ("if flag => { Option::None } else => { maybe }", true, 0),
+        ("match choice { 1 => maybe, _ => Option::None }", true, 42),
+        ("match choice { 1 => Option::None, _ => maybe }", false, 42),
+        ("match choice { 1 => maybe, _ => Option::None }", false, 0),
+        ("match choice { 1 => Option::None, _ => maybe }", true, 0),
     ] {
         let source = format!(
-            "let flag = {flag}; let choice = if flag => {{ 1 }} else => {{ 2 }}; let maybe: ResultJoinRoot? = resultjoin::origin(); let y = {expression};"
+            "let flag = {flag}; let choice = if flag => {{ 1 }} else => {{ 2 }}; let maybe: Option<ResultJoinRoot> = resultjoin::origin(); let y = {expression};"
         );
         let first =
             vm::compile_source_for_repl_with_state_and_options(&source, &[], options.clone())
@@ -111,9 +123,12 @@ fn root_result_join_optional_named_retains_checked_host_identity() {
         println!("root result join: {expression}, y={y:?}");
         assert_eq!(
             y.schema,
-            Some(TypeSchema::Named("ResultJoinRoot".into(), vec![]))
+            Some(TypeSchema::Option(Box::new(TypeSchema::Named(
+                "ResultJoinRoot".into(),
+                vec![],
+            ))))
         );
-        assert!(y.optional);
+        assert!(!y.optional);
         let states = first
             .bindings
             .iter()
@@ -124,7 +139,7 @@ fn root_result_join_optional_named_retains_checked_host_identity() {
             })
             .collect::<Vec<_>>();
         let second = vm::compile_source_for_repl_with_state_and_options(
-            "let following = y; following == null;",
+            "let following = y; match following { Option::None => true, Option::Some(_) => false };",
             &states,
             options.clone(),
         )
@@ -135,7 +150,7 @@ fn root_result_join_optional_named_retains_checked_host_identity() {
             .find(|b| b.name == "following")
             .unwrap();
         assert_eq!(following.schema, y.schema);
-        assert!(following.optional);
+        assert!(!following.optional);
         #[cfg(feature = "runtime")]
         {
             let mut machine = vm::Vm::new(first.compiled.program);
@@ -159,9 +174,15 @@ fn root_result_join_optional_named_retains_checked_host_identity() {
             }
             let y_slot = machine.debug_info().unwrap().local_index("y").unwrap();
             if expected == 0 {
-                assert_eq!(machine.locals()[y_slot as usize], vm::Value::Null);
+                assert_eq!(
+                    machine.locals()[y_slot as usize],
+                    vm::option::none_carrier()
+                );
             } else {
-                let vm::Value::Map(fields) = &machine.locals()[y_slot as usize] else {
+                let (some, payload) = vm::option::payload(&machine.locals()[y_slot as usize])
+                    .expect("named option carrier");
+                assert!(some);
+                let vm::Value::Map(fields) = payload.expect("some payload") else {
                     panic!("host result carrier")
                 };
                 assert_eq!(
@@ -180,10 +201,10 @@ fn root_result_join_optional_named_retains_checked_host_identity() {
 #[test]
 fn root_result_join_match_uses_existing_expression_alternatives() {
     for expression in [
-        "match 1 { 1 => maybe, _ => null }",
-        "match 2 { 1 => null, _ => maybe }",
+        "match 1 { 1 => maybe, _ => Option::None }",
+        "match 2 { 1 => Option::None, _ => maybe }",
     ] {
-        let source = format!("let maybe: float? = 2.5; let y = {expression};");
+        let source = format!("let maybe: Option<float> = Option::Some(2.5); let y = {expression};");
         let compiled = vm::compile_source_for_repl_with_state_and_options(
             &source,
             &[],
@@ -192,15 +213,18 @@ fn root_result_join_match_uses_existing_expression_alternatives() {
         .unwrap();
         let y = compiled.bindings.iter().find(|b| b.name == "y").unwrap();
         println!("root result join: {expression}, y={y:?}");
-        assert_eq!(y.schema, Some(TypeSchema::Float));
-        assert!(y.optional);
+        assert_eq!(
+            y.schema,
+            Some(TypeSchema::Option(Box::new(TypeSchema::Float)))
+        );
+        assert!(!y.optional);
         #[cfg(feature = "runtime")]
         assert_eq!(
             execute_persistent_snippets(
                 &[&source, "let following = y; following;"],
                 vm::CompileSourceFileOptions::default()
             ),
-            vec![vm::Value::Float(2.5)],
+            vec![vm::option::some_carrier(vm::Value::Float(2.5))],
         );
     }
 }
@@ -209,13 +233,13 @@ fn root_result_join_match_uses_existing_expression_alternatives() {
 fn root_result_join_conservative_guards_preserve_optional_flags() {
     for (source, schema, optional) in [
         (
-            "let y = if true => { null } else => { null };",
-            Some(TypeSchema::Null),
+            "let y = if true => { () } else => { () };",
+            Some(TypeSchema::Unit),
             false,
         ),
         (
-            "let y = match 1 { 1 => null, _ => null };",
-            Some(TypeSchema::Null),
+            "let y = match 1 { 1 => (), _ => () };",
+            Some(TypeSchema::Unit),
             false,
         ),
     ] {
@@ -235,7 +259,7 @@ fn root_result_join_conservative_guards_preserve_optional_flags() {
         "match choice { 1 => left, _ => right }",
     ] {
         let source = format!(
-            "struct Left {{ value: int }} struct Right {{ value: int }} let flag = true; let choice = 1; let left: Left? = {{ value: 1 }}; let right: Right? = {{ value: 2 }}; let y = {expression};"
+            "struct Left {{ value: int }} struct Right {{ value: int }} let flag = true; let choice = 1; let left: Option<Left> = Option::Some({{ value: 1 }}); let right: Option<Right> = Option::Some({{ value: 2 }}); let y = {expression};"
         );
         let error = vm::compile_source_for_repl_with_state_and_options(
             &source,
@@ -257,11 +281,11 @@ fn root_result_join_conservative_guards_preserve_optional_flags() {
 #[test]
 fn root_result_join_nullable_result_keeps_binding_effects_separate() {
     for expression in [
-        "if flag => { x = 2.5; maybe } else => { x = 2.5; null }",
-        "match choice { 1 => if flag => { x = 2.5; maybe } else => { x = 2.5; maybe }, _ => if flag => { x = 2.5; null } else => { x = 2.5; null } }",
+        "if flag => { x = 2.5; maybe } else => { x = 2.5; Option::None }",
+        "match choice { 1 => if flag => { x = 2.5; maybe } else => { x = 2.5; maybe }, _ => if flag => { x = 2.5; Option::None } else => { x = 2.5; Option::None } }",
     ] {
         let source = format!(
-            "let flag = true; let choice = 1; let mut x = 1; let maybe: float? = 3.5; let y = {expression};"
+            "let flag = true; let choice = 1; let mut x = 1; let maybe: Option<float> = Option::Some(3.5); let y = {expression};"
         );
         let compiled = vm::compile_source_for_repl_with_state_and_options(
             &source,
@@ -273,15 +297,21 @@ fn root_result_join_nullable_result_keeps_binding_effects_separate() {
         let y = compiled.bindings.iter().find(|b| b.name == "y").unwrap();
         assert_eq!(x.schema, Some(TypeSchema::Float));
         assert!(!x.optional);
-        assert_eq!(y.schema, Some(TypeSchema::Float));
-        assert!(y.optional);
+        assert_eq!(
+            y.schema,
+            Some(TypeSchema::Option(Box::new(TypeSchema::Float)))
+        );
+        assert!(!y.optional);
         #[cfg(feature = "runtime")]
         assert_eq!(
             execute_persistent_snippets(
                 &[&source, "let following: float = x; following; y;"],
                 vm::CompileSourceFileOptions::default()
             ),
-            vec![vm::Value::Float(2.5), vm::Value::Float(3.5)],
+            vec![
+                vm::Value::Float(2.5),
+                vm::option::some_carrier(vm::Value::Float(3.5))
+            ],
         );
     }
 }
@@ -545,18 +575,29 @@ fn final_layout_named_optional_entry_seeds_follow_final_debug_slots() {
         schema,
         TypeSchema::Named("RootNamedOptional".into(), vec![])
     );
-    let states = [false, true].map(|optional| ReplLocalState {
-        binding: ReplLocalBinding {
-            name: if optional { "maybe" } else { "root" }.into(),
-            mutable: false,
-            schema: Some(schema.clone()),
-            optional,
+    let states = [
+        ReplLocalState {
+            binding: ReplLocalBinding {
+                name: "root".into(),
+                mutable: false,
+                schema: Some(schema.clone()),
+                optional: false,
+            },
+            moved: false,
         },
-        moved: false,
-    });
+        ReplLocalState {
+            binding: ReplLocalBinding {
+                name: "maybe".into(),
+                mutable: false,
+                schema: Some(TypeSchema::Option(Box::new(schema.clone()))),
+                optional: false,
+            },
+            moved: false,
+        },
+    ];
     let large = format!("use calibration; {}", sequential_callee_source());
     for source in [
-        "use calibration; root.value; maybe == null; calibration::value();",
+        "use calibration; root.value; match maybe { Option::None => true, Option::Some(_) => false }; calibration::value();",
         "use calibration; calibration::value();",
         large.as_str(),
         "use calibration; fn recurse(n: int) -> int { if n == 0 => { 0 } else => { 1 + recurse(n - 1) } } fn capture() -> int { let value = root.value; let add = |n| n + value; add(recurse(3)) } capture();",
@@ -578,8 +619,7 @@ fn final_layout_named_optional_entry_seeds_follow_final_debug_slots() {
                 .find(|binding| binding.name == state.binding.name)
                 .unwrap();
             assert_eq!(
-                binding.schema,
-                Some(schema.clone()),
+                binding.schema, state.binding.schema,
                 "{} in {source}, final debug slot {slot}",
                 state.binding.name
             );
@@ -588,10 +628,11 @@ fn final_layout_named_optional_entry_seeds_follow_final_debug_slots() {
                 "{} in {source}, final debug slot {slot}",
                 state.binding.name
             );
-            // No-callee-conflict controls retain the previous backend map.
+            // No-callee-conflict controls retain the checked root schema,
+            // including Option, rather than a shared Named plus optional bit.
             if !source.contains("fn ") {
                 let map = program.type_map.as_ref().unwrap();
-                assert_eq!(map.local_schemas[slot], Some(schema.clone()));
+                assert_eq!(map.local_schemas[slot], state.binding.schema);
                 assert_eq!(map.optional_slots[slot], state.binding.optional);
             }
         }

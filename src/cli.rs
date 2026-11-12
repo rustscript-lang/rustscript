@@ -1939,25 +1939,30 @@ mod tests {
     fn root_result_join_float_production_sync_and_nullable_effects() {
         for (source, value, effect) in [
             (
-                "let maybe: float? = 2.5; let y = if true => { maybe } else => { null };",
-                Value::Float(2.5),
+                "let maybe: Option<float> = Option::Some(2.5); let y = if true => { maybe } else => { Option::None };",
+                crate::option::some_carrier(Value::Float(2.5)),
                 false,
             ),
             (
-                "let flag = true; let mut x = 1; let maybe: float? = 3.5; let y = if flag => { x = 2.5; maybe } else => { x = 2.5; null };",
-                Value::Float(3.5),
+                "let flag = true; let mut x = 1; let maybe: Option<float> = Option::Some(3.5); let y = if flag => { x = 2.5; maybe } else => { x = 2.5; Option::None };",
+                crate::option::some_carrier(Value::Float(3.5)),
                 true,
             ),
             (
-                "let flag = false; let mut x = 1; let maybe: float? = 3.5; let y = if flag => { x = 2.5; maybe } else => { x = 2.5; null };",
-                Value::Null,
+                "let flag = false; let mut x = 1; let maybe: Option<float> = Option::Some(3.5); let y = if flag => { x = 2.5; maybe } else => { x = 2.5; Option::None };",
+                crate::option::none_carrier(),
                 true,
             ),
         ] {
             let mut session = super::ReplSession::default();
             run_repl_snippet_and_sync(&mut session, source);
-            assert_eq!(session.locals["y"].schema, Some(crate::TypeSchema::Float));
-            assert!(session.locals["y"].optional);
+            assert_eq!(
+                session.locals["y"].schema,
+                Some(crate::TypeSchema::Option(Box::new(
+                    crate::TypeSchema::Float
+                )))
+            );
+            assert!(!session.locals["y"].optional);
             assert_eq!(session.locals["y"].value, value);
             if effect {
                 assert_eq!(session.locals["x"].schema, Some(crate::TypeSchema::Float));
@@ -1970,9 +1975,11 @@ mod tests {
             assert_eq!(next.stack(), &[value]);
             assert_eq!(
                 session.locals["following"].schema,
-                Some(crate::TypeSchema::Float)
+                Some(crate::TypeSchema::Option(Box::new(
+                    crate::TypeSchema::Float
+                )))
             );
-            assert!(session.locals["following"].optional);
+            assert!(!session.locals["following"].optional);
         }
     }
 
@@ -1990,15 +1997,18 @@ mod tests {
         builder.function(crate::HostFunctionSchema::with_return(
             "resultjoin::origin",
             vec![],
-            crate::HostTypeSchema::Optional(Box::new(named.as_type())),
+            crate::HostTypeSchema::Option(Box::new(named.as_type())),
         ));
         let catalog = std::sync::Arc::new(builder.build().unwrap());
         let options = CompileSourceFileOptions::default()
             .with_host_api_catalog(std::sync::Arc::clone(&catalog));
         fn origin(_: &mut Vm, _: &[Value]) -> crate::VmResult<crate::CallOutcome> {
-            Ok(crate::CallOutcome::Return(crate::return_one(Value::map(
-                vec![(Value::string("value"), Value::Int(42))],
-            ))))
+            Ok(crate::CallOutcome::Return(crate::return_one(
+                crate::option::some_carrier(Value::map(vec![(
+                    Value::string("value"),
+                    Value::Int(42),
+                )])),
+            )))
         }
         let mut registry = crate::HostFunctionRegistry::new();
         registry
@@ -2008,18 +2018,33 @@ mod tests {
             )
             .unwrap();
         for (expression, flag, is_null) in [
-            ("if flag => { maybe } else => { null }", true, false),
-            ("if flag => { null } else => { maybe }", false, false),
-            ("if flag => { maybe } else => { null }", false, true),
-            ("if flag => { null } else => { maybe }", true, true),
-            ("match choice { 1 => maybe, _ => null }", true, false),
-            ("match choice { 1 => null, _ => maybe }", false, false),
+            ("if flag => { maybe } else => { Option::None }", true, false),
+            (
+                "if flag => { Option::None } else => { maybe }",
+                false,
+                false,
+            ),
+            ("if flag => { maybe } else => { Option::None }", false, true),
+            ("if flag => { Option::None } else => { maybe }", true, true),
+            (
+                "match choice { 1 => maybe, _ => Option::None }",
+                true,
+                false,
+            ),
+            (
+                "match choice { 1 => Option::None, _ => maybe }",
+                false,
+                false,
+            ),
         ] {
             let source = format!(
-                "let flag = {flag}; let choice = if flag => {{ 1 }} else => {{ 2 }}; let maybe: ResultJoinRoot? = resultjoin::origin(); let y = {expression};"
+                "let flag = {flag}; let choice = if flag => {{ 1 }} else => {{ 2 }}; let maybe: Option<ResultJoinRoot> = resultjoin::origin(); let y = {expression};"
             );
             let mut session = super::ReplSession::default();
-            for snippet in [&source, "let following = y; following == null;"] {
+            for snippet in [
+                source.as_str(),
+                "let following = y; match following { Option::None => true, Option::Some(_) => false };",
+            ] {
                 let compiled =
                     super::compile_repl_snippet_with_options(snippet, &session.locals, &options)
                         .unwrap();
@@ -2035,10 +2060,22 @@ mod tests {
                 let name = if snippet == source { "y" } else { "following" };
                 assert_eq!(
                     session.locals[name].schema,
-                    Some(crate::TypeSchema::Named("ResultJoinRoot".into(), vec![]))
+                    Some(crate::TypeSchema::Option(Box::new(
+                        crate::TypeSchema::Named("ResultJoinRoot".into(), vec![])
+                    )))
                 );
-                assert!(session.locals[name].optional);
-                assert_eq!(session.locals[name].value == Value::Null, is_null);
+                assert!(!session.locals[name].optional);
+                let absent = session.locals[name].value == crate::option::none_carrier();
+                assert_eq!(absent, is_null, "{expression}");
+                if !is_null {
+                    let (some, payload) = crate::option::payload(&session.locals[name].value)
+                        .expect("named option carrier");
+                    assert!(some);
+                    let Value::Map(fields) = payload.expect("some payload") else {
+                        panic!("named payload");
+                    };
+                    assert_eq!(fields.get(&Value::string("value")), Some(&Value::Int(42)));
+                }
                 if name == "following" {
                     assert_eq!(machine.stack(), &[Value::Bool(is_null)]);
                 }
@@ -2192,32 +2229,44 @@ mod tests {
     #[test]
     fn root_expression_effects_optional_named_alternatives_remain_checked() {
         for assign in [
-            "let ignored = if true => { x = 2.5; 0 } else => { x = 2.5; 0 };",
-            "let ignored = if true => { x = 2.5; 0 } else => { 0 };",
-            "let ignored = if false => { x = 2.5; 0 } else => { 0 };",
+            "let ignored = if true => { x = Option::Some(2.5); 0 } else => { x = Option::Some(2.5); 0 };",
+            "let ignored = if true => { x = Option::Some(2.5); 0 } else => { 0 };",
+            "let ignored = if false => { x = Option::Some(2.5); 0 } else => { 0 };",
         ] {
-            let source = format!("let mut x: float? = null; {assign}");
+            let source = format!("let mut x: Option<float> = Option::None; {assign}");
             let mut session = super::ReplSession::default();
             let compiled = super::compile_repl_snippet(&source, &session.locals).unwrap();
             let x = compiled.bindings.iter().find(|b| b.name == "x").unwrap();
-            assert_eq!(x.schema, Some(crate::TypeSchema::Float));
-            assert!(x.optional);
+            assert_eq!(
+                x.schema,
+                Some(crate::TypeSchema::Option(Box::new(
+                    crate::TypeSchema::Float
+                )))
+            );
+            assert!(!x.optional);
             run_repl_snippet_and_sync(&mut session, &source);
-            assert_eq!(session.locals["x"].schema, Some(crate::TypeSchema::Float));
-            assert!(session.locals["x"].optional);
+            assert_eq!(
+                session.locals["x"].schema,
+                Some(crate::TypeSchema::Option(Box::new(
+                    crate::TypeSchema::Float
+                )))
+            );
+            assert!(!session.locals["x"].optional);
             let value = session.locals["x"].value.clone();
-            run_repl_snippet_and_sync(&mut session, "let y: float? = x;");
+            run_repl_snippet_and_sync(&mut session, "let y: Option<float> = x;");
             assert_eq!(session.locals["y"].value, value);
+            assert_eq!(session.locals["y"].schema, x.schema);
+            assert!(!session.locals["y"].optional);
         }
         for condition in ["true", "false"] {
             let source = format!(
-                "struct EffectRoot {{ value: int }} let mut x: EffectRoot? = null; let ignored = if {condition} => {{ x = {{ value: 41 }}; 0 }} else => {{ 0 }};"
+                "struct EffectRoot {{ value: int }} let mut x: Option<EffectRoot> = Option::None; let ignored = if {condition} => {{ x = Option::Some({{ value: 41 }}); 0 }} else => {{ 0 }};"
             );
             let mut session = super::ReplSession::default();
             let compiled = super::compile_repl_snippet(&source, &session.locals).unwrap();
             let x = compiled.bindings.iter().find(|b| b.name == "x").unwrap();
             let control = super::compile_repl_snippet(
-                "struct EffectRoot { value: int } let mut x: EffectRoot? = null;",
+                "struct EffectRoot { value: int } let mut x: Option<EffectRoot> = Option::None;",
                 &BTreeMap::new(),
             )
             .unwrap();
@@ -2228,15 +2277,20 @@ mod tests {
                 .unwrap()
                 .schema
                 .clone();
-            assert!(
-                matches!(&checked_named, Some(crate::TypeSchema::Named(name, args)) if !name.is_empty() && args.is_empty())
-            );
+            assert!(matches!(
+                &checked_named,
+                Some(crate::TypeSchema::Option(inner))
+                    if matches!(inner.as_ref(), crate::TypeSchema::Named(name, args) if !name.is_empty() && args.is_empty())
+            ));
             assert_eq!(x.schema, checked_named);
-            assert!(x.optional);
+            assert!(!x.optional);
             run_repl_snippet_and_sync(&mut session, &source);
             assert_eq!(session.locals["x"].schema, x.schema);
-            assert!(session.locals["x"].optional);
-            run_repl_snippet_and_sync(&mut session, "x == null;");
+            assert!(!session.locals["x"].optional);
+            run_repl_snippet_and_sync(
+                &mut session,
+                "match x { Option::None => true, Option::Some(_) => false };",
+            );
         }
     }
 
@@ -2327,12 +2381,20 @@ mod tests {
         builder.function(HostFunctionSchema::with_return(
             "layout::maybe",
             vec![],
-            HostTypeSchema::Optional(Box::new(named.as_type())),
+            HostTypeSchema::Option(Box::new(named.as_type())),
         ));
         builder.function(HostFunctionSchema::with_return(
             "layout::read",
             vec![crate::HostParamSchema::value("root", named.as_type())],
             HostTypeSchema::Int,
+        ));
+        builder.function(HostFunctionSchema::with_return(
+            "layout::observe",
+            vec![crate::HostParamSchema::value(
+                "value",
+                HostTypeSchema::Option(Box::new(named.as_type())),
+            )],
+            HostTypeSchema::Bool,
         ));
         let catalog = std::sync::Arc::new(builder.build().unwrap());
         let options = CompileSourceFileOptions::default().with_host_api_catalog(std::sync::Arc::clone(&catalog))
@@ -2343,7 +2405,9 @@ mod tests {
             ))))
         }
         fn maybe(_: &mut Vm, _: &[Value]) -> crate::VmResult<crate::CallOutcome> {
-            Ok(crate::CallOutcome::Return(crate::return_one(Value::Null)))
+            Ok(crate::CallOutcome::Return(crate::return_one(
+                crate::option::none_carrier(),
+            )))
         }
         fn read(_: &mut Vm, args: &[Value]) -> crate::VmResult<crate::CallOutcome> {
             let Value::Map(fields) = &args[0] else {
@@ -2353,11 +2417,20 @@ mod tests {
                 fields.get(&Value::string("value")).unwrap().clone(),
             )))
         }
+        fn observe(_: &mut Vm, args: &[Value]) -> crate::VmResult<crate::CallOutcome> {
+            if !matches!(args.first(), Some(Value::Map(_))) {
+                return Err(crate::VmError::TypeMismatch("Option<RootNamedOptional>"));
+            }
+            Ok(crate::CallOutcome::Return(crate::return_one(Value::Bool(
+                true,
+            ))))
+        }
         let mut registry = HostFunctionRegistry::new();
         for (name, handler) in [
             ("layout::root", root as crate::StaticHostFunction),
             ("layout::maybe", maybe),
             ("layout::read", read),
+            ("layout::observe", observe),
         ] {
             registry
                 .register_catalog_static(
@@ -2393,18 +2466,17 @@ mod tests {
             let mut session = super::ReplSession::default();
             for source in [
                 initial,
-                "use calibration; layout::read(root); maybe == null; calibration::value();",
+                "use calibration; layout::read(root); layout::observe(maybe); calibration::value();",
                 "use calibration; calibration::value();",
                 large_callee.as_str(),
                 recursive_capture.as_str(),
                 if mutable {
                     "root = layout::root();"
                 } else {
-                    "layout::read(root); maybe == null;"
+                    "layout::read(root); layout::observe(maybe);"
                 },
-                "layout::read(root); maybe == null;",
+                "layout::read(root); layout::observe(maybe);",
             ] {
-                let first_snippet = session.locals.is_empty();
                 let compiled =
                     super::compile_repl_snippet_with_options(source, &session.locals, &options)
                         .unwrap();
@@ -2440,16 +2512,14 @@ mod tests {
                         false,
                         Value::map(vec![(Value::string("value"), Value::Int(41))]),
                     ),
-                    ("maybe", true, Value::Null),
+                    ("maybe", false, crate::option::none_carrier()),
                 ] {
                     let slot = machine.debug_info().unwrap().local_index(name).unwrap() as usize;
-                    let schema = crate::TypeSchema::Named("RootNamedOptional".into(), vec![]);
-                    // New optional host results retain their Optional wrapper;
-                    // entry reseeding uses the base schema plus the optional bit.
-                    let schema = if optional && first_snippet {
-                        crate::TypeSchema::Optional(Box::new(schema))
+                    let named = crate::TypeSchema::Named("RootNamedOptional".into(), vec![]);
+                    let schema = if name == "maybe" {
+                        crate::TypeSchema::Option(Box::new(named))
                     } else {
-                        schema
+                        named
                     };
                     let binding = compiled
                         .bindings
@@ -2468,8 +2538,10 @@ mod tests {
                     if source == large_callee && name == "maybe" {
                         // The same physical index also summarizes an Int callee
                         // local. Backend observations remain frame-aggregate.
+                        // Option is a schema, not the legacy optional bit, so
+                        // that aggregate slot is not optional.
                         assert_eq!(map.local_schemas[slot], Some(crate::TypeSchema::Int));
-                        assert!(map.optional_slots[slot]);
+                        assert!(!map.optional_slots[slot]);
                     }
                     assert_eq!(machine.locals()[slot], value, "{source}: {name} at {slot}");
                     println!(
@@ -3021,10 +3093,20 @@ mod tests {
     #[test]
     fn repl_session_preserves_optional_string_move_state() {
         let mut session = super::ReplSession::default();
-        let _ = run_repl_snippet_and_sync(&mut session, "let a: string? = \"payload\";");
+        let _ = run_repl_snippet_and_sync(
+            &mut session,
+            "let a: Option<string> = Option::Some(\"payload\");",
+        );
         let _ = run_repl_snippet_and_sync(&mut session, "let b = a;");
 
         assert_eq!(session.locals.get("a").map(|local| local.moved), Some(true));
+        assert_eq!(
+            session.locals["a"].schema,
+            Some(crate::TypeSchema::Option(Box::new(
+                crate::TypeSchema::String
+            )))
+        );
+        assert!(!session.locals["a"].optional);
         match super::compile_repl_snippet("a", &session.locals) {
             Err(vm::SourceError::Parse(parse)) => {
                 assert_eq!(parse.code.as_deref(), Some("E_LOCAL_MOVED"));
@@ -3053,7 +3135,7 @@ mod tests {
     #[test]
     fn repl_session_marks_all_value_types_moved_after_binding() {
         let cases = [
-            ("null", "let a = null;"),
+            ("unit", "let a = ();"),
             ("int", "let a = 1;"),
             ("float", "let a = 1.5;"),
             ("bool", "let a = true;"),
@@ -3120,14 +3202,44 @@ mod tests {
     #[test]
     fn repl_session_persists_null_between_entries() {
         let mut session = super::ReplSession::default();
-        let _ = run_repl_snippet_and_sync(&mut session, "let x = null;");
+        let _ = run_repl_snippet_and_sync(&mut session, "let x = ();");
+        let local = session.locals.get("x").expect("unit binding");
+        assert_eq!(local.value, Value::Null);
+        assert_eq!(local.schema, Some(crate::TypeSchema::Unit));
+        assert!(!local.optional);
         assert_eq!(
-            session.locals.get("x").map(|local| &local.value),
-            Some(&Value::Null)
+            super::format_repl_result(&local.value, local.schema.as_ref()),
+            "()"
         );
 
         let vm = run_repl_snippet_and_sync(&mut session, "x");
         assert_eq!(vm.stack().last(), Some(&Value::Null));
+        assert_eq!(session.locals["x"].schema, Some(crate::TypeSchema::Unit));
+    }
+
+    #[test]
+    fn repl_session_persists_option_none_between_entries() {
+        let mut session = super::ReplSession::default();
+        let _ = run_repl_snippet_and_sync(&mut session, "let x: Option<int> = Option::None;");
+        let local = session.locals.get("x").expect("option binding");
+        assert_eq!(local.value, crate::option::none_carrier());
+        assert_eq!(
+            local.schema,
+            Some(crate::TypeSchema::Option(Box::new(crate::TypeSchema::Int)))
+        );
+        assert!(!local.optional);
+        assert_eq!(
+            super::format_repl_result(&local.value, local.schema.as_ref()),
+            "None"
+        );
+
+        let vm = run_repl_snippet_and_sync(&mut session, "x");
+        assert_eq!(vm.stack().last(), Some(&crate::option::none_carrier()));
+        assert_eq!(
+            session.locals["x"].schema,
+            Some(crate::TypeSchema::Option(Box::new(crate::TypeSchema::Int)))
+        );
+        assert!(!session.locals["x"].optional);
     }
 
     #[test]
