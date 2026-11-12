@@ -1,0 +1,1 @@
+use json; struct Node { id: int, next: Option<Node> } let decoded: Node = json::decode::<Node>("{\"next\":{\"next\":null}}"); decoded.id;

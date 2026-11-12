@@ -1,0 +1,1 @@
+use json; struct Payload { value: Option<()> } let payload: Payload = {value: Option::Some(())}; json::encode(payload) == "{\"value\":null}";

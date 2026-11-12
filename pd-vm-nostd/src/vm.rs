@@ -1300,4 +1300,53 @@ mod tests {
             })
         ));
     }
+
+    #[test]
+    fn map_edit_keeps_null_entry() {
+        let program = Program::new(
+            vec![
+                Value::map(Vec::new()),
+                Value::string("present"),
+                Value::Null,
+                Value::Bool(false),
+            ],
+            vec![
+                OpCode::Ldc as u8,
+                0,
+                0,
+                0,
+                0,
+                OpCode::Ldc as u8,
+                1,
+                0,
+                0,
+                0,
+                OpCode::Ldc as u8,
+                2,
+                0,
+                0,
+                0,
+                OpCode::Ldc as u8,
+                3,
+                0,
+                0,
+                0,
+                OpCode::Call as u8,
+                0x8F,
+                0xFF,
+                4,
+                OpCode::Ret as u8,
+            ],
+            Vec::new(),
+        );
+        let mut vm = Vm::new(program);
+        assert_eq!(vm.run().expect("map edit should run"), VmStatus::Halted);
+        let Value::Map(entries) = vm.stack().last().expect("map edit should return the map") else {
+            panic!("map edit should return a map");
+        };
+        assert!(
+            entries.iter().any(|(key, value)| key == &Value::string("present") && value == &Value::Null),
+            "no-std MapEdit must keep a null entry when remove is false"
+        );
+    }
 }
