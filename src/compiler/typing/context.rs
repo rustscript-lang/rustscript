@@ -130,6 +130,9 @@ pub(super) struct TypeContext<'a> {
     /// A catalog rejection already owns this exact parser-proven call site.
     /// Skip only its flat legacy signature check, never child/body validation.
     rejected_host_calls: Vec<(Span, Span)>,
+    /// Schemas of presentation sites in source visit order. Empty unless a
+    /// presentation walk is recording. Not a second solver.
+    pub(super) presentation_sites: Vec<Option<TypeSchema>>,
 }
 
 struct CallableBody<'a> {
@@ -178,6 +181,7 @@ impl<'a> TypeContext<'a> {
             parsed,
             result_payload_strict: false,
             rejected_host_calls: Vec::new(),
+            presentation_sites: Vec::new(),
         }
     }
 
@@ -436,7 +440,10 @@ impl<'a> TypeContext<'a> {
                     // because `schema_mentions_generic_param` refuses a
                     // binding that mentions itself, including through Option.
                     let key = schema_instance_key(name, type_args, &vec![None; type_args.len()]);
-                    return (TypeSchema::Named(name.clone(), type_args.clone()), Some(key));
+                    return (
+                        TypeSchema::Named(name.clone(), type_args.clone()),
+                        Some(key),
+                    );
                 }
                 let mut resolved_args = Vec::with_capacity(type_args.len());
                 let mut arg_trips = Vec::with_capacity(type_args.len());
@@ -3751,9 +3758,7 @@ fn builtin_generic_return_schema(
     type_args: &[TypeSchema],
 ) -> Option<TypeSchema> {
     match builtin {
-        BuiltinFunction::JsonDecode | BuiltinFunction::JsonDecodeTyped
-            if type_args.len() == 1 =>
-        {
+        BuiltinFunction::JsonDecode | BuiltinFunction::JsonDecodeTyped if type_args.len() == 1 => {
             Some(type_args[0].clone())
         }
         _ => None,

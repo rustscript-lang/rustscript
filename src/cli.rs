@@ -1776,6 +1776,11 @@ fn format_logical_value(value: &Value, schema: &crate::TypeSchema) -> String {
             _ => format_value(value),
         },
         crate::TypeSchema::Unit if matches!(value, Value::Null) => "()".to_string(),
+        crate::TypeSchema::Result { ok, err } => match crate::result::payload(value) {
+            Ok((true, payload)) => format!("Ok({})", format_logical_value(payload, ok)),
+            Ok((false, payload)) => format!("Err({})", format_logical_value(payload, err)),
+            Err(_) => format_value(value),
+        },
         _ => format_value(value),
     }
 }

@@ -203,20 +203,20 @@ fn prepare_typed_units_with_entry(
                     sources: sources.clone(),
                 }
             })?;
-            let early_schemas =
-                typing::infer_types(&runtime, TypingMode::DynamicHints, &runtime_types)
-                    .local_schemas;
-            super::logical_boundary::lower_logical_print(&mut runtime, &early_schemas).map_err(
-                |error| SourcePathError::SourceWithMap {
-                    error: SourceError::Compile(error),
-                    sources: sources.clone(),
-                },
-            )?;
             super::option::resolve_option_types(&mut runtime, &runtime_types).map_err(|error| {
                 SourcePathError::SourceWithMap {
                     error: SourceError::Compile(error),
                     sources: sources.clone(),
                 }
+            })?;
+            super::logical_boundary::lower_logical_print(
+                &mut runtime,
+                TypingMode::DynamicHints,
+                &runtime_types,
+            )
+            .map_err(|error| SourcePathError::SourceWithMap {
+                error: SourceError::Compile(error),
+                sources: sources.clone(),
             })?;
         }
         if !behavior.recover_host_errors
@@ -392,10 +392,6 @@ fn prepare_owned_typed_ir(
         super::result::resolve_result_types(&mut legalized, entry.types)
             .map_err(SourceError::Compile)?;
         super::option::normalize_omitted_option_fields(&mut legalized);
-        let early_schemas =
-            typing::infer_types(&legalized, TypingMode::DynamicHints, entry.types).local_schemas;
-        super::logical_boundary::lower_logical_print(&mut legalized, &early_schemas)
-            .map_err(SourceError::Compile)?;
         super::option::resolve_option_types(&mut legalized, entry.types)
             .map_err(SourceError::Compile)?;
     }
@@ -452,8 +448,12 @@ fn prepare_owned_typed_ir(
     }
     let logical_schemas = type_info.logical_schemas();
     parsed.semantic_index = Some(SemanticIndex::build(logical_schemas.clone(), &parsed));
-    super::logical_boundary::lower_logical_print(&mut parsed, &logical_schemas)
-        .map_err(SourceError::Compile)?;
+    super::logical_boundary::lower_logical_print(
+        &mut parsed,
+        TypingMode::DynamicHints,
+        entry.types,
+    )
+    .map_err(SourceError::Compile)?;
     super::logical_boundary::lower_typed_json(&mut parsed, &logical_schemas)
         .map_err(SourceError::Compile)?;
     let owned_ir = enforce_owned_sources(
@@ -961,13 +961,11 @@ fn compile_parsed_output_with_capture_output(
     }
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
     let mut parsed = parsed;
+    super::logical_boundary::lower_logical_print(&mut parsed, typing_mode, entry_local_types)
+        .map_err(SourceError::Compile)?;
     super::result::resolve_result_types(&mut parsed, entry_local_types)
         .map_err(SourceError::Compile)?;
     super::option::normalize_omitted_option_fields(&mut parsed);
-    let early_schemas =
-        typing::infer_types(&parsed, typing_mode, entry_local_types).local_schemas;
-    super::logical_boundary::lower_logical_print(&mut parsed, &early_schemas)
-        .map_err(SourceError::Compile)?;
     super::option::resolve_option_types(&mut parsed, entry_local_types)
         .map_err(SourceError::Compile)?;
     let mut parsed =
@@ -981,16 +979,10 @@ fn compile_parsed_output_with_capture_output(
         enforce_strict_type_resolution(&parsed, &pre_lifetime_type_info)
             .map_err(SourceError::Compile)?;
     }
-    super::logical_boundary::lower_logical_print(
-        &mut parsed,
-        &pre_lifetime_type_info.local_schemas,
-    )
-    .map_err(SourceError::Compile)?;
-    super::logical_boundary::lower_typed_json(
-        &mut parsed,
-        &pre_lifetime_type_info.local_schemas,
-    )
-    .map_err(SourceError::Compile)?;
+    super::logical_boundary::lower_logical_print(&mut parsed, typing_mode, entry_local_types)
+        .map_err(SourceError::Compile)?;
+    super::logical_boundary::lower_typed_json(&mut parsed, &pre_lifetime_type_info.local_schemas)
+        .map_err(SourceError::Compile)?;
     let owned_local_slots = pre_lifetime_type_info
         .local_schemas
         .iter()

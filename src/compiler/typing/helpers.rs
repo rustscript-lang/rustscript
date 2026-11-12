@@ -2166,14 +2166,10 @@ pub(super) fn refine_state_for_match_pattern(
         // Option::Some binds the payload, not the Option carrier. The carrier's
         // bound type is Map; projecting only that type makes `v + 1` untyped.
         let (ty, schema) = match (pattern, state.schema(value_slot)) {
-            (MatchPattern::SomeBinding(_), Some(TypeSchema::Option(inner))) => (
-                bound_type_from_schema(inner),
-                Some(inner.as_ref().clone()),
-            ),
-            _ => (
-                state.get(value_slot),
-                state.schema(value_slot).cloned(),
-            ),
+            (MatchPattern::SomeBinding(_), Some(TypeSchema::Option(inner))) => {
+                (bound_type_from_schema(inner), Some(inner.as_ref().clone()))
+            }
+            _ => (state.get(value_slot), state.schema(value_slot).cloned()),
         };
         refined.set_with_optional_schema_origin(
             binding_slot,
@@ -2929,7 +2925,11 @@ pub(super) fn fold_builtin_call(expr: &mut Expr, builtin: BuiltinFunction, state
             if args.len() == 1 {
                 let inferred = infer_expr_type(&args[0], state);
                 if let Some(name) = inferred.type_name() {
-                    *expr = Expr::String(name.to_string());
+                    // Map and null are shared with Option/Result carriers.
+                    // Leave those calls for the checked presentation lower.
+                    if name != "map" && name != "null" {
+                        *expr = Expr::String(name.to_string());
+                    }
                 }
             }
         }

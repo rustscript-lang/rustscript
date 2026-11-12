@@ -1344,6 +1344,57 @@ fn get_and_set_use_hash_map_overwrite_semantics() {
 }
 
 #[test]
+fn low_level_null_key_map_round_trip_keeps_vm_semantics() {
+    let builtin_get = builtin_call_index_with_arity(
+        r#"
+        let text = "abc";
+        text[0];
+        "#,
+        2,
+    );
+    let builtin_set = builtin_call_index_with_arity(
+        r#"
+        let mut values = [1];
+        values[0] = 2;
+        "#,
+        3,
+    );
+    let constants = vec![Value::map(vec![]), Value::Null, Value::Int(42)];
+    let mut bc = BytecodeBuilder::new();
+    bc.ldc(0);
+    bc.ldc(1);
+    bc.ldc(2);
+    bc.call(builtin_set, 3);
+    bc.ldc(1);
+    bc.call(builtin_get, 2);
+    bc.ret();
+    let mut vm = Vm::new(Program::new(constants, bc.finish()));
+    assert_eq!(vm.run().expect("low-level null key"), VmStatus::Halted);
+    assert_eq!(vm.stack(), &[Value::Int(42)]);
+
+    let deletion = vec![
+        Value::map(vec![(Value::string("k"), Value::Int(1))]),
+        Value::string("k"),
+        Value::Null,
+    ];
+    let mut delete_bc = BytecodeBuilder::new();
+    delete_bc.ldc(0);
+    delete_bc.ldc(1);
+    delete_bc.ldc(2);
+    delete_bc.call(builtin_set, 3);
+    delete_bc.ret();
+    let mut delete_vm = Vm::new(Program::new(deletion, delete_bc.finish()));
+    assert_eq!(
+        delete_vm.run().expect("null value deletes"),
+        VmStatus::Halted
+    );
+    let [Value::Map(entries)] = delete_vm.stack() else {
+        panic!("expected map, got {:?}", delete_vm.stack());
+    };
+    assert!(entries.get(&Value::string("k")).is_none());
+}
+
+#[test]
 fn set_rejects_sparse_array_indexes() {
     let builtin_set = builtin_call_index_with_arity(
         r#"
