@@ -3987,27 +3987,18 @@ fn rustscript_explicit_optional_type_annotations_work() {
 
     let error_cases = vec![
         SourceErrorCase {
-            name: "non optional local rejects null assignment",
-            source: r#"
-                let value: int = null;
-                value;
-            "#,
+            name: "non optional local rejects unit assignment",
+            source: "let value: int = ();\n",
             flavor: SourceFlavor::RustScript,
-            expected_kind: SourceErrorKind::Parse,
-            expected_contains_all: &["RSS rejects null literals; use Option::None or ()"],
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
+            expected_contains_all: &["local is declared as schema type 'int' but was assigned ()"],
         },
         SourceErrorCase {
-            name: "non optional return rejects null result",
-            source: r#"
-                fn bad() -> int {
-                    null
-                }
-
-                bad();
-            "#,
+            name: "non optional declared return rejects unit result",
+            source: "fn bad() -> int { () } bad();\n",
             flavor: SourceFlavor::RustScript,
-            expected_kind: SourceErrorKind::Parse,
-            expected_contains_all: &["RSS rejects null literals; use Option::None or ()"],
+            expected_kind: SourceErrorKind::Compile(CompileErrorKind::StrictTypingRequired),
+            expected_contains_all: &["function 'bad' is declared to return 'int' but produced ()"],
         },
         SourceErrorCase {
             name: "typed callable locals reject mismatched closure results",
