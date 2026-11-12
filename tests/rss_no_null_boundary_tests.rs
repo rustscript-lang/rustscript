@@ -296,3 +296,213 @@ fn typed_map_remove_returns_map_without_the_key() {
     );
     assert_eq!(value, vm::Value::Bool(false));
 }
+
+fn print_catalog(
+    params: Vec<vm::HostParamSchema>,
+    returns: vm::HostTypeSchema,
+) -> std::sync::Arc<vm::HostApiCatalog> {
+    let mut builder = vm::HostApiBuilder::new();
+    builder.function(vm::HostFunctionSchema::with_return(
+        "print", params, returns,
+    ));
+    std::sync::Arc::new(builder.build().expect("print catalog"))
+}
+
+fn compile_catalog(
+    source: &str,
+    catalog: &std::sync::Arc<vm::HostApiCatalog>,
+) -> Result<vm::CompiledProgram, vm::SourcePathError> {
+    vm::compile_source_with_flavor_and_options(
+        source,
+        vm::SourceFlavor::RustScript,
+        vm::CompileSourceFileOptions::default()
+            .with_host_api_catalog(std::sync::Arc::clone(catalog)),
+    )
+}
+
+fn assert_matching_print_rejected(returns: vm::HostTypeSchema) {
+    let catalog = print_catalog(
+        vec![vm::HostParamSchema::value("value", vm::HostTypeSchema::Int)],
+        returns,
+    );
+    let message = match compile_catalog("print(1);", &catalog) {
+        Ok(_) => panic!("matching catalog print must not become the language intrinsic"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        message.contains("dynamic or legacy-null"),
+        "expected dynamic output rejection, got {message}"
+    );
+    assert!(
+        !message.contains("print formatting requires"),
+        "catalog identity must be resolved before intrinsic formatting sugar: {message}"
+    );
+}
+
+#[test]
+fn matching_catalog_print_unknown_is_rejected() {
+    assert_matching_print_rejected(vm::HostTypeSchema::Unknown);
+}
+
+#[test]
+fn matching_catalog_print_null_is_rejected() {
+    assert_matching_print_rejected(vm::HostTypeSchema::Null);
+}
+
+#[test]
+fn matching_catalog_print_optional_is_rejected() {
+    assert_matching_print_rejected(vm::HostTypeSchema::Optional(Box::new(
+        vm::HostTypeSchema::Int,
+    )));
+}
+
+static MATCHING_BOOL_PRINT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn matching_bool_print(_: &mut vm::Vm, args: &[vm::Value]) -> vm::VmResult<vm::CallOutcome> {
+    MATCHING_BOOL_PRINT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(args, &[vm::Value::Int(1)]);
+    Ok(vm::CallOutcome::Return(vm::return_one(vm::Value::Bool(
+        true,
+    ))))
+}
+
+static TWO_INT_PRINT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn two_int_print(_: &mut vm::Vm, args: &[vm::Value]) -> vm::VmResult<vm::CallOutcome> {
+    TWO_INT_PRINT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(args, &[vm::Value::Int(1), vm::Value::Int(2)]);
+    Ok(vm::CallOutcome::Return(vm::return_one(vm::Value::Bool(
+        false,
+    ))))
+}
+
+fn run_bound_print(
+    source: &str,
+    catalog: &std::sync::Arc<vm::HostApiCatalog>,
+    handler: vm::StaticHostFunction,
+    counter: &std::sync::atomic::AtomicUsize,
+) -> vm::Value {
+    counter.store(0, std::sync::atomic::Ordering::SeqCst);
+    let compiled = compile_catalog(source, catalog).unwrap_or_else(|error| {
+        panic!("matching catalog print should keep its declared return: {error}")
+    });
+    let mut registry = vm::HostFunctionRegistry::new();
+    let schema = vm::catalog_import_schemas(catalog, "print")
+        .into_iter()
+        .next()
+        .expect("catalog print schema");
+    registry
+        .register_catalog_static(schema, handler)
+        .expect("register matching print handler");
+    let mut machine = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
+    machine.set_fuel(100_000);
+    let sink_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorded = std::sync::Arc::clone(&sink_lines);
+    machine.set_runtime_print_sink(move |rendered| {
+        recorded.lock().expect("sink").push(rendered);
+    });
+    registry
+        .bind_vm_cached(&mut machine)
+        .expect("bind matching print handler");
+    assert_eq!(
+        machine.run().expect("matching print should run"),
+        vm::VmStatus::Halted
+    );
+    assert!(
+        sink_lines.lock().expect("sink").is_empty(),
+        "custom print must not fall through to the language print sink"
+    );
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "custom print handler must actually run"
+    );
+    machine
+        .stack()
+        .last()
+        .cloned()
+        .expect("matching print should leave its return value")
+}
+
+#[test]
+fn matching_catalog_print_bool_keeps_handler_and_return() {
+    let catalog = print_catalog(
+        vec![vm::HostParamSchema::value("value", vm::HostTypeSchema::Int)],
+        vm::HostTypeSchema::Bool,
+    );
+    let value = run_bound_print(
+        "let output: bool = print(1); output;",
+        &catalog,
+        matching_bool_print,
+        &MATCHING_BOOL_PRINT_CALLS,
+    );
+    assert_eq!(value, vm::Value::Bool(true));
+}
+
+static EXPLICIT_BOOL_PRINT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn explicit_bool_print(_: &mut vm::Vm, args: &[vm::Value]) -> vm::VmResult<vm::CallOutcome> {
+    EXPLICIT_BOOL_PRINT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(args, &[vm::Value::Int(1)]);
+    Ok(vm::CallOutcome::Return(vm::return_one(vm::Value::Bool(
+        true,
+    ))))
+}
+
+#[test]
+fn explicit_print_declaration_keeps_catalog_bool_identity() {
+    let catalog = print_catalog(
+        vec![vm::HostParamSchema::value("value", vm::HostTypeSchema::Int)],
+        vm::HostTypeSchema::Bool,
+    );
+    let value = run_bound_print(
+        "fn print(value: int) -> bool; let output: bool = print(1); output;",
+        &catalog,
+        explicit_bool_print,
+        &EXPLICIT_BOOL_PRINT_CALLS,
+    );
+    assert_eq!(value, vm::Value::Bool(true));
+}
+
+#[test]
+fn matching_two_int_catalog_print_is_not_format_sugar() {
+    let catalog = print_catalog(
+        vec![
+            vm::HostParamSchema::value("left", vm::HostTypeSchema::Int),
+            vm::HostParamSchema::value("right", vm::HostTypeSchema::Int),
+        ],
+        vm::HostTypeSchema::Bool,
+    );
+    let value = run_bound_print(
+        "let output: bool = print(1, 2); output;",
+        &catalog,
+        two_int_print,
+        &TWO_INT_PRINT_CALLS,
+    );
+    assert_eq!(value, vm::Value::Bool(false));
+}
+
+#[test]
+fn nonmatching_catalog_print_keeps_language_print() {
+    let catalog = print_catalog(
+        vec![
+            vm::HostParamSchema::value("left", vm::HostTypeSchema::Int),
+            vm::HostParamSchema::value("right", vm::HostTypeSchema::Int),
+        ],
+        vm::HostTypeSchema::Bool,
+    );
+    let compiled = compile_catalog("print(1);", &catalog).unwrap_or_else(|error| {
+        panic!("a nonmatching catalog overload must not ban language print: {error}")
+    });
+    let mut machine = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
+    machine.set_fuel(100_000);
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorded = std::sync::Arc::clone(&lines);
+    machine.set_runtime_print_sink(move |rendered| {
+        recorded.lock().expect("sink").push(rendered);
+    });
+    assert_eq!(machine.run().expect("language print"), vm::VmStatus::Halted);
+    assert_eq!(lines.lock().expect("sink").as_slice(), ["1".to_string()]);
+}
