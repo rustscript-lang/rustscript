@@ -1819,12 +1819,10 @@ fn ensure_compatible_logical_schemas(
     if are_compatible_schemas(&lhs, &rhs) {
         return Ok(());
     }
-    let logical = |schema: &TypeSchema| {
-        matches!(
-            schema,
-            TypeSchema::Option(_) | TypeSchema::Result { .. } | TypeSchema::Named(_, _)
-        )
-    };
+    // Named record literals materialize through the expected-type path.
+    // Only Option and Result joins are rejected here.
+    let logical =
+        |schema: &TypeSchema| matches!(schema, TypeSchema::Option(_) | TypeSchema::Result { .. });
     if !logical(&lhs) && !logical(&rhs) {
         return Ok(());
     }
