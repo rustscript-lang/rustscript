@@ -469,7 +469,7 @@ fn validate_json_schema_with_seen(
         | TypeSchema::Number
         | TypeSchema::Bool
         | TypeSchema::String => Ok(()),
-        TypeSchema::Unit => Err(format!("{path} is (), which json::encode does not support")),
+        TypeSchema::Unit => Ok(()),
         TypeSchema::Bytes => Err(format!(
             "{path} uses bytes, which json::encode does not support"
         )),

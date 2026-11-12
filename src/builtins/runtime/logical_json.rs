@@ -25,7 +25,7 @@ pub(super) fn project_decoded(
 ) -> VmResult<Value> {
     let schema = prepare_json_schema(descriptor, &names)?;
     charge_value(raw, &mut 0)?;
-    project_value(raw, &schema, Position::Value, 0)
+    project_value(raw, &schema, Position::Value, 0, &names)
 }
 
 pub(super) fn encode_typed(
@@ -222,10 +222,19 @@ fn project_value(
     schema: &TypeSchema,
     position: Position,
     depth: usize,
+    names: &JsonNames<'_>,
 ) -> VmResult<Value> {
     let depth = next_depth(depth)?;
     match schema {
-        TypeSchema::Option(inner) => project_option(raw, inner, position, depth),
+        TypeSchema::Named(name, args) => {
+            let Some(body) =
+                crate::vm::resolve_named_struct_body(names.host, names.guest, name, args)
+            else {
+                return Err(unsupported(schema));
+            };
+            project_value(raw, &body, position, depth, names)
+        }
+        TypeSchema::Option(inner) => project_option(raw, inner, position, depth, names),
         TypeSchema::Int => project_int(raw),
         TypeSchema::Bool => match raw {
             Value::Bool(value) => Ok(Value::Bool(*value)),
@@ -240,10 +249,10 @@ fn project_value(
             Value::Null => Ok(Value::Null),
             _ => Err(VmError::TypeMismatch("json unit")),
         },
-        TypeSchema::Array(inner) => project_array(raw, inner, depth),
-        TypeSchema::ArrayTuple(items) => project_tuple(raw, items, depth),
-        TypeSchema::Map(inner) => project_map(raw, inner, depth),
-        TypeSchema::Object(fields) => project_object(raw, fields, depth),
+        TypeSchema::Array(inner) => project_array(raw, inner, depth, names),
+        TypeSchema::ArrayTuple(items) => project_tuple(raw, items, depth, names),
+        TypeSchema::Map(inner) => project_map(raw, inner, depth, names),
+        TypeSchema::Object(fields) => project_object(raw, fields, depth, names),
         other => Err(unsupported(other)),
     }
 }
@@ -253,6 +262,7 @@ fn project_option(
     inner: &TypeSchema,
     position: Position,
     depth: usize,
+    names: &JsonNames<'_>,
 ) -> VmResult<Value> {
     if position == Position::Value && null_ambiguous(inner) {
         return Err(ambiguous_option());
@@ -260,7 +270,7 @@ fn project_option(
     if matches!(raw, Value::Null) {
         return Ok(none_carrier());
     }
-    Ok(some_carrier(project_value(raw, inner, Position::Value, depth)?))
+    Ok(some_carrier(project_value(raw, inner, Position::Value, depth, names)?))
 }
 
 fn project_int(raw: &Value) -> VmResult<Value> {
@@ -293,18 +303,18 @@ fn project_float(raw: &Value) -> VmResult<Value> {
     }
 }
 
-fn project_array(raw: &Value, inner: &TypeSchema, depth: usize) -> VmResult<Value> {
+fn project_array(raw: &Value, inner: &TypeSchema, depth: usize, names: &JsonNames<'_>) -> VmResult<Value> {
     let Value::Array(values) = raw else {
         return Err(VmError::TypeMismatch("json array"));
     };
     let mut out = Vec::with_capacity(values.len());
     for value in values.iter() {
-        out.push(project_value(value, inner, Position::Value, depth)?);
+        out.push(project_value(value, inner, Position::Value, depth, names)?);
     }
     Ok(Value::array(out))
 }
 
-fn project_tuple(raw: &Value, items: &[TypeSchema], depth: usize) -> VmResult<Value> {
+fn project_tuple(raw: &Value, items: &[TypeSchema], depth: usize, names: &JsonNames<'_>) -> VmResult<Value> {
     let Value::Array(values) = raw else {
         return Err(VmError::TypeMismatch("json tuple"));
     };
@@ -317,12 +327,12 @@ fn project_tuple(raw: &Value, items: &[TypeSchema], depth: usize) -> VmResult<Va
     }
     let mut out = Vec::with_capacity(items.len());
     for (value, schema) in values.iter().zip(items) {
-        out.push(project_value(value, schema, Position::Value, depth)?);
+        out.push(project_value(value, schema, Position::Value, depth, names)?);
     }
     Ok(Value::array(out))
 }
 
-fn project_map(raw: &Value, inner: &TypeSchema, depth: usize) -> VmResult<Value> {
+fn project_map(raw: &Value, inner: &TypeSchema, depth: usize, names: &JsonNames<'_>) -> VmResult<Value> {
     if map_value_ambiguous(inner) {
         return Err(VmError::HostError(
             "typed json rejects Map<Option<Unit>> and other null-ambiguous map values".to_string(),
@@ -340,7 +350,7 @@ fn project_map(raw: &Value, inner: &TypeSchema, depth: usize) -> VmResult<Value>
         };
         out.push((
             key.clone(),
-            project_value(value, inner, Position::Value, depth)?,
+            project_value(value, inner, Position::Value, depth, names)?,
         ));
     }
     Ok(Value::map(out))
@@ -350,6 +360,7 @@ fn project_object(
     raw: &Value,
     fields: &std::collections::HashMap<String, TypeSchema>,
     depth: usize,
+    names: &JsonNames<'_>,
 ) -> VmResult<Value> {
     let Value::Map(entries) = raw else {
         return Err(VmError::TypeMismatch("json object"));
@@ -374,7 +385,7 @@ fn project_object(
             Some(value) => {
                 out.push((
                     Value::string(name.clone()),
-                    project_field(value, schema, depth)?,
+                    project_field(value, schema, depth, names)?,
                 ));
             }
             None => out.push((
@@ -386,7 +397,7 @@ fn project_object(
     Ok(Value::map(out))
 }
 
-fn project_field(raw: &Value, schema: &TypeSchema, depth: usize) -> VmResult<Value> {
+fn project_field(raw: &Value, schema: &TypeSchema, depth: usize, names: &JsonNames<'_>) -> VmResult<Value> {
     match field_form(schema)? {
         FieldForm::OrdinaryOption(inner) => {
             if matches!(raw, Value::Null) {
@@ -397,6 +408,7 @@ fn project_field(raw: &Value, schema: &TypeSchema, depth: usize) -> VmResult<Val
                     inner,
                     Position::Value,
                     depth,
+                    names,
                 )?))
             }
         }
@@ -413,10 +425,11 @@ fn project_field(raw: &Value, schema: &TypeSchema, depth: usize) -> VmResult<Val
                     inner,
                     Position::Value,
                     depth,
+                    names,
                 )?)))
             }
         }
-        FieldForm::Value => project_value(raw, schema, Position::Field, depth),
+        FieldForm::Value => project_value(raw, schema, Position::Field, depth, names),
     }
 }
 
@@ -745,12 +758,20 @@ pub(super) fn render_typed(
     let mut nodes = 0;
     let mut stack = Vec::new();
     let schema = expand_named(&schema, &names, &mut stack, &mut nodes)?;
-    render_value(value, &schema, 0)
+    render_value(value, &schema, 0, &names)
 }
 
-fn render_value(value: &Value, schema: &TypeSchema, depth: usize) -> VmResult<String> {
+fn render_value(value: &Value, schema: &TypeSchema, depth: usize, names: &JsonNames<'_>) -> VmResult<String> {
     let depth = next_depth(depth)?;
     match schema {
+        TypeSchema::Named(name, args) => {
+            let Some(body) =
+                crate::vm::resolve_named_struct_body(names.host, names.guest, name, args)
+            else {
+                return Err(unsupported(schema));
+            };
+            return render_value(value, &body, depth, names);
+        }
         TypeSchema::Option(inner) => {
             let (some, payload_value) = payload(value)?;
             if !some {
@@ -759,7 +780,7 @@ fn render_value(value: &Value, schema: &TypeSchema, depth: usize) -> VmResult<St
             let Some(payload_value) = payload_value else {
                 return Err(VmError::TypeMismatch("Option Some payload"));
             };
-            let rendered = render_value(payload_value, inner, depth)?;
+            let rendered = render_value(payload_value, inner, depth, names)?;
             Ok(format!("Some({rendered})"))
         }
         TypeSchema::Unit => match value {
@@ -797,7 +818,7 @@ fn render_value(value: &Value, schema: &TypeSchema, depth: usize) -> VmResult<St
         },
         TypeSchema::Result { ok, err } => {
             let (is_ok, payload_value) = crate::result::payload(value)?;
-            let rendered = render_value(payload_value, if is_ok { ok } else { err }, depth)?;
+            let rendered = render_value(payload_value, if is_ok { ok } else { err }, depth, names)?;
             Ok(if is_ok {
                 format!("Ok({rendered})")
             } else {
@@ -808,7 +829,7 @@ fn render_value(value: &Value, schema: &TypeSchema, depth: usize) -> VmResult<St
             Value::Array(values) => {
                 let mut parts = Vec::with_capacity(values.len());
                 for value in values.iter() {
-                    parts.push(render_value(value, inner, depth)?);
+                    parts.push(render_value(value, inner, depth, names)?);
                 }
                 Ok(format!("[{}]", parts.join(", ")))
             }
@@ -824,7 +845,7 @@ fn render_value(value: &Value, schema: &TypeSchema, depth: usize) -> VmResult<St
                     parts.push(format!(
                         "{}: {}",
                         key.as_str(),
-                        render_value(value, inner, depth)?
+                        render_value(value, inner, depth, names)?
                     ));
                 }
                 Ok(format!("{{{}}}", parts.join(", ")))
@@ -840,7 +861,7 @@ fn render_value(value: &Value, schema: &TypeSchema, depth: usize) -> VmResult<St
                     };
                     parts.push(format!(
                         "{name}: {}",
-                        render_value(field_value, field, depth)?
+                        render_value(field_value, field, depth, names)?
                     ));
                 }
                 Ok(format!("{{{}}}", parts.join(", ")))
