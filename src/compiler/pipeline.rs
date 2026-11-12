@@ -228,6 +228,12 @@ fn prepare_typed_units_with_entry(
             });
         }
         let facts = typing::infer_types(&runtime, TypingMode::DynamicHints, &runtime_types);
+        typing::classify_map_stores(&mut runtime, TypingMode::DynamicHints, &runtime_types)
+            .map_err(typing::map_admission_source_error)
+            .map_err(|error| SourcePathError::SourceWithMap {
+                error,
+                sources: sources.clone(),
+            })?;
         let owned = enforce_owned_sources(
             runtime,
             &facts,
@@ -456,6 +462,8 @@ fn prepare_owned_typed_ir(
     .map_err(SourceError::Compile)?;
     super::logical_boundary::lower_typed_json(&mut parsed, &logical_schemas)
         .map_err(SourceError::Compile)?;
+    typing::classify_map_stores(&mut parsed, TypingMode::DynamicHints, entry.types)
+        .map_err(typing::map_admission_source_error)?;
     let owned_ir = enforce_owned_sources(
         parsed.clone(),
         &type_info,
@@ -983,6 +991,8 @@ fn compile_parsed_output_with_capture_output(
         .map_err(SourceError::Compile)?;
     super::logical_boundary::lower_typed_json(&mut parsed, &pre_lifetime_type_info.local_schemas)
         .map_err(SourceError::Compile)?;
+    typing::classify_map_stores(&mut parsed, typing_mode, entry_local_types)
+        .map_err(typing::map_admission_source_error)?;
     let owned_local_slots = pre_lifetime_type_info
         .local_schemas
         .iter()
