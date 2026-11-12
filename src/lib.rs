@@ -140,7 +140,7 @@ pub use compiler::{
     lint_trailing_function_return_semicolons, lint_unknown_inferred_local_types,
     lint_unknown_inferred_local_types_at_path_with_options,
     lint_unknown_inferred_local_types_with_options, lint_unknown_type_annotations,
-    parse_source_with_dialect,
+    parse_source_with_dialect, parse_source_with_dialect_and_catalog,
 };
 pub use compiler::{
     CertifiedCompilation, compile_source_file_with_capture_certification,

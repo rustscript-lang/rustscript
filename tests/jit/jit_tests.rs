@@ -3,8 +3,11 @@ use std::{cell::Cell, sync::Arc};
 use vm::{
     BytecodeBuilder, CallOutcome, CallReturn, HostFunction, JitConfig, JitTraceTerminal, OpCode,
     Program, RegexCacheVmExt, Value, ValueType, Vm, VmStatus, VmYieldReason, builtin_call_index,
-    compile_source, disassemble_program,
+    compile_source, compile_source_with_flavor_and_options, disassemble_program,
 };
+
+#[path = "../support/legacy_nullable_plugin.rs"]
+mod legacy_nullable_plugin;
 
 fn native_jit_supported() -> bool {
     (cfg!(target_arch = "x86_64")
@@ -3912,7 +3915,12 @@ fn trace_jit_specializes_same_local_map_set_through_loop_back() {
         values["key"];
     "#;
 
-    let compiled = compile_source(source).expect("map-set trace compile should succeed");
+    let compiled = compile_source_with_flavor_and_options(
+        source,
+        legacy_nullable_plugin::legacy_nullable_flavor(),
+        legacy_nullable_plugin::legacy_nullable_options(vm::CompileSourceFileOptions::new()),
+    )
+    .expect("map-set trace compile should succeed");
     let program = force_local_types(
         compiled.program,
         &[(0, ValueType::Map), (1, ValueType::Int)],

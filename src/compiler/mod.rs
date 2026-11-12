@@ -14,6 +14,9 @@ mod codegen;
 pub mod diagnostics;
 mod format;
 mod frontends;
+
+#[cfg(test)]
+pub(crate) use frontends::legacy_rss;
 mod host_call_resolve;
 mod host_conversion;
 pub mod ir;
@@ -41,7 +44,7 @@ pub use self::codegen::Compiler;
 pub use self::format::{
     FormatError, format_source, format_source_with_flavor, format_source_with_flavor_and_options,
 };
-pub use self::frontends::parse_source_with_dialect;
+pub use self::frontends::{parse_source_with_dialect, parse_source_with_dialect_and_catalog};
 pub use self::host_call_resolve::{HostCallResolveError, HostCallResolver};
 pub use self::ir::{
     AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, FunctionParam,

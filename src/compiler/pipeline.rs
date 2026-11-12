@@ -3491,12 +3491,7 @@ mod tests {
     #[test]
     fn native_ir_available_optional_sibling_after_normal_projection() {
         let source = "struct Entry { name: string, note: string? }\nlet entry: Entry = { name: \"first\" };\nlet name = entry.name;\nlet note = entry?.note;\nnote;\n";
-        let mut parsed = crate::compiler::frontends::parse_source(
-            source,
-            SourceFlavor::RustScript,
-            &CompileSourceFileOptions::new(),
-        )
-        .unwrap();
+        let mut parsed = crate::compiler::frontends::legacy_rss::parse(source).unwrap();
         // Native parser IR, with explicit language-neutral field intent.
         // Native `?.` syntax itself keeps its established value semantics.
         for stmt in &mut parsed.stmts {
@@ -3539,12 +3534,7 @@ mod tests {
             let source = format!(
                 "struct Entry {{ name: string, note: string? }}\nlet entry: Entry = {{ name: \"first\"{field} }};\nlet note = entry?.note;\nnote;"
             );
-            let mut parsed = crate::compiler::frontends::parse_source(
-                &source,
-                SourceFlavor::RustScript,
-                &CompileSourceFileOptions::new(),
-            )
-            .unwrap();
+            let mut parsed = crate::compiler::frontends::legacy_rss::parse(&source).unwrap();
             let root = parsed
                 .local_bindings
                 .iter()
@@ -3586,12 +3576,7 @@ mod tests {
     #[test]
     fn native_ir_nested_optional_projection_detaches_noncopy_child() {
         let source = "struct Entry { note: string? }\nlet entry: Entry = { note: \"ready\" };\nlet note = (entry?.note).unwrap_or(\"fallback\");\nnote;";
-        let mut parsed = crate::compiler::frontends::parse_source(
-            source,
-            SourceFlavor::RustScript,
-            &CompileSourceFileOptions::new(),
-        )
-        .unwrap();
+        let mut parsed = crate::compiler::frontends::legacy_rss::parse(source).unwrap();
         let root = parsed
             .local_bindings
             .iter()
@@ -3640,12 +3625,7 @@ mod tests {
     #[test]
     fn native_ir_nested_optional_value_mode_retains_child() {
         let source = "struct Entry { note: string? }\nlet entry: Entry = { note: \"ready\" };\nlet note = (entry?.note).unwrap_or(\"fallback\");\nnote;";
-        let parsed = crate::compiler::frontends::parse_source(
-            source,
-            SourceFlavor::RustScript,
-            &CompileSourceFileOptions::new(),
-        )
-        .unwrap();
+        let parsed = crate::compiler::frontends::legacy_rss::parse(source).unwrap();
         let root = parsed
             .local_bindings
             .iter()

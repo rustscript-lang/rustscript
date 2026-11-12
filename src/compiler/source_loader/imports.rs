@@ -173,6 +173,14 @@ fn use_declarations_to_module_imports(
         .collect()
 }
 
+#[cfg(test)]
+pub(crate) fn test_module_imports_from_uses(
+    path: &Path,
+    decls: &[UseDecl],
+) -> Result<Vec<ModuleImport>, SourcePathError> {
+    use_declarations_to_module_imports(path, decls)
+}
+
 pub(super) fn is_valid_ident(input: &str) -> bool {
     let mut chars = input.chars();
     let Some(first) = chars.next() else {

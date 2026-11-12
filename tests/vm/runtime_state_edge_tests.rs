@@ -275,7 +275,7 @@ fn drop_contract_counts_overwrites_and_reset_clears_counter() {
     let source = r#"
         let mut value = { payload: [1, 2, 3], name: "a" };
         value = { payload: [4], name: "b" };
-        null;
+        ();
     "#;
 
     let compiled = compile_source(source).expect("compile should succeed");

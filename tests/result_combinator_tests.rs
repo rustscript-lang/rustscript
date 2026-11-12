@@ -378,8 +378,8 @@ fn named_payload_and_named_error_keep_their_declarations() {
 #[test]
 fn nullable_unwrap_or_keeps_the_existing_nullable_semantics() {
     let source = r#"
-        let present: int? = 3;
-        let missing: int? = null;
+        let present: Option<int> = Option::Some(3);
+        let missing: Option<int> = Option::None;
         let present_out = present.unwrap_or(9);
         let missing_out = missing.unwrap_or(8);
         present_out + missing_out;

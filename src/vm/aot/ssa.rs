@@ -2960,6 +2960,15 @@ mod tests {
     use super::*;
     use crate::{BytecodeBuilder, HostImport, Value};
 
+    fn compile_legacy(source: &str) -> crate::CompiledProgram {
+        crate::compile_source_with_flavor_and_options(
+            source,
+            crate::compiler::legacy_rss::flavor(),
+            crate::compiler::legacy_rss::options_with(crate::CompileSourceFileOptions::new()),
+        )
+        .unwrap_or_else(|error| panic!("legacy fixture must compile: {error}"))
+    }
+
     #[cfg(feature = "cranelift-jit")]
     #[test]
     fn r4_dynamic_result_aot_ssa_payload_checkpoints_and_host_root_execution() {
@@ -2981,7 +2990,7 @@ mod tests {
             let source = format!(
                 "pub fn increment(n: int) -> int {{ n + 1 }} pub fn relay(flag: bool, payload: {ty}) -> Result<{ty}, {ty}> {{ let carrier: Result<{ty}, {ty}> = if flag => {{ Result::Ok(payload) }} else => {{ Result::Err(payload) }}; let selected = match carrier {{ Result::Ok(v) => v, Result::Err(e) => e, }}; if flag => {{ Result::Ok(selected) }} else => {{ Result::Err(selected) }} }} 0;"
             );
-            let compiled = crate::compile_source(&source).unwrap();
+            let compiled = compile_legacy(&source);
             let program = compiled.program.with_local_count(compiled.locals);
             let ssa = build_aot_ssa(&program).unwrap();
             ssa.verify().unwrap();
@@ -3093,9 +3102,11 @@ mod tests {
         ));
         let compiled = crate::compile_source_with_flavor_and_options(
             "fn absent() -> int? { null } fn relay() -> Result<int,int> { let x = absent().unwrap_or(test::make_err_int()?); Result::Ok(0) } let carried = relay(); carried;",
-            crate::SourceFlavor::RustScript,
-            crate::CompileSourceFileOptions::new()
-                .with_host_api_catalog(Arc::new(catalog.build().unwrap())),
+            crate::compiler::legacy_rss::flavor(),
+            crate::compiler::legacy_rss::options_with(
+                crate::CompileSourceFileOptions::new()
+                    .with_host_api_catalog(Arc::new(catalog.build().unwrap())),
+            ),
         )
         .unwrap();
         let program = compiled.program.with_local_count(compiled.locals);
@@ -3137,7 +3148,7 @@ mod tests {
             let source = format!(
                 "fn absent() -> int? {{ {expression} }} let carried = absent().unwrap_or(41); carried;"
             );
-            let compiled = crate::compile_source(&source).unwrap();
+            let compiled = compile_legacy(&source);
             let program = compiled.program.with_local_count(compiled.locals);
             println!(
                 "AOTNULL source={source}\n{}\nTYPEMAP={:#?}",
@@ -3195,7 +3206,7 @@ mod tests {
                 ),
                 format!("let x:int? = {expression}; x.unwrap_or(41);"),
             ] {
-                let compiled = crate::compile_source(&source).unwrap();
+                let compiled = compile_legacy(&source);
                 let program = compiled.program.with_local_count(compiled.locals);
                 println!(
                     "AOTNULL source={source}\n{}\n{}",
@@ -3231,7 +3242,11 @@ mod tests {
                 format!("use self::nullable as imported; imported::relay({flag}).unwrap_or(41);"),
             )
             .unwrap();
-            let compiled = crate::compile_source_file(&main).unwrap();
+            let compiled = crate::compile_source_file_with_options(
+                &main,
+                crate::compiler::legacy_rss::options_with(crate::CompileSourceFileOptions::new()),
+            )
+            .unwrap_or_else(|error| panic!("legacy import must compile: {error}"));
             let program = compiled.program.with_local_count(compiled.locals);
             let ssa = build_aot_ssa(&program).unwrap();
             assert!(!ssa.text().contains("InterpreterBoundary"));

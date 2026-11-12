@@ -117,12 +117,15 @@ fn nostd_executes_std_encoded_result_ok_and_err_without_source() {
             EmbeddedValue::Int(4),
         ),
         (
-            "let value: Result<Result<int?, bool>, string> = Result::Ok(Result::Err(false)); match value { Result::Ok(inner) => match inner { Result::Ok(n) => true, Result::Err(flag) => flag, }, Result::Err(e) => true, };",
+            "let value: Result<Result<Option<int>, bool>, string> = Result::Ok(Result::Err(false)); match value { Result::Ok(inner) => match inner { Result::Ok(n) => true, Result::Err(flag) => flag, }, Result::Err(e) => true, };",
             EmbeddedValue::Bool(false),
         ),
         (
-            "let value: Result<string, int?> = Result::Err(null); match value { Result::Ok(s) => 9, Result::Err(n) => n, };",
-            EmbeddedValue::Null,
+            "let value: Result<string, Option<int>> = Result::Err(Option::None); match value { Result::Ok(s) => Option::Some(9), Result::Err(n) => n, };",
+            EmbeddedValue::map(vec![(
+                EmbeddedValue::string("tag"),
+                EmbeddedValue::Bool(false),
+            )]),
         ),
     ];
     for (source, expected) in cases {
@@ -146,6 +149,7 @@ fn nostd_executes_std_encoded_result_ok_and_err_without_source() {
             EmbeddedValue::Int(n) => vm::Value::Int(*n),
             EmbeddedValue::Bool(b) => vm::Value::Bool(*b),
             EmbeddedValue::Null => vm::Value::Null,
+            EmbeddedValue::Map(_) => vm::option::none_carrier(),
             _ => unreachable!(),
         };
         assert_eq!(std_vm.stack().last(), Some(&std_expected));
