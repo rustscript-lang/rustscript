@@ -603,6 +603,98 @@ impl SourcePlugin for LogicalSchemaPlugin {
     }
 }
 
+struct OptionSyntaxDialect;
+
+impl ParserDialect for OptionSyntaxDialect {
+    fn allow_option_syntax(&self) -> bool {
+        true
+    }
+}
+
+static OPTION_SYNTAX_DIALECT: OptionSyntaxDialect = OptionSyntaxDialect;
+
+struct OptionSchemaPlugin;
+static OPTION_SCHEMA_PLUGIN: OptionSchemaPlugin = OptionSchemaPlugin;
+
+impl SourcePlugin for OptionSchemaPlugin {
+    fn descriptor(&self) -> SourceFrontendDescriptor {
+        SourceFrontendDescriptor {
+            id: FrontendId::new("neutral-option-schemas"),
+            extensions: &["optlogical"],
+            typing_policy: FrontendTypingPolicy::Strict,
+            supports_ownership_checking: true,
+        }
+    }
+
+    fn parse_source(
+        &self,
+        source: &str,
+        context: &SourceFrontendContext<'_>,
+    ) -> Result<FrontendIr, ParseError> {
+        parse_source_with_dialect(
+            source,
+            &OPTION_SYNTAX_DIALECT,
+            SharedParserOptions {
+                source_id: context.source_id,
+                import_scan_mode: true,
+                ..SharedParserOptions::default()
+            },
+        )
+    }
+
+    fn validate_typed_ir(&self, typed: &FrontendTypedIr<'_>) -> Result<(), CompileError> {
+        let option = TypeSchema::Option(Box::new(TypeSchema::Int));
+        for (name, slot) in &typed.ir.local_bindings {
+            let expected = match name.as_str() {
+                "f" => TypeSchema::Callable {
+                    params: vec![],
+                    result: Box::new(TypeSchema::Int),
+                },
+                "g" => TypeSchema::Callable {
+                    params: vec![option.clone()],
+                    result: Box::new(option.clone()),
+                },
+                _ => continue,
+            };
+            assert_eq!(
+                typed.local_schemas[usize::from(*slot)],
+                Some(expected.clone()),
+                "checked local {name}"
+            );
+            if let Some(expr) = typed.ir.stmts.iter().find_map(|statement| match statement {
+                Stmt::Let { index, expr, .. } if index == slot => Some(expr),
+                _ => None,
+            }) {
+                assert_eq!(
+                    typed.schema_of_expr(&vm::compiler::Expr::Var(*slot)),
+                    Some(expected.clone()),
+                    "variable query {name}"
+                );
+                assert_eq!(
+                    typed.schema_of_expr(expr),
+                    Some(expected),
+                    "initializer query {name}"
+                );
+            }
+        }
+        if let Some(function) = typed
+            .ir
+            .functions
+            .iter()
+            .find(|function| function.name == "maybe")
+        {
+            assert_eq!(
+                typed.schema_of_function(function.index),
+                Some(TypeSchema::Callable {
+                    params: vec![option.clone()],
+                    result: Box::new(option)
+                })
+            );
+        }
+        Ok(())
+    }
+}
+
 #[test]
 fn inferred_function_reference_schema_agrees_with_runtime_hint_and_semantic_query() {
     let source = "fn answer() { 42 }\nlet f = answer;\nf();\n";
@@ -659,22 +751,22 @@ fn logical_optional_schema_is_complete_in_hints_and_validation_queries() {
 
 #[test]
 fn inferred_optional_callable_results_agree_across_native_and_neutral_queries() {
-    let optional = TypeSchema::Optional(Box::new(TypeSchema::Int));
+    let option = TypeSchema::Option(Box::new(TypeSchema::Int));
     let expected = TypeSchema::Callable {
-        params: vec![optional.clone()],
-        result: Box::new(optional),
+        params: vec![option.clone()],
+        result: Box::new(option),
     };
     for (flavor, path) in [
         (SourceFlavor::RustScript, "main.rss"),
         (
-            SourceFlavor::Plugin(FrontendId::new("neutral-logical-schemas")),
-            "main.logical",
+            SourceFlavor::Plugin(FrontendId::new("neutral-option-schemas")),
+            "main.optlogical",
         ),
     ] {
-        let options = || CompileSourceFileOptions::new().with_source_plugin(&LOGICAL_SCHEMA_PLUGIN);
+        let options = || CompileSourceFileOptions::new().with_source_plugin(&OPTION_SCHEMA_PLUGIN);
         for source in [
-            "fn maybe(value: int?) { value }\nlet g = maybe;\ng(null);\n",
-            "let g: fn(int?) -> int? = |value| value;\ng(null);\n",
+            "fn maybe(value: Option<int>) { value }\nlet g = maybe;\ng(Option::None);\n",
+            "let g: fn(Option<int>) -> Option<int> = |value| value;\ng(Option::None);\n",
         ] {
             let hints =
                 collect_inferred_local_type_hints_with_options(source, flavor, options()).unwrap();
@@ -719,7 +811,7 @@ fn inferred_optional_callable_results_agree_across_native_and_neutral_queries() 
                 compile_source_with_flavor_and_options(source, flavor, options()).unwrap();
             let mut machine = Vm::new(compiled.program);
             assert_eq!(machine.run().unwrap(), VmStatus::Halted);
-            assert_eq!(machine.stack(), &[Value::Null]);
+            assert_eq!(machine.stack(), &[vm::option::none_carrier()]);
         }
     }
 }
@@ -789,11 +881,11 @@ fn finalized_named_and_contextual_callable_consumers_keep_authored_generic_decla
     for (flavor, path) in [
         (SourceFlavor::RustScript, "main.rss"),
         (
-            SourceFlavor::Plugin(FrontendId::new("neutral-logical-schemas")),
-            "main.logical",
+            SourceFlavor::Plugin(FrontendId::new("neutral-option-schemas")),
+            "main.optlogical",
         ),
     ] {
-        let options = || CompileSourceFileOptions::new().with_source_plugin(&LOGICAL_SCHEMA_PLUGIN);
+        let options = || CompileSourceFileOptions::new().with_source_plugin(&OPTION_SCHEMA_PLUGIN);
         for (source, name, result, local) in [
             (
                 "fn answer() { 42 }\nlet f = answer;\nanswer();\nf();\n",
@@ -802,9 +894,9 @@ fn finalized_named_and_contextual_callable_consumers_keep_authored_generic_decla
                 "f",
             ),
             (
-                "fn maybe(value: int?) { value }\nlet g = maybe;\nmaybe(null);\ng(null);\n",
+                "fn maybe(value: Option<int>) { value }\nlet g = maybe;\nmaybe(Option::None);\ng(Option::None);\n",
                 "maybe",
-                TypeSchema::Optional(Box::new(TypeSchema::Int)),
+                TypeSchema::Option(Box::new(TypeSchema::Int)),
                 "g",
             ),
         ] {
@@ -860,12 +952,13 @@ fn finalized_named_and_contextual_callable_consumers_keep_authored_generic_decla
             );
             let mut machine = Vm::new(compiled.program);
             assert_eq!(machine.run().unwrap(), VmStatus::Halted);
+            let absent = vm::option::none_carrier();
             assert_eq!(
                 machine.stack().last(),
                 Some(if name == "answer" {
                     &Value::Int(42)
                 } else {
-                    &Value::Null
+                    &absent
                 })
             );
         }
@@ -913,10 +1006,10 @@ fn finalized_named_and_contextual_callable_consumers_keep_authored_generic_decla
         let mut machine = Vm::new(compiled.program);
         assert_eq!(machine.run().unwrap(), VmStatus::Halted);
         assert_eq!(machine.stack(), &[Value::Int(41)]);
-        let source = "let g: fn(int?) -> int? = |value| value;\ng(null);\n";
+        let source = "let g: fn(Option<int>) -> Option<int> = |value| value;\ng(Option::None);\n";
         let expected = TypeSchema::Callable {
-            params: vec![TypeSchema::Optional(Box::new(TypeSchema::Int))],
-            result: Box::new(TypeSchema::Optional(Box::new(TypeSchema::Int))),
+            params: vec![TypeSchema::Option(Box::new(TypeSchema::Int))],
+            result: Box::new(TypeSchema::Option(Box::new(TypeSchema::Int))),
         };
         let compiled = compile_source_with_flavor_and_options(source, flavor, options()).unwrap();
         assert!(

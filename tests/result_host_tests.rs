@@ -2,7 +2,7 @@
 
 use pd_host_function::pd_host_function;
 use std::sync::Arc;
-use vm::{GuestResult, Value, Vm, VmError, VmResult, VmStatus};
+use vm::{GuestOption, GuestResult, Value, Vm, VmError, VmResult, VmStatus};
 
 #[derive(Clone, Debug, PartialEq)]
 struct SdkFailure<T> {
@@ -68,7 +68,12 @@ fn actual_build_fixture_and_proc_macro_have_identical_typed_descriptors() {
     }
     assert!(matches!(
         generated::functions::fixture_descriptor().schema.params[0].ty,
-        vm::HostTypeSchema::Result { .. }
+        vm::HostTypeSchema::Result { ref ok, .. }
+            if matches!(
+                ok.as_ref(),
+                vm::HostTypeSchema::Option(inner)
+                    if matches!(inner.as_ref(), vm::HostTypeSchema::Array(_))
+            )
     ));
 }
 
@@ -103,8 +108,8 @@ fn generated_named_generic_result_catalog_declares_payload() {
 #[test]
 fn typed_array_optional_generated_roundtrip() {
     for (value, expected) in [
-        ("Result::Ok(null)", -1),
-        ("Result::Ok([3, 4])", 7),
+        ("Result::Ok(Option::None)", -1),
+        ("Result::Ok(Option::Some([3, 4]))", 7),
         ("Result::Err(\"typed error\")", -2),
     ] {
         let descriptors = vec![
@@ -113,7 +118,7 @@ fn typed_array_optional_generated_roundtrip() {
         ];
         let catalog = Arc::new(vm::HostFunctionDescriptor::collect_catalog(&descriptors).unwrap());
         let source = format!(
-            "use result_sdk; let input: Result<int[]?, string> = {value}; let value: Result<int[]?, string> = result_sdk::fixture(input); result_sdk::inspect(value);"
+            "use result_sdk; let input: Result<Option<int[]>, string> = {value}; let value: Result<Option<int[]>, string> = result_sdk::fixture(input); result_sdk::inspect(value);"
         );
         let compiled = vm::compile_source_with_flavor_and_options(
             &source,
@@ -132,6 +137,7 @@ fn typed_array_optional_generated_roundtrip() {
         machine.set_fuel(100_000);
         assert_eq!(machine.run().unwrap(), VmStatus::Halted);
         assert_eq!(machine.stack().last(), Some(&Value::Int(expected)));
+        assert_eq!(machine.host_context().module_state::<usize>(), Some(&1));
     }
 }
 
