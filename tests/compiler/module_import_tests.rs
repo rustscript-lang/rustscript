@@ -110,6 +110,61 @@ fn module_call_omitted_option_field_argument_materializes() {
 }
 
 #[test]
+fn rss_module_import_rejects_legacy_nullable_export() {
+    let root = temp_module_root("vm_rustscript_module_nullable_import_test");
+    let module_path = root.join("dep.rss");
+    write_source(
+        &module_path,
+        r#"
+        pub fn value() -> int? { 1 }
+    "#,
+        "nullable module source",
+    );
+    let main_path = root.join("main.rss");
+    let main_source = r#"
+        use self::dep as dep;
+        dep::value();
+    "#;
+    write_source(&main_path, main_source, "main source");
+
+    let error = match compile_source_file(&main_path) {
+        Ok(_) => {
+            panic!("a legacy nullable .rss export must be rejected at its own import boundary")
+        }
+        Err(error) => error,
+    };
+    match error {
+        vm::SourcePathError::SourceWithMap {
+            error: vm::SourceError::Parse(parse),
+            ..
+        } => {
+            assert!(
+                parse.message.contains("RSS rejects T?") && parse.message.contains("dep.rss"),
+                "expected the .rss nullable rejection with module path, got {parse}"
+            );
+        }
+        error => panic!("expected a source-aware module parse error, got {error:?}"),
+    }
+
+    write_source(
+        &module_path,
+        r#"
+        pub fn value() -> int { 1 }
+    "#,
+        "concrete module source",
+    );
+    let compiled = compile_source_file(&main_path).expect("concrete .rss import should compile");
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(
+        vm.run().expect("concrete .rss import should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Int(1)]);
+
+    remove_module_root(&root);
+}
+
+#[test]
 fn nested_module_override_parse_error_preserves_source_text_and_path() {
     let root = temp_module_root("vm_rustscript_nested_override_error_test");
     let main_path = root.join("main.rss");
