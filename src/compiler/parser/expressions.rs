@@ -563,12 +563,18 @@ impl Parser {
                         let semantic_id =
                             self.alloc_local_call_id(name_span, rparen_span, local, name.clone());
                         Expr::LocalCall(local, Vec::new(), args, semantic_id)
+                    } else if self.matching_catalog_print(&name, args.len()) {
+                        // A same-named catalog overload is the selected callee.
+                        // Language print sugar must not run before that identity.
+                        self.build_host_call_expr_with_type_args(&name, args, type_args)?
                     } else if self.functions.contains_key(&name) {
                         let builtin_alias_call = if matches!(name.as_str(), "print" | "println") {
-                            self.functions
-                                .get(&name)
-                                .map(|decl| !self.function_impls.contains_key(&decl.index))
-                                .unwrap_or(false)
+                            self.functions.get(&name).is_some_and(|decl| {
+                                !self.function_impls.contains_key(&decl.index)
+                                    && !self.parsed_function_decls.contains(&decl.index)
+                                    && decl.return_schema.is_none()
+                                    && decl.arg_schemas.iter().all(|schema| schema.is_none())
+                            })
                         } else {
                             false
                         };
@@ -2568,6 +2574,25 @@ impl Parser {
             None,
             None,
         )
+    }
+
+    fn matching_catalog_print(&self, name: &str, arity: usize) -> bool {
+        if !matches!(name, "print" | "println") {
+            return false;
+        }
+        if self
+            .functions
+            .get(name)
+            .is_some_and(|decl| self.function_impls.contains_key(&decl.index))
+        {
+            return false;
+        }
+        self.host_catalog.as_ref().is_some_and(|catalog| {
+            catalog
+                .functions_named(name)
+                .iter()
+                .any(|schema| schema.params.len() == arity)
+        })
     }
 
     pub(super) fn try_build_language_builtin_call(
