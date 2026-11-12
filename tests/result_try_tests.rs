@@ -1282,3 +1282,25 @@ fn fuel_yields_inside_combinator_callback_then_completes() {
     );
     assert_eq!(machine.stack().last(), Some(&vm::Value::Int(101)));
 }
+
+#[test]
+fn result_ok_and_err_from_captured_values_match_plain_capture() {
+    let ok = r#"
+        let mut n = 0;
+        fn next() -> Result<int, string> { n = n + 1; Result::Ok(n) }
+        let first = match next() { Result::Ok(v) => v, Result::Err(_) => -1 };
+        let second = match next() { Result::Ok(v) => v, Result::Err(_) => -1 };
+        first * 10 + second;
+    "#;
+    assert_eq!(eval(ok), vm::Value::Int(12));
+    let err = r#"
+        let label = "e";
+        fn next() -> Result<int, string> { Result::Err(label) }
+        let flag = match next() {
+            Result::Ok(_) => 0,
+            Result::Err(e) => if e == "e" => { 1 } else => { 2 },
+        };
+        flag;
+    "#;
+    assert_eq!(eval(err), vm::Value::Int(1));
+}

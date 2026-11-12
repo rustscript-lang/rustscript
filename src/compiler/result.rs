@@ -21,6 +21,8 @@ pub(crate) const RESULT_PAYLOAD_KEY: &str = "payload";
 
 struct Env {
     slots: HashMap<LocalSlot, TypeSchema>,
+    /// Declaration-position schemas. Assignments update `slots` only.
+    declaration_schemas: HashMap<LocalSlot, TypeSchema>,
     functions: HashMap<u16, FunctionDecl>,
     function_list: Vec<FunctionDecl>,
     function_impls: HashMap<u16, FunctionImpl>,
@@ -77,6 +79,7 @@ pub(crate) fn resolve_result_types(
         }
     }
     let mut env = Env {
+        declaration_schemas: slots.clone(),
         slots,
         functions,
         function_list,
@@ -88,9 +91,7 @@ pub(crate) fn resolve_result_types(
     };
     resolve_stmts(&mut ir.stmts, None, &mut env)?;
     let mut impls = std::mem::take(&mut ir.function_impls);
-    for (index, function_impl) in impls.iter_mut() {
-        resolve_function(*index, function_impl, &mut env)?;
-    }
+    resolve_function_impls(&mut impls, &mut env)?;
     ir.function_impls = impls;
     Ok(())
 }
@@ -113,8 +114,12 @@ fn resolve_function(
         {
             if let Some(schema) = schema {
                 env.slots.insert(*slot, schema.clone());
+                env.declaration_schemas
+                    .entry(*slot)
+                    .or_insert(schema.clone());
             }
         }
+        seed_captured_schemas(function_impl, env);
         resolve_stmts(
             &mut function_impl.body_stmts,
             function.return_schema.clone(),
@@ -126,6 +131,7 @@ fn resolve_function(
             env,
         )?;
     } else {
+        seed_captured_schemas(function_impl, env);
         resolve_stmts(&mut function_impl.body_stmts, None, env)?;
         resolve_expr(&mut function_impl.body_expr, None, env)?;
     }
@@ -133,6 +139,49 @@ fn resolve_function(
     env.local_defs = saved_defs;
     env.volatile_sources = saved_volatile;
     env.lexical_return = saved_return;
+    Ok(())
+}
+
+fn seed_captured_schemas(function_impl: &FunctionImpl, env: &mut Env) {
+    for (source, captured) in &function_impl.capture_copies {
+        let Some(schema) = env
+            .declaration_schemas
+            .get(source)
+            .cloned()
+            .or_else(|| env.slots.get(source).cloned())
+        else {
+            continue;
+        };
+        env.slots.insert(*captured, schema.clone());
+        env.declaration_schemas.entry(*captured).or_insert(schema);
+    }
+}
+
+fn resolve_function_impls(
+    impls: &mut HashMap<u16, FunctionImpl>,
+    env: &mut Env,
+) -> Result<(), CompileError> {
+    let owners = super::option::local_slot_owners(impls);
+    let mut pending: Vec<u16> = impls.keys().copied().collect();
+    while !pending.is_empty() {
+        let ready = pending.iter().position(|index| {
+            impls[&index].capture_copies.iter().all(|(source, _)| {
+                if env.declaration_schemas.contains_key(source) {
+                    return true;
+                }
+                match owners.get(source) {
+                    Some(owner) if *owner != *index && pending.contains(owner) => false,
+                    _ => true,
+                }
+            })
+        });
+        let index = match ready {
+            Some(position) => pending.remove(position),
+            None => pending.remove(0),
+        };
+        let function_impl = impls.get_mut(&index).expect("pending function impl");
+        resolve_function(index, function_impl, env)?;
+    }
     Ok(())
 }
 
@@ -184,6 +233,9 @@ fn resolve_stmt(
                 })
                 .filter(|schema| !matches!(schema, TypeSchema::Unknown))
             {
+                env.declaration_schemas
+                    .entry(*index)
+                    .or_insert_with(|| schema.clone());
                 env.slots.insert(*index, schema);
             }
             let is_callable = env
@@ -5444,6 +5496,7 @@ mod tests {
             },
         );
         Env {
+            declaration_schemas: slots.clone(),
             slots,
             functions: HashMap::new(),
             function_list: Vec::new(),

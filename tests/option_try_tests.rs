@@ -611,3 +611,99 @@ fn typed_construction_required_field_and_wrong_option_payload_still_reject() {
         "wrong generic Option payload must reject at that obligation: {wrong}"
     );
 }
+
+#[test]
+fn named_function_capture_counter_matches_plain_int_baseline() {
+    let source = r#"
+        let mut n = 0;
+        fn next() -> int { n = n + 1; n }
+        let first = next();
+        let second = next();
+        first * 10 + second;
+    "#;
+    assert_eq!(eval(source), Value::Int(12));
+}
+
+#[test]
+fn option_some_from_captured_int_matches_plain_capture_counter() {
+    let source = r#"
+        let mut n = 0;
+        fn next() -> Option<int> { n = n + 1; Option::Some(n) }
+        let first = match next() { Option::Some(v) => v, Option::None => -1 };
+        let second = match next() { Option::Some(v) => v, Option::None => -1 };
+        first * 10 + second;
+    "#;
+    assert_eq!(eval(source), Value::Int(12));
+}
+
+#[test]
+fn option_some_from_captured_string_keeps_source_identity() {
+    let source = r#"
+        let mut label = "a";
+        fn next() -> Option<string> {
+            label = label + "b";
+            Option::Some(label)
+        }
+        let flag = match next() {
+            Option::Some(v) => if v == "ab" => { 1 } else => { 0 },
+            Option::None => -1,
+        };
+        flag;
+    "#;
+    assert_eq!(eval(source), Value::Int(1));
+}
+
+#[test]
+fn option_some_capture_keeps_param_and_root_slots_distinct() {
+    let source = r#"
+        let mut n = 1;
+        fn from_param(n: int) -> Option<int> { Option::Some(n) }
+        fn from_capture() -> Option<int> { Option::Some(n) }
+        let param_value = match from_param(9) { Option::Some(v) => v, Option::None => -1 };
+        let captured = match from_capture() { Option::Some(v) => v, Option::None => -1 };
+        param_value * 10 + captured;
+    "#;
+    assert_eq!(eval(source), Value::Int(91));
+}
+
+#[test]
+fn nested_function_option_some_uses_enclosing_capture_schema() {
+    let source = r#"
+        fn outer() -> int {
+            let mut n = 0;
+            fn next() -> Option<int> { n = n + 1; Option::Some(n) }
+            let first = match next() { Option::Some(v) => v, Option::None => -1 };
+            let second = match next() { Option::Some(v) => v, Option::None => -1 };
+            first * 10 + second
+        }
+        outer();
+    "#;
+    assert_eq!(eval(source), Value::Int(12));
+}
+
+#[test]
+fn captured_option_constructor_in_method_position_uses_capture_schema() {
+    let source = r#"
+        let base = 1;
+        fn next() -> Option<int> {
+            Option::Some(base).map(|v| v + 1)
+        }
+        match next() { Option::Some(v) => v, Option::None => -1 };
+    "#;
+    assert_eq!(eval(source), Value::Int(2));
+}
+
+#[test]
+fn captured_record_schema_materializes_omitted_option_field_in_assignment() {
+    let source = r#"
+        struct Record { value: Option<int> }
+        let seed: Record = {value: Option::None};
+        fn build() -> int {
+            let mut target = seed;
+            target = {};
+            match target.value { Option::Some(v) => v, Option::None => 0 }
+        }
+        build();
+    "#;
+    assert_eq!(eval(source), Value::Int(0));
+}
