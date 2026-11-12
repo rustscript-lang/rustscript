@@ -51,21 +51,16 @@ use super::validate::{
 /// instead of restarting the growth - the failed resolution closes the
 /// expansion rather than reopening it.
 ///
-/// 32 re-entries of one declaration is far beyond any practical JSON
-/// payload depth (each level is one more container wrap of the type
-/// argument), and the walk cost grows quadratically with the budget
-/// (every level re-resolves its own increasingly wrapped arguments), so
-/// the bound also keeps the compile-time walk fast and shallow enough
-/// for the constrained-stack regression probes.
-const MAX_NAMED_SCHEMA_REENTRY: usize = 32;
+const MAX_NAMED_SCHEMA_REENTRY: usize = 2;
 
 /// True when `schema` mentions the generic parameter `name` anywhere.
-/// Used to break self-referential bindings (`T` bound to `[T]`): such a
-/// binding can only arise from an unbound parameter root, and expanding
-/// it would loop through containers forever without ever re-entering a
-/// named declaration (so the named re-entry budget would never trip), so
-/// the parameter is left unresolved instead - the honest marker for a
-/// circular binding.
+/// Used to break self-referential bindings (`T` bound to `[T]` or
+/// `Option<T>`): such a binding can only arise from an unbound parameter
+/// root, and expanding it would loop through containers forever without
+/// ever re-entering a named declaration (so the named re-entry budget
+/// would never trip), so the parameter is left unresolved instead - the
+/// honest marker for a circular binding. `Option` is a container here:
+/// omitting it made `T` bound through `Option<T>` expand forever.
 fn schema_mentions_generic_param(schema: &TypeSchema, name: &str) -> bool {
     match schema {
         TypeSchema::GenericParam(other) => other == name,
@@ -83,7 +78,9 @@ fn schema_mentions_generic_param(schema: &TypeSchema, name: &str) -> bool {
                 || schema_mentions_generic_param(rest, name)
         }
         TypeSchema::Map(value) => schema_mentions_generic_param(value, name),
-        TypeSchema::Optional(inner) => schema_mentions_generic_param(inner, name),
+        TypeSchema::Optional(inner) | TypeSchema::Option(inner) => {
+            schema_mentions_generic_param(inner, name)
+        }
         TypeSchema::Result { ok, err } => {
             schema_mentions_generic_param(ok, name) || schema_mentions_generic_param(err, name)
         }
@@ -414,7 +411,7 @@ impl<'a> TypeContext<'a> {
         seen: &mut HashSet<String>,
         reentries: &mut HashMap<String, usize>,
     ) -> (TypeSchema, Option<String>) {
-        match schema {
+        let resolved = match schema {
             TypeSchema::GenericParam(name) => {
                 let bound = self.resolve_generic_binding(name).cloned();
                 match bound {
@@ -427,6 +424,20 @@ impl<'a> TypeContext<'a> {
                 }
             }
             TypeSchema::Named(name, type_args) => {
+                let reentry_count = reentries.get(name.as_str()).copied().unwrap_or(0);
+                if reentry_count >= MAX_NAMED_SCHEMA_REENTRY {
+                    // Stop before walking arguments. Container-wrapped
+                    // recursion (`Node<T>` -> `Node<[T]>`) makes each
+                    // argument one container deeper, and walking that nest
+                    // before the budget check keeps every ancestor frame
+                    // live. The 512 KiB json-encode probes abort on that
+                    // nest in debug builds. The marker keeps the unresolved
+                    // arguments; a raw parameter cannot restart growth
+                    // because `schema_mentions_generic_param` refuses a
+                    // binding that mentions itself, including through Option.
+                    let key = schema_instance_key(name, type_args, &vec![None; type_args.len()]);
+                    return (TypeSchema::Named(name.clone(), type_args.clone()), Some(key));
+                }
                 let mut resolved_args = Vec::with_capacity(type_args.len());
                 let mut arg_trips = Vec::with_capacity(type_args.len());
                 for arg in type_args {
@@ -600,7 +611,8 @@ impl<'a> TypeContext<'a> {
                 )
             }
             _ => (schema.clone(), None),
-        }
+        };
+        resolved
     }
 
     /// Cycle key for a named schema: the struct name plus the identity of

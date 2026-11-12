@@ -361,7 +361,7 @@ fn validate_json_schema(
 /// remains the final gate for actual values (string keys, bytes,
 /// callables, NaN/infinity), and every runtime value of a structurally
 /// recursive type is finite.
-const MAX_JSON_SCHEMA_VALIDATION_REENTRY: usize = 32;
+const MAX_JSON_SCHEMA_VALIDATION_REENTRY: usize = 2;
 
 /// Walks `schema` for `json::encode` legality. `seen` tracks the named
 /// schemas currently being expanded on the active path, so a self- or
@@ -416,6 +416,15 @@ fn validate_json_schema_with_seen(
         }
         TypeSchema::Named(name, _) => {
             let reentry_count = reentries.get(name.as_str()).copied().unwrap_or(0);
+            if reentry_count > 0 {
+                // The body was already walked on this path. Another wrap of
+                // the same declaration is the recursion edge. Re-resolving
+                // it rebuilds the argument nest and overflows the 512 KiB
+                // json-encode probes. Fixed unsupported fields were
+                // rejected on the first walk; distinct declaration names
+                // still have a zero count and are walked in full.
+                return Ok(());
+            }
             if reentry_count >= MAX_JSON_SCHEMA_VALIDATION_REENTRY {
                 // Budget exhausted: this re-entry is a pure structural
                 // recursion edge (container-wrapped recursion has no
