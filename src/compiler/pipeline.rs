@@ -234,11 +234,11 @@ fn prepare_typed_units_with_entry(
             &runtime_types,
             rss_map_store_scope(&owners),
         )
-            .map_err(typing::map_admission_source_error)
-            .map_err(|error| SourcePathError::SourceWithMap {
-                error,
-                sources: sources.clone(),
-            })?;
+        .map_err(typing::map_admission_source_error)
+        .map_err(|error| SourcePathError::SourceWithMap {
+            error,
+            sources: sources.clone(),
+        })?;
         let owned = enforce_owned_sources(
             runtime,
             &facts,
@@ -477,7 +477,7 @@ fn prepare_owned_typed_ir(
         entry.types,
         rss_map_store_scope(owners),
     )
-        .map_err(typing::map_admission_source_error)?;
+    .map_err(typing::map_admission_source_error)?;
     let owned_ir = enforce_owned_sources(
         parsed.clone(),
         &type_info,

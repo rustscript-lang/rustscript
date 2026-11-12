@@ -77,8 +77,7 @@ fn source_path(plugin: Option<&'static RecordPlugin>) -> String {
     )
 }
 
-const OMITTED: &str =
-    "struct Entry { count: int, note: Option<string> }\nlet entry: Entry = { count: 42 };\nentry.count;\n";
+const OMITTED: &str = "struct Entry { count: int, note: Option<string> }\nlet entry: Entry = { count: 42 };\nentry.count;\n";
 
 fn assert_checked_run(source: &str, plugin: Option<&'static RecordPlugin>) {
     let compiled = compile_source_with_flavor_and_options(source, flavor(plugin), options(plugin))
@@ -128,7 +127,10 @@ fn all_frontends() -> [Option<&'static RecordPlugin>; 3] {
 
 #[test]
 fn present_valid_optional_record_field_runs_across_frontends() {
-    let source = OMITTED.replace("{ count: 42 }", "{ count: 42, note: Option::Some(\"ready\") }");
+    let source = OMITTED.replace(
+        "{ count: 42 }",
+        "{ count: 42, note: Option::Some(\"ready\") }",
+    );
     for plugin in all_frontends() {
         assert_checked_run(&source, plugin);
     }

@@ -270,7 +270,13 @@ fn project_option(
     if matches!(raw, Value::Null) {
         return Ok(none_carrier());
     }
-    Ok(some_carrier(project_value(raw, inner, Position::Value, depth, names)?))
+    Ok(some_carrier(project_value(
+        raw,
+        inner,
+        Position::Value,
+        depth,
+        names,
+    )?))
 }
 
 fn project_int(raw: &Value) -> VmResult<Value> {
@@ -303,7 +309,12 @@ fn project_float(raw: &Value) -> VmResult<Value> {
     }
 }
 
-fn project_array(raw: &Value, inner: &TypeSchema, depth: usize, names: &JsonNames<'_>) -> VmResult<Value> {
+fn project_array(
+    raw: &Value,
+    inner: &TypeSchema,
+    depth: usize,
+    names: &JsonNames<'_>,
+) -> VmResult<Value> {
     let Value::Array(values) = raw else {
         return Err(VmError::TypeMismatch("json array"));
     };
@@ -314,7 +325,12 @@ fn project_array(raw: &Value, inner: &TypeSchema, depth: usize, names: &JsonName
     Ok(Value::array(out))
 }
 
-fn project_tuple(raw: &Value, items: &[TypeSchema], depth: usize, names: &JsonNames<'_>) -> VmResult<Value> {
+fn project_tuple(
+    raw: &Value,
+    items: &[TypeSchema],
+    depth: usize,
+    names: &JsonNames<'_>,
+) -> VmResult<Value> {
     let Value::Array(values) = raw else {
         return Err(VmError::TypeMismatch("json tuple"));
     };
@@ -332,7 +348,12 @@ fn project_tuple(raw: &Value, items: &[TypeSchema], depth: usize, names: &JsonNa
     Ok(Value::array(out))
 }
 
-fn project_map(raw: &Value, inner: &TypeSchema, depth: usize, names: &JsonNames<'_>) -> VmResult<Value> {
+fn project_map(
+    raw: &Value,
+    inner: &TypeSchema,
+    depth: usize,
+    names: &JsonNames<'_>,
+) -> VmResult<Value> {
     if map_value_ambiguous(inner) {
         return Err(VmError::HostError(
             "typed json rejects Map<Option<Unit>> and other null-ambiguous map values".to_string(),
@@ -388,16 +409,18 @@ fn project_object(
                     project_field(value, schema, depth, names)?,
                 ));
             }
-            None => out.push((
-                Value::string(name.clone()),
-                missing_field(schema)?,
-            )),
+            None => out.push((Value::string(name.clone()), missing_field(schema)?)),
         }
     }
     Ok(Value::map(out))
 }
 
-fn project_field(raw: &Value, schema: &TypeSchema, depth: usize, names: &JsonNames<'_>) -> VmResult<Value> {
+fn project_field(
+    raw: &Value,
+    schema: &TypeSchema,
+    depth: usize,
+    names: &JsonNames<'_>,
+) -> VmResult<Value> {
     match field_form(schema)? {
         FieldForm::OrdinaryOption(inner) => {
             if matches!(raw, Value::Null) {
@@ -465,17 +488,18 @@ fn field_form(schema: &TypeSchema) -> VmResult<FieldForm<'_>> {
             other if null_ambiguous(other) => Err(ambiguous_option()),
             other => Ok(FieldForm::OrdinaryOption(other)),
         },
-        other if matches!(
-            other,
-            TypeSchema::Null
-                | TypeSchema::Optional(_)
-                | TypeSchema::Unknown
-                | TypeSchema::GenericParam(_)
-                | TypeSchema::Bytes
-                | TypeSchema::Callable { .. }
-                | TypeSchema::Resource(_)
-                | TypeSchema::Result { .. }
-        ) =>
+        other
+            if matches!(
+                other,
+                TypeSchema::Null
+                    | TypeSchema::Optional(_)
+                    | TypeSchema::Unknown
+                    | TypeSchema::GenericParam(_)
+                    | TypeSchema::Bytes
+                    | TypeSchema::Callable { .. }
+                    | TypeSchema::Resource(_)
+                    | TypeSchema::Result { .. }
+            ) =>
         {
             Err(unsupported(other))
         }
@@ -518,7 +542,13 @@ fn encode_value(
             Value::Null => Ok(JsonValue::Null),
             _ => Err(VmError::TypeMismatch("json unit")),
         },
-        TypeSchema::Array(inner) => encode_array(value, std::slice::from_ref(inner.as_ref()), true, depth, names),
+        TypeSchema::Array(inner) => encode_array(
+            value,
+            std::slice::from_ref(inner.as_ref()),
+            true,
+            depth,
+            names,
+        ),
         TypeSchema::ArrayTuple(items) => encode_array(value, items, false, depth, names),
         TypeSchema::Map(inner) => encode_map(value, inner, depth, names),
         TypeSchema::Object(fields) => encode_object(value, fields, depth, names),
@@ -582,7 +612,12 @@ fn encode_array(
     Ok(JsonValue::Array(out))
 }
 
-fn encode_map(value: &Value, inner: &TypeSchema, depth: usize, names: &JsonNames<'_>) -> VmResult<JsonValue> {
+fn encode_map(
+    value: &Value,
+    inner: &TypeSchema,
+    depth: usize,
+    names: &JsonNames<'_>,
+) -> VmResult<JsonValue> {
     if map_value_ambiguous(inner) {
         return Err(VmError::HostError(
             "typed json rejects Map<Option<Unit>> and other null-ambiguous map values".to_string(),
@@ -627,9 +662,9 @@ fn encode_object(
         let encoded = match present.get(name) {
             Some(value) => encode_field(value, schema, depth, names)?,
             None => match field_form(schema)? {
-                FieldForm::OrdinaryOption(_) | FieldForm::OptionUnit | FieldForm::OptionOption(_) => {
-                    None
-                }
+                FieldForm::OrdinaryOption(_)
+                | FieldForm::OptionUnit
+                | FieldForm::OptionOption(_) => None,
                 FieldForm::Value => {
                     return Err(VmError::HostError(
                         "typed json object is missing a required field".to_string(),
@@ -701,7 +736,13 @@ fn encode_field(
                 names,
             )?))
         }
-        FieldForm::Value => Ok(Some(encode_value(value, schema, Position::Field, depth, names)?)),
+        FieldForm::Value => Ok(Some(encode_value(
+            value,
+            schema,
+            Position::Field,
+            depth,
+            names,
+        )?)),
     }
 }
 
@@ -744,9 +785,7 @@ fn ambiguous_option() -> VmError {
 }
 
 fn unsupported(schema: &TypeSchema) -> VmError {
-    VmError::HostError(format!(
-        "typed json has no natural encoding for {schema:?}"
-    ))
+    VmError::HostError(format!("typed json has no natural encoding for {schema:?}"))
 }
 
 pub(super) fn render_typed(
@@ -761,7 +800,12 @@ pub(super) fn render_typed(
     render_value(value, &schema, 0, &names)
 }
 
-fn render_value(value: &Value, schema: &TypeSchema, depth: usize, names: &JsonNames<'_>) -> VmResult<String> {
+fn render_value(
+    value: &Value,
+    schema: &TypeSchema,
+    depth: usize,
+    names: &JsonNames<'_>,
+) -> VmResult<String> {
     let depth = next_depth(depth)?;
     match schema {
         TypeSchema::Named(name, args) => {

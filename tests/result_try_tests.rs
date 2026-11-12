@@ -644,8 +644,7 @@ fn optional_result_operand_is_rejected_at_try_boundary() {
 
 #[test]
 fn optional_try_payload_cannot_flow_to_required_let_or_argument() {
-    let head =
-        "fn maybe() -> Result<Option<int>, string> { Result::Ok(Option::None) }\nfn take(n: int) -> int { n }\n";
+    let head = "fn maybe() -> Result<Option<int>, string> { Result::Ok(Option::None) }\nfn take(n: int) -> int { n }\n";
     for body in [
         "let required: int = maybe()?; Result::Ok(required)",
         "Result::Ok(take(maybe()?))",

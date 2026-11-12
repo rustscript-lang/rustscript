@@ -4673,10 +4673,7 @@ fn json_encode_runtime_map_rejects_non_string_key() {
         .expect_err("json::encode must reject non-string map keys");
     match err {
         vm::VmError::HostError(message) => {
-            assert!(
-                message.contains("map keys must be strings"),
-                "{message}"
-            );
+            assert!(message.contains("map keys must be strings"), "{message}");
         }
         other => panic!("unexpected vm error: {other}"),
     }

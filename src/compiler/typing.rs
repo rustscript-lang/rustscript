@@ -16,12 +16,12 @@ use self::collect::{
 };
 use self::context::TypeContext;
 pub(crate) use self::context::bound_type_from_schema;
-pub(crate) use self::map_store::{MapStoreScope, classify_map_stores, map_admission_source_error};
 use self::helpers::{
     FunctionLegalizeEnv, HostCallResolutionPass, HostCallResolutionPhase, build_function_decl_map,
     build_function_names, build_host_import_return_types, legalize_function_impl, legalize_stmts,
     validate_function_impl, validate_stmts,
 };
+pub(crate) use self::map_store::{MapStoreScope, classify_map_stores, map_admission_source_error};
 pub(crate) use self::state::{
     BoundType, HostCallableSignature, LocalTypeState, TypeInferenceResult,
 };
@@ -681,13 +681,8 @@ pub(super) fn infer_types_with_capture_origins(
             callable_slots: &mut callable_slots,
             optional_slots: &mut optional_slots,
         };
-        let (function_origins, _) = collect_function_types(
-            decl.index,
-            function_impl,
-            decl,
-            &mut outputs,
-            &env,
-        );
+        let (function_origins, _) =
+            collect_function_types(decl.index, function_impl, decl, &mut outputs, &env);
         origins.extend(function_origins);
     }
 

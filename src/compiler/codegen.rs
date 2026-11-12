@@ -1152,7 +1152,8 @@ impl Compiler {
                     .push_const(Value::string(super::result::RESULT_PAYLOAD_KEY));
                 self.compile_expr(payload)?;
                 self.assembler.push_const(Value::Bool(false));
-                self.assembler.call(BuiltinFunction::MapEdit.call_index(), 4);
+                self.assembler
+                    .call(BuiltinFunction::MapEdit.call_index(), 4);
             }
             Expr::ResultQuery { value, ok, .. } => {
                 self.compile_expr(value)?;
@@ -1258,7 +1259,8 @@ impl Compiler {
                         .push_const(Value::string(super::option::OPTION_PAYLOAD_KEY));
                     self.compile_expr(payload)?;
                     self.assembler.push_const(Value::Bool(false));
-                    self.assembler.call(BuiltinFunction::MapEdit.call_index(), 4);
+                    self.assembler
+                        .call(BuiltinFunction::MapEdit.call_index(), 4);
                 }
             }
             Expr::OptionMatch {

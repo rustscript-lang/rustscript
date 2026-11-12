@@ -1124,15 +1124,14 @@ impl AvailabilityAnalyzer {
                     Ok(out)
                 } else if let Some(root_slot) = self.extract_collection_mutation_root(*index, args)
                 {
-                    let mut out =
-                        if matches!(
-                            BuiltinFunction::from_call_index(*index),
-                            Some(BuiltinFunction::Set | BuiltinFunction::MapEdit)
-                        ) {
-                            self.analyze_projection_args(args, state, line)?
-                        } else {
-                            self.analyze_args(args, state, line)?
-                        };
+                    let mut out = if matches!(
+                        BuiltinFunction::from_call_index(*index),
+                        Some(BuiltinFunction::Set | BuiltinFunction::MapEdit)
+                    ) {
+                        self.analyze_projection_args(args, state, line)?
+                    } else {
+                        self.analyze_args(args, state, line)?
+                    };
                     self.apply_interprocedural_consumed_call_effects(*index, args, &mut out);
                     // Inserting an owned local into an aggregate transfers
                     // ownership of the handle into the collection/field.
@@ -2211,7 +2210,11 @@ impl AvailabilityAnalyzer {
                         && position == 0
                         && matches!(
                             BuiltinFunction::from_call_index(*index),
-                            Some(BuiltinFunction::Get | BuiltinFunction::Set | BuiltinFunction::MapEdit)
+                            Some(
+                                BuiltinFunction::Get
+                                    | BuiltinFunction::Set
+                                    | BuiltinFunction::MapEdit
+                            )
                         ) {
                         // A projection may read an available remaining child
                         // of a partially moved root; it is not a whole read.
@@ -2236,7 +2239,8 @@ impl AvailabilityAnalyzer {
                     let value_position = match builtin {
                         BuiltinFunction::Set if args.len() == 3 => Some(2),
                         BuiltinFunction::MapEdit
-                            if args.len() == 4 && !matches!(args.get(3), Some(Expr::Bool(true))) =>
+                            if args.len() == 4
+                                && !matches!(args.get(3), Some(Expr::Bool(true))) =>
                         {
                             Some(2)
                         }
