@@ -1,6 +1,7 @@
 #![cfg(feature = "runtime")]
 use vm::{
-    GuestResult, IntoScriptValue, ScriptResult, TypeSchema, Value, Vm, VmError, VmResult, VmStatus,
+    GuestOption, GuestResult, IntoScriptValue, ScriptResult, TypeSchema, Value, Vm, VmError,
+    VmResult, VmStatus,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -33,19 +34,27 @@ impl<T: ScriptResult> ScriptResult for Packet<T> {
 
 #[test]
 fn generic_named_optional_arrays_callback_both_variants() {
-    let compiled = vm::compile_source("struct Packet<T> { value: T } pub fn echo(value: Result<Packet<int[]?>, string>) -> Result<Packet<int[]?>, string> { value }").unwrap();
+    let compiled = vm::compile_source("struct Packet<T> { value: T } pub fn echo(value: Result<Packet<Option<int[]>>, string>) -> Result<Packet<Option<int[]>>, string> { value }").unwrap();
     let mut store = vm::Store::from_vm(Vm::new(compiled.program.with_local_count(compiled.locals)));
     store.vm_mut().set_fuel(100_000);
     assert_eq!(store.run().unwrap(), VmStatus::Halted);
-    type R = GuestResult<Packet<Option<Vec<i64>>>, String>;
+    type R = GuestResult<Packet<GuestOption<Vec<i64>>>, String>;
     let callback = store.script_callback_by_name::<(R,), R>("echo").unwrap();
+    let mut calls = 0;
     for value in [
-        GuestResult::Ok(Packet(Some(vec![0, 7]))),
-        GuestResult::Ok(Packet(None)),
+        GuestResult::Ok(Packet(GuestOption::Some(vec![0, 7]))),
+        GuestResult::Ok(Packet(GuestOption::None)),
         GuestResult::Err("error".into()),
     ] {
         assert_eq!(callback.call(&mut store, (value.clone(),)).unwrap(), value);
+        calls += 1;
     }
+    assert_eq!(calls, 3);
+    assert!(
+        store
+            .script_callback_by_name::<(R, i64), R>("echo")
+            .is_err()
+    );
     assert!(
         store
             .script_callback_by_name::<(GuestResult<i64, String>,), R>("echo")
@@ -62,6 +71,26 @@ fn generic_named_optional_arrays_callback_both_variants() {
             .call(&mut store, (GuestResult::Err("error".into()),))
             .is_err()
     );
+}
+
+#[test]
+fn standard_rust_option_codec_stays_independent_of_guest_option() {
+    let array = TypeSchema::Array(Box::new(TypeSchema::Int));
+    assert_eq!(
+        <Option<Vec<i64>> as IntoScriptValue>::schema(),
+        Some(TypeSchema::Optional(Box::new(array.clone())))
+    );
+    assert_eq!(
+        <GuestOption<Vec<i64>> as IntoScriptValue>::schema(),
+        Some(TypeSchema::Option(Box::new(array)))
+    );
+    assert_eq!(Option::<Vec<i64>>::None.into_script_value(), Value::Null);
+    assert_eq!(
+        GuestOption::<Vec<i64>>::None.into_script_value(),
+        vm::option::none_carrier()
+    );
+    assert!(<Option<Vec<i64>> as ScriptResult>::from_value(vm::option::none_carrier()).is_err());
+    assert!(<GuestOption<Vec<i64>> as ScriptResult>::from_value(Value::Null).is_err());
 }
 
 #[test]

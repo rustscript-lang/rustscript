@@ -2075,7 +2075,7 @@ mod tests {
         assert_eq!(
             content["content"],
             serde_json::json!(
-                "adapter::close(connection: take_owned resource<adapter.database>) -> null\n// close the adapter database"
+                "adapter::close(connection: take_owned resource<adapter.database>) -> ()\n// close the adapter database"
             )
         );
     }
@@ -2152,11 +2152,9 @@ mod tests {
             file_signature["signatures"][0]["documentation"]["value"],
             serde_json::json!("close the adapter file")
         );
-        assert!(
-            file_signature["signatures"][0]["label"]
-                .as_str()
-                .unwrap_or("")
-                .contains("resource<adapter.file>")
+        assert_eq!(
+            file_signature["signatures"][0]["label"],
+            serde_json::json!("adapter::close(handle: take_owned resource<adapter.file>) -> bool")
         );
 
         let database_signature = server.handle_signature_help(&serde_json::json!({
@@ -2167,32 +2165,35 @@ mod tests {
             database_signature["signatures"][0]["documentation"]["value"],
             serde_json::json!("close the adapter database")
         );
-        assert!(
-            database_signature["signatures"][0]["label"]
-                .as_str()
-                .unwrap_or("")
-                .contains("resource<adapter.database>")
+        assert_eq!(
+            database_signature["signatures"][0]["label"],
+            serde_json::json!(
+                "adapter::close(connection: take_owned resource<adapter.database>) -> ()"
+            )
         );
 
         let file_hover = server.handle_hover(&serde_json::json!({
             "textDocument": { "uri": uri },
             "position": { "line": 3, "character": 2 }
         }));
+        let file_hover_text = file_hover["contents"]["value"].as_str().unwrap_or("");
+        assert!(file_hover_text.contains("bool"), "{file_hover_text}");
         assert!(
-            file_hover["contents"]["value"]
-                .as_str()
-                .unwrap_or("")
-                .contains("bool")
+            !(file_hover_text.contains("-> ()") || file_hover_text.contains("\n()\n")),
+            "{file_hover_text}"
         );
         let database_hover = server.handle_hover(&serde_json::json!({
             "textDocument": { "uri": uri },
             "position": { "line": 4, "character": 2 }
         }));
+        let database_hover_text = database_hover["contents"]["value"].as_str().unwrap_or("");
         assert!(
-            database_hover["contents"]["value"]
-                .as_str()
-                .unwrap_or("")
-                .contains("null")
+            database_hover_text.contains("-> ()") || database_hover_text.contains("\n()\n"),
+            "{database_hover_text}"
+        );
+        assert!(
+            !database_hover_text.contains("null"),
+            "{database_hover_text}"
         );
 
         let completions = server.handle_completion(&serde_json::json!({

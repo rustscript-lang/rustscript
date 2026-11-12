@@ -1,8 +1,8 @@
 use super::*;
 #[test]
 fn coherent_schema_json_preserves_optional_callable_named_and_module_byte_identity() {
-    let source = "// 中文\r\nuse self::lib as lib;\r\nlet optional: int? = null;\r\nlet value = lib::make();\r\nfn factory() { lib::make() }\r\nlet function = factory;\r\n";
-    let library = "struct Box { value: int }\npub fn make() -> Box { { value: 42 } }\nlet local: int? = null;\n";
+    let source = "// 中文\r\nuse self::lib as lib;\r\nlet optional: Option<int> = Option::None;\r\nlet value = lib::make();\r\nfn factory() { lib::make() }\r\nlet function = factory;\r\n";
+    let library = "struct Box { value: int }\npub fn make() -> Box { { value: 42 } }\nlet local: Option<int> = Option::None;\n";
     let overrides = serde_json::json!([{"path": "./lib.rss", "source": library}]).to_string();
     let response: serde_json::Value =
         serde_json::from_slice(&local_type_hints_json_with_context_response(
@@ -20,7 +20,7 @@ fn coherent_schema_json_preserves_optional_callable_named_and_module_byte_identi
         .unwrap();
     assert_eq!(
         optional["schema"],
-        serde_json::json!({"kind": "optional", "inner": {"kind": "int"}})
+        serde_json::json!({"kind": "option", "inner": {"kind": "int"}})
     );
     assert_eq!(optional["span"]["source_id"], 0);
     let lo = optional["span"]["lo"].as_u64().unwrap() as usize;
@@ -44,7 +44,7 @@ fn coherent_schema_json_preserves_optional_callable_named_and_module_byte_identi
 }
 #[test]
 fn coherent_recursive_json_keeps_distinct_module_nominals_and_instantiated_callable_contracts() {
-    let source = "// 中文\r\nuse self::left::lib as left;\r\nuse self::right::lib as right;\r\nlet left_value = left::make();\r\nlet right_value = right::make();\r\nfn identity<T>(value: T) -> T { value }\r\nlet specialized = identity::<int>;\r\nlet nested: map<[int?]> = { \"one\": [null, 42] };\r\nlet tuple: [int?, fn(int) -> int] = [null, specialized];\r\n";
+    let source = "// 中文\r\nuse self::left::lib as left;\r\nuse self::right::lib as right;\r\nlet left_value = left::make();\r\nlet right_value = right::make();\r\nfn identity<T>(value: T) -> T { value }\r\nlet specialized = identity::<int>;\r\nlet nested: map<[Option<int>]> = { \"one\": [Option::None, Option::Some(42)] };\r\nlet tuple: [Option<int>, fn(int) -> int] = [Option::None, specialized];\r\n";
     let left = "struct Box<T> { value: T }\npub fn make() -> Box<int> { { value: 42 } }\n";
     let right =
         "struct Box<T> { value: T }\npub fn make() -> Box<string> { { value: \"label\" } }\n";
@@ -78,11 +78,11 @@ fn coherent_recursive_json_keeps_distinct_module_nominals_and_instantiated_calla
     assert_eq!(hint("specialized")["schema"], callable);
     assert_eq!(
         hint("nested")["schema"],
-        serde_json::json!({"kind": "map", "item": {"kind": "array", "item": {"kind": "optional", "inner": {"kind": "int"}}}})
+        serde_json::json!({"kind": "map", "item": {"kind": "array", "item": {"kind": "option", "inner": {"kind": "int"}}}})
     );
     assert_eq!(
         hint("tuple")["schema"],
-        serde_json::json!({"kind": "tuple", "items": [{"kind": "optional", "inner": {"kind": "int"}}, callable]})
+        serde_json::json!({"kind": "tuple", "items": [{"kind": "option", "inner": {"kind": "int"}}, callable]})
     );
     for name in [
         "left_value",
@@ -102,7 +102,7 @@ fn coherent_recursive_json_keeps_distinct_module_nominals_and_instantiated_calla
 
 #[test]
 fn coherent_inferred_callable_json_keeps_optional_results_and_per_call_generics() {
-    let source = "// 中文\r\nfn maybe(value: int?) { value }\r\nlet g = maybe;\r\nlet closure: fn(int?) -> int? = |value| value;\r\nfn answer() { 42 }\r\nlet f = answer;\r\nfn identity<T>(value: T) -> T { value }\r\nlet output = identity::<int>(41);\r\ng(null);\r\n";
+    let source = "// 中文\r\nfn maybe(value: Option<int>) { value }\r\nlet g = maybe;\r\nlet closure: fn(Option<int>) -> Option<int> = |value| value;\r\nfn answer() { 42 }\r\nlet f = answer;\r\nfn identity<T>(value: T) -> T { value }\r\nlet output = identity::<int>(41);\r\ng(Option::None);\r\n";
     let response: serde_json::Value =
         serde_json::from_slice(&local_type_hints_json_with_context_response(
             source,
@@ -114,7 +114,7 @@ fn coherent_inferred_callable_json_keeps_optional_results_and_per_call_generics(
     assert!(response.get("error").is_none(), "{response}");
     let hints = response["hints"].as_array().unwrap();
     let hint = |name| hints.iter().find(|hint| hint["name"] == name).unwrap();
-    let optional = serde_json::json!({"kind": "optional", "inner": {"kind": "int"}});
+    let optional = serde_json::json!({"kind": "option", "inner": {"kind": "int"}});
     let callable =
         serde_json::json!({"kind": "callable", "params": [optional.clone()], "result": optional});
     assert_eq!(hint("g")["schema"], callable);

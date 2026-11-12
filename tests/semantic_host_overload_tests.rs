@@ -60,7 +60,7 @@ fn overload_catalog() -> Arc<HostApiCatalog> {
                 HostTypeSchema::Resource(database_key),
                 HostParamPassing::TakeOwned,
             )],
-            HostTypeSchema::Null,
+            HostTypeSchema::Unit,
         )
         .with_description("close the adapter database"),
     );
@@ -120,7 +120,7 @@ fn semantic_host_metadata_selects_documentation_for_exact_overload() {
         .callable_signature_at(SourcePosition::new(0, second + 2))
         .expect("database close signature");
     assert_eq!(database_signature.description, "close the adapter database");
-    assert_eq!(database_signature.return_type, HostTypeSchema::Null);
+    assert_eq!(database_signature.return_type, HostTypeSchema::Unit);
     assert_eq!(database_signature.params[0].name, "connection");
     assert_eq!(
         database_signature.params[0].passing,

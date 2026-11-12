@@ -2072,13 +2072,14 @@ mod catalog_call_resolution_tests {
                     vec![HostParamSchema::value("path", HostTypeSchema::String)],
                     resource.clone(),
                 ),
-                HostFunctionSchema::new(
+                HostFunctionSchema::with_return(
                     "acme::consume",
                     vec![HostParamSchema::with_passing(
                         "file",
                         resource,
                         HostParamPassing::TakeOwned,
                     )],
+                    HostTypeSchema::Unit,
                 ),
             ],
         );
