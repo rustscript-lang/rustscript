@@ -710,7 +710,8 @@ fn encode_field(
             match payload_value {
                 Some(Value::Null) => Ok(Some(JsonValue::Null)),
                 Some(_) => Err(VmError::TypeMismatch("json unit")),
-                None => Err(VmError::TypeMismatch("Option Some payload")),
+                // A canonical writer may omit the Null-valued Unit payload.
+                None => Ok(Some(JsonValue::Null)),
             }
         }
         FieldForm::OptionOption(inner) => {
@@ -822,6 +823,11 @@ fn render_value(
                 return Ok("None".to_string());
             }
             let Some(payload_value) = payload_value else {
+                // Only the authoritative Unit schema may restore an omitted
+                // Null-valued payload; every other payload stays malformed.
+                if matches!(inner.as_ref(), TypeSchema::Unit) {
+                    return Ok("Some(())".to_string());
+                }
                 return Err(VmError::TypeMismatch("Option Some payload"));
             };
             let rendered = render_value(payload_value, inner, depth, names)?;
