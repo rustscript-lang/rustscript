@@ -1936,7 +1936,7 @@ impl Parser {
                 span: Some(self.current_span()),
                 code: Some("E_MAP_REMOVE_RECORD".to_string()),
                 line: self.current_line(),
-                message: "cannot remove a field from a record, object, Option, or Result"
+                message: "E_MAP_REMOVE_RECORD: cannot remove a field from a record, object, Option, or Result; removal requires an explicit map<T>"
                     .to_string(),
             });
         }

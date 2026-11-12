@@ -1,6 +1,7 @@
 mod collect;
 mod context;
 mod helpers;
+mod map_store;
 mod state;
 mod validate;
 
@@ -15,6 +16,7 @@ use self::collect::{
 };
 use self::context::TypeContext;
 pub(crate) use self::context::bound_type_from_schema;
+pub(crate) use self::map_store::{classify_map_stores, map_admission_source_error};
 use self::helpers::{
     FunctionLegalizeEnv, HostCallResolutionPass, HostCallResolutionPhase, build_function_decl_map,
     build_function_names, build_host_import_return_types, legalize_function_impl, legalize_stmts,
