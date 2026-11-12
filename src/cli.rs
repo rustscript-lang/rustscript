@@ -1224,7 +1224,10 @@ pub fn run_repl_with_options(
                                 &mut session,
                             );
                             if let Some(value) = vm.stack().last() {
-                                println!("=> {}", format_value(value));
+                                println!(
+                                    "=> {}",
+                                    format_repl_result(value, compiled.result_schema.as_ref())
+                                );
                             } else {
                                 println!("=> <empty>");
                             }
@@ -1756,6 +1759,27 @@ fn echo_host_function(_vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmErr
     Ok(CallOutcome::Return(CallReturn::one(value)))
 }
 
+fn format_repl_result(value: &Value, result_schema: Option<&crate::TypeSchema>) -> String {
+    match result_schema {
+        Some(schema) => format_logical_value(value, schema),
+        None => format_value(value),
+    }
+}
+
+fn format_logical_value(value: &Value, schema: &crate::TypeSchema) -> String {
+    match schema {
+        crate::TypeSchema::Option(inner) => match crate::option::payload(value) {
+            Ok((false, _)) => "None".to_string(),
+            Ok((true, Some(payload))) => {
+                format!("Some({})", format_logical_value(payload, inner))
+            }
+            _ => format_value(value),
+        },
+        crate::TypeSchema::Unit if matches!(value, Value::Null) => "()".to_string(),
+        _ => format_value(value),
+    }
+}
+
 fn format_value(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
@@ -1895,6 +1919,15 @@ mod tests {
         }
         super::sync_repl_session(&vm, &compiled.bindings, &moved_by_rebinding, session);
         vm
+    }
+
+    #[test]
+    fn logical_display_renders_option_none_from_schema() {
+        let rendered = super::format_logical_value(
+            &crate::option::none_carrier(),
+            &crate::TypeSchema::Option(Box::new(crate::TypeSchema::Int)),
+        );
+        assert_eq!(rendered, "None");
     }
 
     #[test]

@@ -781,10 +781,11 @@ fn infer_schema(expr: &Expr, env: &Env) -> Option<TypeSchema> {
         Expr::Var(slot) | Expr::MoveVar(slot) => env.slots.get(slot).cloned(),
         Expr::OptionConstruct { option_schema, .. } => Some(option_schema.clone()),
         Expr::ResultConstruct { result_schema, .. } => Some(result_schema.clone()),
-        Expr::ResultTry {
-            operand_schema: TypeSchema::Option(inner),
-            ..
-        } => Some(inner.as_ref().clone()),
+        Expr::ResultTry { operand_schema, .. } => match operand_schema {
+            TypeSchema::Option(inner) => Some(inner.as_ref().clone()),
+            TypeSchema::Result { ok, .. } => Some(ok.as_ref().clone()),
+            _ => None,
+        },
         Expr::Add(lhs, rhs) | Expr::Sub(lhs, rhs) | Expr::Mul(lhs, rhs) => {
             match (infer_schema(lhs, env), infer_schema(rhs, env)) {
                 (Some(TypeSchema::Int), Some(TypeSchema::Int)) => Some(TypeSchema::Int),
@@ -1359,9 +1360,14 @@ fn normalize_map_literal_values(
             }
         }
         Expr::Call(index, _, args, _, _)
-            if crate::BuiltinFunction::from_call_index(*index)
-                == Some(crate::BuiltinFunction::Set)
-                && args.len() == 3 =>
+            if matches!(
+                crate::BuiltinFunction::from_call_index(*index),
+                Some(crate::BuiltinFunction::Set)
+            ) && args.len() == 3
+                || matches!(
+                    crate::BuiltinFunction::from_call_index(*index),
+                    Some(crate::BuiltinFunction::MapEdit)
+                ) && args.len() == 4 =>
         {
             normalize_map_literal_values(&mut args[0], fields, env);
             let expected_value = match &args[1] {
@@ -1385,9 +1391,14 @@ fn collect_map_literal_keys(expr: &Expr, keys: &mut Vec<String>) -> bool {
             args.is_empty()
         }
         Expr::Call(index, _, args, _, _)
-            if crate::BuiltinFunction::from_call_index(*index)
-                == Some(crate::BuiltinFunction::Set)
-                && args.len() == 3 =>
+            if matches!(
+                crate::BuiltinFunction::from_call_index(*index),
+                Some(crate::BuiltinFunction::Set)
+            ) && args.len() == 3
+                || matches!(
+                    crate::BuiltinFunction::from_call_index(*index),
+                    Some(crate::BuiltinFunction::MapEdit)
+                ) && args.len() == 4 =>
         {
             if let Expr::String(key) = &args[1] {
                 keys.push(key.clone());

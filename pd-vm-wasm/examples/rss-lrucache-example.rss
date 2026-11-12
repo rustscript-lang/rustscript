@@ -7,8 +7,8 @@ use re;
 // - `lookup`: user key -> node id
 // - `nodes`: node id -> LruNode<K, V>
 //
-// Node ids start at 1. The cache uses `0` as the internal "no link" sentinel,
-// because storing `null` into a map entry now deletes that entry.
+// Node ids start at 1. The cache uses `0` as the internal "no link" sentinel.
+// Missing map entries are removed explicitly; absent result payloads are Option::None.
 struct LruNode<K, V> {
     key: K,
     value: V,
@@ -34,19 +34,19 @@ struct LruCacheState<K, V> {
 
 struct LruPeekResult<V> {
     found: bool,
-    value: V
+    value: Option<V>
 }
 
 struct LruGetResult<K, V> {
     cache: LruCacheState<K, V>,
     found: bool,
-    value: V
+    value: Option<V>
 }
 
 struct LruEntryReport<K, V> {
     found: bool,
-    key: K,
-    value: V
+    key: Option<K>,
+    value: Option<V>
 }
 
 struct LruEntryRow<K, V> {
@@ -191,8 +191,8 @@ fn evict_oldest<K, V>(
         let evicted_key = head_node.key.copy();
         let mut next_lookup = lookup;
         let mut next_nodes = nodes;
-        next_lookup[evicted_key] = null;
-        next_nodes[head] = null;
+        next_lookup = next_lookup.remove(evicted_key);
+        next_nodes = next_nodes.remove(head);
 
         let next_tail = if tail == head => {
             0
@@ -222,9 +222,9 @@ fn evict_oldest<K, V>(
 fn entry_report<K, V>(cache: LruCacheState<K, V>, id: int) -> LruEntryReport<K, V> {
     let out: LruEntryReport<K, V> = if id != 0 => {
         let node: LruNode<K, V> = &((&cache).nodes[id]);
-        {found: true, key: node.key.copy(), value: node.value.copy()}
+        {found: true, key: Option::Some(node.key.copy()), value: Option::Some(node.value.copy())}
     } else => {
-        {found: false, key: null, value: null}
+        {found: false, key: Option::None, value: Option::None}
     };
     out
 }
@@ -266,9 +266,9 @@ pub fn peek<K, V>(cache: LruCacheState<K, V>, key: K) -> LruPeekResult<V> {
     let out: LruPeekResult<V> = if lookup.has(key) => {
         let id = (&lookup)[key];
         let node: LruNode<K, V> = &((&state.nodes)[id]);
-        {found: true, value: node.value.copy()}
+        {found: true, value: Option::Some(node.value.copy())}
     } else => {
-        {found: false, value: null}
+        {found: false, value: Option::None}
     };
     out
 }
@@ -311,12 +311,12 @@ pub fn get<K, V>(cache: LruCacheState<K, V>, key: K) -> LruGetResult<K, V> {
                 relinked.nodes
             )
         };
-        {cache: next_cache, found: true, value: value}
+        {cache: next_cache, found: true, value: Option::Some(value)}
     } else => {
         {
             cache: make_cache::<K, V>(limit, size, next_id, head, tail, lookup, nodes),
             found: false,
-            value: null
+            value: Option::None
         }
     };
     out
@@ -461,10 +461,10 @@ pub fn remove<K, V>(cache: LruCacheState<K, V>, key: K) -> LruCacheState<K, V> {
         let id = (&lookup)[key];
         let node: LruNode<K, V> = (&nodes)[id];
         let mut next_lookup = lookup;
-        next_lookup[key] = null;
+        next_lookup = next_lookup.remove(key);
         let unlinked: LinkState<K, V> = unlink_node::<K, V>(nodes, head, tail, id, node);
         let mut next_nodes = unlinked.nodes;
-        next_nodes[id] = null;
+        next_nodes = next_nodes.remove(id);
         make_cache::<K, V>(
             limit,
             size - 1,
@@ -578,7 +578,12 @@ assert(initial_order[2] == "build-ops");
 
 let mut world_hit = get::<string, FeedCacheItem>(cache, "world-news");
 assert(world_hit.found);
-let world_item: FeedCacheItem = world_hit.value.copy();
+let world_item: FeedCacheItem = world_hit.value.unwrap_or({
+    day: "",
+    topic: "",
+    article_count: 0,
+    slug: ""
+}).copy();
 assert(world_item.article_count == 5);
 assert(re::match("^[a-z-]+$", world_item.slug));
 cache = world_hit.cache;
@@ -595,14 +600,20 @@ cache = put::<string, FeedCacheItem>(
 );
 
 assert(has::<string, FeedCacheItem>(cache, "markets") == false);
-assert(peek::<string, FeedCacheItem>(cache, "world-news").value.article_count == 5);
+let world_peek = peek::<string, FeedCacheItem>(cache, "world-news");
+assert(world_peek.value.unwrap_or({
+    day: "",
+    topic: "",
+    article_count: 0,
+    slug: ""
+}).article_count == 5);
 
 cache = touch::<string, FeedCacheItem>(cache, "build-ops");
 
 let oldest_entry = oldest::<string, FeedCacheItem>(cache);
 let newest_entry = newest::<string, FeedCacheItem>(cache);
-let oldest_key: string = oldest_entry.key.copy();
-let newest_key: string = newest_entry.key.copy();
+let oldest_key: string = oldest_entry.key.unwrap_or("").copy();
+let newest_key: string = newest_entry.key.unwrap_or("").copy();
 assert(oldest_key == "world-news");
 assert(newest_key == "build-ops");
 

@@ -1151,7 +1151,8 @@ impl Compiler {
                 self.assembler
                     .push_const(Value::string(super::result::RESULT_PAYLOAD_KEY));
                 self.compile_expr(payload)?;
-                self.assembler.call(BuiltinFunction::Set.call_index(), 3);
+                self.assembler.push_const(Value::Bool(false));
+                self.assembler.call(BuiltinFunction::MapEdit.call_index(), 4);
             }
             Expr::ResultQuery { value, ok, .. } => {
                 self.compile_expr(value)?;
@@ -1256,7 +1257,8 @@ impl Compiler {
                     self.assembler
                         .push_const(Value::string(super::option::OPTION_PAYLOAD_KEY));
                     self.compile_expr(payload)?;
-                    self.assembler.call(BuiltinFunction::Set.call_index(), 3);
+                    self.assembler.push_const(Value::Bool(false));
+                    self.assembler.call(BuiltinFunction::MapEdit.call_index(), 4);
                 }
             }
             Expr::OptionMatch {
@@ -1924,6 +1926,7 @@ impl Compiler {
         };
         let expected_arity = match builtin {
             BuiltinFunction::Set => 3,
+            BuiltinFunction::MapEdit => 4,
             BuiltinFunction::ArrayPush => 2,
             _ => return Ok(false),
         };

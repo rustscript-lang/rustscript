@@ -12,8 +12,8 @@
 //
 // | Block | Range | Purpose |
 // |---|---|---|
-// | extension | 0x0000 ..= 0xFF8F | reserved for future builtins and host imports |
-// | special-call | 0xFF90 ..= 0xFFA1 | special-call builtins (incl. internal lowering builtins) |
+// | extension | 0x0000 ..= 0xFF8B | reserved for future builtins and host imports |
+// | special-call | 0xFF8C ..= 0xFFA1 | special-call builtins (incl. internal lowering builtins) |
 // | ordinary | 0xFFA2 ..= 0xFFFF | ordinary builtins (language + namespaced) |
 //
 // # Rules
@@ -145,3 +145,7 @@ builtin_id!(0xFF96, "__map_iter_take_value", MapIterTakeValue, Internal, none);
 builtin_id!(0xFF95, "__map_iter_close", MapIterClose, Internal, none);
 builtin_id!(0xFF94, "__bind_callable", BindCallable, Internal, none);
 builtin_id!(0xFF93, "__detach_local", DetachLocal, Internal, none);
+builtin_id!(0xFF8C, "__json_decode_typed", JsonDecodeTyped, Internal, none);
+builtin_id!(0xFF8D, "__json_encode_typed", JsonEncodeTyped, Internal, none);
+builtin_id!(0xFF8E, "__logical_render", LogicalRender, Internal, none);
+builtin_id!(0xFF8F, "__map_edit", MapEdit, Internal, none);

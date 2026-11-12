@@ -119,6 +119,12 @@ pub trait ParserDialect {
     fn allow_result_try(&self) -> bool {
         false
     }
+
+    /// RSS closes null literals, patterns, types, map keys and `T?`.
+    /// Other dialects keep those forms. Expression `?` is not this switch.
+    fn reject_legacy_null(&self) -> bool {
+        false
+    }
 }
 
 pub(super) fn lint_trailing_function_return_semicolons(
@@ -211,6 +217,15 @@ pub(super) struct Parser {
 struct ClosureCaptureContext {
     by_name: HashMap<String, LocalSlot>,
     capture_copies: Vec<(LocalSlot, LocalSlot)>,
+}
+
+pub(super) fn legacy_null_error(parser: &Parser, message: &str) -> ParseError {
+    ParseError {
+        span: Some(parser.current_span()),
+        code: Some("E_RSS_NULL".to_string()),
+        line: parser.current_line(),
+        message: message.to_string(),
+    }
 }
 
 impl Parser {

@@ -15,14 +15,18 @@ pub(super) fn builtin_json_encode(value: &AnyValue) -> VmResult<String> {
         .map_err(|err| VmError::HostError(format!("json_encode failed: {err}")))
 }
 
+pub(super) fn decode_json_text(text: &str) -> VmResult<Value> {
+    let json_value = serde_json::from_str::<DecodedJsonValue>(text)
+        .map_err(|err| VmError::HostError(format!("json_decode failed: {err}")))?;
+    Ok(json_value.0)
+}
+
 /// Decodes a JSON string into a `Value`.
 /// Note: This function enforces a strict unique-keys contract for JSON objects.
 /// If the JSON string contains duplicate keys, it will return an error instead of letting the last key win.
 #[pd_host_function(name = "json::decode")]
 pub(super) fn builtin_json_decode(text: &str) -> VmResult<UnknownValue> {
-    let json_value = serde_json::from_str::<DecodedJsonValue>(text)
-        .map_err(|err| VmError::HostError(format!("json_decode failed: {err}")))?;
-    Ok(json_value.0)
+    decode_json_text(text)
 }
 
 fn vm_to_json_value(value: &Value) -> VmResult<JsonValue> {

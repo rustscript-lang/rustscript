@@ -101,7 +101,7 @@ fn services(audit: Audit, fail_init: bool, reset_probe: bool) -> CliHostServices
             resource.clone(),
             HostParamPassing::BorrowMut,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
     ));
     builder.function(HostFunctionSchema::with_return(
         "counter::read",
@@ -115,7 +115,7 @@ fn services(audit: Audit, fail_init: bool, reset_probe: bool) -> CliHostServices
     builder.function(HostFunctionSchema::with_return(
         "counter::abort",
         vec![],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
     ));
     let catalog = Arc::new(builder.build().unwrap());
     let register_catalog = Arc::clone(&catalog);

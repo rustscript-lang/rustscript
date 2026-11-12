@@ -26,6 +26,7 @@ pub(crate) mod http;
 mod io;
 mod jit;
 mod json;
+mod logical_json;
 mod map_iter;
 mod math;
 pub(crate) mod print;
@@ -159,6 +160,7 @@ pub(crate) fn execute_builtin_call(
         BuiltinFunction::Get => core::builtin_get(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Has => core::builtin_has(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Set => core::builtin_set(args).map(BuiltinCallOutcome::Return),
+        BuiltinFunction::MapEdit => core::execute_map_edit(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Keys => core::builtin_keys(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::Count => core::builtin_count(args).map(BuiltinCallOutcome::Return),
         BuiltinFunction::MapIterInit => map_iter::init(vm, args).map(BuiltinCallOutcome::Return),
@@ -208,6 +210,12 @@ pub(crate) fn execute_builtin_call(
         BuiltinFunction::ToString => {
             core::builtin_to_string(args).map(IntoBuiltinCallOutcome::into_builtin_call_outcome)
         }
+        BuiltinFunction::JsonDecodeTyped => core::builtin_json_decode_typed(vm, args)
+            .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
+        BuiltinFunction::JsonEncodeTyped => core::builtin_json_encode_typed(vm, args)
+            .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
+        BuiltinFunction::LogicalRender => core::builtin_logical_render(vm, args)
+            .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
         BuiltinFunction::TypeOf => {
             core::builtin_type_of(args).map(IntoBuiltinCallOutcome::into_builtin_call_outcome)
         }

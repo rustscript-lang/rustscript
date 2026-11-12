@@ -79,7 +79,7 @@ fn catalog() -> Arc<crate::HostApiCatalog> {
             HostTypeSchema::Resource(key()),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Null,
+        HostTypeSchema::Unit,
     ));
     Arc::new(builder.build().unwrap())
 }

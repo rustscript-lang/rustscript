@@ -175,6 +175,14 @@ fn prepare_typed_units_with_entry(
         error: preserve_strict_diagnostic_path(error, diagnostic_path.as_deref()),
         sources: sources.clone(),
     })?;
+    if flavor == SourceFlavor::RustScript {
+        super::logical_boundary::reject_dynamic_host_output(&ir).map_err(|error| {
+            SourcePathError::SourceWithMap {
+                error: SourceError::Compile(error),
+                sources: sources.clone(),
+            }
+        })?;
+    }
     let (owned_ir, entry_local_types) = if let Some(runtime) = runtime {
         // Admission has already checked every source and invoked each hook once.
         // Link/codegen authority is independently restricted to Value paths.
@@ -195,6 +203,15 @@ fn prepare_typed_units_with_entry(
                     sources: sources.clone(),
                 }
             })?;
+            let early_schemas =
+                typing::infer_types(&runtime, TypingMode::DynamicHints, &runtime_types)
+                    .local_schemas;
+            super::logical_boundary::lower_logical_print(&mut runtime, &early_schemas).map_err(
+                |error| SourcePathError::SourceWithMap {
+                    error: SourceError::Compile(error),
+                    sources: sources.clone(),
+                },
+            )?;
             super::option::resolve_option_types(&mut runtime, &runtime_types).map_err(|error| {
                 SourcePathError::SourceWithMap {
                     error: SourceError::Compile(error),
@@ -375,6 +392,10 @@ fn prepare_owned_typed_ir(
         super::result::resolve_result_types(&mut legalized, entry.types)
             .map_err(SourceError::Compile)?;
         super::option::normalize_omitted_option_fields(&mut legalized);
+        let early_schemas =
+            typing::infer_types(&legalized, TypingMode::DynamicHints, entry.types).local_schemas;
+        super::logical_boundary::lower_logical_print(&mut legalized, &early_schemas)
+            .map_err(SourceError::Compile)?;
         super::option::resolve_option_types(&mut legalized, entry.types)
             .map_err(SourceError::Compile)?;
     }
@@ -431,6 +452,10 @@ fn prepare_owned_typed_ir(
     }
     let logical_schemas = type_info.logical_schemas();
     parsed.semantic_index = Some(SemanticIndex::build(logical_schemas.clone(), &parsed));
+    super::logical_boundary::lower_logical_print(&mut parsed, &logical_schemas)
+        .map_err(SourceError::Compile)?;
+    super::logical_boundary::lower_typed_json(&mut parsed, &logical_schemas)
+        .map_err(SourceError::Compile)?;
     let owned_ir = enforce_owned_sources(
         parsed.clone(),
         &type_info,
@@ -939,6 +964,10 @@ fn compile_parsed_output_with_capture_output(
     super::result::resolve_result_types(&mut parsed, entry_local_types)
         .map_err(SourceError::Compile)?;
     super::option::normalize_omitted_option_fields(&mut parsed);
+    let early_schemas =
+        typing::infer_types(&parsed, typing_mode, entry_local_types).local_schemas;
+    super::logical_boundary::lower_logical_print(&mut parsed, &early_schemas)
+        .map_err(SourceError::Compile)?;
     super::option::resolve_option_types(&mut parsed, entry_local_types)
         .map_err(SourceError::Compile)?;
     let mut parsed =
@@ -952,6 +981,16 @@ fn compile_parsed_output_with_capture_output(
         enforce_strict_type_resolution(&parsed, &pre_lifetime_type_info)
             .map_err(SourceError::Compile)?;
     }
+    super::logical_boundary::lower_logical_print(
+        &mut parsed,
+        &pre_lifetime_type_info.local_schemas,
+    )
+    .map_err(SourceError::Compile)?;
+    super::logical_boundary::lower_typed_json(
+        &mut parsed,
+        &pre_lifetime_type_info.local_schemas,
+    )
+    .map_err(SourceError::Compile)?;
     let owned_local_slots = pre_lifetime_type_info
         .local_schemas
         .iter()
@@ -2444,6 +2483,11 @@ fn compile_source_for_repl_with_locals_impl(
                 repl: Some((predefined_locals, moved_names)),
             },
         )?;
+        let result_schema = typing::root_expression_result_schema(
+            &prepared.ir,
+            policy.typing_mode,
+            &prepared.entry_local_types,
+        );
         let debug_ranges = collect_named_local_debug_ranges(&prepared.ir);
         let (compiled, root_projection) = compile_owned_ir_with_root_projection(
             source.to_string(),
@@ -2479,7 +2523,11 @@ fn compile_source_for_repl_with_locals_impl(
             binding.schema = fact.schema.clone();
             binding.optional = fact.optional;
         }
-        Ok(CompiledReplProgram { compiled, bindings })
+        Ok(CompiledReplProgram {
+            compiled,
+            bindings,
+            result_schema,
+        })
     };
     compile().map_err(|error| match error {
         SourcePathError::Source(error) | SourcePathError::SourceWithMap { error, .. } => error,

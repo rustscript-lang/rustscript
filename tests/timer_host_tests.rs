@@ -513,7 +513,7 @@ impl vm::HostExtension for TimerTestExtension {
             HostImportSchema {
                 name: "test::wait".to_string(),
                 params: Vec::new(),
-                return_type: HostTypeSchema::Unknown,
+                return_type: HostTypeSchema::Bool,
                 fingerprint: self.catalog.fingerprint(),
             },
             |vm, _args| {
@@ -528,7 +528,7 @@ impl vm::HostExtension for TimerTestExtension {
             HostImportSchema {
                 name: "test::panic".to_string(),
                 params: Vec::new(),
-                return_type: HostTypeSchema::Unknown,
+                return_type: HostTypeSchema::Bool,
                 fingerprint: self.catalog.fingerprint(),
             },
             panic_host,
@@ -543,7 +543,7 @@ impl vm::HostExtension for TimerTestExtension {
                         schema: HostTypeSchema::Int,
                         passing: HostParamPassing::Value,
                     }],
-                    return_type: HostTypeSchema::Unknown,
+                    return_type: HostTypeSchema::Unit,
                     fingerprint: self.catalog.fingerprint(),
                 },
                 move || -> Box<dyn vm::HostFunction> {
@@ -560,7 +560,7 @@ impl vm::HostExtension for TimerTestExtension {
                     HostImportSchema {
                         name: "test::probe".to_string(),
                         params: Vec::new(),
-                        return_type: HostTypeSchema::Unknown,
+                        return_type: HostTypeSchema::Unit,
                         fingerprint: self.catalog.fingerprint(),
                     },
                     move || -> Box<dyn vm::HostFunction> {
@@ -591,25 +591,27 @@ fn test_wait_catalog() -> Arc<HostApiCatalog> {
     for function in standard.functions() {
         builder.function(function.clone());
     }
+    // These custom hosts are not the trusted timer callback-result exception.
+    // wait/panic are consumed as bool; record/probe are void Unit calls.
     builder.function(HostFunctionSchema::with_return(
         "test::wait",
         Vec::new(),
-        HostTypeSchema::Unknown,
+        HostTypeSchema::Bool,
     ));
     builder.function(HostFunctionSchema::with_return(
         "test::panic",
         Vec::new(),
-        HostTypeSchema::Unknown,
+        HostTypeSchema::Bool,
     ));
     builder.function(HostFunctionSchema::with_return(
         "test::record",
         vec![HostParamSchema::value("value", HostTypeSchema::Int)],
-        HostTypeSchema::Unknown,
+        HostTypeSchema::Unit,
     ));
     builder.function(HostFunctionSchema::with_return(
         "test::probe",
         Vec::new(),
-        HostTypeSchema::Unknown,
+        HostTypeSchema::Unit,
     ));
     Arc::new(builder.build().expect("test host catalog"))
 }
@@ -689,7 +691,7 @@ fn run_with_probe<B: TimerBackend>(
 
 #[test]
 fn at_compile_contract_uses_callable_take_owned() {
-    let compiled = compile_standard("use timer; timer::at(10, |premature| null);")
+    let compiled = compile_standard("use timer; timer::at(10, |premature| ());")
         .expect("timer::at must compile");
     let index = compiled
         .program
@@ -708,7 +710,7 @@ fn at_compile_contract_uses_callable_take_owned() {
 }
 
 /// The typed callback surface declares its result as `unknown` because the
-/// module discards it: an `int`/`string`/`map`/`bool`/`null` callback body all
+/// module discards it: an `int`/`string`/`map`/`bool`/`()` callback body all
 /// compile against the standard catalog and run to completion, and the
 /// discarded value never reaches the guest.
 #[test]
@@ -718,7 +720,7 @@ fn callbacks_with_any_declared_result_compile_and_discard_their_result() {
         ("string", "\"text\""),
         ("map", "{a: 1}"),
         ("bool", "true"),
-        ("null", "null"),
+        ("unit", "()"),
     ] {
         let backend = Arc::new(ManualBackend::default());
         let mut vm = run_with_backend(
@@ -749,7 +751,7 @@ fn callbacks_with_any_declared_result_compile_and_discard_their_result() {
 fn at_registers_and_returns_then_callback_runs() {
     let backend = Arc::new(ManualBackend::default());
     let mut vm = run_with_backend(
-        "use timer; timer::at(25, |premature| null);",
+        "use timer; timer::at(25, |premature| ());",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -772,7 +774,7 @@ fn at_registers_and_returns_then_callback_runs() {
 fn at_callback_observes_a_non_premature_round() {
     let backend = Arc::new(ManualBackend::default());
     run_with_backend(
-        "use timer; timer::at(10, |premature| if true => { assert(!premature); null } else => { null });",
+        "use timer; timer::at(10, |premature| if true => { assert(!premature); () } else => { () });",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -803,7 +805,7 @@ fn default_limits_match_the_documented_contract() {
 
     let backend = Arc::new(ManualBackend::default());
     run_with_backend(
-        "use timer; timer::at(1, |premature| null);",
+        "use timer; timer::at(1, |premature| ());",
         Arc::clone(&backend),
         config,
     )
@@ -817,7 +819,7 @@ fn default_limits_match_the_documented_contract() {
 fn every_marks_interval_and_preserves_callable_between_rounds() {
     let backend = Arc::new(ManualBackend::default());
     run_with_backend(
-        "use timer; timer::every(7, |premature| null);",
+        "use timer; timer::every(7, |premature| ());",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -840,7 +842,7 @@ fn every_marks_interval_and_preserves_callable_between_rounds() {
 fn every_preserves_captured_callable_graph_across_rounds() {
     let backend = Arc::new(ManualBackend::default());
     let source_vm = run_with_backend(
-        "use timer; let expected = false; timer::every(1, |premature| if true => { assert(expected == premature); null } else => { null });",
+        "use timer; let expected = false; timer::every(1, |premature| if true => { assert(expected == premature); () } else => { () });",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -865,7 +867,7 @@ fn every_preserves_captured_callable_graph_across_rounds() {
 fn every_rounds_share_one_mutable_capture_cell() {
     let backend = Arc::new(ManualBackend::default());
     let (_vm, recorded) = run_with_test_recorder(
-        "use test;\nuse timer;\nlet mut rounds = 0;\ntimer::every(5, |premature| if true => { rounds = rounds + 1; test::record(rounds); null } else => { test::record(rounds); null });\n",
+        "use test;\nuse timer;\nlet mut rounds = 0;\ntimer::every(5, |premature| if true => { rounds = rounds + 1; test::record(rounds); () } else => { test::record(rounds); () });\n",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -890,7 +892,7 @@ fn counts_are_synchronous_and_reflect_backend_state() {
     let backend = Arc::new(ManualBackend::default());
     *backend.running.lock().expect("running") = 3;
     let vm = run_with_backend(
-        "use timer; timer::at(1, |premature| null); timer::pending_count() + timer::running_count();",
+        "use timer; timer::at(1, |premature| ()); timer::pending_count() + timer::running_count();",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -901,8 +903,8 @@ fn counts_are_synchronous_and_reflect_backend_state() {
 #[test]
 fn invalid_durations_and_pending_limit_are_rejected() {
     for source in [
-        "use timer; let callback = |premature| null; timer::at(-1, callback);",
-        "use timer; let callback = |premature| null; timer::every(0, callback);",
+        "use timer; let callback = |premature| (); timer::at(-1, callback);",
+        "use timer; let callback = |premature| (); timer::every(0, callback);",
     ] {
         let backend = Arc::new(ManualBackend::default());
         let mut vm = build_vm_with_backend(source, &backend, TimerConfig::default())
@@ -925,7 +927,7 @@ fn invalid_durations_and_pending_limit_are_rejected() {
 
     let backend = Arc::new(ManualBackend::default());
     run_with_backend(
-        "use timer; timer::at(1, |premature| null);",
+        "use timer; timer::at(1, |premature| ());",
         Arc::clone(&backend),
         TimerConfig {
             max_pending: 1,
@@ -934,7 +936,7 @@ fn invalid_durations_and_pending_limit_are_rejected() {
     )
     .expect("first timer accepted");
     let mut vm = build_vm_with_backend(
-        "use timer; let callback = |premature| null; timer::at(2, callback);",
+        "use timer; let callback = |premature| (); timer::at(2, callback);",
         &backend,
         TimerConfig {
             max_pending: 1,
@@ -959,7 +961,7 @@ fn invalid_durations_and_pending_limit_are_rejected() {
 fn backend_rejection_restores_callback_argument_and_allows_shutdown() {
     let backend = Arc::new(RejectingBackend::default());
     let mut vm = build_vm_with_backend(
-        "use timer; timer::at(1, |premature| null);",
+        "use timer; timer::at(1, |premature| ());",
         &backend,
         TimerConfig::default(),
     )
@@ -981,7 +983,7 @@ fn backend_rejection_restores_callback_argument_and_allows_shutdown() {
 fn backend_panic_restores_callback_argument_before_unwinding() {
     let backend = Arc::new(PanickingBackend::default());
     let mut vm = build_vm_with_backend(
-        "use timer; timer::at(1, |premature| null);",
+        "use timer; timer::at(1, |premature| ());",
         &backend,
         TimerConfig::default(),
     )
@@ -1009,7 +1011,7 @@ fn scheduler_leaves_due_callback_pending_until_running_slot_is_free() {
         max_running: 1,
     };
     run_with_test_wait_backend(
-        "use test;\nuse timer;\nfn wait() -> bool { test::wait() }\ntimer::every(1, |premature| if true => { wait(); null } else => { null });\ntimer::every(1, |premature| if true => { wait(); null } else => { null });\n",
+        "use test;\nuse timer;\nfn wait() -> bool { test::wait() }\ntimer::every(1, |premature| if true => { wait(); () } else => { () });\ntimer::every(1, |premature| if true => { wait(); () } else => { () });\n",
         Arc::clone(&backend),
         config,
     )
@@ -1074,7 +1076,7 @@ fn scheduler_leaves_due_callback_pending_until_running_slot_is_free() {
 fn scheduler_survives_callback_panic_and_repeats_after_recovery() {
     let backend = Arc::new(LimitedSchedulerBackend::new(1));
     run_with_test_wait_backend(
-        "use test;\nuse timer;\nfn invoke_panic() -> bool { test::panic() }\ntimer::every(1, |premature| if true => { invoke_panic(); null } else => { null });\n",
+        "use test;\nuse timer;\nfn invoke_panic() -> bool { test::panic() }\ntimer::every(1, |premature| if true => { invoke_panic(); () } else => { () });\n",
         Arc::clone(&backend),
         TimerConfig {
             max_pending: 4,
@@ -1104,7 +1106,7 @@ fn scheduler_survives_callback_panic_and_repeats_after_recovery() {
 fn backend_installs_independent_bridges_for_waiting_timer_callbacks() {
     let backend = Arc::new(ManualBackend::default());
     run_with_test_wait_backend(
-        "use test;\nuse timer;\nfn wait() -> bool { test::wait() }\ntimer::at(1, |premature| if true => { wait(); null } else => { null });\ntimer::at(1, |premature| if true => { wait(); null } else => { null });\n",
+        "use test;\nuse timer;\nfn wait() -> bool { test::wait() }\ntimer::at(1, |premature| if true => { wait(); () } else => { () });\ntimer::at(1, |premature| if true => { wait(); () } else => { () });\n",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -1160,7 +1162,7 @@ fn backend_installs_independent_bridges_for_waiting_timer_callbacks() {
 fn backend_cancellation_of_waiting_timer_calls_bridge_once() {
     let backend = Arc::new(ManualBackend::default());
     run_with_test_wait_backend(
-        "use test;\nuse timer;\nfn wait() -> bool { test::wait() }\ntimer::at(1, |premature| if true => { wait(); null } else => { null });\n",
+        "use test;\nuse timer;\nfn wait() -> bool { test::wait() }\ntimer::at(1, |premature| if true => { wait(); () } else => { () });\n",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -1189,7 +1191,7 @@ fn backend_cancellation_of_waiting_timer_calls_bridge_once() {
 fn callback_errors_go_to_backend_sink_without_touching_source_vm() {
     let backend = Arc::new(ManualBackend::default());
     let source_vm = run_with_backend(
-        "use timer; timer::at(1, |premature| if true => { let unused = 1 / 0; null } else => { null });",
+        "use timer; timer::at(1, |premature| if true => { let unused = 1 / 0; () } else => { () });",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -1211,7 +1213,7 @@ fn callback_errors_go_to_backend_sink_without_touching_source_vm() {
 fn every_callback_can_report_each_round_after_an_error() {
     let backend = Arc::new(ManualBackend::default());
     run_with_backend(
-        "use timer; timer::every(1, |premature| if true => { let unused = 1 / 0; null } else => { null });",
+        "use timer; timer::every(1, |premature| if true => { let unused = 1 / 0; () } else => { () });",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -1237,7 +1239,7 @@ fn every_callback_can_report_each_round_after_an_error() {
 fn source_vm_drop_leaves_pending_callbacks_until_explicit_shutdown() {
     let backend = Arc::new(ShutdownBackend::default());
     let vm = run_with_backend(
-        "use timer; timer::at(100, |premature| if true => { assert(premature); null } else => { null });",
+        "use timer; timer::at(100, |premature| if true => { assert(premature); () } else => { () });",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -1259,7 +1261,7 @@ fn source_vm_drop_leaves_pending_callbacks_until_explicit_shutdown() {
 fn every_shutdown_runs_once_premature_and_stops_rescheduling() {
     let backend = Arc::new(ShutdownBackend::default());
     run_with_backend(
-        "use timer; timer::every(50, |premature| if true => { assert(premature); null } else => { null });",
+        "use timer; timer::every(50, |premature| if true => { assert(premature); () } else => { () });",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -1289,8 +1291,8 @@ fn concurrent_backend_admission_allows_only_the_configured_pending_count() {
     };
     let mut handles = Vec::new();
     for source in [
-        "use timer; timer::at(1, |premature| null);",
-        "use timer; timer::at(2, |premature| null);",
+        "use timer; timer::at(1, |premature| ());",
+        "use timer; timer::at(2, |premature| ());",
     ] {
         let backend = Arc::clone(&backend);
         handles.push(std::thread::spawn(move || {
@@ -1312,7 +1314,7 @@ fn concurrent_backend_admission_allows_only_the_configured_pending_count() {
 fn cancellation_is_idempotent_and_blocks_restart() {
     let backend = Arc::new(ManualBackend::default());
     run_with_backend(
-        "use timer; timer::at(1, |premature| null);",
+        "use timer; timer::at(1, |premature| ());",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -1351,7 +1353,7 @@ fn expect_compile_code(
 fn timer_move_contract_rejects_reusing_a_moved_callback() {
     for register in ["timer::at(1, callback);", "timer::every(1, callback);"] {
         let source = format!(
-            "use timer;\nlet callback = |premature| null;\n{register}\ntimer::at(2, callback);\n"
+            "use timer;\nlet callback = |premature| ();\n{register}\ntimer::at(2, callback);\n"
         );
         let error = expect_compile_code(compile_standard(&source), "E_LOCAL_MOVED");
         if let SourceError::Parse(parse) = &error {
@@ -1368,7 +1370,7 @@ fn timer_move_contract_rejects_reusing_a_moved_callback() {
 #[test]
 fn timer_calls_without_installed_runtime_state_report_missing_backend() {
     for source in [
-        "use timer; timer::at(1, |premature| null);",
+        "use timer; timer::at(1, |premature| ());",
         "use timer; timer::pending_count();",
         "use timer; timer::running_count();",
     ] {
@@ -1395,7 +1397,7 @@ fn timer_calls_without_installed_runtime_state_report_missing_backend() {
 fn clearing_the_timer_runtime_blocks_further_timer_calls() {
     let backend = Arc::new(ManualBackend::default());
     let mut vm = build_vm_with_backend(
-        "use timer; timer::at(1, |premature| null);",
+        "use timer; timer::at(1, |premature| ());",
         &backend,
         TimerConfig::default(),
     )
@@ -1418,7 +1420,7 @@ fn clearing_the_timer_runtime_blocks_further_timer_calls() {
 fn timer_callback_with_a_dropped_backend_reports_shutdown() {
     let backend = Arc::new(ManualBackend::default());
     let vm = run_with_backend(
-        "use timer;\nfn count() -> int { timer::pending_count() }\ntimer::at(1, |premature| if true => { count(); null } else => { null });\n",
+        "use timer;\nfn count() -> int { timer::pending_count() }\ntimer::at(1, |premature| if true => { count(); () } else => { () });\n",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -1442,7 +1444,7 @@ fn timer_callback_with_a_dropped_backend_reports_shutdown() {
 fn drop_while_waiting_cancels_the_bridge_exactly_once() {
     let backend = Arc::new(ManualBackend::default());
     run_with_test_wait_backend(
-        "use test;\nuse timer;\nfn wait() -> bool { test::wait() }\ntimer::at(1, |premature| if true => { wait(); null } else => { null });\n",
+        "use test;\nuse timer;\nfn wait() -> bool { test::wait() }\ntimer::at(1, |premature| if true => { wait(); () } else => { () });\n",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -1477,7 +1479,7 @@ fn completed_callback_vm_is_released_exactly_once() {
     let counters = Arc::new(ProbeCounters::default());
     let backend = Arc::new(ManualBackend::default());
     let source_vm = run_with_probe(
-        "use test;\nuse timer;\ntimer::at(1, |premature| if true => { test::probe(); null } else => { test::probe(); null });\n",
+        "use test;\nuse timer;\ntimer::at(1, |premature| if true => { test::probe(); () } else => { test::probe(); () });\n",
         Arc::clone(&backend),
         TimerConfig::default(),
         Arc::clone(&counters),
@@ -1531,7 +1533,7 @@ fn rejected_registration_releases_the_callback_vm_exactly_once() {
     let counters = Arc::new(ProbeCounters::default());
     let backend = Arc::new(RejectingBackend::default());
     let mut vm = build_vm_with_probe(
-        "use test;\nuse timer;\ntimer::at(1, |premature| if true => { test::probe(); null } else => { test::probe(); null });\n",
+        "use test;\nuse timer;\ntimer::at(1, |premature| if true => { test::probe(); () } else => { test::probe(); () });\n",
         &backend,
         TimerConfig::default(),
         Arc::clone(&counters),
@@ -1566,7 +1568,7 @@ fn error_rounds_reuse_one_callback_vm_released_exactly_once() {
     let counters = Arc::new(ProbeCounters::default());
     let backend = Arc::new(ManualBackend::default());
     let source_vm = run_with_probe(
-        "use test;\nuse timer;\ntimer::every(1, |premature| if true => { test::probe(); let unused = 1 / 0; null } else => { null });\n",
+        "use test;\nuse timer;\ntimer::every(1, |premature| if true => { test::probe(); let unused = 1 / 0; () } else => { () });\n",
         Arc::clone(&backend),
         TimerConfig::default(),
         Arc::clone(&counters),
@@ -1618,7 +1620,7 @@ fn cancelled_waiting_callback_releases_its_vm_exactly_once() {
     let counters = Arc::new(ProbeCounters::default());
     let backend = Arc::new(ManualBackend::default());
     let source_vm = run_with_probe(
-        "use test;\nuse timer;\nfn wait() -> bool { test::wait() }\ntimer::at(1, |premature| if true => { test::probe(); wait(); null } else => { null });\n",
+        "use test;\nuse timer;\nfn wait() -> bool { test::wait() }\ntimer::at(1, |premature| if true => { test::probe(); wait(); () } else => { () });\n",
         Arc::clone(&backend),
         TimerConfig::default(),
         Arc::clone(&counters),
@@ -1888,7 +1890,7 @@ fn downstream_adapter_registers_through_the_shared_backend_path() {
         max_running: 3,
     };
     let vm = run_with_vendor(
-        "use vendor;\nvendor::at(3, |premature| null);\n",
+        "use vendor;\nvendor::at(3, |premature| ());\n",
         Arc::clone(&backend),
         config,
     )
@@ -1914,7 +1916,7 @@ fn downstream_adapter_registers_through_the_shared_backend_path() {
 fn downstream_adapter_seconds_interval_repeats_on_the_same_owned_callback() {
     let backend = Arc::new(ManualBackend::default());
     run_with_vendor(
-        "use vendor;\nlet mut rounds = 0;\nvendor::every(2, |premature| if true => { rounds = rounds + 1; null } else => { null });\n",
+        "use vendor;\nlet mut rounds = 0;\nvendor::every(2, |premature| if true => { rounds = rounds + 1; () } else => { () });\n",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
@@ -1935,7 +1937,7 @@ fn downstream_adapter_seconds_interval_repeats_on_the_same_owned_callback() {
 fn downstream_adapter_rejects_a_negative_duration_before_the_handoff() {
     let backend = Arc::new(ManualBackend::default());
     let mut vm = build_vm_with_vendor(
-        "use vendor;\nlet callback = |premature| null;\nvendor::at(-1, callback);\n",
+        "use vendor;\nlet callback = |premature| ();\nvendor::at(-1, callback);\n",
         &backend,
         TimerConfig::default(),
     )
@@ -1958,7 +1960,7 @@ fn downstream_adapter_rejects_a_negative_duration_before_the_handoff() {
 fn downstream_adapter_rejects_a_zero_repeating_interval() {
     let backend = Arc::new(ManualBackend::default());
     let mut vm = build_vm_with_vendor(
-        "use vendor;\nlet callback = |premature| null;\nvendor::every(0, callback);\n",
+        "use vendor;\nlet callback = |premature| ();\nvendor::every(0, callback);\n",
         &backend,
         TimerConfig::default(),
     )
@@ -1975,7 +1977,7 @@ fn downstream_adapter_rejects_a_zero_repeating_interval() {
 fn downstream_adapter_backend_rejection_and_panic_restore_the_callback() {
     let backend = Arc::new(RejectingBackend::default());
     let mut vm = build_vm_with_vendor(
-        "use vendor;\nvendor::at(1, |premature| null);\n",
+        "use vendor;\nvendor::at(1, |premature| ());\n",
         &backend,
         TimerConfig::default(),
     )
@@ -1992,7 +1994,7 @@ fn downstream_adapter_backend_rejection_and_panic_restore_the_callback() {
 
     let backend = Arc::new(PanickingBackend::default());
     let mut vm = build_vm_with_vendor(
-        "use vendor;\nvendor::at(1, |premature| null);\n",
+        "use vendor;\nvendor::at(1, |premature| ());\n",
         &backend,
         TimerConfig::default(),
     )
@@ -2012,7 +2014,7 @@ fn downstream_adapter_backend_rejection_and_panic_restore_the_callback() {
 fn downstream_adapter_without_installed_runtime_reports_missing_backend() {
     let catalog = vendor_catalog();
     let compiled = compile_source_with_flavor_and_options(
-        "use vendor;\nvendor::at(1, |premature| null);\n",
+        "use vendor;\nvendor::at(1, |premature| ());\n",
         SourceFlavor::RustScript,
         CompileSourceFileOptions::default().with_host_api_catalog(Arc::clone(&catalog)),
     )
@@ -2066,7 +2068,7 @@ fn downstream_count_functions_report_the_installed_backend_synchronously() {
     let backend = Arc::new(ManualBackend::default());
     *backend.running.lock().expect("running") = 4;
     let vm = run_with_vendor(
-        "use vendor;\nvendor::at(1, |premature| null);\nvendor::pending() + vendor::running();\n",
+        "use vendor;\nvendor::at(1, |premature| ());\nvendor::pending() + vendor::running();\n",
         Arc::clone(&backend),
         TimerConfig::default(),
     )

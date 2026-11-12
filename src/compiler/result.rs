@@ -4993,9 +4993,17 @@ fn resolve_try(
     };
     let (operand_ok, operand_err) = match &operand {
         TypeSchema::Result { ok, err } => ((**ok).clone(), (**err).clone()),
-        TypeSchema::Option(_) => {
-            // The Option resolver owns propagation from a logical Option
-            // operand; this pass has only established that it is not Result.
+        TypeSchema::Option(inner) => {
+            // Option<Result> is not a Result operand and not a scalar Option
+            // propagation. Reject at the '?' so the caller unwraps first.
+            if matches!(inner.as_ref(), TypeSchema::Result { .. }) {
+                return Err(result_error(
+                    span,
+                    "? operand must be Result<T, E>, not Option<Result<T, E>>; unwrap the Option before ?"
+                        .to_string(),
+                ));
+            }
+            // Scalar Option propagation is owned by the Option resolver.
             return Ok(());
         }
         other => {

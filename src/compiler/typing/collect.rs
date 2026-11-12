@@ -23,7 +23,17 @@ pub(super) fn collect_root_stmt_state(
     context: &mut TypeContext<'_>,
 ) {
     let mut visible = entry_slots.iter().copied().collect();
-    collect_root_stmts(stmts, state, &mut visible, context);
+    let _ = collect_root_stmts(stmts, state, &mut visible, context);
+}
+
+pub(super) fn collect_root_expression_result(
+    stmts: &[Stmt],
+    state: &mut LocalTypeState,
+    entry_slots: &[LocalSlot],
+    context: &mut TypeContext<'_>,
+) -> Option<LocalTypeState> {
+    let mut visible = entry_slots.iter().copied().collect();
+    collect_root_stmts(stmts, state, &mut visible, context)
 }
 
 fn commit_root_scope(
@@ -41,7 +51,8 @@ fn collect_root_stmts(
     state: &mut LocalTypeState,
     visible: &mut std::collections::HashSet<LocalSlot>,
     context: &mut TypeContext<'_>,
-) {
+) -> Option<LocalTypeState> {
+    let mut last_expression = None;
     for stmt in stmts {
         match stmt {
             Stmt::Let {
@@ -59,7 +70,7 @@ fn collect_root_stmts(
                 bind_root_value(state, *index, None, &value, context);
             }
             Stmt::Expr { expr, .. } => {
-                collect_root_expr(expr, state, visible, context);
+                last_expression = Some(collect_root_expr(expr, state, visible, context));
             }
             Stmt::Drop { index, .. } => state.set(*index, BoundType::Null),
             Stmt::IfElse {
@@ -132,6 +143,7 @@ fn collect_root_stmts(
             | Stmt::Continue { .. } => {}
         }
     }
+    last_expression
 }
 
 // Expression values occupy slot zero in a standalone facts state. Operand
