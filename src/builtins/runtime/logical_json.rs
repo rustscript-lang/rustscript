@@ -63,7 +63,20 @@ fn expand_named(
     charge_node(nodes)?;
     match schema {
         TypeSchema::Named(name, args) => {
-            if stack.iter().any(|seen| seen == name) {
+            let key = format!("{name}/{}", args.len());
+            let mut rendered_args = String::new();
+            for arg in args {
+                rendered_args.push_str(&format!("/{arg:?}"));
+            }
+            let key = format!("{key}{rendered_args}");
+            if stack.iter().any(|seen| seen == &key) {
+                return Ok(schema.clone());
+            }
+            let reentries = stack
+                .iter()
+                .filter(|seen| seen.starts_with(&format!("{name}/")))
+                .count();
+            if reentries >= 2 {
                 return Ok(schema.clone());
             }
             let Some(body) =
@@ -73,7 +86,7 @@ fn expand_named(
                     "typed json named schema '{name}' is not in the host catalog or guest program"
                 )));
             };
-            stack.push(name.clone());
+            stack.push(key);
             let expanded = expand_named(&body, names, stack, nodes)?;
             stack.pop();
             Ok(expanded)
@@ -355,13 +368,6 @@ fn project_object(
             )));
         }
     }
-    for name in present.keys() {
-        if !fields.contains_key(name) {
-            return Err(VmError::HostError(format!(
-                "typed json object has an extra field '{name}'"
-            )));
-        }
-    }
     let mut out = Vec::new();
     for (name, schema) in fields {
         match present.get(name) {
@@ -603,13 +609,6 @@ fn encode_object(
         };
         present.insert(name.as_str().to_string(), value);
     }
-    for name in present.keys() {
-        if !fields.contains_key(name) {
-            return Err(VmError::HostError(format!(
-                "typed json object has an extra field '{name}'"
-            )));
-        }
-    }
     let mut out = JsonMap::new();
     for (name, schema) in fields {
         let encoded = match present.get(name) {
@@ -618,7 +617,11 @@ fn encode_object(
                 FieldForm::OrdinaryOption(_) | FieldForm::OptionUnit | FieldForm::OptionOption(_) => {
                     None
                 }
-                FieldForm::Value => None,
+                FieldForm::Value => {
+                    return Err(VmError::HostError(
+                        "typed json object is missing a required field".to_string(),
+                    ));
+                }
             },
         };
         if let Some(encoded) = encoded {

@@ -3424,28 +3424,32 @@ fn rustscript_language_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
-            name: "null literal is supported",
+            name: "option none is observable",
             source: r#"
-                let v = null;
-                type(v) == "null";
+                let v: Option<int> = Option::None;
+                match v {
+                    Option::None => true,
+                    _ => false,
+                };
             "#,
             flavor: SourceFlavor::RustScript,
             expected_stack: vec![Value::Bool(true)],
             expected_locals: None,
         },
         RuntimeCase {
-            name: "null values and type patterns are supported",
+            name: "option none and type patterns are supported",
             source: r#"
                 let some = 1 + 1;
-                let none = null;
+                let none: Option<int> = Option::None;
                 let some2 = 40;
 
                 let a = match none {
-                    null => 1,
+                    Option::None => 1,
                     _ => 0,
                 };
-                let b = match some {
-                    null => 0,
+                let present: Option<int> = Option::Some(some);
+                let b = match present {
+                    Option::None => 0,
                     _ => 1,
                 };
                 let c = match some2 {
@@ -3453,8 +3457,11 @@ fn rustscript_language_runtime_cases_work() {
                     _ => 0,
                 };
 
-                let t = type(null);
-                if t == "null" {
+                let saw_none = match none {
+                    Option::None => true,
+                    _ => false,
+                };
+                if saw_none {
                     (a + b + c) + some2;
                 } else {
                     0;
@@ -3479,10 +3486,12 @@ fn rustscript_language_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
-            name: "null literal can be used as map key",
+            name: "option none can be used as map key",
             source: r#"
-                let m = { null: 42 };
-                m[null];
+                let mut m: map<int> = {};
+                let key: Option<int> = Option::None;
+                m[key] = 42;
+                m[key];
             "#,
             flavor: SourceFlavor::RustScript,
             expected_stack: vec![Value::Int(42)],
@@ -3507,7 +3516,7 @@ fn rustscript_language_parse_rejection_cases_work() {
         ParseErrorCase {
             name: "type name of val alias is rejected",
             source: r#"
-                type_name_of_val(null);
+                type_name_of_val(1);
             "#,
             flavor: SourceFlavor::RustScript,
             expected_contains_all: &["unknown function 'type_name_of_val'"],
@@ -4934,22 +4943,20 @@ fn spawn_json_probe(probe_env: &str, test_name: &str, sentinel: &str) -> Result<
 #[test]
 fn json_encode_accepts_mutually_recursive_structs_inside_concrete_map() {
     // A `map<A>` whose inner schema is a mutually recursive struct pair
-    // (A -> B -> A) must compile and encode: the recursion is structural,
-    // every runtime value is finite, and the cycle edge itself is
-    // encodable. The innermost partial literal `{}` (an `A` missing its
-    // required `b`) is admitted only because the declared-schema check
-    // allows partial objects at recursive re-entries, so the runtime
-    // value is exactly the map literal as written and the expected
-    // encoding is `{"x":{"b":{"a":{"b":{"a":{}}}}}}`.
+    // (A -> B -> A) must compile and encode. The cycle fields are
+    // `Option`, so the finite base is `Option::None` rather than an
+    // omitted required field. `Option::None` is omitted from the
+    // encoding, so the innermost object is `{}` and the value is
+    // `{"x":{"b":{"a":{"b":{"a":{}}}}}}`.
     const PROBE: &str = "RUSTSCRIPT_JSON_PROBE_ACCEPT_RECURSIVE_MAP";
     const SENTINEL: &str = "json-probe-entered:RUSTSCRIPT_JSON_PROBE_ACCEPT_RECURSIVE_MAP";
     run_json_probe_child(PROBE, SENTINEL, || {
         let compiled = match compile_source(
             r#"
             use json;
-            struct A { b: B }
-            struct B { a: A }
-            let payload: map<A> = { "x": { b: { a: { b: { a: {} } } } } };
+            struct A { b: Option<B> }
+            struct B { a: Option<A> }
+            let payload: map<A> = { "x": { b: Option::Some({ a: Option::Some({ b: Option::Some({ a: Option::Some({ b: Option::None }) }) }) }) } };
             json::encode(payload);
             "#,
         ) {
@@ -4997,6 +5004,31 @@ fn json_encode_accepts_mutually_recursive_structs_inside_concrete_map() {
         panic!(
             "mutually recursive structs in map<A> must compile and encode (probe failed): {reason}"
         );
+    }
+}
+
+#[test]
+fn json_encode_rejects_missing_required_field_on_recursive_partial() {
+    // A finite literal that omits a required non-Option field is not a
+    // legal construction, even when the omission sits on a recursive
+    // re-entry. Encode must not be reached by skipping that field.
+    match compile_source(
+        r#"
+        use json;
+        struct A { b: B }
+        struct B { a: A }
+        let payload: map<A> = { "x": { b: { a: {} } } };
+        json::encode(payload);
+        "#,
+    ) {
+        Err(err) => {
+            let text = err.to_string();
+            assert!(
+                text.contains("required by the declared schema but is missing"),
+                "missing required field must be refused, got: {text}"
+            );
+        }
+        Ok(_) => panic!("omitting required field b must not compile"),
     }
 }
 

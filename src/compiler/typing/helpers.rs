@@ -1702,6 +1702,21 @@ fn find_declared_schema_mismatch_with_recursion(
             }
             let instance = render_schema_path_segment(name, type_args);
             let is_recursive = !recursive_named.insert(instance.clone());
+            // Instance keys include the type arguments, so container-wrapped
+            // recursion (`Node<int>` then `Node<[int]>`) never repeats a key
+            // and would resolve a deeper argument nest on every descent.
+            // The declaration name is the stable identity for that family:
+            // the outer instantiation already walks the struct body, and a
+            // second sight of the same name is the recursion edge. Expanding
+            // it again overflows the 512 KiB json-encode probes.
+            let decl_key = format!("\u{0}{name}");
+            let decl_seen = !recursive_named.insert(decl_key.clone());
+            if decl_seen {
+                if !is_recursive {
+                    recursive_named.remove(&instance);
+                }
+                return None;
+            }
             let resolved = context.resolve_schema(expected);
             let mismatch = find_declared_schema_mismatch_with_recursion(
                 &resolved,
@@ -1714,6 +1729,7 @@ fn find_declared_schema_mismatch_with_recursion(
             if !is_recursive {
                 recursive_named.remove(&instance);
             }
+            recursive_named.remove(&decl_key);
             return mismatch;
         }
         _ => context.substitute_schema_generics(expected),
