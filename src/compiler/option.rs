@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 use super::CompileError;
 use super::ir::{
-    AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, LocalSlot, Stmt,
-    StructDecl, TypeSchema,
+    AssignmentKind, ClosureExpr, Expr, FrontendIr, FunctionDecl, FunctionImpl, HostApiIrMetadata,
+    LocalSlot, Stmt, StructDecl, TypeSchema,
 };
 use super::source_map::Span;
 
@@ -863,6 +863,7 @@ struct NormalizeEnv<'a> {
     function_list: &'a [FunctionDecl],
     function_impls: &'a HashMap<u16, FunctionImpl>,
     struct_schemas: &'a HashMap<String, StructDecl>,
+    host: Option<&'a HostApiIrMetadata>,
     slots: HashMap<LocalSlot, TypeSchema>,
 }
 
@@ -874,10 +875,12 @@ pub(crate) fn normalize_omitted_option_fields(ir: &mut FrontendIr) {
     let functions = ir.functions.clone();
     let structs = ir.struct_schemas.clone();
     let impls = ir.function_impls.clone();
+    let host = ir.host_api_metadata.clone();
     let mut env = NormalizeEnv {
         function_list: &functions,
         function_impls: &impls,
         struct_schemas: &structs,
+        host: host.as_ref(),
         slots: HashMap::new(),
     };
     for stmt in &mut ir.stmts {
@@ -1062,6 +1065,7 @@ fn normalize_expr_omitted(
                         expected,
                     )
                 });
+            let expected_args = overlay_host_argument_schemas(expected_args, env.host, *index);
             for (offset, arg) in args.iter_mut().enumerate() {
                 let expected_arg = expected_args
                     .as_ref()
@@ -1273,6 +1277,78 @@ fn normalize_closure_omitted(
     let saved = std::mem::replace(&mut env.slots, nested);
     normalize_expr_omitted(&mut closure.body, expected_return, env);
     env.slots = saved;
+}
+
+/// Catalog host decls store `arg_schemas: None`. Fill from the candidate's
+/// compiler schema (`Named(name, [])` included) so struct lookup uses the
+/// same declaration body later Option checking expects. Do not expand to an
+/// object here: that body does not match `Named` field identity.
+fn overlay_host_argument_schemas(
+    existing: Option<Vec<Option<TypeSchema>>>,
+    host: Option<&HostApiIrMetadata>,
+    index: u16,
+) -> Option<Vec<Option<TypeSchema>>> {
+    let Some(host_args) = host.and_then(|metadata| host_candidate_argument_schemas(metadata, index))
+    else {
+        return existing;
+    };
+    let mut existing = existing.unwrap_or_else(|| vec![None; host_args.len()]);
+    if existing.len() < host_args.len() {
+        existing.resize(host_args.len(), None);
+    }
+    for (slot, host_schema) in existing.iter_mut().zip(host_args) {
+        if slot.is_none() {
+            *slot = host_schema;
+        }
+    }
+    Some(existing)
+}
+
+fn host_candidate_argument_schemas(
+    metadata: &HostApiIrMetadata,
+    index: u16,
+) -> Option<Vec<Option<TypeSchema>>> {
+    let candidates = metadata.candidates(index)?;
+    let arity = candidates.first()?.params.len();
+    if candidates.iter().any(|candidate| candidate.params.len() != arity) {
+        return None;
+    }
+    let mut schemas = Vec::with_capacity(arity);
+    for offset in 0..arity {
+        let objects = candidates
+            .iter()
+            .map(|candidate| candidate.params[offset].ty.to_compiler_schema())
+            .collect::<Vec<_>>();
+        schemas.push(agreed_host_object_schema(&objects));
+    }
+    Some(schemas)
+}
+
+fn agreed_host_object_schema(schemas: &[TypeSchema]) -> Option<TypeSchema> {
+    let first = schemas.first()?;
+    if schemas.iter().all(|schema| schema == first) {
+        return Some(first.clone());
+    }
+    let TypeSchema::Object(first_fields) = first else {
+        return None;
+    };
+    let mut fields = HashMap::new();
+    for (name, schema) in first_fields {
+        if !matches!(schema, TypeSchema::Option(_)) {
+            continue;
+        }
+        if schemas.iter().all(|other| match other {
+            TypeSchema::Object(map) => map.get(name) == Some(schema),
+            _ => false,
+        }) {
+            fields.insert(name.clone(), schema.clone());
+        }
+    }
+    if fields.is_empty() {
+        None
+    } else {
+        Some(TypeSchema::Object(fields))
+    }
 }
 
 fn object_fields_for_normalization(
