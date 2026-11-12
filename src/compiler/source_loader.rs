@@ -52,6 +52,9 @@ use super::{
 
 mod graph;
 mod imports;
+
+#[cfg(test)]
+pub(crate) use imports::test_module_imports_from_uses;
 mod model;
 
 pub use self::model::{DeclarationNamespace, ImportClause, ModuleImport, NamedImport};

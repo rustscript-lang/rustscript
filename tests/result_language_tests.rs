@@ -67,7 +67,7 @@ fn false_and_null_payloads_follow_the_active_branch() {
     let source = r#"
         let ok_false: Result<bool, int> = Result::Ok(false);
         let err_false: Result<int, bool> = Result::Err(false);
-        let ok_null: Result<int?, string> = Result::Ok(null);
+        let ok_null: Result<Option<int>, string> = Result::Ok(Option::None);
         let flag = match ok_false {
             Result::Ok(v) => v,
             Result::Err(e) => true,
@@ -78,18 +78,21 @@ fn false_and_null_payloads_follow_the_active_branch() {
         };
         let missing = match ok_null {
             Result::Ok(v) => v,
-            Result::Err(e) => 9,
+            Result::Err(e) => Option::Some(-1),
         };
-        let err_null: Result<string, int?> = Result::Err(null);
-        let result = if flag || err_flag => { -1 } else => { missing };
+        let err_null: Result<string, Option<int>> = Result::Err(Option::None);
+        let result = if flag || err_flag => { Option::Some(-1) } else => { missing };
         let err_observed = match err_null {
-            Result::Ok(v) => 2,
+            Result::Ok(v) => Option::Some(2),
             Result::Err(e) => e,
         };
-        let observed = if result == null => { err_observed } else => { result };
+        let observed = match result {
+            Option::None => err_observed,
+            Option::Some(v) => result,
+        };
         observed;
     "#;
-    assert_eq!(eval(source), vm::Value::Null);
+    assert_eq!(eval(source), vm::option::none_carrier());
 }
 
 #[test]
@@ -372,7 +375,7 @@ fn nested_result_array_constructors_keep_inactive_branches() {
         let rows: Result<array<Result<int, string>>, string> = Result::Ok([Result::Ok(1), Result::Err("e")]);
         let outer: Result<array<Result<int, string>>, string> = Result::Err("outer");
         let deep: Result<array<Result<Result<int, bool>, string>>, string> = Result::Ok([Result::Ok(Result::Err(false))]);
-        let nullable: Result<array<Result<int?, string>>, string> = Result::Ok([Result::Ok(null)]);
+        let nullable: Result<array<Result<Option<int>, string>>, string> = Result::Ok([Result::Ok(Option::None)]);
         let first = match rows {
             Result::Ok(items) => match items[0] {
                 Result::Ok(n) => n,
@@ -403,7 +406,10 @@ fn nested_result_array_constructors_keep_inactive_branches() {
         };
         let null_flag = match nullable {
             Result::Ok(items) => match items[0] {
-                Result::Ok(n) => if n == null => { 16 } else => { -1 },
+                Result::Ok(n) => match n {
+                    Option::None => 16,
+                    Option::Some(v) => -1,
+                },
                 Result::Err(e) => -1,
             },
             Result::Err(e) => -1,

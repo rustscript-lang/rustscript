@@ -6,6 +6,9 @@ use std::sync::{
 };
 use vm::{CallOutcome, CallReturn, HostFunction, HostTypeSchema, Value, Vm, VmResult, VmStatus};
 
+#[path = "support/legacy_nullable_plugin.rs"]
+mod legacy_nullable_plugin;
+
 struct Input(Value, Arc<AtomicUsize>);
 impl HostFunction for Input {
     fn call(&mut self, _: &mut Vm, _: &[Value]) -> VmResult<CallOutcome> {
@@ -44,9 +47,11 @@ fn dynamic_payload(ty: &str, schema: HostTypeSchema, payload: Value, ok: bool, m
     ));
     let compiled = vm::compile_source_with_flavor_and_options(
         &source,
-        vm::SourceFlavor::RustScript,
-        vm::CompileSourceFileOptions::new()
-            .with_host_api_catalog(Arc::new(builder.build().unwrap())),
+        legacy_nullable_plugin::legacy_nullable_flavor(),
+        legacy_nullable_plugin::legacy_nullable_options(
+            vm::CompileSourceFileOptions::new()
+                .with_host_api_catalog(Arc::new(builder.build().unwrap())),
+        ),
     )
     .unwrap();
     let mut machine = Vm::new_with_jit_config(

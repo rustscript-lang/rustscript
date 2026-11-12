@@ -1591,7 +1591,8 @@ mod catalog_call_resolution_tests {
                 false,
             ),
         ] {
-            let ir = parse(source, catalog(vec![], vec![]));
+            let ir = super::super::frontends::legacy_rss::parse(source)
+                .expect("legacy nullable fixture must parse");
             let slot = ir
                 .local_bindings
                 .iter()
@@ -1636,10 +1637,10 @@ mod catalog_call_resolution_tests {
     #[test]
     fn root_result_join_unknown_snapshot_is_not_null_or_a_reused_slot() {
         for reverse in [false, true] {
-            let mut ir = parse(
+            let mut ir = super::super::frontends::legacy_rss::parse(
                 "let maybe: float? = 2.5; let y = if true => { maybe } else => { null };",
-                catalog(vec![], vec![]),
-            );
+            )
+            .expect("legacy nullable fixture must parse");
             let Stmt::Let { index, expr, .. } = &mut ir.stmts[1] else {
                 panic!("result binding")
             };

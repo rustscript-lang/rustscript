@@ -1,5 +1,8 @@
 mod rustscript;
 
+#[cfg(test)]
+pub(crate) mod legacy_rss;
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -482,6 +485,18 @@ pub fn parse_source_with_dialect(
     dialect: &'static dyn ParserDialect,
     options: SharedParserOptions,
 ) -> Result<FrontendIr, ParseError> {
+    parse_source_with_dialect_and_catalog(source, dialect, options, None)
+}
+
+/// Same parser as [`parse_source_with_dialect`], with the caller catalog
+/// installed so namespaced host calls bind to that catalog instead of a
+/// name-only fallback.
+pub fn parse_source_with_dialect_and_catalog(
+    source: &str,
+    dialect: &'static dyn ParserDialect,
+    options: SharedParserOptions,
+    host_catalog: Option<Arc<HostApiCatalog>>,
+) -> Result<FrontendIr, ParseError> {
     parse_with_parser(
         source,
         options.source_id,
@@ -490,7 +505,7 @@ pub fn parse_source_with_dialect(
         options.enforce_mutable_bindings,
         options.import_scan_mode,
         dialect,
-        None,
+        host_catalog,
     )
 }
 
@@ -2661,7 +2676,7 @@ mod postfix_provenance_tests {
     #[test]
     fn unwrap_or_records_member_callee_and_node_id() {
         let source = "let o = null;\no.unwrap_or(5);\n";
-        let ir = parse(source);
+        let ir = super::legacy_rss::parse(source).expect("legacy nullable fixture must parse");
         let index = ir.parsed_semantic_index.as_ref().expect("index present");
 
         let unwrap = site(index, "unwrap_or");
@@ -2695,7 +2710,7 @@ mod postfix_provenance_tests {
     #[test]
     fn optional_access_records_member_callee_and_node_id() {
         let source = "let x = null; let k = 1;\nx?.y;\nx?.[k];\n";
-        let ir = parse(source);
+        let ir = super::legacy_rss::parse(source).expect("legacy nullable fixture must parse");
         let index = ir.parsed_semantic_index.as_ref().expect("index present");
 
         let member_sites = index
