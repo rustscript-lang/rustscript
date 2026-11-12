@@ -88,6 +88,12 @@ fn option_unit_field_some_encodes_present_null() {
 }
 
 #[test]
+fn generic_unit_insert_keeps_entry() {
+    let source = include_str!("fixtures/map_json/generic_unit_insert.rss");
+    assert_eq!(eval(source), Value::Bool(true));
+}
+
+#[test]
 fn inferred_unit_insert_survives_vmbc_reload() {
     let source = "let mut values = {}; values[\"present\"] = (); values.has(\"present\");";
     let compiled = compile_source(source).expect("source should compile");

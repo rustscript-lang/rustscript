@@ -1,0 +1,9 @@
+fn insert_unit<T>(values: map<T>, key: string, value: T) -> map<T> {
+    let mut values = values;
+    values[key] = value;
+    values
+}
+
+let mut values: map<()> = {};
+values = insert_unit::<()>(values, "present", ());
+values.has("present");
