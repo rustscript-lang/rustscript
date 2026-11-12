@@ -175,14 +175,13 @@ fn prepare_typed_units_with_entry(
         error: preserve_strict_diagnostic_path(error, diagnostic_path.as_deref()),
         sources: sources.clone(),
     })?;
-    if flavor == SourceFlavor::RustScript {
-        super::logical_boundary::reject_dynamic_host_output(&ir).map_err(|error| {
-            SourcePathError::SourceWithMap {
-                error: SourceError::Compile(error),
-                sources: sources.clone(),
-            }
-        })?;
-    }
+    let logical_scope = rss_source_scope(&owners);
+    super::logical_boundary::reject_dynamic_host_output(&ir, &logical_scope).map_err(|error| {
+        SourcePathError::SourceWithMap {
+            error: SourceError::Compile(error),
+            sources: sources.clone(),
+        }
+    })?;
     let (owned_ir, entry_local_types) = if let Some(runtime) = runtime {
         // Admission has already checked every source and invoked each hook once.
         // Link/codegen authority is independently restricted to Value paths.
@@ -213,6 +212,7 @@ fn prepare_typed_units_with_entry(
                 &mut runtime,
                 TypingMode::DynamicHints,
                 &runtime_types,
+                &logical_scope,
             )
             .map_err(|error| SourcePathError::SourceWithMap {
                 error: SourceError::Compile(error),
@@ -463,13 +463,15 @@ fn prepare_owned_typed_ir(
     }
     let logical_schemas = type_info.logical_schemas();
     parsed.semantic_index = Some(SemanticIndex::build(logical_schemas.clone(), &parsed));
+    let logical_scope = rss_source_scope(owners);
     super::logical_boundary::lower_logical_print(
         &mut parsed,
         TypingMode::DynamicHints,
         entry.types,
+        &logical_scope,
     )
     .map_err(SourceError::Compile)?;
-    super::logical_boundary::lower_typed_json(&mut parsed, &logical_schemas)
+    super::logical_boundary::lower_typed_json(&mut parsed, &logical_schemas, &logical_scope)
         .map_err(SourceError::Compile)?;
     typing::classify_map_stores(
         &mut parsed,
@@ -923,6 +925,26 @@ fn rss_map_store_scope(owners: &[TypedSourceOwner<'_>]) -> typing::MapStoreScope
     )
 }
 
+/// Logical/JSON policy follows actual source provenance, never the root
+/// frontend flavor. A single-producer IR without a source name keeps the
+/// whole-IR scope it was compiled with.
+fn rss_source_scope(owners: &[TypedSourceOwner<'_>]) -> super::logical_boundary::SourceScope {
+    if owners.iter().any(|owner| owner.source_name.is_empty()) {
+        return if owners.iter().all(|owner| owner.plugin.is_none()) {
+            super::logical_boundary::SourceScope::all()
+        } else {
+            super::logical_boundary::SourceScope::none()
+        };
+    }
+    super::logical_boundary::SourceScope::sources(
+        owners
+            .iter()
+            .filter(|owner| owner.plugin.is_none())
+            .map(|owner| (owner.source_name.clone(), owner.source_id))
+            .collect(),
+    )
+}
+
 fn frontend_policy_for_flavor(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
@@ -995,8 +1017,14 @@ fn compile_parsed_output_with_capture_output(
     }
     let local_debug_ranges = collect_named_local_debug_ranges(&parsed);
     let mut parsed = parsed;
-    super::logical_boundary::lower_logical_print(&mut parsed, typing_mode, entry_local_types)
-        .map_err(SourceError::Compile)?;
+    let logical_scope = super::logical_boundary::SourceScope::all();
+    super::logical_boundary::lower_logical_print(
+        &mut parsed,
+        typing_mode,
+        entry_local_types,
+        &logical_scope,
+    )
+    .map_err(SourceError::Compile)?;
     super::result::resolve_result_types(&mut parsed, entry_local_types)
         .map_err(SourceError::Compile)?;
     super::option::normalize_omitted_option_fields(&mut parsed);
@@ -1013,10 +1041,19 @@ fn compile_parsed_output_with_capture_output(
         enforce_strict_type_resolution(&parsed, &pre_lifetime_type_info)
             .map_err(SourceError::Compile)?;
     }
-    super::logical_boundary::lower_logical_print(&mut parsed, typing_mode, entry_local_types)
-        .map_err(SourceError::Compile)?;
-    super::logical_boundary::lower_typed_json(&mut parsed, &pre_lifetime_type_info.local_schemas)
-        .map_err(SourceError::Compile)?;
+    super::logical_boundary::lower_logical_print(
+        &mut parsed,
+        typing_mode,
+        entry_local_types,
+        &logical_scope,
+    )
+    .map_err(SourceError::Compile)?;
+    super::logical_boundary::lower_typed_json(
+        &mut parsed,
+        &pre_lifetime_type_info.local_schemas,
+        &logical_scope,
+    )
+    .map_err(SourceError::Compile)?;
     typing::classify_map_stores(&mut parsed, typing_mode, entry_local_types, map_store_scope)
         .map_err(typing::map_admission_source_error)?;
     let owned_local_slots = pre_lifetime_type_info

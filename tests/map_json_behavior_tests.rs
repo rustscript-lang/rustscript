@@ -28,6 +28,48 @@ fn inferred_empty_map_keeps_unit_entry() {
 }
 
 #[test]
+fn option_map_callback_encodes_nested_payload_as_natural_json() {
+    let source = r#"
+        use json;
+        let src: Option<Option<int>> = Option::Some(Option::Some(1));
+        let encoded = src.map(|item| json::encode(item));
+        match encoded {
+            Option::Some(text) => text == "1",
+            Option::None => false,
+        };
+    "#;
+    assert_eq!(eval(source), Value::Bool(true));
+}
+
+#[test]
+fn result_map_callback_encodes_nested_payload_as_natural_json() {
+    let source = r#"
+        use json;
+        let src: Result<Option<int>, string> = Result::Ok(Option::Some(1));
+        let encoded = src.map(|item| json::encode(item));
+        match encoded {
+            Result::Ok(text) => text == "1",
+            Result::Err(error) => error == "",
+        };
+    "#;
+    assert_eq!(eval(source), Value::Bool(true));
+}
+
+#[test]
+fn option_and_then_callback_encodes_nested_payload_as_natural_json() {
+    let source = r#"
+        use json;
+        let src: Option<Option<int>> = Option::Some(Option::Some(1));
+        let encoded = src.and_then(|item| Option::Some(json::encode(item)));
+        match encoded {
+            Option::Some(text) => text == "1",
+            Option::None => false,
+        };
+    "#;
+    assert_eq!(eval(source), Value::Bool(true));
+}
+
+#[test]
 fn record_factory_remove_is_rejected_at_admission() {
     let source = r#"
         struct Entry { value: int }

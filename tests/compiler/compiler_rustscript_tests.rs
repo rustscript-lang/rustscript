@@ -2,6 +2,19 @@
 mod common;
 use common::*;
 
+#[path = "../support/legacy_nullable_plugin.rs"]
+mod legacy_nullable_plugin;
+
+/// The untyped public JSON encoder/decoder stays available to non-RustScript
+/// frontends. These runtime-encoder cases exercise that owner directly.
+fn compile_plugin_source(source: &str) -> Result<vm::CompiledProgram, vm::SourcePathError> {
+    vm::compile_source_with_flavor_and_options(
+        source,
+        legacy_nullable_plugin::legacy_nullable_flavor(),
+        legacy_nullable_plugin::legacy_nullable_options(vm::CompileSourceFileOptions::default()),
+    )
+}
+
 struct BoundRuntimeCase<'a> {
     case: RuntimeCase<'a>,
     bindings: Vec<HostBindingCase<'a>>,
@@ -4517,7 +4530,7 @@ fn json_encode_accepts_string_key_runtime_map() {
     // A runtime map annotated as `map` has schema `map<unknown>`: key
     // legality cannot be proven statically, so the compile-time validator
     // must admit it and the runtime encoder's string-key check decides.
-    let compiled = compile_source(
+    let compiled = compile_plugin_source(
         r#"
         use json;
         let request: map = {
@@ -4548,7 +4561,7 @@ fn json_encode_accepts_nested_runtime_maps_and_arrays() {
     // Provider-shaped payload: nested maps and arrays inside a runtime map.
     // The generated object key order is unspecified, so the assertion parses
     // the text and compares semantic JSON.
-    let compiled = compile_source(
+    let compiled = compile_plugin_source(
         r#"
         use json;
         let request: map = {
@@ -4666,7 +4679,7 @@ fn json_encode_runtime_map_rejects_non_string_key() {
 
 #[test]
 fn json_encode_runtime_map_rejects_nested_bytes() {
-    let compiled = compile_source(
+    let compiled = compile_plugin_source(
         r#"
         use json;
         let payload: map = { "data": b"abc" };
@@ -4692,7 +4705,7 @@ fn json_encode_runtime_map_rejects_nested_bytes() {
 
 #[test]
 fn json_encode_runtime_map_rejects_nested_callable() {
-    let compiled = compile_source(
+    let compiled = compile_plugin_source(
         r#"
         use json;
         fn handler(value: int) -> int { value + 1 }
