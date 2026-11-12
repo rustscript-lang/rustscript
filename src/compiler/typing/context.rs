@@ -5,7 +5,8 @@ use crate::builtins::BuiltinFunction;
 use super::super::CompileError;
 use super::super::TypingMode;
 use super::super::ir::{
-    ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, Stmt, StructDecl, TypeSchema,
+    ClosureExpr, Expr, FunctionDecl, FunctionImpl, LocalSlot, SemanticNodeId, Stmt, StructDecl,
+    TypeSchema,
 };
 use super::super::source_map::Span;
 use super::helpers::{
@@ -97,6 +98,16 @@ fn schema_mentions_generic_param(schema: &TypeSchema, name: &str) -> bool {
     }
 }
 
+/// Store action recorded at a checked call, keyed later by semantic id.
+/// This is the decision only. It is not a source-position schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MapStoreAction {
+    RewriteInsert,
+    RejectCarrier,
+    RejectUnresolved,
+    RejectRemove,
+}
+
 pub(super) struct TypeContext<'a> {
     pub(super) function_impls: &'a HashMap<u16, FunctionImpl>,
     pub(super) function_decls: &'a HashMap<u16, FunctionDecl>,
@@ -133,6 +144,8 @@ pub(super) struct TypeContext<'a> {
     /// Schemas of presentation sites in source visit order. Empty unless a
     /// presentation walk is recording. Not a second solver.
     pub(super) presentation_sites: Vec<Option<TypeSchema>>,
+    /// Set-versus-MapEdit decisions taken from the checked state at each call.
+    pub(super) map_store_decisions: HashMap<SemanticNodeId, MapStoreAction>,
 }
 
 struct CallableBody<'a> {
@@ -182,6 +195,7 @@ impl<'a> TypeContext<'a> {
             result_payload_strict: false,
             rejected_host_calls: Vec::new(),
             presentation_sites: Vec::new(),
+            map_store_decisions: HashMap::new(),
         }
     }
 

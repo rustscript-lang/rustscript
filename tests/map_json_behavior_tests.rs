@@ -104,3 +104,74 @@ fn inferred_unit_insert_survives_vmbc_reload() {
     assert_eq!(vm.run().expect("reloaded program should run"), VmStatus::Halted);
     assert_eq!(vm.stack().last().cloned(), Some(Value::Bool(true)));
 }
+
+#[test]
+fn closure_contextual_unit_map_store_keeps_entry() {
+    let source = r#"
+        let set: fn(map<()>) -> bool = |m| if true => { m["x"] = (); m.has("x") } else => { false };
+        set({});
+    "#;
+    assert_eq!(eval(source), Value::Bool(true));
+}
+
+#[test]
+fn pattern_moved_unit_map_store_keeps_entry() {
+    let source = r#"let maybe: Option<map<()>> = Option::Some({}); let ok = match maybe { Option::Some(m) => if true => { let mut values = m; values["x"] = (); values.has("x") } else => { false }, Option::None => false }; ok;"#;
+    assert_eq!(eval(source), Value::Bool(true));
+}
+
+#[test]
+fn option_carrier_index_store_is_rejected() {
+    let source = r#"let mut o: Option<int> = Option::Some(1); o["x"] = ();"#;
+    let message = match compile_source(source) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("Option index store must be rejected"),
+    };
+    assert!(
+        message.contains("cannot store into an Option or Result"),
+        "expected carrier refusal, got {message}"
+    );
+}
+
+#[test]
+fn result_carrier_index_store_is_rejected() {
+    let source = r#"let mut r: Result<int, string> = Result::Ok(1); r["x"] = 2;"#;
+    let message = match compile_source(source) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("Result index store must be rejected"),
+    };
+    assert!(
+        message.contains("cannot store into an Option or Result"),
+        "expected carrier refusal, got {message}"
+    );
+}
+
+#[test]
+fn option_carrier_stays_unmodified_without_store() {
+    let source = r#"let o: Option<int> = Option::Some(1); o.has("x");"#;
+    assert_eq!(eval(source), Value::Bool(false));
+}
+
+#[test]
+fn result_pattern_moved_unit_map_store_keeps_entry() {
+    let source = r#"let maybe: Result<map<()>, string> = Result::Ok({}); let ok = match maybe { Result::Ok(m) => if true => { let mut values = m; values["x"] = (); values.has("x") } else => { false }, Result::Err(_) => false }; ok;"#;
+    assert_eq!(eval(source), Value::Bool(true));
+}
+
+#[test]
+fn loop_unit_store_keeps_entry_after_iterations() {
+    let source = r#"let mut values: map<()> = {}; let mut n = 0; while n < 2 { values["x"] = (); n = n + 1; } values.has("x");"#;
+    assert_eq!(eval(source), Value::Bool(true));
+}
+
+#[test]
+fn zero_iteration_loop_does_not_invent_unit_entry() {
+    let source = r#"let mut values: map<()> = {}; let mut n = 0; while n < 0 { values["x"] = (); n = n + 1; } values.has("x");"#;
+    assert_eq!(eval(source), Value::Bool(false));
+}
+
+#[test]
+fn typed_map_remove_drops_key() {
+    let source = r#"let mut values: map<int> = {}; values["x"] = 1; let updated = values.remove("x"); updated.has("x");"#;
+    assert_eq!(eval(source), Value::Bool(false));
+}

@@ -337,7 +337,7 @@ fn schema_contains_unresolved(schema: &TypeSchema) -> bool {
     }
 }
 
-fn stmt_line(stmt: &Stmt) -> u32 {
+pub(super) fn stmt_line(stmt: &Stmt) -> u32 {
     match stmt {
         Stmt::Noop { line }
         | Stmt::Let { line, .. }

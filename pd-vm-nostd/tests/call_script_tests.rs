@@ -86,6 +86,26 @@ fn call_script_executes_direct_call() {
 }
 
 #[test]
+fn nostd_executes_std_encoded_unit_map_edit_without_source() {
+    let source = "let mut values = {}; values[\"present\"] = (); values.has(\"present\");";
+    let compiled = compile_source(source).expect("unit map store should compile");
+    let bytes = encode_program(&compiled.program.with_local_count(compiled.locals))
+        .expect("unit map store should encode");
+    let program = decode_program(&bytes).expect("no-std should decode unit map store");
+    let edit = vm::BuiltinFunction::MapEdit.call_index().to_le_bytes();
+    assert!(
+        program.code().windows(2).any(|pair| pair == edit),
+        "std-encoded MapEdit must survive the no-std decoder"
+    );
+    let mut vm = EmbeddedVm::new(program);
+    assert_eq!(
+        vm.run().expect("no-std unit map store should run"),
+        EmbeddedVmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[EmbeddedValue::Bool(true)]);
+}
+
+#[test]
 fn nostd_executes_std_encoded_result_ok_and_err_without_source() {
     let cases = [
         (

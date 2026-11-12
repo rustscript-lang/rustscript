@@ -16,7 +16,7 @@ use self::collect::{
 };
 use self::context::TypeContext;
 pub(crate) use self::context::bound_type_from_schema;
-pub(crate) use self::map_store::{classify_map_stores, map_admission_source_error};
+pub(crate) use self::map_store::{MapStoreScope, classify_map_stores, map_admission_source_error};
 use self::helpers::{
     FunctionLegalizeEnv, HostCallResolutionPass, HostCallResolutionPhase, build_function_decl_map,
     build_function_names, build_host_import_return_types, legalize_function_impl, legalize_stmts,
@@ -681,13 +681,14 @@ pub(super) fn infer_types_with_capture_origins(
             callable_slots: &mut callable_slots,
             optional_slots: &mut optional_slots,
         };
-        origins.extend(collect_function_types(
+        let (function_origins, _) = collect_function_types(
             decl.index,
             function_impl,
             decl,
             &mut outputs,
             &env,
-        ));
+        );
+        origins.extend(function_origins);
     }
 
     let mut facts = TypeInferenceResult {
@@ -716,6 +717,82 @@ pub(super) fn infer_types_with_capture_origins(
         })
         .collect();
     (facts, root_projection, origins)
+}
+
+fn collect_checked_map_store_decisions(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+) -> HashMap<super::ir::SemanticNodeId, context::MapStoreAction> {
+    let function_names = build_function_names(&ir.functions);
+    let function_decls = build_function_decl_map(&ir.functions);
+    let host_import_return_types =
+        build_host_import_return_types(&ir.functions, &ir.function_impls);
+    let host_import_signatures = build_host_import_signatures(&ir.functions, &ir.function_impls);
+    let mut local_types = vec![ValueType::Unknown; ir.locals];
+    let mut local_schemas = vec![None; ir.locals];
+    let mut local_schema_labels = vec![None; ir.locals];
+    let mut callable_slots = vec![false; ir.locals];
+    let mut optional_slots = vec![false; ir.locals];
+    let mut top_state = LocalTypeState::default();
+    seed_entry_local_state(&mut top_state, entry_local_types);
+    let mut context = TypeContext::new(
+        &ir.function_impls,
+        &function_decls,
+        &ir.struct_schemas,
+        &function_names,
+        &host_import_return_types,
+        &host_import_signatures,
+        typing_mode,
+        ir.parsed_semantic_index.as_ref(),
+    );
+    for stmt in &ir.stmts {
+        collect_stmt_types(
+            std::slice::from_ref(stmt),
+            &mut top_state,
+            &mut local_types,
+            &mut local_schemas,
+            &mut local_schema_labels,
+            &mut callable_slots,
+            &mut optional_slots,
+            &mut context,
+        );
+    }
+    let mut decisions = context.map_store_decisions;
+    let observed_function_param_types = context.observed_function_param_types;
+    let observed_function_param_schemas = context.observed_function_param_schemas;
+    let observed_function_param_callables = context.observed_function_param_callables;
+    let observed_function_param_capture_states = context.observed_function_param_capture_states;
+    let observed_function_capture_states = context.observed_function_capture_states;
+    let env = CollectFunctionTypesEnv {
+        function_impls: &ir.function_impls,
+        function_decls: &function_decls,
+        function_names: &function_names,
+        struct_schemas: &ir.struct_schemas,
+        host_import_return_types: &host_import_return_types,
+        host_import_signatures: &host_import_signatures,
+        observed_function_param_types: &observed_function_param_types,
+        observed_function_param_schemas: &observed_function_param_schemas,
+        observed_function_param_callables: &observed_function_param_callables,
+        observed_function_param_capture_states: &observed_function_param_capture_states,
+        observed_function_capture_states: &observed_function_capture_states,
+    };
+    for decl in &ir.functions {
+        let Some(function_impl) = ir.function_impls.get(&decl.index) else {
+            continue;
+        };
+        let mut outputs = CollectFunctionTypeOutputs {
+            local_types: &mut local_types,
+            local_schemas: &mut local_schemas,
+            local_schema_labels: &mut local_schema_labels,
+            callable_slots: &mut callable_slots,
+            optional_slots: &mut optional_slots,
+        };
+        let (_, function_decisions) =
+            collect_function_types(decl.index, function_impl, decl, &mut outputs, &env);
+        decisions.extend(function_decisions);
+    }
+    decisions
 }
 
 pub(super) fn validate_if_else_type_consistency(

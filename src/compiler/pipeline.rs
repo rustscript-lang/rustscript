@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -228,7 +228,12 @@ fn prepare_typed_units_with_entry(
             });
         }
         let facts = typing::infer_types(&runtime, TypingMode::DynamicHints, &runtime_types);
-        typing::classify_map_stores(&mut runtime, TypingMode::DynamicHints, &runtime_types)
+        typing::classify_map_stores(
+            &mut runtime,
+            TypingMode::DynamicHints,
+            &runtime_types,
+            rss_map_store_scope(&owners),
+        )
             .map_err(typing::map_admission_source_error)
             .map_err(|error| SourcePathError::SourceWithMap {
                 error,
@@ -462,7 +467,12 @@ fn prepare_owned_typed_ir(
     .map_err(SourceError::Compile)?;
     super::logical_boundary::lower_typed_json(&mut parsed, &logical_schemas)
         .map_err(SourceError::Compile)?;
-    typing::classify_map_stores(&mut parsed, TypingMode::DynamicHints, entry.types)
+    typing::classify_map_stores(
+        &mut parsed,
+        TypingMode::DynamicHints,
+        entry.types,
+        rss_map_store_scope(owners),
+    )
         .map_err(typing::map_admission_source_error)?;
     let owned_ir = enforce_owned_sources(
         parsed.clone(),
@@ -899,6 +909,16 @@ fn is_compiler_primitive_import(name: &str) -> bool {
     name.starts_with("__prim_")
 }
 
+fn rss_map_store_scope(owners: &[TypedSourceOwner<'_>]) -> typing::MapStoreScope {
+    typing::MapStoreScope::Sources(
+        owners
+            .iter()
+            .filter(|owner| owner.plugin.is_none())
+            .map(|owner| owner.source_id)
+            .collect::<HashSet<_>>(),
+    )
+}
+
 fn frontend_policy_for_flavor(
     flavor: SourceFlavor,
     options: &CompileSourceFileOptions,
@@ -947,6 +967,7 @@ fn compile_parsed_output_with_entry_locals(
         enable_local_move_semantics,
         None,
         None,
+        typing::MapStoreScope::RustScript,
     )
 }
 
@@ -961,6 +982,7 @@ fn compile_parsed_output_with_capture_output(
     enable_local_move_semantics: bool,
     certification: Option<&mut super::capture_certification::CaptureCertification>,
     capture_source_policies: Option<super::capture_certification::CaptureProducerPolicies<'_>>,
+    map_store_scope: typing::MapStoreScope,
 ) -> Result<CompiledProgram, SourceError> {
     // Normal compilation passes no entry locals. The REPL uses this hook to treat
     // carried-over locals from prior entries as already available at snippet start.
@@ -991,7 +1013,7 @@ fn compile_parsed_output_with_capture_output(
         .map_err(SourceError::Compile)?;
     super::logical_boundary::lower_typed_json(&mut parsed, &pre_lifetime_type_info.local_schemas)
         .map_err(SourceError::Compile)?;
-    typing::classify_map_stores(&mut parsed, typing_mode, entry_local_types)
+    typing::classify_map_stores(&mut parsed, typing_mode, entry_local_types, map_store_scope)
         .map_err(typing::map_admission_source_error)?;
     let owned_local_slots = pre_lifetime_type_info
         .local_schemas
@@ -2652,6 +2674,11 @@ fn compile_source_with_flavor_capture_output(
                 policies: &capture_source_policies,
             },
         ),
+        if matches!(flavor, SourceFlavor::RustScript) {
+            typing::MapStoreScope::RustScript
+        } else {
+            typing::MapStoreScope::Legacy
+        },
     ) {
         Err(SourceError::Parse(err)) => Err(SourceError::Parse(
             err.with_line_span_from_source(&source_map, source_id),

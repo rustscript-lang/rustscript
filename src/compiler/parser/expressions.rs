@@ -1848,6 +1848,23 @@ impl Parser {
         self.build_builtin_call_expr(builtin, args)
     }
 
+    fn map_store_call_with_provenance(
+        &mut self,
+        container: Expr,
+        key: Expr,
+        value: Expr,
+        callee_span: Span,
+        expr_span: Span,
+    ) -> Result<Expr, ParseError> {
+        let builtin = self.map_store_builtin(&container, &value);
+        let args = if builtin == BuiltinFunction::MapEdit {
+            vec![container, key, value, Expr::Bool(false)]
+        } else {
+            vec![container, key, value]
+        };
+        self.build_postfix_builtin_call(builtin, args, callee_span, expr_span, "set".to_string())
+    }
+
     /// RSS map stores keep Unit and other possibly-null data. Proven non-null
     /// values stay on the existing three-argument set path.
     fn map_store_builtin(&self, container: &Expr, value: &Expr) -> BuiltinFunction {
@@ -3249,6 +3266,11 @@ impl Parser {
             "expected '=' after indexed assignment target",
         )?;
         let value = self.parse_expr()?;
+        let expr_hi = self
+            .tokens
+            .get(self.pos.saturating_sub(1))
+            .map(|token| token.span.hi)
+            .unwrap_or(ident_span.hi);
         if expect_terminator {
             self.consume_stmt_terminator("expected ';' after indexed assignment")?;
         }
@@ -3257,7 +3279,9 @@ impl Parser {
         self.require_local_mutable_for_operation(index, Some(name.as_str()), line, "mutate")?;
         // Record the indexed-assignment root as a local reference site.
         self.record_local_ref(ident_span, index, name);
-        let expr = self.map_store_call(Expr::Var(index), key, value)?;
+        let expr_span = Span::new(ident_span.source_id, ident_span.lo, expr_hi);
+        let expr =
+            self.map_store_call_with_provenance(Expr::Var(index), key, value, ident_span, expr_span)?;
         Ok(Stmt::Assign {
             kind: AssignmentKind::Set,
             index,

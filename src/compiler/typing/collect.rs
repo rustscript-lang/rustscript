@@ -583,7 +583,10 @@ pub(super) fn collect_function_types(
     function_decl: &FunctionDecl,
     outputs: &mut CollectFunctionTypeOutputs<'_>,
     env: &CollectFunctionTypesEnv<'_>,
-) -> super::super::capture_certification::DeclarationCaptures {
+) -> (
+    super::super::capture_certification::DeclarationCaptures,
+    HashMap<super::super::ir::SemanticNodeId, super::context::MapStoreAction>,
+) {
     let mut state = LocalTypeState::default();
     let mut context = TypeContext::new(
         env.function_impls,
@@ -674,7 +677,7 @@ pub(super) fn collect_function_types(
         &mut context,
     );
     let _ = context.infer_expr_type(&function_impl.body_expr, &state);
-    context.capture_origins
+    (context.capture_origins, context.map_store_decisions)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1132,6 +1135,7 @@ fn collect_expr_types(
                     context,
                 );
             }
+            super::map_store::note_checked_map_store(expr, state, context);
             let _ = context.infer_expr_type(expr, state);
         }
         Expr::Closure(closure) => {

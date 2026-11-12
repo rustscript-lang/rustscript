@@ -1279,3 +1279,90 @@ fn closure_let_guest_named_expected_schema_survives_canonical_remap() {
         }
     }
 }
+
+struct NullDeletePlugin;
+
+impl SourcePlugin for NullDeletePlugin {
+    fn descriptor(&self) -> SourceFrontendDescriptor {
+        SourceFrontendDescriptor {
+            id: FrontendId::new("plugin-null-delete"),
+            extensions: &["nulldelete"],
+            typing_policy: FrontendTypingPolicy::Dynamic,
+            supports_ownership_checking: false,
+        }
+    }
+
+    fn parse_source(
+        &self,
+        _source: &str,
+        _context: &SourceFrontendContext<'_>,
+    ) -> Result<FrontendIr, ParseError> {
+        let stored = builtin_call(
+            vm::BuiltinFunction::Set,
+            vec![
+                builtin_call(vm::BuiltinFunction::MapNew, Vec::new()),
+                Expr::String("k".to_string()),
+                Expr::Int(1),
+            ],
+        );
+        let cleared = builtin_call(
+            vm::BuiltinFunction::Set,
+            vec![stored, Expr::String("k".to_string()), Expr::Null],
+        );
+        let present = builtin_call(
+            vm::BuiltinFunction::Has,
+            vec![cleared, Expr::String("k".to_string())],
+        );
+        Ok(FrontendIr {
+            stmts: vec![Stmt::Expr {
+                expr: present,
+                line: 1,
+            }],
+            locals: 0,
+            local_bindings: Vec::new(),
+            struct_schemas: Default::default(),
+            unknown_type_spans: Vec::new(),
+            functions: Vec::new(),
+            function_impls: Default::default(),
+            stmt_sources: Vec::new(),
+            function_sources: Default::default(),
+            use_declarations: Vec::new(),
+            implicit_extern_names: Vec::new(),
+            host_api_metadata: None,
+            semantic_index: None,
+            parsed_semantic_index: None,
+            catalog_visibility: None,
+            lexer_tokens: Vec::new(),
+        })
+    }
+}
+
+#[test]
+fn plugin_null_store_stays_set_and_deletes_key() {
+    let compiled = compile_source_with_flavor_and_options(
+        "synthetic null delete",
+        SourceFlavor::Plugin(FrontendId::new("plugin-null-delete")),
+        CompileSourceFileOptions::new().with_source_plugin(&NullDeletePlugin),
+    )
+    .expect("plugin null store must keep legacy Set deletion");
+    let set_index = vm::BuiltinFunction::Set.call_index().to_le_bytes();
+    let edit_index = vm::BuiltinFunction::MapEdit.call_index().to_le_bytes();
+    assert!(
+        compiled.program.code.windows(2).any(|pair| pair == set_index),
+        "plugin null store must remain a Set call"
+    );
+    assert!(
+        !compiled
+            .program
+            .code
+            .windows(2)
+            .any(|pair| pair == edit_index),
+        "plugin null store must not be rewritten to MapEdit"
+    );
+    let mut vm = Vm::new(compiled.program);
+    assert_eq!(
+        vm.run().expect("plugin null delete should run"),
+        VmStatus::Halted
+    );
+    assert_eq!(vm.stack(), &[Value::Bool(false)]);
+}
