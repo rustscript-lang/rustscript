@@ -475,6 +475,83 @@ pub(super) fn root_expression_result_schema(
         .filter(|schema| !matches!(schema, TypeSchema::Unknown))
 }
 
+pub(super) fn presentation_site_schemas(
+    ir: &FrontendIr,
+    typing_mode: TypingMode,
+    entry_local_types: &[EntryLocalType],
+) -> Vec<Option<TypeSchema>> {
+    let function_names = build_function_names(&ir.functions);
+    let function_decls = build_function_decl_map(&ir.functions);
+    let host_import_return_types =
+        build_host_import_return_types(&ir.functions, &ir.function_impls);
+    let host_import_signatures = build_host_import_signatures(&ir.functions, &ir.function_impls);
+    let mut state = LocalTypeState::default();
+    seed_entry_local_state(&mut state, entry_local_types);
+    let mut context = TypeContext::new(
+        &ir.function_impls,
+        &function_decls,
+        &ir.struct_schemas,
+        &function_names,
+        &host_import_return_types,
+        &host_import_signatures,
+        typing_mode,
+        ir.parsed_semantic_index.as_ref(),
+    );
+    let mut visible = entry_local_types
+        .iter()
+        .map(|entry| entry.slot)
+        .collect::<HashSet<_>>();
+    let mut capture_seeds = HashMap::new();
+    collect::walk_presentation_root(
+        &ir.stmts,
+        &mut state,
+        &mut visible,
+        &mut context,
+        &mut capture_seeds,
+    );
+    let mut indexes = ir.function_impls.keys().copied().collect::<Vec<_>>();
+    indexes.sort_unstable();
+    let bodies = indexes
+        .into_iter()
+        .filter_map(|index| {
+            let function = ir.function_impls.get(&index)?;
+            let arg_schemas = function_decls
+                .get(&index)
+                .map(|decl| decl.arg_schemas.clone())
+                .unwrap_or_default();
+            Some((
+                function.param_slots.clone(),
+                arg_schemas,
+                function.body_stmts.clone(),
+                function.body_expr.clone(),
+                capture_seeds.remove(&index),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (param_slots, arg_schemas, body_stmts, body_expr, seed) in bodies {
+        let mut function_state = LocalTypeState::default();
+        collect::seed_function_param_state(
+            &mut function_state,
+            &param_slots,
+            Some(arg_schemas.as_slice()),
+            None,
+            None,
+            None,
+            None,
+        );
+        if let Some(seed) = seed {
+            function_state.copy_all_bindings_from(&seed);
+        }
+        collect::walk_presentation_function(
+            &body_stmts,
+            &body_expr,
+            &mut function_state,
+            &mut context,
+        );
+    }
+    context.presentation_sites
+}
+
 pub(super) fn infer_types_with_capture_origins(
     ir: &FrontendIr,
     typing_mode: TypingMode,

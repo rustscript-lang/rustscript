@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::ValueType;
 
@@ -1794,4 +1794,311 @@ pub(super) fn record_local_schema_label(
         (Some(current), None) => Some(current.clone()),
         _ => None,
     };
+}
+
+pub(super) fn walk_presentation_root(
+    stmts: &[Stmt],
+    state: &mut LocalTypeState,
+    visible: &mut HashSet<LocalSlot>,
+    context: &mut TypeContext<'_>,
+    capture_seeds: &mut HashMap<u16, LocalTypeState>,
+) {
+    presentation_walk_stmts(stmts, state, visible, context, capture_seeds);
+}
+
+pub(super) fn walk_presentation_function(
+    body_stmts: &[Stmt],
+    body_expr: &Expr,
+    state: &mut LocalTypeState,
+    context: &mut TypeContext<'_>,
+) {
+    let mut visible = HashSet::new();
+    let mut seeds = HashMap::new();
+    presentation_walk_stmts(body_stmts, state, &mut visible, context, &mut seeds);
+    presentation_walk_expr(body_expr, state, &mut visible, context, &mut seeds);
+}
+
+fn presentation_walk_stmts(
+    stmts: &[Stmt],
+    state: &mut LocalTypeState,
+    visible: &mut HashSet<LocalSlot>,
+    context: &mut TypeContext<'_>,
+    capture_seeds: &mut HashMap<u16, LocalTypeState>,
+) {
+    for stmt in stmts {
+        presentation_walk_stmt(stmt, state, visible, context, capture_seeds);
+    }
+}
+
+fn presentation_walk_stmt(
+    stmt: &Stmt,
+    state: &mut LocalTypeState,
+    visible: &mut HashSet<LocalSlot>,
+    context: &mut TypeContext<'_>,
+    capture_seeds: &mut HashMap<u16, LocalTypeState>,
+) {
+    match stmt {
+        Stmt::Let {
+            index,
+            declared_schema,
+            expr,
+            ..
+        } => {
+            presentation_walk_expr(expr, state, visible, context, capture_seeds);
+            let value = root_expr_value(expr, state, context);
+            bind_root_value(state, *index, declared_schema.as_ref(), &value, context);
+            visible.insert(*index);
+        }
+        Stmt::Assign { index, expr, .. } => {
+            presentation_walk_expr(expr, state, visible, context, capture_seeds);
+            let value = root_expr_value(expr, state, context);
+            bind_root_value(state, *index, None, &value, context);
+        }
+        Stmt::Expr { expr, .. } => {
+            presentation_walk_expr(expr, state, visible, context, capture_seeds);
+            let _ = collect_root_expr(expr, state, visible, context);
+        }
+        Stmt::IfElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            presentation_walk_expr(condition, state, visible, context, capture_seeds);
+            let mut then_state = refine_state_for_condition(state, condition, true);
+            let mut else_state = refine_state_for_condition(state, condition, false);
+            presentation_walk_stmts(
+                then_branch,
+                &mut then_state,
+                &mut visible.clone(),
+                context,
+                capture_seeds,
+            );
+            presentation_walk_stmts(
+                else_branch,
+                &mut else_state,
+                &mut visible.clone(),
+                context,
+                capture_seeds,
+            );
+            let mut joined = LocalTypeState::default();
+            joined.merge_from_branches(&then_state, &else_state);
+            commit_root_scope(state, &joined, visible);
+        }
+        Stmt::While {
+            condition, body, ..
+        } => {
+            presentation_walk_expr(condition, state, visible, context, capture_seeds);
+            let mut nested = state.clone();
+            presentation_walk_stmts(
+                body,
+                &mut nested,
+                &mut visible.clone(),
+                context,
+                capture_seeds,
+            );
+            commit_root_scope(state, &nested, visible);
+        }
+        Stmt::For {
+            init,
+            condition,
+            post,
+            body,
+            ..
+        } => {
+            presentation_walk_stmt(init, state, visible, context, capture_seeds);
+            presentation_walk_expr(condition, state, visible, context, capture_seeds);
+            presentation_walk_stmt(post, state, visible, context, capture_seeds);
+            presentation_walk_stmts(body, state, visible, context, capture_seeds);
+        }
+        Stmt::ClosureLet { closure, .. } => {
+            presentation_walk_closure(closure, state, context, capture_seeds);
+        }
+        Stmt::FuncDecl { index, .. } => {
+            if let Some(function) = context.function_impls.get(index) {
+                let mut seed = LocalTypeState::default();
+                for (source, capture) in &function.capture_copies {
+                    seed.copy_exact_binding_from(state, *source, *capture);
+                }
+                capture_seeds.insert(*index, seed);
+            }
+        }
+        Stmt::Drop { index, .. } => state.set(*index, BoundType::Null),
+        Stmt::Noop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
+    }
+}
+
+fn presentation_walk_expr(
+    expr: &Expr,
+    state: &mut LocalTypeState,
+    visible: &mut HashSet<LocalSlot>,
+    context: &mut TypeContext<'_>,
+    capture_seeds: &mut HashMap<u16, LocalTypeState>,
+) {
+    if let Expr::Closure(closure) = expr {
+        presentation_walk_closure(closure, state, context, capture_seeds);
+        return;
+    }
+    if let Expr::Block { stmts, expr } = expr {
+        let mut nested = state.clone();
+        let mut scope = visible.clone();
+        presentation_walk_stmts(stmts, &mut nested, &mut scope, context, capture_seeds);
+        presentation_walk_expr(expr, &mut nested, &mut scope, context, capture_seeds);
+        commit_root_scope(state, &nested, visible);
+        return;
+    }
+    if let Expr::LocalCall(slot, _, args, _) = expr {
+        if args.len() == 1 && language_print_alias(state, *slot, context) {
+            let schema = presentation_schema(&args[0], state, context);
+            context.presentation_sites.push(schema);
+            presentation_walk_expr(&args[0], state, visible, context, capture_seeds);
+            return;
+        }
+    }
+    if let Some(values) = super::super::logical_boundary::presentation_inputs(
+        context.function_impls,
+        context.function_names,
+        expr,
+    ) {
+        let mut noted = Vec::with_capacity(values.len());
+        for value in &values {
+            noted.push(presentation_schema(value, state, context));
+        }
+        context.presentation_sites.extend(noted);
+        for value in values {
+            presentation_walk_expr(value, state, visible, context, capture_seeds);
+        }
+        return;
+    }
+    match expr {
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            presentation_walk_expr(condition, state, visible, context, capture_seeds);
+            presentation_walk_expr(then_expr, state, visible, context, capture_seeds);
+            presentation_walk_expr(else_expr, state, visible, context, capture_seeds);
+        }
+        Expr::Call(_, _, args, _, _)
+        | Expr::LocalCall(_, _, args, _)
+        | Expr::ModuleCall(_, _, args, _)
+        | Expr::ClosureCall(_, args) => {
+            for arg in args {
+                presentation_walk_expr(arg, state, visible, context, capture_seeds);
+            }
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs) => {
+            presentation_walk_expr(lhs, state, visible, context, capture_seeds);
+            presentation_walk_expr(rhs, state, visible, context, capture_seeds);
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => {
+            presentation_walk_expr(inner, state, visible, context, capture_seeds);
+        }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                presentation_walk_expr(payload, state, visible, context, capture_seeds);
+            }
+        }
+        Expr::ResultConstruct { payload, .. }
+        | Expr::ResultQuery { value: payload, .. }
+        | Expr::ResultTry { value: payload, .. } => {
+            presentation_walk_expr(payload, state, visible, context, capture_seeds);
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            presentation_walk_expr(value, state, visible, context, capture_seeds);
+            presentation_walk_expr(some_expr, state, visible, context, capture_seeds);
+            presentation_walk_expr(none_expr, state, visible, context, capture_seeds);
+        }
+        _ => {}
+    }
+}
+
+fn presentation_walk_closure(
+    closure: &ClosureExpr,
+    outer: &LocalTypeState,
+    context: &mut TypeContext<'_>,
+    capture_seeds: &mut HashMap<u16, LocalTypeState>,
+) {
+    let mut inner = LocalTypeState::default();
+    for (source, capture) in &closure.capture_copies {
+        inner.copy_exact_binding_from(outer, *source, *capture);
+    }
+    let mut visible = HashSet::new();
+    presentation_walk_expr(
+        &closure.body,
+        &mut inner,
+        &mut visible,
+        context,
+        capture_seeds,
+    );
+}
+
+fn language_print_alias(
+    state: &LocalTypeState,
+    slot: LocalSlot,
+    context: &TypeContext<'_>,
+) -> bool {
+    match state.callable(slot) {
+        Some(InferredCallable::Function(index, _)) => {
+            super::super::logical_boundary::is_language_print(
+                context.function_impls,
+                context.function_names,
+                *index,
+            )
+        }
+        _ => false,
+    }
+}
+
+fn presentation_schema(
+    expr: &Expr,
+    state: &LocalTypeState,
+    context: &mut TypeContext<'_>,
+) -> Option<TypeSchema> {
+    let schema = context
+        .infer_expr_schema(expr, state)
+        .or_else(|| constructor_presentation_schema(expr));
+    schema.filter(super::super::logical_boundary::contains_logical_display)
+}
+
+fn constructor_presentation_schema(expr: &Expr) -> Option<TypeSchema> {
+    match expr {
+        Expr::Unit => Some(TypeSchema::Unit),
+        Expr::OptionConstruct {
+            option_schema,
+            some,
+            ..
+        } => {
+            if matches!(option_schema, TypeSchema::Option(_)) {
+                return Some(option_schema.clone());
+            }
+            if !*some {
+                return Some(TypeSchema::Option(Box::new(TypeSchema::Unknown)));
+            }
+            None
+        }
+        Expr::ResultConstruct { result_schema, .. } => {
+            matches!(result_schema, TypeSchema::Result { .. }).then(|| result_schema.clone())
+        }
+        _ => None,
+    }
 }

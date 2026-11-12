@@ -5,8 +5,114 @@
 //! lossless schema constant before ownership planning.
 
 use crate::builtins::BuiltinFunction;
-use crate::compiler::ir::{Expr, FrontendIr, FunctionImpl, LocalSlot, Stmt, TypeSchema};
 use crate::compiler::CompileError;
+use crate::compiler::ir::{Expr, FrontendIr, FunctionImpl, LocalSlot, Stmt, TypeSchema};
+use std::collections::HashMap;
+
+/// Value expressions of a presentation site, in the order their schemas are
+/// recorded. `None` means this expression is not a site. Trusted print is the
+/// language binding: no user impl and no catalog resolution. A same-name
+/// concrete host or user function is not a site.
+pub(super) fn presentation_inputs<'a>(
+    function_impls: &HashMap<u16, FunctionImpl>,
+    function_names: &HashMap<u16, String>,
+    expr: &'a Expr,
+) -> Option<Vec<&'a Expr>> {
+    let Expr::Call(index, _, args, resolution, _) = expr else {
+        return None;
+    };
+    if resolution.is_none()
+        && !function_impls.contains_key(index)
+        && function_names.get(index).map(String::as_str) == Some("print")
+        && args.len() == 1
+    {
+        return Some(vec![print_input_expr(&args[0])]);
+    }
+    if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::TypeOf) && args.len() == 1
+    {
+        return Some(vec![&args[0]]);
+    }
+    if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::FormatTemplate)
+        && args.len() == 2
+    {
+        return Some(format_payload_exprs(&args[1]));
+    }
+    None
+}
+
+pub(super) fn is_language_print(
+    function_impls: &HashMap<u16, FunctionImpl>,
+    function_names: &HashMap<u16, String>,
+    index: u16,
+) -> bool {
+    !function_impls.contains_key(&index)
+        && function_names.get(&index).map(String::as_str) == Some("print")
+}
+
+fn print_input_expr(arg: &Expr) -> &Expr {
+    let (inner, _) = split_print_newline(arg);
+    to_string_input(inner).unwrap_or(inner)
+}
+
+fn split_print_newline(arg: &Expr) -> (&Expr, bool) {
+    match arg {
+        Expr::Add(left, right) if matches!(right.as_ref(), Expr::String(text) if text == "\n") => {
+            (left.as_ref(), true)
+        }
+        other => (other, false),
+    }
+}
+
+fn to_string_input(expr: &Expr) -> Option<&Expr> {
+    let Expr::Call(index, _, args, _, _) = expr else {
+        return None;
+    };
+    if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::ToString)
+        && args.len() == 1
+    {
+        Some(&args[0])
+    } else {
+        None
+    }
+}
+
+fn format_payload_exprs(expr: &Expr) -> Vec<&Expr> {
+    let mut values = Vec::new();
+    collect_format_payload(expr, &mut values);
+    values
+}
+
+fn collect_format_payload<'a>(expr: &'a Expr, values: &mut Vec<&'a Expr>) {
+    let Expr::Call(index, _, args, _, _) = expr else {
+        return;
+    };
+    if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::ArrayPush)
+        || args.len() != 2
+    {
+        return;
+    }
+    collect_format_payload(&args[0], values);
+    values.push(&args[1]);
+}
+
+pub(super) fn contains_logical_display(schema: &TypeSchema) -> bool {
+    match schema {
+        TypeSchema::Option(_) | TypeSchema::Unit | TypeSchema::Result { .. } => true,
+        TypeSchema::Array(inner) | TypeSchema::Map(inner) | TypeSchema::Optional(inner) => {
+            contains_logical_display(inner)
+        }
+        TypeSchema::ArrayTuple(items) => items.iter().any(contains_logical_display),
+        TypeSchema::ArrayTupleRest { prefix, rest } => {
+            prefix.iter().any(contains_logical_display) || contains_logical_display(rest)
+        }
+        TypeSchema::Object(fields) => fields.values().any(contains_logical_display),
+        TypeSchema::Named(_, args) => args.iter().any(contains_logical_display),
+        TypeSchema::Callable { params, result } => {
+            params.iter().any(contains_logical_display) || contains_logical_display(result)
+        }
+        _ => false,
+    }
+}
 
 pub(super) fn lower_typed_json(
     ir: &mut FrontendIr,
@@ -124,7 +230,9 @@ fn lower_expr(expr: &mut Expr) -> Result<(), CompileError> {
             lower_expr(container)?;
             lower_expr(key)
         }
-        Expr::OptionUnwrapOr { value, fallback, .. } => {
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
             lower_expr(value)?;
             lower_expr(fallback)
         }
@@ -434,7 +542,10 @@ fn visit_encode_children(
         }
         Expr::Closure(closure) => collect_encode_expr(&closure.body, typed, facts),
         Expr::Match {
-            value, arms, default, ..
+            value,
+            arms,
+            default,
+            ..
         } => {
             collect_encode_expr(value, typed, facts);
             for (_, arm) in arms {
@@ -507,9 +618,9 @@ fn typed_json_schema_is_concrete(schema: &TypeSchema) -> bool {
         | TypeSchema::Bool
         | TypeSchema::String
         | TypeSchema::Unit => true,
-        TypeSchema::Array(inner)
-        | TypeSchema::Map(inner)
-        | TypeSchema::Option(inner) => typed_json_schema_is_concrete(inner),
+        TypeSchema::Array(inner) | TypeSchema::Map(inner) | TypeSchema::Option(inner) => {
+            typed_json_schema_is_concrete(inner)
+        }
         TypeSchema::ArrayTuple(items) => items.iter().all(typed_json_schema_is_concrete),
         TypeSchema::Object(fields) => fields.values().all(typed_json_schema_is_concrete),
         TypeSchema::Named(_, args) => args.iter().all(typed_json_schema_is_concrete),
@@ -630,7 +741,10 @@ fn apply_encode_children(
         }
         Expr::Closure(closure) => apply_encode_expr(&mut closure.body, facts),
         Expr::Match {
-            value, arms, default, ..
+            value,
+            arms,
+            default,
+            ..
         } => {
             apply_encode_expr(value, facts)?;
             for (_, arm) in arms {
@@ -793,179 +907,106 @@ fn logical_label_schema(schema: &TypeSchema) -> bool {
 
 pub(super) fn lower_logical_print(
     ir: &mut FrontendIr,
-    local_schemas: &[Option<TypeSchema>],
+    typing_mode: super::TypingMode,
+    entry_local_types: &[super::typing::EntryLocalType],
 ) -> Result<(), CompileError> {
-    let mut schemas = declared_schemas(ir);
-    for (slot, schema) in local_schemas.iter().enumerate() {
-        if let Some(schema) = schema {
-            let slot = slot as LocalSlot;
-            if let Some(existing) = schemas.get(&slot) {
-                if logical_label_schema(existing) && !logical_label_schema(schema) {
-                    continue;
-                }
-            }
-            schemas.insert(slot, schema.clone());
-        }
-    }
-    let print_index = ir
+    let facts = super::typing::presentation_site_schemas(ir, typing_mode, entry_local_types);
+    let mut facts = facts.into_iter();
+    let names: HashMap<u16, String> = ir
         .functions
         .iter()
-        .find(|function| function.name == "print" && function.arity == 1)
-        .map(|function| function.index);
-    let to_string = BuiltinFunction::ToString.call_index();
-    lower_print_stmts(
+        .map(|function| (function.index, function.name.clone()))
+        .collect();
+    let impls: HashMap<u16, ()> = ir
+        .function_impls
+        .keys()
+        .copied()
+        .map(|index| (index, ()))
+        .collect();
+    let mut aliases = HashMap::new();
+    rewrite_stmts(
         &mut ir.stmts,
-        print_index,
-        to_string,
-        &schemas,
+        &names,
+        &impls,
+        &mut facts,
+        &mut aliases,
         &mut ir.locals,
     )?;
-    for function in ir.function_impls.values_mut() {
-        lower_print_function(function, print_index, to_string, &schemas, &mut ir.locals)?;
+    let mut indexes = ir.function_impls.keys().copied().collect::<Vec<_>>();
+    indexes.sort_unstable();
+    for index in indexes {
+        let Some(function) = ir.function_impls.get_mut(&index) else {
+            continue;
+        };
+        let mut function_aliases = HashMap::new();
+        rewrite_stmts(
+            &mut function.body_stmts,
+            &names,
+            &impls,
+            &mut facts,
+            &mut function_aliases,
+            &mut ir.locals,
+        )?;
+        rewrite_expr(
+            &mut function.body_expr,
+            &names,
+            &impls,
+            &mut facts,
+            &mut function_aliases,
+            &mut ir.locals,
+        )?;
+    }
+    if facts.next().is_some() {
+        return Err(presentation_error("unused presentation fact"));
     }
     Ok(())
 }
 
-fn lower_print_function(
-    function: &mut FunctionImpl,
-    print_index: Option<u16>,
-    to_string: u16,
-    schemas: &std::collections::HashMap<LocalSlot, TypeSchema>,
-    locals: &mut usize,
-) -> Result<(), CompileError> {
-    lower_print_stmts(
-        &mut function.body_stmts,
-        print_index,
-        to_string,
-        schemas,
-        locals,
-    )?;
-    lower_print_expr(
-        &mut function.body_expr,
-        print_index,
-        to_string,
-        schemas,
-        locals,
-    )
-}
-
-fn declared_schemas(ir: &FrontendIr) -> std::collections::HashMap<LocalSlot, TypeSchema> {
-    let mut schemas = std::collections::HashMap::new();
-    for stmt in &ir.stmts {
-        collect_declared(stmt, &mut schemas);
-    }
-    for function in ir.function_impls.values() {
-        for stmt in &function.body_stmts {
-            collect_declared(stmt, &mut schemas);
-        }
-    }
-    schemas
-}
-
-fn collect_declared(stmt: &Stmt, schemas: &mut std::collections::HashMap<LocalSlot, TypeSchema>) {
-    match stmt {
-        Stmt::Let {
-            index,
-            declared_schema: Some(schema),
-            expr,
-            ..
-        } => {
-            schemas.insert(*index, schema.clone());
-            collect_declared_expr(expr, schemas);
-        }
-        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-            collect_declared_expr(expr, schemas);
-        }
-        Stmt::IfElse {
-            condition,
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            collect_declared_expr(condition, schemas);
-            for nested in then_branch.iter().chain(else_branch) {
-                collect_declared(nested, schemas);
-            }
-        }
-        Stmt::While {
-            condition, body, ..
-        } => {
-            collect_declared_expr(condition, schemas);
-            for nested in body {
-                collect_declared(nested, schemas);
-            }
-        }
-        Stmt::For {
-            init,
-            condition,
-            post,
-            body,
-            ..
-        } => {
-            collect_declared(init, schemas);
-            collect_declared_expr(condition, schemas);
-            collect_declared(post, schemas);
-            for nested in body {
-                collect_declared(nested, schemas);
-            }
-        }
-        Stmt::Noop { .. }
-        | Stmt::FuncDecl { .. }
-        | Stmt::Break { .. }
-        | Stmt::Continue { .. }
-        | Stmt::Drop { .. }
-        | Stmt::ClosureLet { .. } => {}
-    }
-}
-
-fn collect_declared_expr(expr: &Expr, schemas: &mut std::collections::HashMap<LocalSlot, TypeSchema>) {
-    if let Expr::Block { stmts, expr } = expr {
-        for stmt in stmts {
-            collect_declared(stmt, schemas);
-        }
-        collect_declared_expr(expr, schemas);
-    }
-}
-
-fn lower_print_stmts(
+fn rewrite_stmts(
     stmts: &mut [Stmt],
-    print_index: Option<u16>,
-    to_string: u16,
-    schemas: &std::collections::HashMap<LocalSlot, TypeSchema>,
+    names: &HashMap<u16, String>,
+    impls: &HashMap<u16, ()>,
+    facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
+    aliases: &mut HashMap<LocalSlot, ()>,
     locals: &mut usize,
 ) -> Result<(), CompileError> {
     for stmt in stmts {
-        lower_print_stmt(stmt, print_index, to_string, schemas, locals)?;
+        rewrite_stmt(stmt, names, impls, facts, aliases, locals)?;
     }
     Ok(())
 }
 
-fn lower_print_stmt(
+fn rewrite_stmt(
     stmt: &mut Stmt,
-    print_index: Option<u16>,
-    to_string: u16,
-    schemas: &std::collections::HashMap<LocalSlot, TypeSchema>,
+    names: &HashMap<u16, String>,
+    impls: &HashMap<u16, ()>,
+    facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
+    aliases: &mut HashMap<LocalSlot, ()>,
     locals: &mut usize,
 ) -> Result<(), CompileError> {
     match stmt {
-        Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-            lower_print_expr(expr, print_index, to_string, schemas, locals)
+        Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
+            rewrite_expr(expr, names, impls, facts, aliases, locals)?;
+            note_print_alias(*index, expr, names, impls, aliases);
         }
+        Stmt::Expr { expr, .. } => rewrite_expr(expr, names, impls, facts, aliases, locals)?,
         Stmt::IfElse {
             condition,
             then_branch,
             else_branch,
             ..
         } => {
-            lower_print_expr(condition, print_index, to_string, schemas, locals)?;
-            lower_print_stmts(then_branch, print_index, to_string, schemas, locals)?;
-            lower_print_stmts(else_branch, print_index, to_string, schemas, locals)
+            rewrite_expr(condition, names, impls, facts, aliases, locals)?;
+            let mut then_aliases = aliases.clone();
+            let mut else_aliases = aliases.clone();
+            rewrite_stmts(then_branch, names, impls, facts, &mut then_aliases, locals)?;
+            rewrite_stmts(else_branch, names, impls, facts, &mut else_aliases, locals)?;
         }
         Stmt::While {
             condition, body, ..
         } => {
-            lower_print_expr(condition, print_index, to_string, schemas, locals)?;
-            lower_print_stmts(body, print_index, to_string, schemas, locals)
+            rewrite_expr(condition, names, impls, facts, aliases, locals)?;
+            rewrite_stmts(body, names, impls, facts, &mut aliases.clone(), locals)?;
         }
         Stmt::For {
             init,
@@ -974,59 +1015,353 @@ fn lower_print_stmt(
             body,
             ..
         } => {
-            lower_print_stmt(init, print_index, to_string, schemas, locals)?;
-            lower_print_expr(condition, print_index, to_string, schemas, locals)?;
-            lower_print_stmt(post, print_index, to_string, schemas, locals)?;
-            lower_print_stmts(body, print_index, to_string, schemas, locals)
+            rewrite_stmt(init, names, impls, facts, aliases, locals)?;
+            rewrite_expr(condition, names, impls, facts, aliases, locals)?;
+            rewrite_stmt(post, names, impls, facts, aliases, locals)?;
+            rewrite_stmts(body, names, impls, facts, aliases, locals)?;
+        }
+        Stmt::ClosureLet { closure, .. } => {
+            rewrite_closure(closure, names, impls, facts, aliases, locals)?;
         }
         Stmt::Noop { .. }
         | Stmt::FuncDecl { .. }
         | Stmt::Break { .. }
         | Stmt::Continue { .. }
-        | Stmt::Drop { .. }
-        | Stmt::ClosureLet { .. } => Ok(()),
+        | Stmt::Drop { .. } => {}
+    }
+    Ok(())
+}
+
+fn rewrite_expr(
+    expr: &mut Expr,
+    names: &HashMap<u16, String>,
+    impls: &HashMap<u16, ()>,
+    facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
+    aliases: &mut HashMap<LocalSlot, ()>,
+    locals: &mut usize,
+) -> Result<(), CompileError> {
+    if let Expr::Closure(closure) = expr {
+        return rewrite_closure(closure, names, impls, facts, aliases, locals);
+    }
+    if let Expr::Block { stmts, expr } = expr {
+        let mut nested = aliases.clone();
+        rewrite_stmts(stmts, names, impls, facts, &mut nested, locals)?;
+        return rewrite_expr(expr, names, impls, facts, &mut nested, locals);
+    }
+    if let Expr::LocalCall(slot, _, args, _) = expr {
+        if args.len() == 1 && aliases.contains_key(slot) {
+            let schema = next_fact(facts)?;
+            rewrite_expr(&mut args[0], names, impls, facts, aliases, locals)?;
+            if let Some(schema) = schema {
+                return rewrite_print_call(expr, schema, false, locals);
+            }
+            return Ok(());
+        }
+    }
+    if presentation_inputs_mut(names, impls, expr).is_some() {
+        return rewrite_presentation_site(expr, names, impls, facts, aliases, locals);
+    }
+    match expr {
+        Expr::IfElse {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            rewrite_expr(condition, names, impls, facts, aliases, locals)?;
+            rewrite_expr(then_expr, names, impls, facts, aliases, locals)?;
+            rewrite_expr(else_expr, names, impls, facts, aliases, locals)?;
+        }
+        Expr::Call(_, _, args, _, _)
+        | Expr::LocalCall(_, _, args, _)
+        | Expr::ModuleCall(_, _, args, _)
+        | Expr::ClosureCall(_, args) => {
+            for arg in args {
+                rewrite_expr(arg, names, impls, facts, aliases, locals)?;
+            }
+        }
+        Expr::Add(lhs, rhs)
+        | Expr::Sub(lhs, rhs)
+        | Expr::Mul(lhs, rhs)
+        | Expr::Div(lhs, rhs)
+        | Expr::Mod(lhs, rhs)
+        | Expr::Eq(lhs, rhs)
+        | Expr::Lt(lhs, rhs)
+        | Expr::Gt(lhs, rhs)
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs) => {
+            rewrite_expr(lhs, names, impls, facts, aliases, locals)?;
+            rewrite_expr(rhs, names, impls, facts, aliases, locals)?;
+        }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => {
+            rewrite_expr(inner, names, impls, facts, aliases, locals)?;
+        }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                rewrite_expr(payload, names, impls, facts, aliases, locals)?;
+            }
+        }
+        Expr::ResultConstruct { payload, .. }
+        | Expr::ResultQuery { value: payload, .. }
+        | Expr::ResultTry { value: payload, .. } => {
+            rewrite_expr(payload, names, impls, facts, aliases, locals)?;
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            rewrite_expr(value, names, impls, facts, aliases, locals)?;
+            rewrite_expr(some_expr, names, impls, facts, aliases, locals)?;
+            rewrite_expr(none_expr, names, impls, facts, aliases, locals)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn rewrite_closure(
+    closure: &mut crate::compiler::ir::ClosureExpr,
+    names: &HashMap<u16, String>,
+    impls: &HashMap<u16, ()>,
+    facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
+    aliases: &HashMap<LocalSlot, ()>,
+    locals: &mut usize,
+) -> Result<(), CompileError> {
+    let mut inner = HashMap::new();
+    for (source, capture) in &closure.capture_copies {
+        if aliases.contains_key(source) {
+            inner.insert(*capture, ());
+        }
+    }
+    rewrite_expr(&mut closure.body, names, impls, facts, &mut inner, locals)
+}
+
+fn rewrite_presentation_site(
+    expr: &mut Expr,
+    names: &HashMap<u16, String>,
+    impls: &HashMap<u16, ()>,
+    facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
+    aliases: &mut HashMap<LocalSlot, ()>,
+    locals: &mut usize,
+) -> Result<(), CompileError> {
+    let kind = presentation_kind(names, impls, expr);
+    let count = match &kind {
+        PresentationKind::Print | PresentationKind::Type => 1,
+        PresentationKind::Format(count) => *count,
+        PresentationKind::None => 0,
+    };
+    let mut schemas = Vec::with_capacity(count);
+    for _ in 0..count {
+        schemas.push(next_fact(facts)?);
+    }
+    match kind {
+        PresentationKind::Print => {
+            let newline = print_newline(expr);
+            if let Expr::Call(_, _, args, _, _) = expr {
+                if let Some(arg) = args.get_mut(0) {
+                    rewrite_print_input(arg, names, impls, facts, aliases, locals)?;
+                }
+            }
+            if let Some(schema) = schemas.pop().flatten() {
+                rewrite_print_call(expr, schema, newline, locals)?;
+            }
+        }
+        PresentationKind::Type => {
+            if let Expr::Call(_, _, args, _, _) = expr {
+                if let Some(arg) = args.get_mut(0) {
+                    rewrite_expr(arg, names, impls, facts, aliases, locals)?;
+                }
+            }
+            if let Some(schema) = schemas.pop().flatten() {
+                if let Some(label) = type_label(&schema) {
+                    rewrite_type_call(expr, schema, label, locals)?;
+                }
+            }
+        }
+        PresentationKind::Format(_) => {
+            schemas.reverse();
+            if let Expr::Call(_, _, args, _, _) = expr {
+                if args.len() == 2 {
+                    rewrite_format_values(
+                        &mut args[1],
+                        &mut schemas,
+                        names,
+                        impls,
+                        facts,
+                        aliases,
+                        locals,
+                    )?;
+                }
+            }
+        }
+        PresentationKind::None => {}
+    }
+    Ok(())
+}
+
+enum PresentationKind {
+    None,
+    Print,
+    Type,
+    Format(usize),
+}
+
+fn presentation_kind(
+    names: &HashMap<u16, String>,
+    impls: &HashMap<u16, ()>,
+    expr: &Expr,
+) -> PresentationKind {
+    let Expr::Call(index, _, args, resolution, _) = expr else {
+        return PresentationKind::None;
+    };
+    if resolution.is_none()
+        && !impls.contains_key(index)
+        && names.get(index).map(String::as_str) == Some("print")
+        && args.len() == 1
+    {
+        return PresentationKind::Print;
+    }
+    if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::TypeOf) && args.len() == 1
+    {
+        return PresentationKind::Type;
+    }
+    if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::FormatTemplate)
+        && args.len() == 2
+    {
+        return PresentationKind::Format(format_payload_exprs(&args[1]).len());
+    }
+    PresentationKind::None
+}
+
+fn presentation_inputs_mut(
+    names: &HashMap<u16, String>,
+    impls: &HashMap<u16, ()>,
+    expr: &Expr,
+) -> Option<()> {
+    match presentation_kind(names, impls, expr) {
+        PresentationKind::None => None,
+        _ => Some(()),
     }
 }
 
-fn lower_print_expr(
-    expr: &mut Expr,
-    print_index: Option<u16>,
-    to_string: u16,
-    schemas: &std::collections::HashMap<LocalSlot, TypeSchema>,
+fn print_newline(expr: &Expr) -> bool {
+    let Expr::Call(_, _, args, _, _) = expr else {
+        return false;
+    };
+    let Some(arg) = args.first() else {
+        return false;
+    };
+    let (inner, newline) = split_print_newline(arg);
+    newline && to_string_input(inner).is_some()
+}
+
+enum PrintInputLoc {
+    ToStringNewline,
+    PlainToString,
+    NewlineLeft,
+    Whole,
+}
+
+fn print_input_loc(arg: &Expr) -> PrintInputLoc {
+    let (inner, newline) = split_print_newline(arg);
+    if to_string_input(inner).is_some() {
+        if newline {
+            PrintInputLoc::ToStringNewline
+        } else {
+            PrintInputLoc::PlainToString
+        }
+    } else if newline {
+        PrintInputLoc::NewlineLeft
+    } else {
+        PrintInputLoc::Whole
+    }
+}
+
+fn rewrite_print_input(
+    arg: &mut Expr,
+    names: &HashMap<u16, String>,
+    impls: &HashMap<u16, ()>,
+    facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
+    aliases: &mut HashMap<LocalSlot, ()>,
     locals: &mut usize,
 ) -> Result<(), CompileError> {
-    if let Expr::Block { stmts, expr } = expr {
-        lower_print_stmts(stmts, print_index, to_string, schemas, locals)?;
-        return lower_print_expr(expr, print_index, to_string, schemas, locals);
-    }
-    rewrite_format_templates(expr, schemas)?;
-    if rewrite_logical_type(expr, schemas, locals)? {
-        return Ok(());
-    }
-    let Expr::Call(index, _, args, _, _) = &*expr else {
-        return Ok(());
-    };
-    if print_index != Some(*index) || args.len() != 1 {
-        return Ok(());
-    }
-    let Some((value_slot, newline, schema)) = logical_print_arg(&args[0], to_string, schemas) else {
-        return Ok(());
-    };
-    let descriptor = crate::vmbc::encode_type_schema_bytes(&schema).map_err(|err| {
-        CompileError::HostCallResolve {
-            line: None,
-            source_name: None,
-            detail: format!("logical render descriptor: {err}"),
-            span: None,
+    match print_input_loc(arg) {
+        PrintInputLoc::ToStringNewline => {
+            if let Expr::Add(left, _) = arg {
+                if let Expr::Call(_, _, args, _, _) = left.as_mut() {
+                    if let Some(input) = args.get_mut(0) {
+                        return rewrite_expr(input, names, impls, facts, aliases, locals);
+                    }
+                }
+            }
+            Ok(())
         }
-    })?;
-    let hidden = (*locals).try_into().map_err(|_| CompileError::HostCallResolve {
-        line: None,
-        source_name: None,
-        detail: "logical print local overflow".to_string(),
-        span: None,
-    })?;
-    *locals += 1;
+        PrintInputLoc::PlainToString => {
+            if let Expr::Call(_, _, args, _, _) = arg {
+                if let Some(input) = args.get_mut(0) {
+                    return rewrite_expr(input, names, impls, facts, aliases, locals);
+                }
+            }
+            Ok(())
+        }
+        PrintInputLoc::NewlineLeft => {
+            if let Expr::Add(left, _) = arg {
+                return rewrite_expr(left, names, impls, facts, aliases, locals);
+            }
+            Ok(())
+        }
+        PrintInputLoc::Whole => rewrite_expr(arg, names, impls, facts, aliases, locals),
+    }
+}
+
+fn take_print_input(arg: &mut Expr) -> Expr {
+    match print_input_loc(arg) {
+        PrintInputLoc::ToStringNewline => {
+            if let Expr::Add(left, _) = arg {
+                if let Expr::Call(_, _, args, _, _) = left.as_mut() {
+                    if !args.is_empty() {
+                        return std::mem::replace(&mut args[0], Expr::Null);
+                    }
+                }
+            }
+            Expr::Null
+        }
+        PrintInputLoc::PlainToString => {
+            if let Expr::Call(_, _, args, _, _) = arg {
+                if !args.is_empty() {
+                    return std::mem::replace(&mut args[0], Expr::Null);
+                }
+            }
+            Expr::Null
+        }
+        PrintInputLoc::NewlineLeft => {
+            if let Expr::Add(left, _) = arg {
+                return std::mem::replace(left.as_mut(), Expr::Null);
+            }
+            Expr::Null
+        }
+        PrintInputLoc::Whole => std::mem::replace(arg, Expr::Null),
+    }
+}
+
+fn rewrite_print_call(
+    expr: &mut Expr,
+    schema: TypeSchema,
+    newline: bool,
+    locals: &mut usize,
+) -> Result<(), CompileError> {
+    let Expr::Call(index, _, args, _, _) = expr else {
+        return Ok(());
+    };
+    let print_index = *index;
+    let input = args.get_mut(0).map(take_print_input).unwrap_or(Expr::Null);
+    let descriptor = encode_descriptor(&schema)?;
+    let hidden = alloc_local(locals)?;
     let mut rendered = Expr::Call(
         BuiltinFunction::LogicalRender.call_index(),
         Vec::new(),
@@ -1037,74 +1372,78 @@ fn lower_print_expr(
     if newline {
         rendered = Expr::Add(Box::new(rendered), Box::new(Expr::String("\n".to_string())));
     }
-    let print = Expr::Call(print_index.expect("print rewrite requires print"), Vec::new(), vec![rendered], None, None);
+    let print = Expr::Call(print_index, Vec::new(), vec![rendered], None, None);
     *expr = Expr::Block {
         stmts: vec![
             Stmt::Let {
                 index: hidden,
                 declared_schema: Some(schema),
-                expr: Expr::Var(value_slot),
+                expr: input,
                 line: 0,
             },
-            Stmt::Expr { expr: print, line: 0 },
+            Stmt::Expr {
+                expr: print,
+                line: 0,
+            },
         ],
         expr: Box::new(Expr::Var(hidden)),
     };
     Ok(())
 }
 
-fn rewrite_format_templates(
+fn rewrite_type_call(
     expr: &mut Expr,
-    schemas: &std::collections::HashMap<LocalSlot, TypeSchema>,
+    schema: TypeSchema,
+    label: &'static str,
+    locals: &mut usize,
 ) -> Result<(), CompileError> {
-    match expr {
-        Expr::Call(index, _, args, _, _) => {
-            for arg in args.iter_mut() {
-                rewrite_format_templates(arg, schemas)?;
-            }
-            if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::FormatTemplate)
-                && args.len() == 2
-            {
-                rewrite_format_payload(&mut args[1], schemas)?;
-            }
-        }
-        Expr::Add(lhs, rhs)
-        | Expr::Sub(lhs, rhs)
-        | Expr::Mul(lhs, rhs)
-        | Expr::Div(lhs, rhs)
-        | Expr::Mod(lhs, rhs) => {
-            rewrite_format_templates(lhs, schemas)?;
-            rewrite_format_templates(rhs, schemas)?;
-        }
-        _ => {}
-    }
+    let Expr::Call(_, _, args, _, _) = expr else {
+        return Ok(());
+    };
+    let input = args
+        .get_mut(0)
+        .map(|arg| std::mem::replace(arg, Expr::Null))
+        .unwrap_or(Expr::Null);
+    let hidden = alloc_local(locals)?;
+    *expr = Expr::Block {
+        stmts: vec![Stmt::Let {
+            index: hidden,
+            declared_schema: Some(schema),
+            expr: input,
+            line: 0,
+        }],
+        expr: Box::new(Expr::String(label.to_string())),
+    };
     Ok(())
 }
 
-fn rewrite_format_payload(
+fn rewrite_format_values(
     expr: &mut Expr,
-    schemas: &std::collections::HashMap<LocalSlot, TypeSchema>,
+    schemas: &mut Vec<Option<TypeSchema>>,
+    names: &HashMap<u16, String>,
+    impls: &HashMap<u16, ()>,
+    facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
+    aliases: &mut HashMap<LocalSlot, ()>,
+    locals: &mut usize,
 ) -> Result<(), CompileError> {
     let Expr::Call(index, _, args, _, _) = expr else {
         return Ok(());
     };
-    if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::ArrayPush) || args.len() != 2
+    if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::ArrayPush)
+        || args.len() != 2
     {
         return Ok(());
     }
-    rewrite_format_payload(&mut args[0], schemas)?;
-    let Some(schema) = logical_schema_of_expr(&args[1], schemas) else {
+    rewrite_format_values(&mut args[0], schemas, names, impls, facts, aliases, locals)?;
+    rewrite_expr(&mut args[1], names, impls, facts, aliases, locals)?;
+    let Some(schema) = schemas.pop().flatten() else {
         return Ok(());
     };
-    let descriptor = crate::vmbc::encode_type_schema_bytes(&schema).map_err(|err| {
-        CompileError::HostCallResolve {
-            line: None,
-            source_name: None,
-            detail: format!("logical format descriptor: {err}"),
-            span: None,
-        }
-    })?;
-    let value = args[1].clone();
+    if !contains_logical_display(&schema) {
+        return Ok(());
+    }
+    let descriptor = encode_descriptor(&schema)?;
+    let value = std::mem::replace(&mut args[1], Expr::Null);
     args[1] = Expr::Call(
         BuiltinFunction::LogicalRender.call_index(),
         Vec::new(),
@@ -1112,86 +1451,72 @@ fn rewrite_format_payload(
         None,
         None,
     );
+    let _ = locals;
     Ok(())
 }
 
-fn logical_schema_of_expr(
+fn note_print_alias(
+    slot: LocalSlot,
     expr: &Expr,
-    schemas: &std::collections::HashMap<LocalSlot, TypeSchema>,
-) -> Option<TypeSchema> {
-    let Expr::Var(slot) = expr else {
-        return None;
+    names: &HashMap<u16, String>,
+    impls: &HashMap<u16, ()>,
+    aliases: &mut HashMap<LocalSlot, ()>,
+) {
+    let trusted = match expr {
+        Expr::FunctionRef(index, _) => is_language_print_index(*index, names, impls),
+        Expr::Var(source) | Expr::MoveVar(source) => aliases.contains_key(source),
+        _ => false,
     };
-    let schema = schemas.get(slot)?;
-    logical_label_schema(schema).then(|| schema.clone())
-}
-
-fn logical_print_arg(
-    arg: &Expr,
-    to_string: u16,
-    schemas: &std::collections::HashMap<LocalSlot, TypeSchema>,
-) -> Option<(LocalSlot, bool, TypeSchema)> {
-    let (inner, newline) = match arg {
-        Expr::Add(left, right) if matches!(right.as_ref(), Expr::String(text) if text == "\n") => {
-            (left.as_ref(), true)
-        }
-        other => (other, false),
-    };
-    let Expr::Call(index, _, args, _, _) = inner else {
-        return None;
-    };
-    if *index != to_string || args.len() != 1 {
-        return None;
-    }
-    let Expr::Var(slot) = &args[0] else {
-        return None;
-    };
-    let schema = schemas.get(slot)?.clone();
-    if matches!(schema, TypeSchema::Option(_) | TypeSchema::Unit) {
-        Some((*slot, newline, schema))
+    if trusted {
+        aliases.insert(slot, ());
     } else {
-        None
+        aliases.remove(&slot);
     }
 }
 
-fn rewrite_logical_type(
-    expr: &mut Expr,
-    schemas: &std::collections::HashMap<LocalSlot, TypeSchema>,
-    locals: &mut usize,
-) -> Result<bool, CompileError> {
-    let Expr::Call(index, _, args, _, _) = &*expr else {
-        return Ok(false);
-    };
-    if BuiltinFunction::from_call_index(*index) != Some(BuiltinFunction::TypeOf) || args.len() != 1
-    {
-        return Ok(false);
+fn is_language_print_index(
+    index: u16,
+    names: &HashMap<u16, String>,
+    impls: &HashMap<u16, ()>,
+) -> bool {
+    !impls.contains_key(&index) && names.get(&index).map(String::as_str) == Some("print")
+}
+
+fn type_label(schema: &TypeSchema) -> Option<&'static str> {
+    match schema {
+        TypeSchema::Option(_) => Some("Option"),
+        TypeSchema::Result { .. } => Some("Result"),
+        TypeSchema::Unit => Some("()"),
+        _ => None,
     }
-    let Expr::Var(slot) = &args[0] else {
-        return Ok(false);
-    };
-    let Some(schema) = schemas.get(slot) else {
-        return Ok(false);
-    };
-    let label = match schema {
-        TypeSchema::Option(_) => "Option",
-        TypeSchema::Unit => "()",
-        _ => return Ok(false),
-    };
-    let hidden = (*locals).try_into().map_err(|_| CompileError::HostCallResolve {
+}
+
+fn next_fact(
+    facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
+) -> Result<Option<TypeSchema>, CompileError> {
+    facts
+        .next()
+        .ok_or_else(|| presentation_error("missing presentation fact"))
+}
+
+fn encode_descriptor(schema: &TypeSchema) -> Result<Vec<u8>, CompileError> {
+    crate::vmbc::encode_type_schema_bytes(schema)
+        .map_err(|err| presentation_error(&format!("logical render descriptor: {err}")))
+}
+
+fn alloc_local(locals: &mut usize) -> Result<LocalSlot, CompileError> {
+    let hidden = (*locals)
+        .try_into()
+        .map_err(|_| presentation_error("logical presentation local overflow"))?;
+    *locals += 1;
+    Ok(hidden)
+}
+
+fn presentation_error(detail: &str) -> CompileError {
+    CompileError::HostCallResolve {
         line: None,
         source_name: None,
-        detail: "logical type local overflow".to_string(),
+        detail: detail.to_string(),
         span: None,
-    })?;
-    *locals += 1;
-    *expr = Expr::Block {
-        stmts: vec![Stmt::Let {
-            index: hidden,
-            declared_schema: Some(schema.clone()),
-            expr: Expr::Var(*slot),
-            line: 0,
-        }],
-        expr: Box::new(Expr::String(label.to_string())),
-    };
-    Ok(true)
+    }
 }
