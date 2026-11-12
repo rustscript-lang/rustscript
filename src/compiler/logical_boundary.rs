@@ -6,8 +6,89 @@
 
 use crate::builtins::BuiltinFunction;
 use crate::compiler::CompileError;
-use crate::compiler::ir::{Expr, FrontendIr, FunctionImpl, LocalSlot, Stmt, TypeSchema};
+use crate::compiler::ir::{
+    Expr, FrontendIr, FunctionImpl, LocalSlot, SemanticNodeId, Stmt, TypeSchema,
+};
 use std::collections::HashMap;
+
+/// Which source producers receive the RustScript logical/JSON policy.
+///
+/// `All` is a single-producer IR compiled by an already-selected RustScript
+/// frontend. `Sources` maps RustScript producer names to their linked source
+/// ids, so a merged compilation can keep other frontend capabilities.
+#[derive(Clone, Debug)]
+pub(super) enum SourceScope {
+    All,
+    Sources(HashMap<String, u32>),
+    None,
+}
+
+impl SourceScope {
+    pub(super) fn all() -> Self {
+        Self::All
+    }
+
+    pub(super) fn none() -> Self {
+        Self::None
+    }
+
+    pub(super) fn sources(names: HashMap<String, u32>) -> Self {
+        if names.is_empty() {
+            Self::None
+        } else {
+            Self::Sources(names)
+        }
+    }
+}
+
+/// Per-compilation site attribution for one lowering pass.
+struct LoweringScope<'a> {
+    scope: &'a SourceScope,
+    call_sources: HashMap<SemanticNodeId, u32>,
+    call_spans: HashMap<SemanticNodeId, crate::compiler::source_map::Span>,
+}
+
+impl<'a> LoweringScope<'a> {
+    fn new(ir: &FrontendIr, scope: &'a SourceScope) -> Self {
+        let mut call_sources = HashMap::new();
+        let mut call_spans = HashMap::new();
+        if let Some(index) = ir.parsed_semantic_index.as_ref() {
+            for site in &index.call_sites {
+                call_sources.insert(site.id, site.callee_span.source_id);
+                call_spans.insert(site.id, site.callee_span);
+            }
+        }
+        Self {
+            scope,
+            call_sources,
+            call_spans,
+        }
+    }
+
+    fn allows(&self, id: Option<SemanticNodeId>, default_source: Option<&str>) -> bool {
+        let SourceScope::Sources(names) = self.scope else {
+            return matches!(self.scope, SourceScope::All);
+        };
+        if let Some(id) = id
+            && self
+                .call_sources
+                .get(&id)
+                .is_some_and(|source_id| names.values().any(|candidate| candidate == source_id))
+        {
+            return true;
+        }
+        default_source.is_some_and(|name| names.contains_key(name))
+    }
+}
+
+fn call_site_id(expr: &Expr) -> Option<SemanticNodeId> {
+    match expr {
+        Expr::Call(_, _, _, _, id) => *id,
+        Expr::ModuleCall(_, _, _, id) => *id,
+        Expr::LocalCall(_, _, _, id) => *id,
+        _ => None,
+    }
+}
 
 /// Value expressions of a presentation site, in the order their schemas are
 /// recorded. `None` means this expression is not a site. Trusted print is the
@@ -117,39 +198,55 @@ pub(super) fn contains_logical_display(schema: &TypeSchema) -> bool {
 pub(super) fn lower_typed_json(
     ir: &mut FrontendIr,
     local_schemas: &[Option<TypeSchema>],
+    scope: &SourceScope,
 ) -> Result<(), CompileError> {
-    attach_inferred_encode_schemas(ir, local_schemas)?;
-    for stmt in &mut ir.stmts {
-        lower_stmt(stmt)?;
+    let lowering = LoweringScope::new(ir, scope);
+    attach_inferred_encode_schemas(ir, local_schemas, &lowering)?;
+    for (index, stmt) in ir.stmts.iter_mut().enumerate() {
+        let default_source = ir.stmt_sources.get(index).and_then(Option::as_deref);
+        lower_stmt(stmt, &lowering, default_source)?;
     }
-    for function in ir.function_impls.values_mut() {
-        lower_function(function)?;
+    let indexes = ir.function_impls.keys().copied().collect::<Vec<_>>();
+    for index in indexes {
+        let default_source = ir.function_sources.get(&index).map(String::as_str).or(None);
+        let Some(function) = ir.function_impls.get_mut(&index) else {
+            continue;
+        };
+        lower_function(function, &lowering, default_source)?;
     }
     Ok(())
 }
 
-fn lower_function(function: &mut FunctionImpl) -> Result<(), CompileError> {
+fn lower_function(
+    function: &mut FunctionImpl,
+    lowering: &LoweringScope<'_>,
+    default_source: Option<&str>,
+) -> Result<(), CompileError> {
     for stmt in &mut function.body_stmts {
-        lower_stmt(stmt)?;
+        lower_stmt(stmt, lowering, default_source)?;
     }
-    lower_expr(&mut function.body_expr)
+    lower_expr(&mut function.body_expr, lowering, default_source)
 }
 
-fn lower_stmt(stmt: &mut Stmt) -> Result<(), CompileError> {
+fn lower_stmt(
+    stmt: &mut Stmt,
+    lowering: &LoweringScope<'_>,
+    default_source: Option<&str>,
+) -> Result<(), CompileError> {
     match stmt {
         Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-            lower_expr(expr)
+            lower_expr(expr, lowering, default_source)
         }
-        Stmt::ClosureLet { closure, .. } => lower_expr(&mut closure.body),
+        Stmt::ClosureLet { closure, .. } => lower_expr(&mut closure.body, lowering, default_source),
         Stmt::IfElse {
             condition,
             then_branch,
             else_branch,
             ..
         } => {
-            lower_expr(condition)?;
+            lower_expr(condition, lowering, default_source)?;
             for stmt in then_branch.iter_mut().chain(else_branch.iter_mut()) {
-                lower_stmt(stmt)?;
+                lower_stmt(stmt, lowering, default_source)?;
             }
             Ok(())
         }
@@ -160,20 +257,20 @@ fn lower_stmt(stmt: &mut Stmt) -> Result<(), CompileError> {
             body,
             ..
         } => {
-            lower_stmt(init)?;
-            lower_expr(condition)?;
-            lower_stmt(post)?;
+            lower_stmt(init, lowering, default_source)?;
+            lower_expr(condition, lowering, default_source)?;
+            lower_stmt(post, lowering, default_source)?;
             for stmt in body {
-                lower_stmt(stmt)?;
+                lower_stmt(stmt, lowering, default_source)?;
             }
             Ok(())
         }
         Stmt::While {
             condition, body, ..
         } => {
-            lower_expr(condition)?;
+            lower_expr(condition, lowering, default_source)?;
             for stmt in body {
-                lower_stmt(stmt)?;
+                lower_stmt(stmt, lowering, default_source)?;
             }
             Ok(())
         }
@@ -185,21 +282,25 @@ fn lower_stmt(stmt: &mut Stmt) -> Result<(), CompileError> {
     }
 }
 
-fn lower_expr(expr: &mut Expr) -> Result<(), CompileError> {
+fn lower_expr(
+    expr: &mut Expr,
+    lowering: &LoweringScope<'_>,
+    default_source: Option<&str>,
+) -> Result<(), CompileError> {
     match expr {
-        Expr::ResultConstruct { payload, .. } => lower_expr(payload),
+        Expr::ResultConstruct { payload, .. } => lower_expr(payload, lowering, default_source),
         Expr::ResultQuery { value, .. }
         | Expr::ResultTry { value, .. }
-        | Expr::ResultConvert { value, .. } => lower_expr(value),
+        | Expr::ResultConvert { value, .. } => lower_expr(value, lowering, default_source),
         Expr::ResultMatch {
             value,
             ok_expr,
             err_expr,
             ..
         } => {
-            lower_expr(value)?;
-            lower_expr(ok_expr)?;
-            lower_expr(err_expr)
+            lower_expr(value, lowering, default_source)?;
+            lower_expr(ok_expr, lowering, default_source)?;
+            lower_expr(err_expr, lowering, default_source)
         }
         Expr::ResultMethod {
             receiver, argument, ..
@@ -207,12 +308,12 @@ fn lower_expr(expr: &mut Expr) -> Result<(), CompileError> {
         | Expr::OptionMethod {
             receiver, argument, ..
         } => {
-            lower_expr(receiver)?;
-            lower_expr(argument)
+            lower_expr(receiver, lowering, default_source)?;
+            lower_expr(argument, lowering, default_source)
         }
         Expr::OptionConstruct { payload, .. } => {
             if let Some(payload) = payload {
-                lower_expr(payload)?;
+                lower_expr(payload, lowering, default_source)?;
             }
             Ok(())
         }
@@ -222,50 +323,70 @@ fn lower_expr(expr: &mut Expr) -> Result<(), CompileError> {
             none_expr,
             ..
         } => {
-            lower_expr(value)?;
-            lower_expr(some_expr)?;
-            lower_expr(none_expr)
+            lower_expr(value, lowering, default_source)?;
+            lower_expr(some_expr, lowering, default_source)?;
+            lower_expr(none_expr, lowering, default_source)
         }
         Expr::OptionalGet { container, key, .. } => {
-            lower_expr(container)?;
-            lower_expr(key)
+            lower_expr(container, lowering, default_source)?;
+            lower_expr(key, lowering, default_source)
         }
         Expr::OptionUnwrapOr {
             value, fallback, ..
         } => {
-            lower_expr(value)?;
-            lower_expr(fallback)
+            lower_expr(value, lowering, default_source)?;
+            lower_expr(fallback, lowering, default_source)
         }
-        Expr::Call(index, type_args, args, _, _semantic_id) => {
+        Expr::Call(index, type_args, args, _, semantic_id) => {
             for arg in args.iter_mut() {
-                lower_expr(arg)?;
+                lower_expr(arg, lowering, default_source)?;
             }
-            if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::JsonDecode)
+            let builtin = BuiltinFunction::from_call_index(*index);
+            let allowed = lowering.allows(*semantic_id, default_source);
+            if builtin == Some(BuiltinFunction::JsonDecode)
                 && type_args.len() == 1
                 && args.len() == 1
+                && allowed
             {
                 let schema = type_args[0].clone();
                 rewrite_typed_json(expr, schema, BuiltinFunction::JsonDecodeTyped)?;
-            } else if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::JsonEncode)
+            } else if builtin == Some(BuiltinFunction::JsonEncode)
                 && type_args.len() == 1
                 && args.len() == 1
+                && allowed
             {
                 let schema = type_args[0].clone();
                 rewrite_typed_json(expr, schema, BuiltinFunction::JsonEncodeTyped)?;
+            } else if allowed
+                && matches!(
+                    builtin,
+                    Some(BuiltinFunction::JsonDecode | BuiltinFunction::JsonEncode)
+                )
+            {
+                let builtin = builtin.expect("json builtin");
+                return Err(CompileError::StrictTypingRequired {
+                    line: None,
+                    source_name: None,
+                    detail: format!(
+                        "RustScript source JSON calls require a concrete typed JSON target; untyped {} is not part of the RustScript boundary",
+                        builtin.name()
+                    ),
+                    span: semantic_id.and_then(|id| lowering.call_spans.get(&id).copied()),
+                });
             }
             Ok(())
         }
         Expr::ModuleCall(_, _, args, _) | Expr::LocalCall(_, _, args, _) => {
             for arg in args {
-                lower_expr(arg)?;
+                lower_expr(arg, lowering, default_source)?;
             }
             Ok(())
         }
-        Expr::Closure(closure) => lower_expr(&mut closure.body),
+        Expr::Closure(closure) => lower_expr(&mut closure.body, lowering, default_source),
         Expr::ClosureCall(closure, args) => {
-            lower_expr(&mut closure.body)?;
+            lower_expr(&mut closure.body, lowering, default_source)?;
             for arg in args {
-                lower_expr(arg)?;
+                lower_expr(arg, lowering, default_source)?;
             }
             Ok(())
         }
@@ -279,22 +400,22 @@ fn lower_expr(expr: &mut Expr) -> Result<(), CompileError> {
         | Expr::Eq(lhs, rhs)
         | Expr::Lt(lhs, rhs)
         | Expr::Gt(lhs, rhs) => {
-            lower_expr(lhs)?;
-            lower_expr(rhs)
+            lower_expr(lhs, lowering, default_source)?;
+            lower_expr(rhs, lowering, default_source)
         }
         Expr::Neg(inner)
         | Expr::Not(inner)
         | Expr::ToOwned(inner)
         | Expr::Borrow(inner)
-        | Expr::BorrowMut(inner) => lower_expr(inner),
+        | Expr::BorrowMut(inner) => lower_expr(inner, lowering, default_source),
         Expr::IfElse {
             condition,
             then_expr,
             else_expr,
         } => {
-            lower_expr(condition)?;
-            lower_expr(then_expr)?;
-            lower_expr(else_expr)
+            lower_expr(condition, lowering, default_source)?;
+            lower_expr(then_expr, lowering, default_source)?;
+            lower_expr(else_expr, lowering, default_source)
         }
         Expr::Match {
             value,
@@ -302,17 +423,17 @@ fn lower_expr(expr: &mut Expr) -> Result<(), CompileError> {
             default,
             ..
         } => {
-            lower_expr(value)?;
+            lower_expr(value, lowering, default_source)?;
             for (_, arm) in arms {
-                lower_expr(arm)?;
+                lower_expr(arm, lowering, default_source)?;
             }
-            lower_expr(default)
+            lower_expr(default, lowering, default_source)
         }
         Expr::Block { stmts, expr } => {
             for stmt in stmts {
-                lower_stmt(stmt)?;
+                lower_stmt(stmt, lowering, default_source)?;
             }
-            lower_expr(expr)
+            lower_expr(expr, lowering, default_source)
         }
         Expr::Null
         | Expr::Unit
@@ -361,33 +482,43 @@ fn rewrite_typed_json(
 fn attach_inferred_encode_schemas(
     ir: &mut FrontendIr,
     local_schemas: &[Option<TypeSchema>],
+    lowering: &LoweringScope<'_>,
 ) -> Result<(), CompileError> {
-    let typed = super::FrontendTypedIr {
-        source_id: None,
-        ir,
-        local_schemas,
-        host_api_catalog: None,
-        source_map: None,
-    };
     let mut facts = Vec::new();
-    for stmt in &ir.stmts {
-        collect_encode_stmt(stmt, &typed, &mut facts);
-    }
-    for function in ir.function_impls.values() {
-        for stmt in &function.body_stmts {
+    {
+        let typed = super::FrontendTypedIr {
+            source_id: None,
+            ir,
+            local_schemas,
+            host_api_catalog: None,
+            source_map: None,
+        };
+        for stmt in &ir.stmts {
             collect_encode_stmt(stmt, &typed, &mut facts);
         }
-        collect_encode_expr(&function.body_expr, &typed, &mut facts);
+        for function in ir.function_impls.values() {
+            for stmt in &function.body_stmts {
+                collect_encode_stmt(stmt, &typed, &mut facts);
+            }
+            collect_encode_expr(&function.body_expr, &typed, &mut facts);
+        }
     }
     let mut facts = facts.into_iter();
-    for stmt in &mut ir.stmts {
-        apply_encode_stmt(stmt, &mut facts)?;
+    for (index, stmt) in ir.stmts.iter_mut().enumerate() {
+        let default_source = ir.stmt_sources.get(index).and_then(Option::as_deref);
+        apply_encode_stmt(stmt, lowering, default_source, &mut facts)?;
     }
-    for function in ir.function_impls.values_mut() {
+    for (index, function) in ir.function_impls.iter_mut() {
+        let default_source = ir.function_sources.get(index).map(String::as_str).or(None);
         for stmt in &mut function.body_stmts {
-            apply_encode_stmt(stmt, &mut facts)?;
+            apply_encode_stmt(stmt, lowering, default_source, &mut facts)?;
         }
-        apply_encode_expr(&mut function.body_expr, &mut facts)?;
+        apply_encode_expr(
+            &mut function.body_expr,
+            lowering,
+            default_source,
+            &mut facts,
+        )?;
     }
     Ok(())
 }
@@ -532,12 +663,35 @@ fn visit_encode_children(
                 collect_encode_expr(payload, typed, facts);
             }
         }
-        Expr::ModuleCall(_, _, args, _)
-        | Expr::LocalCall(_, _, args, _)
-        | Expr::ClosureCall(_, args) => {
+        Expr::ModuleCall(_, _, args, _) | Expr::LocalCall(_, _, args, _) => {
             for arg in args {
                 collect_encode_expr(arg, typed, facts);
             }
+        }
+        Expr::ClosureCall(closure, args) => {
+            collect_encode_expr(&closure.body, typed, facts);
+            for arg in args {
+                collect_encode_expr(arg, typed, facts);
+            }
+        }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        }
+        | Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            collect_encode_expr(receiver, typed, facts);
+            collect_encode_expr(argument, typed, facts);
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            collect_encode_expr(value, typed, facts);
+            collect_encode_expr(fallback, typed, facts);
+        }
+        Expr::OptionalGet { container, key, .. } => {
+            collect_encode_expr(container, typed, facts);
+            collect_encode_expr(key, typed, facts);
         }
         Expr::Closure(closure) => collect_encode_expr(&closure.body, typed, facts),
         Expr::Match {
@@ -558,31 +712,35 @@ fn visit_encode_children(
 
 fn apply_encode_stmt(
     stmt: &mut Stmt,
+    lowering: &LoweringScope<'_>,
+    default_source: Option<&str>,
     facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
 ) -> Result<(), CompileError> {
     match stmt {
         Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-            apply_encode_expr(expr, facts)
+            apply_encode_expr(expr, lowering, default_source, facts)
         }
-        Stmt::ClosureLet { closure, .. } => apply_encode_expr(&mut closure.body, facts),
+        Stmt::ClosureLet { closure, .. } => {
+            apply_encode_expr(&mut closure.body, lowering, default_source, facts)
+        }
         Stmt::IfElse {
             condition,
             then_branch,
             else_branch,
             ..
         } => {
-            apply_encode_expr(condition, facts)?;
+            apply_encode_expr(condition, lowering, default_source, facts)?;
             for nested in then_branch.iter_mut().chain(else_branch.iter_mut()) {
-                apply_encode_stmt(nested, facts)?;
+                apply_encode_stmt(nested, lowering, default_source, facts)?;
             }
             Ok(())
         }
         Stmt::While {
             condition, body, ..
         } => {
-            apply_encode_expr(condition, facts)?;
+            apply_encode_expr(condition, lowering, default_source, facts)?;
             for nested in body {
-                apply_encode_stmt(nested, facts)?;
+                apply_encode_stmt(nested, lowering, default_source, facts)?;
             }
             Ok(())
         }
@@ -593,11 +751,11 @@ fn apply_encode_stmt(
             body,
             ..
         } => {
-            apply_encode_stmt(init, facts)?;
-            apply_encode_expr(condition, facts)?;
-            apply_encode_stmt(post, facts)?;
+            apply_encode_stmt(init, lowering, default_source, facts)?;
+            apply_encode_expr(condition, lowering, default_source, facts)?;
+            apply_encode_stmt(post, lowering, default_source, facts)?;
             for nested in body {
-                apply_encode_stmt(nested, facts)?;
+                apply_encode_stmt(nested, lowering, default_source, facts)?;
             }
             Ok(())
         }
@@ -639,18 +797,22 @@ fn typed_json_schema_is_concrete(schema: &TypeSchema) -> bool {
 
 fn apply_encode_expr(
     expr: &mut Expr,
+    lowering: &LoweringScope<'_>,
+    default_source: Option<&str>,
     facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
 ) -> Result<(), CompileError> {
     match expr {
-        Expr::Call(index, type_args, args, _, _) => {
+        Expr::Call(index, type_args, args, _, semantic_id) => {
             for arg in args.iter_mut() {
-                apply_encode_expr(arg, facts)?;
+                apply_encode_expr(arg, lowering, default_source, facts)?;
             }
             if BuiltinFunction::from_call_index(*index) == Some(BuiltinFunction::JsonEncode)
                 && type_args.is_empty()
                 && args.len() == 1
             {
-                if let Some(Some(schema)) = facts.next()
+                let fact = facts.next();
+                if lowering.allows(*semantic_id, default_source)
+                    && let Some(Some(schema)) = fact
                     && typed_json_schema_is_concrete(&schema)
                 {
                     type_args.push(schema);
@@ -660,9 +822,9 @@ fn apply_encode_expr(
         }
         Expr::Block { stmts, expr } => {
             for stmt in stmts {
-                apply_encode_stmt(stmt, facts)?;
+                apply_encode_stmt(stmt, lowering, default_source, facts)?;
             }
-            apply_encode_expr(expr, facts)
+            apply_encode_expr(expr, lowering, default_source, facts)
         }
         Expr::Add(lhs, rhs)
         | Expr::Sub(lhs, rhs)
@@ -674,24 +836,26 @@ fn apply_encode_expr(
         | Expr::Eq(lhs, rhs)
         | Expr::Lt(lhs, rhs)
         | Expr::Gt(lhs, rhs) => {
-            apply_encode_expr(lhs, facts)?;
-            apply_encode_expr(rhs, facts)
+            apply_encode_expr(lhs, lowering, default_source, facts)?;
+            apply_encode_expr(rhs, lowering, default_source, facts)
         }
         Expr::IfElse {
             condition,
             then_expr,
             else_expr,
         } => {
-            apply_encode_expr(condition, facts)?;
-            apply_encode_expr(then_expr, facts)?;
-            apply_encode_expr(else_expr, facts)
+            apply_encode_expr(condition, lowering, default_source, facts)?;
+            apply_encode_expr(then_expr, lowering, default_source, facts)?;
+            apply_encode_expr(else_expr, lowering, default_source, facts)
         }
-        other => apply_encode_children(other, facts),
+        other => apply_encode_children(other, lowering, default_source, facts),
     }
 }
 
 fn apply_encode_children(
     expr: &mut Expr,
+    lowering: &LoweringScope<'_>,
+    default_source: Option<&str>,
     facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
 ) -> Result<(), CompileError> {
     match expr {
@@ -703,16 +867,16 @@ fn apply_encode_children(
         | Expr::Not(payload)
         | Expr::ToOwned(payload)
         | Expr::Borrow(payload)
-        | Expr::BorrowMut(payload) => apply_encode_expr(payload, facts),
+        | Expr::BorrowMut(payload) => apply_encode_expr(payload, lowering, default_source, facts),
         Expr::ResultMatch {
             value,
             ok_expr,
             err_expr,
             ..
         } => {
-            apply_encode_expr(value, facts)?;
-            apply_encode_expr(ok_expr, facts)?;
-            apply_encode_expr(err_expr, facts)
+            apply_encode_expr(value, lowering, default_source, facts)?;
+            apply_encode_expr(ok_expr, lowering, default_source, facts)?;
+            apply_encode_expr(err_expr, lowering, default_source, facts)
         }
         Expr::OptionMatch {
             value,
@@ -720,78 +884,130 @@ fn apply_encode_children(
             none_expr,
             ..
         } => {
-            apply_encode_expr(value, facts)?;
-            apply_encode_expr(some_expr, facts)?;
-            apply_encode_expr(none_expr, facts)
+            apply_encode_expr(value, lowering, default_source, facts)?;
+            apply_encode_expr(some_expr, lowering, default_source, facts)?;
+            apply_encode_expr(none_expr, lowering, default_source, facts)
         }
         Expr::OptionConstruct { payload, .. } => {
             if let Some(payload) = payload {
-                apply_encode_expr(payload, facts)?;
+                apply_encode_expr(payload, lowering, default_source, facts)?;
             }
             Ok(())
         }
-        Expr::ModuleCall(_, _, args, _)
-        | Expr::LocalCall(_, _, args, _)
-        | Expr::ClosureCall(_, args) => {
+        Expr::ModuleCall(_, _, args, _) | Expr::LocalCall(_, _, args, _) => {
             for arg in args {
-                apply_encode_expr(arg, facts)?;
+                apply_encode_expr(arg, lowering, default_source, facts)?;
             }
             Ok(())
         }
-        Expr::Closure(closure) => apply_encode_expr(&mut closure.body, facts),
+        Expr::ClosureCall(closure, args) => {
+            apply_encode_expr(&mut closure.body, lowering, default_source, facts)?;
+            for arg in args {
+                apply_encode_expr(arg, lowering, default_source, facts)?;
+            }
+            Ok(())
+        }
+        Expr::ResultMethod {
+            receiver, argument, ..
+        }
+        | Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            apply_encode_expr(receiver, lowering, default_source, facts)?;
+            apply_encode_expr(argument, lowering, default_source, facts)
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            apply_encode_expr(value, lowering, default_source, facts)?;
+            apply_encode_expr(fallback, lowering, default_source, facts)
+        }
+        Expr::OptionalGet { container, key, .. } => {
+            apply_encode_expr(container, lowering, default_source, facts)?;
+            apply_encode_expr(key, lowering, default_source, facts)
+        }
+        Expr::Closure(closure) => {
+            apply_encode_expr(&mut closure.body, lowering, default_source, facts)
+        }
         Expr::Match {
             value,
             arms,
             default,
             ..
         } => {
-            apply_encode_expr(value, facts)?;
+            apply_encode_expr(value, lowering, default_source, facts)?;
             for (_, arm) in arms {
-                apply_encode_expr(arm, facts)?;
+                apply_encode_expr(arm, lowering, default_source, facts)?;
             }
-            apply_encode_expr(default, facts)
+            apply_encode_expr(default, lowering, default_source, facts)
         }
         _ => Ok(()),
     }
 }
 
-pub(super) fn reject_dynamic_host_output(ir: &FrontendIr) -> Result<(), CompileError> {
-    for stmt in &ir.stmts {
-        reject_dynamic_host_stmt(stmt)?;
+struct RejectContext<'a, 'b> {
+    lowering: &'b LoweringScope<'b>,
+    default_source: Option<&'a str>,
+}
+
+impl RejectContext<'_, '_> {
+    fn allows(&self, expr: &Expr) -> bool {
+        self.lowering
+            .allows(call_site_id(expr), self.default_source)
     }
-    for function in ir.function_impls.values() {
+}
+
+pub(super) fn reject_dynamic_host_output(
+    ir: &FrontendIr,
+    scope: &SourceScope,
+) -> Result<(), CompileError> {
+    let lowering = LoweringScope::new(ir, scope);
+    for (index, stmt) in ir.stmts.iter().enumerate() {
+        let default_source = ir.stmt_sources.get(index).and_then(Option::as_deref);
+        let ctx = RejectContext {
+            lowering: &lowering,
+            default_source,
+        };
+        reject_dynamic_host_stmt(&ctx, stmt)?;
+    }
+    for (index, function) in ir.function_impls.iter() {
+        let default_source = ir.function_sources.get(index).map(String::as_str).or(None);
+        let ctx = RejectContext {
+            lowering: &lowering,
+            default_source,
+        };
         for stmt in &function.body_stmts {
-            reject_dynamic_host_stmt(stmt)?;
+            reject_dynamic_host_stmt(&ctx, stmt)?;
         }
-        reject_dynamic_host_expr(&function.body_expr)?;
+        reject_dynamic_host_expr(&ctx, &function.body_expr)?;
     }
     Ok(())
 }
 
-fn reject_dynamic_host_stmt(stmt: &Stmt) -> Result<(), CompileError> {
+fn reject_dynamic_host_stmt(ctx: &RejectContext<'_, '_>, stmt: &Stmt) -> Result<(), CompileError> {
     match stmt {
         Stmt::Let { expr, .. } | Stmt::Assign { expr, .. } | Stmt::Expr { expr, .. } => {
-            reject_dynamic_host_expr(expr)
+            reject_dynamic_host_expr(ctx, expr)
         }
-        Stmt::ClosureLet { closure, .. } => reject_dynamic_host_expr(&closure.body),
+        Stmt::ClosureLet { closure, .. } => reject_dynamic_host_expr(ctx, &closure.body),
         Stmt::IfElse {
             condition,
             then_branch,
             else_branch,
             ..
         } => {
-            reject_dynamic_host_expr(condition)?;
+            reject_dynamic_host_expr(ctx, condition)?;
             for nested in then_branch.iter().chain(else_branch) {
-                reject_dynamic_host_stmt(nested)?;
+                reject_dynamic_host_stmt(ctx, nested)?;
             }
             Ok(())
         }
         Stmt::While {
             condition, body, ..
         } => {
-            reject_dynamic_host_expr(condition)?;
+            reject_dynamic_host_expr(ctx, condition)?;
             for nested in body {
-                reject_dynamic_host_stmt(nested)?;
+                reject_dynamic_host_stmt(ctx, nested)?;
             }
             Ok(())
         }
@@ -802,11 +1018,11 @@ fn reject_dynamic_host_stmt(stmt: &Stmt) -> Result<(), CompileError> {
             body,
             ..
         } => {
-            reject_dynamic_host_stmt(init)?;
-            reject_dynamic_host_expr(condition)?;
-            reject_dynamic_host_stmt(post)?;
+            reject_dynamic_host_stmt(ctx, init)?;
+            reject_dynamic_host_expr(ctx, condition)?;
+            reject_dynamic_host_stmt(ctx, post)?;
             for nested in body {
-                reject_dynamic_host_stmt(nested)?;
+                reject_dynamic_host_stmt(ctx, nested)?;
             }
             Ok(())
         }
@@ -818,34 +1034,45 @@ fn reject_dynamic_host_stmt(stmt: &Stmt) -> Result<(), CompileError> {
     }
 }
 
-fn reject_dynamic_host_expr(expr: &Expr) -> Result<(), CompileError> {
-    if let Some(resolved) = expr.host_call_resolution() {
-        if host_output_forbidden(&resolved.host_return_type) {
-            return Err(CompileError::StrictTypingRequired {
-                line: None,
-                source_name: None,
-                detail: format!(
-                    "host function '{}' returns a dynamic or legacy-null schema, which RustScript does not admit",
-                    resolved.name
-                ),
-                span: None,
-            });
-        }
+fn reject_dynamic_host_expr(ctx: &RejectContext<'_, '_>, expr: &Expr) -> Result<(), CompileError> {
+    if ctx.allows(expr)
+        && let Some(resolved) = expr.host_call_resolution()
+        && host_output_forbidden(&resolved.host_return_type)
+    {
+        return Err(CompileError::StrictTypingRequired {
+            line: None,
+            source_name: None,
+            detail: format!(
+                "host function '{}' returns a dynamic or legacy-null schema, which RustScript does not admit",
+                resolved.name
+            ),
+            span: None,
+        });
     }
+    // Exhaustive child traversal: every structured position that can hold a
+    // value expression must be visited, including match/option/result
+    // carriers, projection and method nodes, and a closure-call body. Guest
+    // consumption (host arguments) and the timer callback result exception
+    // stay outside this host-to-guest output check.
     match expr {
         Expr::Call(_, _, args, _, _)
         | Expr::ModuleCall(_, _, args, _)
-        | Expr::LocalCall(_, _, args, _)
-        | Expr::ClosureCall(_, args) => {
+        | Expr::LocalCall(_, _, args, _) => {
             for arg in args {
-                reject_dynamic_host_expr(arg)?;
+                reject_dynamic_host_expr(ctx, arg)?;
+            }
+        }
+        Expr::ClosureCall(closure, args) => {
+            reject_dynamic_host_expr(ctx, &closure.body)?;
+            for arg in args {
+                reject_dynamic_host_expr(ctx, arg)?;
             }
         }
         Expr::Block { stmts, expr } => {
             for stmt in stmts {
-                reject_dynamic_host_stmt(stmt)?;
+                reject_dynamic_host_stmt(ctx, stmt)?;
             }
-            reject_dynamic_host_expr(expr)?;
+            reject_dynamic_host_expr(ctx, expr)?;
         }
         Expr::Add(lhs, rhs)
         | Expr::Sub(lhs, rhs)
@@ -857,20 +1084,98 @@ fn reject_dynamic_host_expr(expr: &Expr) -> Result<(), CompileError> {
         | Expr::Eq(lhs, rhs)
         | Expr::Lt(lhs, rhs)
         | Expr::Gt(lhs, rhs) => {
-            reject_dynamic_host_expr(lhs)?;
-            reject_dynamic_host_expr(rhs)?;
+            reject_dynamic_host_expr(ctx, lhs)?;
+            reject_dynamic_host_expr(ctx, rhs)?;
         }
+        Expr::Neg(inner)
+        | Expr::Not(inner)
+        | Expr::ToOwned(inner)
+        | Expr::Borrow(inner)
+        | Expr::BorrowMut(inner) => reject_dynamic_host_expr(ctx, inner)?,
         Expr::IfElse {
             condition,
             then_expr,
             else_expr,
         } => {
-            reject_dynamic_host_expr(condition)?;
-            reject_dynamic_host_expr(then_expr)?;
-            reject_dynamic_host_expr(else_expr)?;
+            reject_dynamic_host_expr(ctx, condition)?;
+            reject_dynamic_host_expr(ctx, then_expr)?;
+            reject_dynamic_host_expr(ctx, else_expr)?;
         }
-        Expr::Closure(closure) => reject_dynamic_host_expr(&closure.body)?,
-        _ => {}
+        Expr::Closure(closure) => reject_dynamic_host_expr(ctx, &closure.body)?,
+        Expr::Match {
+            value,
+            arms,
+            default,
+            ..
+        } => {
+            reject_dynamic_host_expr(ctx, value)?;
+            for (_, arm) in arms {
+                reject_dynamic_host_expr(ctx, arm)?;
+            }
+            reject_dynamic_host_expr(ctx, default)?;
+        }
+        Expr::ResultConstruct { payload, .. } => reject_dynamic_host_expr(ctx, payload)?,
+        Expr::ResultMatch {
+            value,
+            ok_expr,
+            err_expr,
+            ..
+        } => {
+            reject_dynamic_host_expr(ctx, value)?;
+            reject_dynamic_host_expr(ctx, ok_expr)?;
+            reject_dynamic_host_expr(ctx, err_expr)?;
+        }
+        Expr::ResultQuery { value, .. }
+        | Expr::ResultTry { value, .. }
+        | Expr::ResultConvert { value, .. } => reject_dynamic_host_expr(ctx, value)?,
+        Expr::ResultMethod {
+            receiver, argument, ..
+        }
+        | Expr::OptionMethod {
+            receiver, argument, ..
+        } => {
+            reject_dynamic_host_expr(ctx, receiver)?;
+            reject_dynamic_host_expr(ctx, argument)?;
+        }
+        Expr::OptionConstruct { payload, .. } => {
+            if let Some(payload) = payload {
+                reject_dynamic_host_expr(ctx, payload)?;
+            }
+        }
+        Expr::OptionMatch {
+            value,
+            some_expr,
+            none_expr,
+            ..
+        } => {
+            reject_dynamic_host_expr(ctx, value)?;
+            reject_dynamic_host_expr(ctx, some_expr)?;
+            reject_dynamic_host_expr(ctx, none_expr)?;
+        }
+        Expr::OptionalGet { container, key, .. } => {
+            reject_dynamic_host_expr(ctx, container)?;
+            reject_dynamic_host_expr(ctx, key)?;
+        }
+        Expr::OptionUnwrapOr {
+            value, fallback, ..
+        } => {
+            reject_dynamic_host_expr(ctx, value)?;
+            reject_dynamic_host_expr(ctx, fallback)?;
+        }
+        Expr::Null
+        | Expr::Unit
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Bool(_)
+        | Expr::String(_)
+        | Expr::Bytes(_)
+        | Expr::FunctionRef(..)
+        | Expr::ModuleFunctionRef(..)
+        | Expr::UnresolvedFunctionRef { .. }
+        | Expr::Var(_)
+        | Expr::MoveVar(_)
+        | Expr::MoveField { .. }
+        | Expr::MoveIndex { .. } => {}
     }
     Ok(())
 }
@@ -900,14 +1205,25 @@ fn host_output_forbidden(schema: &crate::host_api::HostTypeSchema) -> bool {
     }
 }
 
-fn logical_label_schema(schema: &TypeSchema) -> bool {
-    matches!(schema, TypeSchema::Option(_) | TypeSchema::Unit)
+/// Rewrite context shared by the presentation walk.
+struct RewriteContext<'a, 'b> {
+    names: &'a HashMap<u16, String>,
+    impls: &'a HashMap<u16, ()>,
+    lowering: &'b LoweringScope<'b>,
+    default_source: Option<&'a str>,
+}
+
+impl RewriteContext<'_, '_> {
+    fn allows(&self, id: Option<SemanticNodeId>) -> bool {
+        self.lowering.allows(id, self.default_source)
+    }
 }
 
 pub(super) fn lower_logical_print(
     ir: &mut FrontendIr,
     typing_mode: super::TypingMode,
     entry_local_types: &[super::typing::EntryLocalType],
+    scope: &SourceScope,
 ) -> Result<(), CompileError> {
     let facts = super::typing::presentation_site_schemas(ir, typing_mode, entry_local_types);
     let mut facts = facts.into_iter();
@@ -922,34 +1238,42 @@ pub(super) fn lower_logical_print(
         .copied()
         .map(|index| (index, ()))
         .collect();
+    let lowering = LoweringScope::new(ir, scope);
     let mut aliases = HashMap::new();
-    rewrite_stmts(
-        &mut ir.stmts,
-        &names,
-        &impls,
-        &mut facts,
-        &mut aliases,
-        &mut ir.locals,
-    )?;
+    for (index, stmt) in ir.stmts.iter_mut().enumerate() {
+        let default_source = ir.stmt_sources.get(index).and_then(Option::as_deref);
+        let ctx = RewriteContext {
+            names: &names,
+            impls: &impls,
+            lowering: &lowering,
+            default_source,
+        };
+        rewrite_stmt(stmt, &ctx, &mut facts, &mut aliases, &mut ir.locals)?;
+    }
     let mut indexes = ir.function_impls.keys().copied().collect::<Vec<_>>();
     indexes.sort_unstable();
     for index in indexes {
+        let default_source = ir.function_sources.get(&index).map(String::as_str).or(None);
         let Some(function) = ir.function_impls.get_mut(&index) else {
             continue;
+        };
+        let ctx = RewriteContext {
+            names: &names,
+            impls: &impls,
+            lowering: &lowering,
+            default_source,
         };
         let mut function_aliases = HashMap::new();
         rewrite_stmts(
             &mut function.body_stmts,
-            &names,
-            &impls,
+            &ctx,
             &mut facts,
             &mut function_aliases,
             &mut ir.locals,
         )?;
         rewrite_expr(
             &mut function.body_expr,
-            &names,
-            &impls,
+            &ctx,
             &mut facts,
             &mut function_aliases,
             &mut ir.locals,
@@ -963,49 +1287,47 @@ pub(super) fn lower_logical_print(
 
 fn rewrite_stmts(
     stmts: &mut [Stmt],
-    names: &HashMap<u16, String>,
-    impls: &HashMap<u16, ()>,
+    ctx: &RewriteContext<'_, '_>,
     facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
     aliases: &mut HashMap<LocalSlot, ()>,
     locals: &mut usize,
 ) -> Result<(), CompileError> {
     for stmt in stmts {
-        rewrite_stmt(stmt, names, impls, facts, aliases, locals)?;
+        rewrite_stmt(stmt, ctx, facts, aliases, locals)?;
     }
     Ok(())
 }
 
 fn rewrite_stmt(
     stmt: &mut Stmt,
-    names: &HashMap<u16, String>,
-    impls: &HashMap<u16, ()>,
+    ctx: &RewriteContext<'_, '_>,
     facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
     aliases: &mut HashMap<LocalSlot, ()>,
     locals: &mut usize,
 ) -> Result<(), CompileError> {
     match stmt {
         Stmt::Let { index, expr, .. } | Stmt::Assign { index, expr, .. } => {
-            rewrite_expr(expr, names, impls, facts, aliases, locals)?;
-            note_print_alias(*index, expr, names, impls, aliases);
+            rewrite_expr(expr, ctx, facts, aliases, locals)?;
+            note_print_alias(*index, expr, ctx.names, ctx.impls, aliases);
         }
-        Stmt::Expr { expr, .. } => rewrite_expr(expr, names, impls, facts, aliases, locals)?,
+        Stmt::Expr { expr, .. } => rewrite_expr(expr, ctx, facts, aliases, locals)?,
         Stmt::IfElse {
             condition,
             then_branch,
             else_branch,
             ..
         } => {
-            rewrite_expr(condition, names, impls, facts, aliases, locals)?;
+            rewrite_expr(condition, ctx, facts, aliases, locals)?;
             let mut then_aliases = aliases.clone();
             let mut else_aliases = aliases.clone();
-            rewrite_stmts(then_branch, names, impls, facts, &mut then_aliases, locals)?;
-            rewrite_stmts(else_branch, names, impls, facts, &mut else_aliases, locals)?;
+            rewrite_stmts(then_branch, ctx, facts, &mut then_aliases, locals)?;
+            rewrite_stmts(else_branch, ctx, facts, &mut else_aliases, locals)?;
         }
         Stmt::While {
             condition, body, ..
         } => {
-            rewrite_expr(condition, names, impls, facts, aliases, locals)?;
-            rewrite_stmts(body, names, impls, facts, &mut aliases.clone(), locals)?;
+            rewrite_expr(condition, ctx, facts, aliases, locals)?;
+            rewrite_stmts(body, ctx, facts, &mut aliases.clone(), locals)?;
         }
         Stmt::For {
             init,
@@ -1014,13 +1336,13 @@ fn rewrite_stmt(
             body,
             ..
         } => {
-            rewrite_stmt(init, names, impls, facts, aliases, locals)?;
-            rewrite_expr(condition, names, impls, facts, aliases, locals)?;
-            rewrite_stmt(post, names, impls, facts, aliases, locals)?;
-            rewrite_stmts(body, names, impls, facts, aliases, locals)?;
+            rewrite_stmt(init, ctx, facts, aliases, locals)?;
+            rewrite_expr(condition, ctx, facts, aliases, locals)?;
+            rewrite_stmt(post, ctx, facts, aliases, locals)?;
+            rewrite_stmts(body, ctx, facts, aliases, locals)?;
         }
         Stmt::ClosureLet { closure, .. } => {
-            rewrite_closure(closure, names, impls, facts, aliases, locals)?;
+            rewrite_closure(closure, ctx, facts, aliases, locals)?;
         }
         Stmt::Noop { .. }
         | Stmt::FuncDecl { .. }
@@ -1033,32 +1355,32 @@ fn rewrite_stmt(
 
 fn rewrite_expr(
     expr: &mut Expr,
-    names: &HashMap<u16, String>,
-    impls: &HashMap<u16, ()>,
+    ctx: &RewriteContext<'_, '_>,
     facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
     aliases: &mut HashMap<LocalSlot, ()>,
     locals: &mut usize,
 ) -> Result<(), CompileError> {
     if let Expr::Closure(closure) = expr {
-        return rewrite_closure(closure, names, impls, facts, aliases, locals);
+        return rewrite_closure(closure, ctx, facts, aliases, locals);
     }
     if let Expr::Block { stmts, expr } = expr {
         let mut nested = aliases.clone();
-        rewrite_stmts(stmts, names, impls, facts, &mut nested, locals)?;
-        return rewrite_expr(expr, names, impls, facts, &mut nested, locals);
+        rewrite_stmts(stmts, ctx, facts, &mut nested, locals)?;
+        return rewrite_expr(expr, ctx, facts, &mut nested, locals);
     }
-    if let Expr::LocalCall(slot, _, args, _) = expr {
+    if let Expr::LocalCall(slot, _, args, semantic_id) = expr {
         if args.len() == 1 && aliases.contains_key(slot) {
+            let allowed = ctx.allows(*semantic_id);
             let schema = next_fact(facts)?;
-            rewrite_expr(&mut args[0], names, impls, facts, aliases, locals)?;
-            if let Some(schema) = schema {
+            rewrite_expr(&mut args[0], ctx, facts, aliases, locals)?;
+            if allowed && let Some(schema) = schema {
                 return rewrite_print_call(expr, schema, false, locals);
             }
             return Ok(());
         }
     }
-    if presentation_inputs_mut(names, impls, expr).is_some() {
-        return rewrite_presentation_site(expr, names, impls, facts, aliases, locals);
+    if presentation_inputs_mut(ctx.names, ctx.impls, expr).is_some() {
+        return rewrite_presentation_site(expr, ctx, facts, aliases, locals);
     }
     match expr {
         Expr::IfElse {
@@ -1066,16 +1388,16 @@ fn rewrite_expr(
             then_expr,
             else_expr,
         } => {
-            rewrite_expr(condition, names, impls, facts, aliases, locals)?;
-            rewrite_expr(then_expr, names, impls, facts, aliases, locals)?;
-            rewrite_expr(else_expr, names, impls, facts, aliases, locals)?;
+            rewrite_expr(condition, ctx, facts, aliases, locals)?;
+            rewrite_expr(then_expr, ctx, facts, aliases, locals)?;
+            rewrite_expr(else_expr, ctx, facts, aliases, locals)?;
         }
         Expr::Call(_, _, args, _, _)
         | Expr::LocalCall(_, _, args, _)
         | Expr::ModuleCall(_, _, args, _)
         | Expr::ClosureCall(_, args) => {
             for arg in args {
-                rewrite_expr(arg, names, impls, facts, aliases, locals)?;
+                rewrite_expr(arg, ctx, facts, aliases, locals)?;
             }
         }
         Expr::Add(lhs, rhs)
@@ -1088,25 +1410,25 @@ fn rewrite_expr(
         | Expr::Gt(lhs, rhs)
         | Expr::And(lhs, rhs)
         | Expr::Or(lhs, rhs) => {
-            rewrite_expr(lhs, names, impls, facts, aliases, locals)?;
-            rewrite_expr(rhs, names, impls, facts, aliases, locals)?;
+            rewrite_expr(lhs, ctx, facts, aliases, locals)?;
+            rewrite_expr(rhs, ctx, facts, aliases, locals)?;
         }
         Expr::Neg(inner)
         | Expr::Not(inner)
         | Expr::ToOwned(inner)
         | Expr::Borrow(inner)
         | Expr::BorrowMut(inner) => {
-            rewrite_expr(inner, names, impls, facts, aliases, locals)?;
+            rewrite_expr(inner, ctx, facts, aliases, locals)?;
         }
         Expr::OptionConstruct { payload, .. } => {
             if let Some(payload) = payload {
-                rewrite_expr(payload, names, impls, facts, aliases, locals)?;
+                rewrite_expr(payload, ctx, facts, aliases, locals)?;
             }
         }
         Expr::ResultConstruct { payload, .. }
         | Expr::ResultQuery { value: payload, .. }
         | Expr::ResultTry { value: payload, .. } => {
-            rewrite_expr(payload, names, impls, facts, aliases, locals)?;
+            rewrite_expr(payload, ctx, facts, aliases, locals)?;
         }
         Expr::OptionMatch {
             value,
@@ -1114,9 +1436,9 @@ fn rewrite_expr(
             none_expr,
             ..
         } => {
-            rewrite_expr(value, names, impls, facts, aliases, locals)?;
-            rewrite_expr(some_expr, names, impls, facts, aliases, locals)?;
-            rewrite_expr(none_expr, names, impls, facts, aliases, locals)?;
+            rewrite_expr(value, ctx, facts, aliases, locals)?;
+            rewrite_expr(some_expr, ctx, facts, aliases, locals)?;
+            rewrite_expr(none_expr, ctx, facts, aliases, locals)?;
         }
         _ => {}
     }
@@ -1125,8 +1447,7 @@ fn rewrite_expr(
 
 fn rewrite_closure(
     closure: &mut crate::compiler::ir::ClosureExpr,
-    names: &HashMap<u16, String>,
-    impls: &HashMap<u16, ()>,
+    ctx: &RewriteContext<'_, '_>,
     facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
     aliases: &HashMap<LocalSlot, ()>,
     locals: &mut usize,
@@ -1137,18 +1458,18 @@ fn rewrite_closure(
             inner.insert(*capture, ());
         }
     }
-    rewrite_expr(&mut closure.body, names, impls, facts, &mut inner, locals)
+    rewrite_expr(&mut closure.body, ctx, facts, &mut inner, locals)
 }
 
 fn rewrite_presentation_site(
     expr: &mut Expr,
-    names: &HashMap<u16, String>,
-    impls: &HashMap<u16, ()>,
+    ctx: &RewriteContext<'_, '_>,
     facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
     aliases: &mut HashMap<LocalSlot, ()>,
     locals: &mut usize,
 ) -> Result<(), CompileError> {
-    let kind = presentation_kind(names, impls, expr);
+    let kind = presentation_kind(ctx.names, ctx.impls, expr);
+    let allowed = ctx.allows(call_site_id(expr));
     let count = match &kind {
         PresentationKind::Print | PresentationKind::Type => 1,
         PresentationKind::Format(count) => *count,
@@ -1163,20 +1484,24 @@ fn rewrite_presentation_site(
             let newline = print_newline(expr);
             if let Expr::Call(_, _, args, _, _) = expr {
                 if let Some(arg) = args.get_mut(0) {
-                    rewrite_print_input(arg, names, impls, facts, aliases, locals)?;
+                    if allowed {
+                        rewrite_print_input(arg, ctx, facts, aliases, locals)?;
+                    } else {
+                        rewrite_expr(arg, ctx, facts, aliases, locals)?;
+                    }
                 }
             }
-            if let Some(schema) = schemas.pop().flatten() {
+            if allowed && let Some(schema) = schemas.pop().flatten() {
                 rewrite_print_call(expr, schema, newline, locals)?;
             }
         }
         PresentationKind::Type => {
             if let Expr::Call(_, _, args, _, _) = expr {
                 if let Some(arg) = args.get_mut(0) {
-                    rewrite_expr(arg, names, impls, facts, aliases, locals)?;
+                    rewrite_expr(arg, ctx, facts, aliases, locals)?;
                 }
             }
-            if let Some(schema) = schemas.pop().flatten() {
+            if allowed && let Some(schema) = schemas.pop().flatten() {
                 if let Some(label) = type_label(&schema) {
                     rewrite_type_call(expr, schema, label, locals)?;
                 }
@@ -1189,8 +1514,8 @@ fn rewrite_presentation_site(
                     rewrite_format_values(
                         &mut args[1],
                         &mut schemas,
-                        names,
-                        impls,
+                        ctx,
+                        allowed,
                         facts,
                         aliases,
                         locals,
@@ -1283,8 +1608,7 @@ fn print_input_loc(arg: &Expr) -> PrintInputLoc {
 
 fn rewrite_print_input(
     arg: &mut Expr,
-    names: &HashMap<u16, String>,
-    impls: &HashMap<u16, ()>,
+    ctx: &RewriteContext<'_, '_>,
     facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
     aliases: &mut HashMap<LocalSlot, ()>,
     locals: &mut usize,
@@ -1294,7 +1618,7 @@ fn rewrite_print_input(
             if let Expr::Add(left, _) = arg {
                 if let Expr::Call(_, _, args, _, _) = left.as_mut() {
                     if let Some(input) = args.get_mut(0) {
-                        return rewrite_expr(input, names, impls, facts, aliases, locals);
+                        return rewrite_expr(input, ctx, facts, aliases, locals);
                     }
                 }
             }
@@ -1303,18 +1627,18 @@ fn rewrite_print_input(
         PrintInputLoc::PlainToString => {
             if let Expr::Call(_, _, args, _, _) = arg {
                 if let Some(input) = args.get_mut(0) {
-                    return rewrite_expr(input, names, impls, facts, aliases, locals);
+                    return rewrite_expr(input, ctx, facts, aliases, locals);
                 }
             }
             Ok(())
         }
         PrintInputLoc::NewlineLeft => {
             if let Expr::Add(left, _) = arg {
-                return rewrite_expr(left, names, impls, facts, aliases, locals);
+                return rewrite_expr(left, ctx, facts, aliases, locals);
             }
             Ok(())
         }
-        PrintInputLoc::Whole => rewrite_expr(arg, names, impls, facts, aliases, locals),
+        PrintInputLoc::Whole => rewrite_expr(arg, ctx, facts, aliases, locals),
     }
 }
 
@@ -1419,8 +1743,8 @@ fn rewrite_type_call(
 fn rewrite_format_values(
     expr: &mut Expr,
     schemas: &mut Vec<Option<TypeSchema>>,
-    names: &HashMap<u16, String>,
-    impls: &HashMap<u16, ()>,
+    ctx: &RewriteContext<'_, '_>,
+    allowed: bool,
     facts: &mut std::vec::IntoIter<Option<TypeSchema>>,
     aliases: &mut HashMap<LocalSlot, ()>,
     locals: &mut usize,
@@ -1433,8 +1757,12 @@ fn rewrite_format_values(
     {
         return Ok(());
     }
-    rewrite_format_values(&mut args[0], schemas, names, impls, facts, aliases, locals)?;
-    rewrite_expr(&mut args[1], names, impls, facts, aliases, locals)?;
+    rewrite_format_values(&mut args[0], schemas, ctx, allowed, facts, aliases, locals)?;
+    rewrite_expr(&mut args[1], ctx, facts, aliases, locals)?;
+    if !allowed {
+        let _ = schemas.pop();
+        return Ok(());
+    }
     let Some(schema) = schemas.pop().flatten() else {
         return Ok(());
     };

@@ -1298,10 +1298,11 @@ fn member_has_lowering_checks_container_membership() {
 
 #[test]
 fn json_decode_rejects_duplicate_object_keys() {
+    // Typed decode keeps the same strict unique-key oracle on the RSS route.
     let compiled = compile_source(
         r#"
         use json;
-        json::decode("{\"k\":1,\"k\":2}");
+        json::decode::<map<int>>("{\"k\":1,\"k\":2}");
     "#,
     )
     .expect("source should compile");

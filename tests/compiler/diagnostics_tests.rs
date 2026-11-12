@@ -1,6 +1,9 @@
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "../support/legacy_nullable_plugin.rs"]
+mod legacy_nullable_plugin;
+
 use vm::{
     ParseError, SourceError, SourceFlavor, SourceMap, SourcePathError, Span,
     collect_inferred_local_type_hints, compile_source, compile_source_file,
@@ -348,8 +351,12 @@ let payload_decoded: Profile = json::decode(payload_json);
 payload_decoded.stats.score;
 "#;
 
-    let hints = collect_inferred_local_type_hints(source, SourceFlavor::RustScript)
-        .expect("type hints should succeed");
+    let hints = vm::collect_inferred_local_type_hints_with_options(
+        source,
+        legacy_nullable_plugin::legacy_nullable_flavor(),
+        legacy_nullable_plugin::legacy_nullable_options(vm::CompileSourceFileOptions::default()),
+    )
+    .expect("type hints should succeed");
     let payload_decoded = hints
         .iter()
         .find(|hint| hint.name == "payload_decoded")
