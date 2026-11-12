@@ -563,10 +563,14 @@ impl Parser {
                         let semantic_id =
                             self.alloc_local_call_id(name_span, rparen_span, local, name.clone());
                         Expr::LocalCall(local, Vec::new(), args, semantic_id)
-                    } else if self.matching_catalog_print(&name, args.len()) {
-                        // A same-named catalog overload is the selected callee.
-                        // Language print sugar must not run before that identity.
-                        self.build_host_call_expr_with_type_args(&name, args, type_args)?
+                    } else if let Some(selected) =
+                        self.selected_catalog_print_target(&name, args.len())
+                    {
+                        // A same-named catalog overload, an explicit direct
+                        // import, or a matching wildcard member is the
+                        // selected callee. Language print sugar must not run
+                        // before that identity.
+                        self.build_host_call_expr_with_type_args(&selected, args, type_args)?
                     } else if self.functions.contains_key(&name) {
                         let builtin_alias_call = if matches!(name.as_str(), "print" | "println") {
                             self.functions.get(&name).is_some_and(|decl| {
@@ -2576,23 +2580,48 @@ impl Parser {
         )
     }
 
-    fn matching_catalog_print(&self, name: &str, arity: usize) -> bool {
+    /// Select the direct host target for a bare `print`/`println` call.
+    ///
+    /// Explicit direct imports (`use demo::{print};` or an `as` alias) choose
+    /// their target even when the language builtin shares the spelling. A
+    /// single wildcard import selects a matching wildcard member; an
+    /// unmatched or non-matching-arity wildcard member keeps intrinsic
+    /// print. A source-defined implementation always wins.
+    fn selected_catalog_print_target(&self, name: &str, arity: usize) -> Option<String> {
         if !matches!(name, "print" | "println") {
-            return false;
+            return None;
         }
         if self
             .functions
             .get(name)
             .is_some_and(|decl| self.function_impls.contains_key(&decl.index))
         {
-            return false;
+            return None;
         }
-        self.host_catalog.as_ref().is_some_and(|catalog| {
-            catalog
-                .functions_named(name)
+        if let Some(target) = self.direct_host_call_aliases.get(name) {
+            return Some(target.clone());
+        }
+        let catalog = self.host_catalog.as_ref()?;
+        if catalog
+            .functions_named(name)
+            .iter()
+            .any(|schema| schema.params.len() == arity)
+        {
+            return Some(name.to_string());
+        }
+        if self.direct_host_wildcard_imports.len() == 1
+            && let Some(namespace) = self.direct_host_wildcard_imports.iter().next()
+        {
+            let target = format!("{namespace}::{name}");
+            if catalog
+                .functions_named(&target)
                 .iter()
                 .any(|schema| schema.params.len() == arity)
-        })
+            {
+                return Some(target);
+            }
+        }
+        None
     }
 
     pub(super) fn try_build_language_builtin_call(
