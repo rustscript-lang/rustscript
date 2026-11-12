@@ -3591,12 +3591,29 @@ impl Vm {
             });
         }
         let extra = usize::from(argc_u8 - value_argc);
+        let mut hidden = Vec::with_capacity(extra);
         for _ in 0..extra {
-            let descriptor = self.pop_value()?;
-            self.drop_value_with_contract(descriptor);
+            hidden.push(self.pop_value()?);
         }
-        self.execute_builtin_override_call(public_index, value_argc, call_ip)
-            .map(Some)
+        // The public override sees only the value. A retrying Yield re-executes
+        // this same Call, so the hidden descriptor must be back in its original
+        // slot. Return, Halt, Pending and errors consume the invocation and
+        // release it without a guest drop-contract event.
+        let arg_boundary = self.instance.stack.len();
+        match self.execute_builtin_override_call(public_index, value_argc, call_ip) {
+            Ok(HostCallExecOutcome::Yielded) => {
+                let mut at = arg_boundary.min(self.instance.stack.len());
+                for operand in hidden.into_iter().rev() {
+                    self.instance.stack.insert(at, operand);
+                    at += 1;
+                }
+                Ok(Some(HostCallExecOutcome::Yielded))
+            }
+            other => {
+                drop(hidden);
+                other.map(Some)
+            }
+        }
     }
 
     pub(super) fn execute_builtin_override_call(
