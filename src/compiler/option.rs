@@ -1214,7 +1214,15 @@ pub(crate) fn normalize_omitted_option_fields(ir: &mut FrontendIr) {
             }
         }
         for (source, captured) in &implementation.capture_copies {
-            if let Some(schema) = env.slots.get(source).cloned() {
+            // The source may be owned by an enclosing function that has
+            // already been normalized in this pass; its declaration schema is
+            // then in `resolved`, not in the root/parameter environment.
+            let schema = env
+                .slots
+                .get(source)
+                .cloned()
+                .or_else(|| resolved.get(source).cloned());
+            if let Some(schema) = schema {
                 env.slots.insert(*captured, schema);
             }
         }
