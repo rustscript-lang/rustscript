@@ -161,10 +161,10 @@ fn capture_sources_ready(
         if declarations.contains_key(source) {
             return true;
         }
-        match owners.get(source) {
-            Some(owner) if *owner != index && pending.contains(owner) => false,
-            _ => true,
-        }
+        !matches!(
+            owners.get(source),
+            Some(owner) if *owner != index && pending.contains(owner)
+        )
     })
 }
 

@@ -430,7 +430,7 @@ impl<'a> TypeContext<'a> {
         seen: &mut HashSet<String>,
         reentries: &mut HashMap<String, usize>,
     ) -> (TypeSchema, Option<String>) {
-        let resolved = match schema {
+        match schema {
             TypeSchema::GenericParam(name) => {
                 let bound = self.resolve_generic_binding(name).cloned();
                 match bound {
@@ -633,8 +633,7 @@ impl<'a> TypeContext<'a> {
                 )
             }
             _ => (schema.clone(), None),
-        };
-        resolved
+        }
     }
 
     /// Cycle key for a named schema: the struct name plus the identity of

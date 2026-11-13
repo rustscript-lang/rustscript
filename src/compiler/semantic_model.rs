@@ -1025,10 +1025,7 @@ impl SemanticModel {
                     let mut segments: Vec<String> = Vec::new();
                     let mut walk = cursor - 1;
                     let mut expect_ident = true;
-                    loop {
-                        let Some(token) = tokens.get(walk) else {
-                            break;
-                        };
+                    while let Some(token) = tokens.get(walk) {
                         if token.span.source_id != position.source_id {
                             break;
                         }
@@ -1070,10 +1067,7 @@ impl SemanticModel {
         let mut segments: Vec<String> = Vec::new();
         let mut cursor = idx;
         let mut expect_ident = true;
-        loop {
-            let Some(token) = tokens.get(cursor) else {
-                break;
-            };
+        while let Some(token) = tokens.get(cursor) {
             if token.span.source_id != position.source_id {
                 break;
             }

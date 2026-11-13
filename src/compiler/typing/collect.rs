@@ -1951,13 +1951,14 @@ fn presentation_walk_expr(
         commit_root_scope(state, &nested, visible);
         return;
     }
-    if let Expr::LocalCall(slot, _, args, _) = expr {
-        if args.len() == 1 && language_print_alias(state, *slot, context) {
-            let schema = presentation_schema(&args[0], state, context);
-            context.presentation_sites.push(schema);
-            presentation_walk_expr(&args[0], state, visible, context, capture_seeds);
-            return;
-        }
+    if let Expr::LocalCall(slot, _, args, _) = expr
+        && args.len() == 1
+        && language_print_alias(state, *slot, context)
+    {
+        let schema = presentation_schema(&args[0], state, context);
+        context.presentation_sites.push(schema);
+        presentation_walk_expr(&args[0], state, visible, context, capture_seeds);
+        return;
     }
     if let Some(values) = super::super::logical_boundary::presentation_inputs(
         context.function_impls,
@@ -2012,10 +2013,11 @@ fn presentation_walk_expr(
         | Expr::BorrowMut(inner) => {
             presentation_walk_expr(inner, state, visible, context, capture_seeds);
         }
-        Expr::OptionConstruct { payload, .. } => {
-            if let Some(payload) = payload {
-                presentation_walk_expr(payload, state, visible, context, capture_seeds);
-            }
+        Expr::OptionConstruct {
+            payload: Some(payload),
+            ..
+        } => {
+            presentation_walk_expr(payload, state, visible, context, capture_seeds);
         }
         Expr::ResultConstruct { payload, .. }
         | Expr::ResultQuery { value: payload, .. }

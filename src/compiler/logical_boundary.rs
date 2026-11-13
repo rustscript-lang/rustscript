@@ -658,10 +658,11 @@ fn visit_encode_children(
             collect_encode_expr(some_expr, typed, facts);
             collect_encode_expr(none_expr, typed, facts);
         }
-        Expr::OptionConstruct { payload, .. } => {
-            if let Some(payload) = payload {
-                collect_encode_expr(payload, typed, facts);
-            }
+        Expr::OptionConstruct {
+            payload: Some(payload),
+            ..
+        } => {
+            collect_encode_expr(payload, typed, facts);
         }
         Expr::ModuleCall(_, _, args, _) | Expr::LocalCall(_, _, args, _) => {
             for arg in args {
@@ -1368,16 +1369,17 @@ fn rewrite_expr(
         rewrite_stmts(stmts, ctx, facts, &mut nested, locals)?;
         return rewrite_expr(expr, ctx, facts, &mut nested, locals);
     }
-    if let Expr::LocalCall(slot, _, args, semantic_id) = expr {
-        if args.len() == 1 && aliases.contains_key(slot) {
-            let allowed = ctx.allows(*semantic_id);
-            let schema = next_fact(facts)?;
-            rewrite_expr(&mut args[0], ctx, facts, aliases, locals)?;
-            if allowed && let Some(schema) = schema {
-                return rewrite_print_call(expr, schema, false, locals);
-            }
-            return Ok(());
+    if let Expr::LocalCall(slot, _, args, semantic_id) = expr
+        && args.len() == 1
+        && aliases.contains_key(slot)
+    {
+        let allowed = ctx.allows(*semantic_id);
+        let schema = next_fact(facts)?;
+        rewrite_expr(&mut args[0], ctx, facts, aliases, locals)?;
+        if allowed && let Some(schema) = schema {
+            return rewrite_print_call(expr, schema, false, locals);
         }
+        return Ok(());
     }
     if presentation_inputs_mut(ctx.names, ctx.impls, expr).is_some() {
         return rewrite_presentation_site(expr, ctx, facts, aliases, locals);
@@ -1420,10 +1422,11 @@ fn rewrite_expr(
         | Expr::BorrowMut(inner) => {
             rewrite_expr(inner, ctx, facts, aliases, locals)?;
         }
-        Expr::OptionConstruct { payload, .. } => {
-            if let Some(payload) = payload {
-                rewrite_expr(payload, ctx, facts, aliases, locals)?;
-            }
+        Expr::OptionConstruct {
+            payload: Some(payload),
+            ..
+        } => {
+            rewrite_expr(payload, ctx, facts, aliases, locals)?;
         }
         Expr::ResultConstruct { payload, .. }
         | Expr::ResultQuery { value: payload, .. }
@@ -1482,13 +1485,13 @@ fn rewrite_presentation_site(
     match kind {
         PresentationKind::Print => {
             let newline = print_newline(expr);
-            if let Expr::Call(_, _, args, _, _) = expr {
-                if let Some(arg) = args.get_mut(0) {
-                    if allowed {
-                        rewrite_print_input(arg, ctx, facts, aliases, locals)?;
-                    } else {
-                        rewrite_expr(arg, ctx, facts, aliases, locals)?;
-                    }
+            if let Expr::Call(_, _, args, _, _) = expr
+                && let Some(arg) = args.get_mut(0)
+            {
+                if allowed {
+                    rewrite_print_input(arg, ctx, facts, aliases, locals)?;
+                } else {
+                    rewrite_expr(arg, ctx, facts, aliases, locals)?;
                 }
             }
             if allowed && let Some(schema) = schemas.pop().flatten() {
@@ -1496,31 +1499,32 @@ fn rewrite_presentation_site(
             }
         }
         PresentationKind::Type => {
-            if let Expr::Call(_, _, args, _, _) = expr {
-                if let Some(arg) = args.get_mut(0) {
-                    rewrite_expr(arg, ctx, facts, aliases, locals)?;
-                }
+            if let Expr::Call(_, _, args, _, _) = expr
+                && let Some(arg) = args.get_mut(0)
+            {
+                rewrite_expr(arg, ctx, facts, aliases, locals)?;
             }
-            if allowed && let Some(schema) = schemas.pop().flatten() {
-                if let Some(label) = type_label(&schema) {
-                    rewrite_type_call(expr, schema, label, locals)?;
-                }
+            if allowed
+                && let Some(schema) = schemas.pop().flatten()
+                && let Some(label) = type_label(&schema)
+            {
+                rewrite_type_call(expr, schema, label, locals)?;
             }
         }
         PresentationKind::Format(_) => {
             schemas.reverse();
-            if let Expr::Call(_, _, args, _, _) = expr {
-                if args.len() == 2 {
-                    rewrite_format_values(
-                        &mut args[1],
-                        &mut schemas,
-                        ctx,
-                        allowed,
-                        facts,
-                        aliases,
-                        locals,
-                    )?;
-                }
+            if let Expr::Call(_, _, args, _, _) = expr
+                && args.len() == 2
+            {
+                rewrite_format_values(
+                    &mut args[1],
+                    &mut schemas,
+                    ctx,
+                    allowed,
+                    facts,
+                    aliases,
+                    locals,
+                )?;
             }
         }
         PresentationKind::None => {}
@@ -1615,20 +1619,19 @@ fn rewrite_print_input(
 ) -> Result<(), CompileError> {
     match print_input_loc(arg) {
         PrintInputLoc::ToStringNewline => {
-            if let Expr::Add(left, _) = arg {
-                if let Expr::Call(_, _, args, _, _) = left.as_mut() {
-                    if let Some(input) = args.get_mut(0) {
-                        return rewrite_expr(input, ctx, facts, aliases, locals);
-                    }
-                }
+            if let Expr::Add(left, _) = arg
+                && let Expr::Call(_, _, args, _, _) = left.as_mut()
+                && let Some(input) = args.get_mut(0)
+            {
+                return rewrite_expr(input, ctx, facts, aliases, locals);
             }
             Ok(())
         }
         PrintInputLoc::PlainToString => {
-            if let Expr::Call(_, _, args, _, _) = arg {
-                if let Some(input) = args.get_mut(0) {
-                    return rewrite_expr(input, ctx, facts, aliases, locals);
-                }
+            if let Expr::Call(_, _, args, _, _) = arg
+                && let Some(input) = args.get_mut(0)
+            {
+                return rewrite_expr(input, ctx, facts, aliases, locals);
             }
             Ok(())
         }
@@ -1645,20 +1648,19 @@ fn rewrite_print_input(
 fn take_print_input(arg: &mut Expr) -> Expr {
     match print_input_loc(arg) {
         PrintInputLoc::ToStringNewline => {
-            if let Expr::Add(left, _) = arg {
-                if let Expr::Call(_, _, args, _, _) = left.as_mut() {
-                    if !args.is_empty() {
-                        return std::mem::replace(&mut args[0], Expr::Null);
-                    }
-                }
+            if let Expr::Add(left, _) = arg
+                && let Expr::Call(_, _, args, _, _) = left.as_mut()
+                && !args.is_empty()
+            {
+                return std::mem::replace(&mut args[0], Expr::Null);
             }
             Expr::Null
         }
         PrintInputLoc::PlainToString => {
-            if let Expr::Call(_, _, args, _, _) = arg {
-                if !args.is_empty() {
-                    return std::mem::replace(&mut args[0], Expr::Null);
-                }
+            if let Expr::Call(_, _, args, _, _) = arg
+                && !args.is_empty()
+            {
+                return std::mem::replace(&mut args[0], Expr::Null);
             }
             Expr::Null
         }
