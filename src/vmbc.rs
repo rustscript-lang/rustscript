@@ -2157,10 +2157,6 @@ fn next_host_schema_depth(depth: usize) -> Result<usize, WireError> {
     ))
 }
 
-pub(crate) fn encode_type_schema_bytes(schema: &TypeSchema) -> Result<Vec<u8>, WireError> {
-    type_schema_codec::encode_type_schema_bytes(schema).map_err(schema_codec_error)
-}
-
 pub(crate) fn decode_type_schema_bytes(bytes: &[u8]) -> Result<TypeSchema, WireError> {
     type_schema_codec::decode_type_schema_bytes(bytes).map_err(schema_codec_error)
 }
@@ -2933,15 +2929,13 @@ mod ret_cleanup_wire_tests {
     }
 
     #[test]
-    fn schema_forward_bytes_match_the_pure_codec() {
+    fn schema_wire_decode_matches_the_pure_codec() {
         let schema = TypeSchema::Option(Box::new(TypeSchema::Unit));
-        let forwarded = encode_type_schema_bytes(&schema).expect("vmbc forward should encode");
-        let owned = crate::compiler::type_schema_codec::encode_type_schema_bytes(&schema)
+        let encoded = crate::compiler::type_schema_codec::encode_type_schema_bytes(&schema)
             .expect("pure codec should encode");
-        assert_eq!(forwarded, owned);
-        assert_eq!(forwarded, vec![19, 20]);
+        assert_eq!(encoded, vec![19, 20]);
         assert_eq!(
-            decode_type_schema_bytes(&forwarded).expect("vmbc forward should decode"),
+            decode_type_schema_bytes(&encoded).expect("vmbc wire decode should decode"),
             schema
         );
     }
