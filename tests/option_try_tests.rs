@@ -707,3 +707,23 @@ fn captured_record_schema_materializes_omitted_option_field_in_assignment() {
     "#;
     assert_eq!(eval(source), Value::Int(0));
 }
+
+#[test]
+fn nested_owner_local_captured_record_materializes_omitted_option_field() {
+    let source = r#"
+        struct Record { value: Option<int> }
+        fn outer() -> int {
+            let mut seed: Record = { value: Option::Some(7) };
+            fn clear() -> int {
+                seed = {};
+                match seed.value {
+                    Option::None => 0,
+                    Option::Some(n) => n
+                }
+            }
+            clear()
+        }
+        outer();
+    "#;
+    assert_eq!(eval(source), Value::Int(0));
+}
