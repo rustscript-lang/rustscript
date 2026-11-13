@@ -1061,10 +1061,8 @@ impl LspServer {
             None => {
                 // Unknown source id: fall back to the entry document's URI
                 // and text so a diagnostic is still surfaced.
-                match self.documents.values().find(|doc| doc.model.is_some()) {
-                    Some(entry) => (entry.uri.as_str(), entry.text.as_str()),
-                    None => return None,
-                }
+                let entry = self.documents.values().find(|doc| doc.model.is_some())?;
+                (entry.uri.as_str(), entry.text.as_str())
             }
         };
         let uri = self.uri_for_source_name(name);
