@@ -522,7 +522,7 @@ fn encode_value(
             else {
                 return Err(unsupported(schema));
             };
-            return encode_value(value, &body, position, depth, names);
+            encode_value(value, &body, position, depth, names)
         }
         TypeSchema::Option(inner) => encode_option(value, inner, position, depth, names),
         TypeSchema::Int => match value {
@@ -815,7 +815,7 @@ fn render_value(
             else {
                 return Err(unsupported(schema));
             };
-            return render_value(value, &body, depth, names);
+            render_value(value, &body, depth, names)
         }
         TypeSchema::Option(inner) => {
             let (some, payload_value) = payload(value)?;

@@ -201,10 +201,8 @@ fn collect_block_starts(
                     starts.insert(next_ip);
                 }
             }
-            OpCode::CallValue | OpCode::CallScript => {
-                if next_ip < code.len() {
-                    starts.insert(next_ip);
-                }
+            OpCode::CallValue | OpCode::CallScript if next_ip < code.len() => {
+                starts.insert(next_ip);
             }
             _ => {}
         }

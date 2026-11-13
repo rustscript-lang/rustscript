@@ -349,7 +349,7 @@ impl Instance {
     }
 
     pub(crate) fn clear_stack_with_drop_contract(&mut self) {
-        let drained = self.stack.drain(..).collect::<Vec<_>>();
+        let drained = std::mem::take(&mut self.stack);
         for value in drained {
             self.drop_value_with_contract(value);
         }
