@@ -239,15 +239,26 @@ fn static_builtin_ids_are_frozen() {
         assert_eq!(builtin.name(), expected_name);
     }
 
-    // The public reverse lookup resolves every catalog source name to its
-    // explicit static ID.
+    // The public source-name reverse lookup resolves every source-visible
+    // catalog name to its explicit static ID. Compiler-internal helpers
+    // (`CatalogClass::Internal`) are addressable only through the generated
+    // call index, never through a source name.
     for entry in &entries {
-        assert_eq!(
-            builtin_call_index(&entry.source_name),
-            Some(entry.id),
-            "reverse lookup for '{}'",
-            entry.source_name
-        );
+        let resolved = builtin_call_index(&entry.source_name);
+        if entry.class == "Internal" {
+            assert_eq!(
+                resolved, None,
+                "internal source name '{}' must not resolve for source",
+                entry.source_name
+            );
+        } else {
+            assert_eq!(
+                resolved,
+                Some(entry.id),
+                "reverse lookup for '{}'",
+                entry.source_name
+            );
+        }
     }
 }
 
