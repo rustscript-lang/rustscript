@@ -81,3 +81,57 @@ fn typed_rss_decode_and_print_keep_logical_unit() {
     );
     assert_eq!(lines.lock().expect("sink").as_slice(), ["()".to_string()]);
 }
+
+#[test]
+fn rss_public_json_function_value_syntax_is_not_a_source_route() {
+    // Current RustScript source accepts `json::decode` / `json::encode` only
+    // as namespaced calls. A first-class public JSON function value is not
+    // legal syntax, so no reference form can bypass the direct-call typed
+    // policy.
+    for member in ["decode", "encode"] {
+        let source = format!("use json;\nlet function = json::{member};\nfunction;\n");
+        let error = match compile_source(&source) {
+            Ok(_) => panic!("public json function reference became a source route: {source}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("expected '(' after namespaced function name"),
+            "public json function reference must stay outside source syntax: {error}"
+        );
+    }
+}
+
+#[test]
+fn rss_source_cannot_name_compiler_internal_json_helpers() {
+    for name in ["__json_decode_typed", "__json_encode_typed", "__logical_render"] {
+        let source = format!("let hidden = {name};\nhidden;\n");
+        let error = match compile_source(&source) {
+            Ok(_) => panic!("compiler-internal helper '{name}' resolved as a source name"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("unknown local"),
+            "compiler-internal helper '{name}' must not be a source name: {error}"
+        );
+    }
+}
+
+#[test]
+fn rss_ordinary_builtin_and_user_underscore_function_values_remain_source_visible() {
+    let builtin = "let function = len;\nfunction([1, 2]);\n";
+    let compiled =
+        compile_source(builtin).unwrap_or_else(|error| panic!("ordinary builtin ref: {error}"));
+    let mut machine = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
+    machine.set_fuel(100_000);
+    assert_eq!(machine.run().expect("ordinary builtin ref run"), vm::VmStatus::Halted);
+    assert_eq!(machine.stack().last(), Some(&vm::Value::Int(2)));
+
+    let user = "fn _helper() -> int { 7 }\nlet function = _helper;\nfunction();\n";
+    let compiled =
+        compile_source(user).unwrap_or_else(|error| panic!("user underscore ref: {error}"));
+    let mut machine = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
+    machine.set_fuel(100_000);
+    assert_eq!(machine.run().expect("user underscore ref run"), vm::VmStatus::Halted);
+    assert_eq!(machine.stack().last(), Some(&vm::Value::Int(7)));
+}
+

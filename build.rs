@@ -1100,6 +1100,12 @@ fn render_builtin_catalog(
     .unwrap();
     writeln!(&mut out, "        match name {{").unwrap();
     for entry in catalog {
+        // Internal entries are compiler-owned lowering helpers. Their source
+        // spellings must not resolve from guest source; trusted compiler and
+        // runtime consumers address them through the generated call index.
+        if entry.class == CatalogClass::Internal {
+            continue;
+        }
         writeln!(
             &mut out,
             "            {:?} => Some(Self::{}),",
