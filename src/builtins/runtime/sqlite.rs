@@ -1642,6 +1642,37 @@ fn transaction_deadline_error(max_transaction_ms: u64) -> VmError {
     ))
 }
 
+fn is_deadline_lock_wait(error: &VmError) -> bool {
+    let VmError::HostError(message) = error else {
+        return false;
+    };
+    message.starts_with("SQLite error DatabaseBusy (")
+        || message.starts_with("SQLite error DatabaseLocked (")
+}
+
+fn should_surface_transaction_deadline(deadline: Instant, now: Instant, error: &VmError) -> bool {
+    if now >= deadline {
+        return true;
+    }
+    // sqlite3_busy_timeout is an integer millisecond API. A deadline-bounded
+    // wait can therefore return SQLITE_BUSY up to one millisecond before the
+    // Instant deadline. That is still the configured deadline, not a new budget.
+    is_deadline_lock_wait(error)
+        && deadline.saturating_duration_since(now) <= Duration::from_millis(1)
+}
+
+fn busy_wait_covering_deadline(remaining: Duration, busy_timeout_ms: u64) -> Option<Duration> {
+    // A sub-millisecond Duration truncates to 0, and sqlite3_busy_timeout(0)
+    // clears the handler instead of waiting. Treat that remainder as expired.
+    if remaining < Duration::from_millis(1) {
+        return None;
+    }
+    let fractional_millis = !remaining.subsec_nanos().is_multiple_of(1_000_000);
+    let wait_ms = remaining.as_millis() + u128::from(fractional_millis);
+    let capped = wait_ms.min(u128::from(busy_timeout_ms));
+    Some(Duration::from_millis(capped as u64))
+}
+
 fn set_transaction_busy_timeout(
     connection: &Connection,
     deadline: Instant,
@@ -1649,12 +1680,10 @@ fn set_transaction_busy_timeout(
     busy_timeout_ms: u64,
 ) -> VmResult<()> {
     let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
+    let Some(wait) = busy_wait_covering_deadline(remaining, busy_timeout_ms) else {
         return Err(transaction_deadline_error(max_transaction_ms));
-    }
-    connection
-        .busy_timeout(remaining.min(Duration::from_millis(busy_timeout_ms)))
-        .map_err(sqlite_error)
+    };
+    connection.busy_timeout(wait).map_err(sqlite_error)
 }
 
 fn transaction_with_connection(
@@ -1775,7 +1804,9 @@ fn transaction_with_connection_until(
     commit_hook_cleanup?;
     progress_cleanup?;
     busy_timeout_cleanup?;
-    if Instant::now() >= deadline && result.is_err() {
+    if let Err(error) = &result
+        && should_surface_transaction_deadline(deadline, Instant::now(), error)
+    {
         return Err(transaction_deadline_error(max_transaction_ms));
     }
     result
@@ -2118,6 +2149,52 @@ mod tests {
             count_after_reuse, 5_000,
             "progress and commit hooks must not leak into later writes"
         );
+    }
+
+    #[test]
+    fn deadline_busy_wait_covers_fractional_milliseconds_without_widening_the_cap() {
+        let fractional = Duration::from_nanos(97_200_000);
+        let wait = busy_wait_covering_deadline(fractional, 2_000)
+            .expect("a multi-millisecond remainder must still wait");
+        assert!(wait >= fractional);
+        assert_eq!(wait, Duration::from_millis(98));
+        assert_eq!(
+            busy_wait_covering_deadline(Duration::from_millis(100), 2_000),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            busy_wait_covering_deadline(Duration::from_millis(2_500), 2_000),
+            Some(Duration::from_millis(2_000))
+        );
+        assert!(busy_wait_covering_deadline(Duration::from_micros(400), 2_000).is_none());
+    }
+
+    #[test]
+    fn near_deadline_lock_wait_surfaces_as_the_configured_deadline() {
+        let deadline = Instant::now();
+        let busy =
+            VmError::HostError("SQLite error DatabaseBusy (5): database is locked".to_string());
+        let other = VmError::HostError("SQLite error ConstraintViolation (19): veto".to_string());
+        assert!(should_surface_transaction_deadline(
+            deadline,
+            deadline - Duration::from_micros(400),
+            &busy
+        ));
+        assert!(!should_surface_transaction_deadline(
+            deadline,
+            deadline - Duration::from_millis(50),
+            &busy
+        ));
+        assert!(should_surface_transaction_deadline(
+            deadline,
+            deadline + Duration::from_millis(1),
+            &other
+        ));
+        assert!(!should_surface_transaction_deadline(
+            deadline,
+            deadline - Duration::from_micros(400),
+            &other
+        ));
     }
 
     #[test]
