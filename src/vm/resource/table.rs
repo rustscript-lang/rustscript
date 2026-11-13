@@ -171,7 +171,7 @@ pub struct ResourceTable {
 /// is exhausted.
 ///
 /// Allocation is atomic and monotonic: the counter is advanced exactly once
-/// per successful handout (via `fetch_update`), never on failure, and ids are
+/// per successful handout (via `try_update`), never on failure, and ids are
 /// never recycled or wrapped. Under `#[cfg(test)]`, the current thread's
 /// [`test_seam`] override (if installed) replaces the process-global
 /// `NEXT_ARENA_ID` so exhaustion tests are deterministic and never consume the
@@ -182,7 +182,7 @@ fn allocate_arena_id() -> Result<u64, ResourceError> {
     #[cfg(not(test))]
     let source = &NEXT_ARENA_ID;
     source
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |arena_id| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |arena_id| {
             (arena_id <= MAX_HANDLE_ARENA_ID).then_some(arena_id + 1)
         })
         .map_err(|_| {

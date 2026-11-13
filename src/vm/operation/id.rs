@@ -188,7 +188,7 @@ pub(super) fn allocate_registry_tag() -> OperationResult<u64> {
     let source = test_seam::source().unwrap_or(&NEXT_REGISTRY_TAG);
     #[cfg(not(test))]
     let source = &NEXT_REGISTRY_TAG;
-    match source.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    match source.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         // Hand out `current` (1..=MAX), advancing to `current + 1`; once
         // `current` exceeds `MAX_REGISTRY_TAG` the space is exhausted.
         if current <= MAX_REGISTRY_TAG {
