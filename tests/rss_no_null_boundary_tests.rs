@@ -245,7 +245,7 @@ fn unannotated_decode_keeps_explicit_type_argument() {
         typed;
     "#;
     let value = eval(source);
-    assert!(vm::option::payload(&value).expect("option").0 == false);
+    assert!(!vm::option::payload(&value).expect("option").0);
 }
 
 #[test]

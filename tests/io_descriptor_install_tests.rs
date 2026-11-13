@@ -525,14 +525,14 @@ fn install_async_driver(_vm: &mut Vm) -> SubmittedOps {
 fn assert_pending_ops_resolved_by_backend(
     submitted: &SubmittedOps,
     driven_ops: usize,
-    minimum_driven: usize,
+    _minimum_driven: usize,
 ) {
     use std::sync::atomic::Ordering;
     let submitted = submitted.load(Ordering::SeqCst);
     #[cfg(feature = "async")]
     {
         assert!(
-            driven_ops >= minimum_driven,
+            driven_ops >= _minimum_driven,
             "the async backend must yield a pending operation per IO call, drove {driven_ops}"
         );
         assert_eq!(
