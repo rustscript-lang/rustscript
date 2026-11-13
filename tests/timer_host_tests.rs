@@ -319,12 +319,6 @@ impl HostAsyncBridge for ControlledBridge {
     }
 }
 
-struct NoopWake;
-
-impl std::task::Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
-
 struct AdmissionBackend {
     barrier: Barrier,
     registrations: Mutex<Vec<TimerRegistration>>,
@@ -1050,7 +1044,7 @@ fn scheduler_leaves_due_callback_pending_until_running_slot_is_free() {
     assert_eq!(backend.running_count(), 1);
 
     first_state.lock().expect("first bridge state").complete = true;
-    let waker = std::task::Waker::from(Arc::new(NoopWake));
+    let waker = std::task::Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
     assert!(matches!(
         backend.poll_active(0, &mut cx),
@@ -1137,7 +1131,7 @@ fn backend_installs_independent_bridges_for_waiting_timer_callbacks() {
         vm::TimerCallbackStatus::Waiting(_)
     ));
 
-    let waker = std::task::Waker::from(Arc::new(NoopWake));
+    let waker = std::task::Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
     let first_poll = first.callback.poll(&mut cx);
     assert!(matches!(first_poll, Poll::Pending), "{first_poll:?}");

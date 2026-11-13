@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(not(target_family = "wasm"))]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 #[cfg(all(not(target_family = "wasm"), test))]
 use std::time::Duration;
 #[cfg(not(target_family = "wasm"))]
@@ -360,16 +360,6 @@ impl HostFunction for PlaygroundRuntimeSleepHostFunction {
     }
 }
 
-struct NoopWake;
-
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
-
-fn noop_waker() -> Waker {
-    Waker::from(Arc::new(NoopWake))
-}
-
 #[cfg(target_family = "wasm")]
 #[link(wasm_import_module = "env")]
 unsafe extern "C" {
@@ -412,7 +402,7 @@ fn wait_message(op_id: HostOpId) -> String {
 }
 
 fn poll_waiting_host_op_once(vm: &mut Vm) -> Poll<VmResult<()>> {
-    let waker = noop_waker();
+    let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
     vm.poll_waiting_host_op(&mut cx)
 }
