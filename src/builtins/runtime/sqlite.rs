@@ -2314,7 +2314,7 @@ mod tests {
                 open_connections: Arc::clone(&open_connections),
             },
         };
-        let program = crate::compile_source("null;")
+        let program = crate::compile_source("();")
             .expect("test program should compile")
             .program;
         let mut vm = Vm::new(program);
@@ -2409,7 +2409,7 @@ mod tests {
                 open_connections: Arc::clone(&open_connections),
             },
         };
-        let program = crate::compile_source("null;")
+        let program = crate::compile_source("();")
             .expect("test program should compile")
             .program;
         let mut vm = Vm::new(program);
