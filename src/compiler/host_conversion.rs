@@ -38,7 +38,7 @@ impl HostTypeSchema {
     /// integration calls when it needs the compiler's semantic view of a
     /// host signature. Every [`HostTypeSchema::Resource`] becomes the
     /// distinct nominal [`TypeSchema::Resource`] carrying the same shared
-    /// [`ResourceTypeKey`]. Named structs become [`TypeSchema::Named`];
+    /// `ResourceTypeKey`. Named structs become [`TypeSchema::Named`];
     /// dynamic maps stay maps.
     pub fn to_compiler_schema(&self) -> TypeSchema {
         match self {

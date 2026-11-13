@@ -8,7 +8,7 @@
 //! one event item is buffered between polls (natural backpressure).
 //!
 //! The invocation reuses the existing callable execution state
-//! ([`Vm::start_callable`], [`Vm::run`], [`Vm::take_invocation_result`]) and the
+//! ([`Vm::start_callable`], [`Vm::run`], `Vm::take_invocation_result`) and the
 //! existing async host bridge; it does not duplicate interpreter or host loops,
 //! and it does not add an executor, generator syntax, an event queue, or event
 //! persistence policy. Cancellation is a per-invocation typed reason carried

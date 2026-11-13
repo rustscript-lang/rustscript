@@ -409,7 +409,7 @@ impl TypeSchema {
     /// schema and the eventual runtime handle/token ABI. A later scope that
     /// wires a resource table / handle transport resolves a [`Self::Resource`]
     /// schema to an integral token here. It is deliberately NOT used by
-    /// [`Self::coarse_value_type`], which keeps resources semantically opaque
+    /// `Self::coarse_value_type`, which keeps resources semantically opaque
     /// (`ValueType::Unknown`) so inferred schemas and diagnostics never reveal
     /// the integer backing.
     // Test-only boundary surface (see compiler::typing::helpers); non-test
@@ -1967,7 +1967,7 @@ pub struct CatalogVisibility {
 /// cursor-position queries (completion prefix derivation, token-at-offset
 /// resolution). The parser's full token stream is preserved verbatim so the
 /// language service never re-lexes or scans source text; spans carry their
-/// owning [`SourceId`] and survive unit merge unchanged.
+/// owning `SourceId` and survive unit merge unchanged.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LexerToken {
     /// The lexer token kind, as a stable string tag (e.g. `Ident`, `Colon`,

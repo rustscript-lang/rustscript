@@ -3893,7 +3893,7 @@ impl Vm {
 
     /// Returns the generic host boundary for this VM.
     ///
-    /// [`HostContext`](crate::vm::host_context::HostContext) exposes typed
+    /// [`HostContext`] exposes typed
     /// per-VM module state and the generic host-agnostic execution-scope SDK
     /// to external host extensions without leaking the underlying host runtime
     /// or naming a builtin domain module.
@@ -3927,7 +3927,7 @@ impl Vm {
         self.host.install_host_state_requirements(requirements)
     }
 
-    /// Installs a [`HostExtension`](crate::vm::host_extension::HostExtension)
+    /// Installs a [`HostExtension`]
     /// onto this VM.
     ///
     /// Registration (into the VM's bound host-function registry) is

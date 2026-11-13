@@ -4,7 +4,7 @@
 //! functions that do not borrow the VM across a poll. The two pieces are:
 //!
 //! * [`HostFutureOutput`] — the terminal result of an async host call,
-//!   either an already-produced [`CallReturn`] or a [`VmCompletion`] closure
+//!   either an already-produced [`CallReturn`] or a `VmCompletion` closure
 //!   that must run against the VM (e.g. to insert a resource into the
 //!   execution scope) before the call can return to the guest.
 //! * [`CaptureAsyncHostContext`] — the trait async host functions use to
@@ -13,7 +13,7 @@
 //! Submitted futures are handed to the configured [`HostAsyncBridge`], which
 //! owns their polling on its own executor. The returned host-operation id is
 //! tracked in the host runtime's `submitted_host_ops` set so the VM routes
-//! the waiting dispatch to the bridge's [`poll_submitted_op`] instead of a
+//! the waiting dispatch to the bridge's `poll_submitted_op` instead of a
 //! runtime-owned operation driver. Async host operations therefore go
 //! through the bridge (the concrete driver of the submitted future); the VM
 //! never builds a second cancellation framework or static poller table.

@@ -4,15 +4,15 @@
 //! [`HostContext`] is the public, builtin-agnostic surface that a host
 //! embedding or an external host extension (a module living outside
 //! `src/builtins/**`) uses to register typed, per-VM module state, push typed
-//! [`HostResource`]s, start [`HostOperation`]s, and read back resources /
+//! [`HostResource`]s, start `HostOperation`s, and read back resources /
 //! operation status. Every scope SDK method delegates to the
 //! [`ExecutionScope`] owned by the underlying
-//! [`HostRuntime`](super::host_runtime::HostRuntime), so all inserts land in
+//! `HostRuntime`, so all inserts land in
 //! the same live scope and a Closing/Quiescent scope rejects them with a
 //! structured [`ExecutionScopeError::ScopeClosing`] (propagated through
 //! [`HostContextErrorKind::Scope`]).
 //!
-//! It never hands out the underlying [`HostRuntime`](super::host_runtime::HostRuntime)
+//! It never hands out the underlying `HostRuntime`
 //! and never names a builtin domain module; concrete SQLite / IO / HTTP / SSE
 //! remain same-crate builtins, but `src/vm` must not depend on any of their
 //! implementation modules or on `rusqlite`.
@@ -20,7 +20,7 @@
 //! **Boundary contract (enforced by `tests/host_context_arch_tests.rs`):**
 //! this module references neither concrete builtin paths nor `rusqlite`.
 //!
-//! Host module state is owned directly by [`HostRuntime`]: typed, per-VM, and
+//! Host module state is owned directly by `HostRuntime`: typed, per-VM, and
 //! deliberately **not** cleared on
 //! [`Vm::reset_for_reuse`](super::Vm::reset_for_reuse) or on execution-scope
 //! close. Registered state therefore survives invocation resets — and scope
@@ -50,7 +50,7 @@ use super::resource::{
 ///
 /// A host extension implements this for exactly one concrete `State` type and
 /// registers it through [`HostContext::set_module_state`]. State is typed at
-/// compile time (keyed by [`TypeId`]) and is per-`Vm`; it is intentionally not
+/// compile time (keyed by `TypeId`) and is per-`Vm`; it is intentionally not
 /// cleared by [`Vm::reset_for_reuse`](super::Vm::reset_for_reuse) or by
 /// execution-scope close, so policy / extension configuration survives across
 /// invocation resets.
@@ -173,10 +173,10 @@ impl std::error::Error for HostContextError {}
 /// Result type used by the generic host boundary.
 pub type HostContextResult<T> = Result<T, HostContextError>;
 
-/// The public, generic host boundary for one [`Vm`](super::Vm).
+/// The public, generic host boundary for one [`Vm`].
 ///
 /// Obtained from [`Vm::host_context`](super::Vm::host_context). It never leaks
-/// the underlying [`HostRuntime`] and never references a builtin domain module,
+/// the underlying `HostRuntime` and never references a builtin domain module,
 /// so external host extensions can register typed per-VM state and drive the
 /// generic execution scope through a stable public surface.
 pub struct HostContext<'a> {
@@ -449,10 +449,10 @@ impl<'a> HostContext<'a> {
     }
 
     /// Starts a host operation in the current execution scope from a full
-    /// generic [`OperationSpec`] (concrete [`HostOperation`] driver, optional
+    /// generic [`OperationSpec`] (concrete `HostOperation` driver, optional
     /// deadline, optional cleanup).
     ///
-    /// External operations must produce concrete [`HostOperation`] drivers:
+    /// External operations must produce concrete `HostOperation` drivers:
     /// the scope and its registry own poll/cancel, so a driver is the only
     /// thing the extension supplies. There is deliberately no second registry
     /// and no adapter-specific generic helper on this surface.

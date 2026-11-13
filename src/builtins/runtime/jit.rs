@@ -253,7 +253,7 @@ pub(super) fn jit_host_module() -> super::host_modules::StandardHostModule {
     }
 }
 
-/// Registers `jit::get_config` / `jit::set_config` from [`standard_host_catalog`].
+/// Registers `jit::get_config` / `jit::set_config` from `standard_host_catalog`.
 pub fn register_jit_builtin_module(registry: &mut HostFunctionRegistry) -> VmResult<()> {
     let catalog = crate::builtins::runtime::standard_host_catalog();
     register_jit_builtin_module_from_catalog(registry, catalog.as_ref())

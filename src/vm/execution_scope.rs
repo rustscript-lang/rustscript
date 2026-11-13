@@ -12,7 +12,7 @@
 //! class or a host operation domain. Concrete drivers own poll/cancel (see
 //! [`HostOperation`](crate::vm::operation::HostOperation)) and concrete
 //! resources own their close (see
-//! [`HostResource`](crate::vm::resource::HostResource)).
+//! [`HostResource`]).
 
 use std::task::{Context, Poll};
 
@@ -63,7 +63,7 @@ pub enum ExecutionScopeError {
     ScopeNotClosing,
     /// Construction of a fresh scope failed because the process-unique
     /// resource-arena identity space is exhausted. Carries the typed resource
-    /// error ([`ResourceErrorCode::ResourceTableArenaExhausted`]); the scope
+    /// error (`ResourceErrorCode::ResourceTableArenaExhausted`); the scope
     /// was not created and no partial state exists.
     ArenaExhausted(ResourceError),
     /// The underlying resource insert/close failed.
