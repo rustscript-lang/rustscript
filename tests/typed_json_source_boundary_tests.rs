@@ -103,7 +103,11 @@ fn rss_public_json_function_value_syntax_is_not_a_source_route() {
 
 #[test]
 fn rss_source_cannot_name_compiler_internal_json_helpers() {
-    for name in ["__json_decode_typed", "__json_encode_typed", "__logical_render"] {
+    for name in [
+        "__json_decode_typed",
+        "__json_encode_typed",
+        "__logical_render",
+    ] {
         let source = format!("let hidden = {name};\nhidden;\n");
         let error = match compile_source(&source) {
             Ok(_) => panic!("compiler-internal helper '{name}' resolved as a source name"),
@@ -123,7 +127,10 @@ fn rss_ordinary_builtin_and_user_underscore_function_values_remain_source_visibl
         compile_source(builtin).unwrap_or_else(|error| panic!("ordinary builtin ref: {error}"));
     let mut machine = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
     machine.set_fuel(100_000);
-    assert_eq!(machine.run().expect("ordinary builtin ref run"), vm::VmStatus::Halted);
+    assert_eq!(
+        machine.run().expect("ordinary builtin ref run"),
+        vm::VmStatus::Halted
+    );
     assert_eq!(machine.stack().last(), Some(&vm::Value::Int(2)));
 
     let user = "fn _helper() -> int { 7 }\nlet function = _helper;\nfunction();\n";
@@ -131,7 +138,9 @@ fn rss_ordinary_builtin_and_user_underscore_function_values_remain_source_visibl
         compile_source(user).unwrap_or_else(|error| panic!("user underscore ref: {error}"));
     let mut machine = vm::Vm::new(compiled.program.with_local_count(compiled.locals));
     machine.set_fuel(100_000);
-    assert_eq!(machine.run().expect("user underscore ref run"), vm::VmStatus::Halted);
+    assert_eq!(
+        machine.run().expect("user underscore ref run"),
+        vm::VmStatus::Halted
+    );
     assert_eq!(machine.stack().last(), Some(&vm::Value::Int(7)));
 }
-
