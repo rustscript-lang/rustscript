@@ -2,7 +2,7 @@
 //!
 //! This module is the controlled extension boundary through which an external
 //! host crate installs persistent policy state and registers host functions
-//! without accessing any [`HostRuntime`](super::host_runtime::HostRuntime)
+//! without accessing any `HostRuntime`
 //! private field or naming a builtin domain module:
 //!
 //! - [`HostExtension::install`] installs typed per-VM module state (policy /
@@ -11,7 +11,7 @@
 //!   [`Vm::reset_for_reuse`](super::Vm::reset_for_reuse) and execution-scope
 //!   close, and it never participates in resource close.
 //! - [`HostExtension::register`] registers host functions into a
-//!   [`HostFunctionRegistry`]. Registration is validated against the
+//!   `HostFunctionRegistry`. Registration is validated against the
 //!   extension's [`HostApiCatalog`] via [`catalog_import_schemas`] so the
 //!   registered function declarations — parameter labels, type schemas and
 //!   passing modes — match the catalog exactly. Named-struct bodies from
@@ -806,9 +806,9 @@ fn collect_named_structs_from_type(
 ///
 /// Used directly by embedders; the `register` / `install` lifecycle is split
 /// so an extension can also be registered into a caller-supplied (e.g.
-/// restricted / capability-granted) [`HostFunctionRegistry`] by calling
+/// restricted / capability-granted) `HostFunctionRegistry` by calling
 /// [`register_host_extension`] and binding it with
-/// [`HostFunctionRegistry::bind_vm_cached`].
+/// `HostFunctionRegistry::bind_vm_cached`.
 pub trait HostExtension: Send + Sync + 'static {
     /// Catalog whose named-struct bodies are installed atomically before
     /// [`Self::register`] by [`super::Vm::install_extension`] and
@@ -888,7 +888,7 @@ pub fn catalog_import_schemas(catalog: &HostApiCatalog, name: &str) -> Vec<HostI
 
 /// Named struct bodies for VM resource walks. Compiler import schemas keep
 /// `TypeSchema::Named` identity; install these on
-/// [`HostFunctionRegistry::install_named_struct_schemas`] so nested resources
+/// `HostFunctionRegistry::install_named_struct_schemas` so nested resources
 /// inside named structs remain visible after catalog registration.
 pub fn catalog_named_struct_schemas(
     catalog: &HostApiCatalog,

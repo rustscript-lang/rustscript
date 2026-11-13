@@ -3,8 +3,8 @@
 //! An [`OperationId`] is an opaque 63-bit token that *packs* the three
 //! identifiers that uniquely address an in-flight operation in this VM:
 //!
-//! * a **registry tag** identifying which [`registry::OperationRegistry`]
-//!   owns the id (allocated by [`allocate_registry_tag`]);
+//! * a **registry tag** identifying which `registry::OperationRegistry`
+//!   owns the id (allocated by `allocate_registry_tag`);
 //! * a one-based **slot identity** selecting an entry inside that registry;
 //! * a **generation** that distinguishes successive occupants of the same
 //!   slot.

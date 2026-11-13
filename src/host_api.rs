@@ -4,7 +4,7 @@
 //! the functions and resource types a host exposes to scripts. It is deliberately
 //! independent of the compiler's inference types, the VM's runtime
 //! [`crate::vm`] resource table, the wire format ([`crate::vmbc`]) and the
-//! generated builtin catalog ([`crate::builtins`]), so all of those can be
+//! generated builtin catalog (`crate::builtins`), so all of those can be
 //! consumed without introducing a reverse dependency.
 //!
 //! ## Design invariants
@@ -3286,7 +3286,7 @@ pub enum HostApiCatalogError {
     GuestResourceEffectMismatch {
         function: String,
     },
-    /// A [`HostResourceType`] declaration used an invalid catalog key.
+    /// A `HostResourceType` declaration used an invalid catalog key.
     InvalidResourceTypeKey {
         type_name: &'static str,
         reason: String,

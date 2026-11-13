@@ -100,7 +100,7 @@ pub fn standard_host_catalog_fingerprint() -> HostApiFingerprint {
     standard_host_catalog().fingerprint()
 }
 
-/// The standard host modules for this build (see [`host_modules`]).
+/// The standard host modules for this build (see `host_modules`).
 pub fn standard_host_modules() -> &'static [StandardHostModule] {
     host_modules::standard_host_modules()
 }
