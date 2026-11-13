@@ -65,6 +65,9 @@ impl HostResourceType for OtherOptionSuccess {
 
 mod generated {
     pub use vm::borrow_arg;
+    // The host scanner needs the explicit nested callable signatures in this
+    // fixture; aliases would hide them from the macro.
+    #[allow(clippy::type_complexity)]
     pub mod functions {
         use super::super::*;
         include!("fixtures/option_sdk_signature.rs");
