@@ -3252,14 +3252,11 @@ impl Parser {
         member: &str,
         subpath: &[String],
     ) -> Option<String> {
-        let mut host_name = if let Some(host_root) = self.host_namespace_aliases.get(namespace) {
-            if member.is_empty() {
-                host_root.clone()
-            } else {
-                format!("{host_root}::{member}")
-            }
+        let host_root = self.host_namespace_aliases.get(namespace)?;
+        let mut host_name = if member.is_empty() {
+            host_root.clone()
         } else {
-            return None;
+            format!("{host_root}::{member}")
         };
 
         for segment in subpath {

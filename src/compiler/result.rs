@@ -165,14 +165,14 @@ fn resolve_function_impls(
     let mut pending: Vec<u16> = impls.keys().copied().collect();
     while !pending.is_empty() {
         let ready = pending.iter().position(|index| {
-            impls[&index].capture_copies.iter().all(|(source, _)| {
+            impls[index].capture_copies.iter().all(|(source, _)| {
                 if env.declaration_schemas.contains_key(source) {
                     return true;
                 }
-                match owners.get(source) {
-                    Some(owner) if *owner != *index && pending.contains(owner) => false,
-                    _ => true,
-                }
+                !matches!(
+                    owners.get(source),
+                    Some(owner) if *owner != *index && pending.contains(owner)
+                )
             })
         });
         let index = match ready {

@@ -2102,7 +2102,7 @@ fn rebase_parsed_semantic_index(
                 let mut site = site.clone();
                 site.call_id = remap_node(site.call_id);
                 for arg in &mut site.arguments {
-                    arg.local = arg.local.map(&remap_slot).transpose()?;
+                    arg.local = arg.local.map(remap_slot).transpose()?;
                 }
                 Ok(site)
             })
