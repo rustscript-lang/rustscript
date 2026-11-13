@@ -1804,8 +1804,8 @@ mod runtime_tests {
             struct Stats { score: int }
             struct Profile { stats: Stats }
 
-            let payload_json = json::encode({});
-            let payload_decoded: Profile = json::decode(payload_json);
+            let payload_json = json::encode::<Profile>(json::decode::<Profile>("{\"stats\":{\"score\":41}}"));
+            let payload_decoded: Profile = json::decode::<Profile>(payload_json);
             payload_decoded.stats.score;
         "#;
 
@@ -2231,8 +2231,10 @@ mod runtime_tests {
         let source = r#"
             use re;
             use json;
+            struct MatchPayload { ok: bool }
             let matched = re::match("(?i)^rss$", "RSS");
-            let payload = json::encode({ ok: matched });
+            let value: MatchPayload = { ok: matched };
+            let payload = json::encode::<MatchPayload>(value);
             payload;
         "#;
         let report = lint_source_with_flavor(source, SourceFlavor::RustScript);
@@ -2248,9 +2250,10 @@ mod runtime_tests {
         let source = r#"
             use re;
             use json;
-            let matched = re::match("(?i)^rss$", "RSS");
-            let payload = json::encode({ ok: matched });
             struct Payload { ok: bool }
+            let matched = re::match("(?i)^rss$", "RSS");
+            let value: Payload = { ok: matched };
+            let payload = json::encode::<Payload>(value);
             let decoded = json::decode::<Payload>(payload);
             let ok = decoded.ok.copy();
             if ok {
