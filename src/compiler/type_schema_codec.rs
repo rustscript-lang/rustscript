@@ -133,7 +133,7 @@ pub(crate) fn write_schema(schema: &TypeSchema, out: &mut Vec<u8>) -> Result<(),
         TypeSchema::Object(fields) => {
             out.push(14);
             let mut entries = fields.iter().collect::<Vec<_>>();
-            entries.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+            entries.sort_unstable_by_key(|(name, _)| *name);
             write_u32_count("schema object fields", entries.len(), out)?;
             for (name, value) in entries {
                 write_string("schema object field", name, out)?;

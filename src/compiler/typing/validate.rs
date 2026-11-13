@@ -496,7 +496,7 @@ fn validate_json_schema_with_seen(
             // the diagnostic (and probe assertions on it) deterministic
             // across processes and runs.
             let mut sorted_fields: Vec<(&String, &TypeSchema)> = fields.iter().collect();
-            sorted_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+            sorted_fields.sort_by_key(|(name, _)| *name);
             for (field, value_schema) in sorted_fields {
                 let child_path = if path.is_empty() {
                     format!("field '{field}'")

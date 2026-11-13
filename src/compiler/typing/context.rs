@@ -597,7 +597,7 @@ impl<'a> TypeContext<'a> {
                 // contributes it must be deterministic: visit fields in
                 // sorted name order.
                 let mut sorted_fields: Vec<(&String, &TypeSchema)> = fields.iter().collect();
-                sorted_fields.sort_by(|(a, _), (b, _)| a.cmp(b));
+                sorted_fields.sort_by_key(|(name, _)| *name);
                 for (name, value) in sorted_fields {
                     let (resolved_value, trip) =
                         self.resolve_schema_with_seen_tripped(value, seen, reentries);

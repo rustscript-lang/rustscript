@@ -537,7 +537,7 @@ fn cleanup_schema_owns_resource(
         TypeSchema::Object(fields) => {
             let mut owned = false;
             let mut fields = fields.iter().collect::<Vec<_>>();
-            fields.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+            fields.sort_unstable_by_key(|(name, _)| *name);
             for (_, field) in fields {
                 owned |= cleanup_schema_owns_resource(field, decls, next, nodes, active)?;
             }

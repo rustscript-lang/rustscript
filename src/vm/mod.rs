@@ -456,7 +456,7 @@ fn compute_program_cache_key(program: &Program) -> u64 {
     }
     hash_type_map(program.type_map.as_ref(), &mut hasher);
     let mut named_struct_decls = program.named_struct_decls.iter().collect::<Vec<_>>();
-    named_struct_decls.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    named_struct_decls.sort_unstable_by_key(|(name, _)| *name);
     named_struct_decls.len().hash(&mut hasher);
     for (name, decl) in named_struct_decls {
         name.hash(&mut hasher);
