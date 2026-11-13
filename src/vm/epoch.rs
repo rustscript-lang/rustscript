@@ -42,7 +42,7 @@ impl EpochHandle {
         }
         let previous = self
             .current
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_add(delta))
             })
             .unwrap_or_else(|current| current);

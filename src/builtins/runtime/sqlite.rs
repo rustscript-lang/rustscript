@@ -185,7 +185,7 @@ fn reserve_connection(
     limit: usize,
 ) -> VmResult<ConnectionCountPermit> {
     open_connections
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
             (count < limit).then_some(count + 1)
         })
         .map_err(|_| VmError::HostError(format!("SQLite connection limit {limit} reached")))?;
@@ -267,7 +267,7 @@ impl SqliteCloseLifecycle {
         #[cfg(test)]
         let inject_failure = self
             .injected_failures
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok();
@@ -483,7 +483,7 @@ impl SqliteConnectionContext {
         self.ensure_open()?;
         let limit = self.limits.max_pending_operations;
         self.in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < limit).then_some(count + 1)
             })
             .map_err(|_| {
