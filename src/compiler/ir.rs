@@ -104,7 +104,7 @@ impl Hash for TypeSchema {
             TypeSchema::Object(fields) => {
                 fields.len().hash(state);
                 let mut fields = fields.iter().collect::<Vec<_>>();
-                fields.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+                fields.sort_unstable_by_key(|(name, _)| *name);
                 for (name, schema) in fields {
                     name.hash(state);
                     schema.hash(state);
