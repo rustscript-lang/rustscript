@@ -3602,10 +3602,9 @@ impl Vm {
         let arg_boundary = self.instance.stack.len();
         match self.execute_builtin_override_call(public_index, value_argc, call_ip) {
             Ok(HostCallExecOutcome::Yielded) => {
-                let mut at = arg_boundary.min(self.instance.stack.len());
-                for operand in hidden.into_iter().rev() {
-                    self.instance.stack.insert(at, operand);
-                    at += 1;
+                let at = arg_boundary.min(self.instance.stack.len());
+                for (offset, operand) in hidden.into_iter().rev().enumerate() {
+                    self.instance.stack.insert(at + offset, operand);
                 }
                 Ok(Some(HostCallExecOutcome::Yielded))
             }

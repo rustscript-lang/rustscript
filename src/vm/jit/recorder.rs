@@ -1317,10 +1317,7 @@ pub(crate) fn record_trace_with_local_count(
     let mut entry_callable_guards = Vec::new();
     let mut inline_frame: Option<InlineRecorderFrame> = None;
 
-    loop {
-        let Some(decoded) = cursor.next()? else {
-            break;
-        };
+    while let Some(decoded) = cursor.next()? {
         let is_useful_native_computation = decoded.is_useful_native_computation();
         let instruction_failure_exit = if decoded.may_need_inline_failure_exit() {
             inline_frame
