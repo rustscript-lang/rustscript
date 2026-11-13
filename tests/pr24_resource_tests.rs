@@ -110,7 +110,7 @@ fn standard_catalog_contains_exact_resource_close_schemas() {
                 HostParamPassing::TakeOwned,
             )]
         );
-        assert_eq!(sqlite_close.return_type, HostTypeSchema::Null);
+        assert_eq!(sqlite_close.return_type, HostTypeSchema::Unit);
     }
     #[cfg(not(all(feature = "sqlite", not(target_family = "wasm"))))]
     assert!(catalog.function("sqlite::close").is_none());
