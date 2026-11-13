@@ -2761,9 +2761,11 @@ impl<'a> TypeContext<'a> {
                         type_args,
                         args,
                         state,
-                        line_context,
-                        source_name,
-                        expr_span,
+                        DiagnosticSite {
+                            line: line_context,
+                            source_name,
+                            span: expr_span,
+                        },
                     )
                 } else if let Some(signature) = self.host_import_signatures.get(index).cloned() {
                     self.validate_host_argument_types(
@@ -2809,9 +2811,11 @@ impl<'a> TypeContext<'a> {
                             type_args,
                             args,
                             state,
-                            line_context,
-                            source_name,
-                            expr_span,
+                            DiagnosticSite {
+                                line: line_context,
+                                source_name,
+                                span: expr_span,
+                            },
                         )
                     } else if let Some(signature) = self.host_import_signatures.get(&index).cloned()
                     {
@@ -2883,22 +2887,11 @@ impl<'a> TypeContext<'a> {
         type_args: &[crate::compiler::ir::TypeSchema],
         args: &[Expr],
         state: &LocalTypeState,
-        line_context: Option<u32>,
-        source_name: Option<&str>,
-        span: Option<Span>,
+        site: DiagnosticSite<'_>,
     ) -> Result<(), CompileError> {
         if builtin == BuiltinFunction::JsonEncode && type_args.is_empty() {
             let arg = args.first().expect("json::encode arity is fixed");
-            return validate_json_encode_argument(
-                arg,
-                state,
-                self,
-                DiagnosticSite {
-                    line: line_context,
-                    source_name,
-                    span,
-                },
-            );
+            return validate_json_encode_argument(arg, state, self, site);
         }
         validate_signature_overloads(
             &display_name_for_builtin(builtin),
@@ -2907,11 +2900,7 @@ impl<'a> TypeContext<'a> {
             args,
             state,
             self,
-            super::validate::DiagnosticSite {
-                line: line_context,
-                source_name,
-                span,
-            },
+            site,
         )
     }
 
