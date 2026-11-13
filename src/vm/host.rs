@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use crate::BuiltinFunction;
 use crate::host_api::{HostImportSchema, HostParamPassing, HostTypeSchema, ResourceTypeKey};
@@ -2560,16 +2560,6 @@ pub(super) enum WaitingHostOpSource {
     CallableStreamTermination,
 }
 
-struct NoopWake;
-
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
-
-fn noop_waker() -> Waker {
-    Waker::from(Arc::new(NoopWake))
-}
-
 #[inline]
 fn builtin_for_binding_name(name: &str) -> Option<BuiltinFunction> {
     if !name.contains("::") {
@@ -3429,8 +3419,8 @@ impl Vm {
     }
 
     pub fn wait_for_host_op_blocking(&mut self) -> VmResult<()> {
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
         loop {
             match self.poll_waiting_host_op(&mut cx) {
                 Poll::Ready(result) => return result,

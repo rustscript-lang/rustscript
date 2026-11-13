@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use vm::compiler::{
     CompileSourceFileOptions, SourceFlavor, compile_source_with_flavor_and_options,
@@ -632,11 +632,7 @@ fn logical_option_sqlite_consumer_compiles_and_runs() {
 }
 
 fn noop_waker() -> Waker {
-    struct LocalNoop;
-    impl Wake for LocalNoop {
-        fn wake(self: Arc<Self>) {}
-    }
-    Waker::from(Arc::new(LocalNoop))
+    Waker::noop().clone()
 }
 
 fn drive_to_halt(vm: &mut vm::vm::Vm) {

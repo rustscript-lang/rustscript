@@ -6,7 +6,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 struct PendingOnce {
     call_count: Arc<AtomicUsize>,
@@ -18,16 +18,6 @@ impl HostFunction for PendingOnce {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         Ok(CallOutcome::Pending(self.op_id))
     }
-}
-
-struct NoopWake;
-
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
-
-fn noop_waker() -> Waker {
-    Waker::from(Arc::new(NoopWake))
 }
 
 fn new_runtime_state_vm(program: Program) -> Vm {
@@ -131,7 +121,7 @@ fn poll_waiting_host_op_reports_missing_async_bridge() {
     let status = vm.run().expect("run should wait");
     assert_eq!(status, VmStatus::Waiting(321));
 
-    let waker = noop_waker();
+    let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
     match vm.poll_waiting_host_op(&mut cx) {
         Poll::Ready(Err(err)) => {

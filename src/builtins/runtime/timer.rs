@@ -806,12 +806,6 @@ mod tests {
     use crate::vm::{HostImportParam, HostImportSchema};
     use crate::{BytecodeBuilder, HostAsyncBridge, HostFunction, HostOpId};
 
-    struct NoopWake;
-
-    impl std::task::Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     #[derive(Default)]
     struct RecordingBackend {
         registrations: Mutex<usize>,
@@ -919,7 +913,7 @@ mod tests {
         );
 
         callback.vm.add_fuel(16).expect("recharge fuel");
-        let waker = Waker::from(Arc::new(NoopWake));
+        let waker = Waker::noop().clone();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(
             callback.poll(&mut cx),
@@ -1465,7 +1459,7 @@ mod tests {
             TimerCallbackStatus::Waiting(_)
         ));
 
-        let waker = Waker::from(Arc::new(NoopWake));
+        let waker = Waker::noop().clone();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(first.poll(&mut cx), Poll::Pending));
         assert!(matches!(second.poll(&mut cx), Poll::Pending));
@@ -1526,7 +1520,7 @@ mod tests {
         ));
         state.lock().expect("bridge state").complete = true;
 
-        let waker = Waker::from(Arc::new(NoopWake));
+        let waker = Waker::noop().clone();
         let mut cx = Context::from_waker(&waker);
         let result = callback.poll(&mut cx);
         assert!(matches!(result, Poll::Ready(Err(_))));
@@ -1550,7 +1544,7 @@ mod tests {
         ));
         state.lock().expect("bridge state").poll_error = true;
 
-        let waker = Waker::from(Arc::new(NoopWake));
+        let waker = Waker::noop().clone();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(callback.poll(&mut cx), Poll::Ready(Err(_))));
         assert_eq!(callback.state(), TimerCallbackStatus::Complete);
@@ -1584,7 +1578,7 @@ mod tests {
             TimerCallbackStatus::Waiting(_)
         ));
         state.lock().expect("bridge state").complete = true;
-        let waker = Waker::from(Arc::new(NoopWake));
+        let waker = Waker::noop().clone();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(
             callback.poll(&mut cx),
@@ -1610,7 +1604,7 @@ mod tests {
         ));
         state.lock().expect("bridge state").poll_error = true;
 
-        let waker = Waker::from(Arc::new(NoopWake));
+        let waker = Waker::noop().clone();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(
             callback.poll_reporting(&mut cx, &backend),
@@ -1661,7 +1655,7 @@ mod tests {
         ));
         state.lock().expect("bridge state").panic_poll = true;
 
-        let waker = Waker::from(Arc::new(NoopWake));
+        let waker = Waker::noop().clone();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(
             callback.poll_reporting(&mut cx, &backend),
@@ -1724,7 +1718,7 @@ mod tests {
         ));
         state.lock().expect("bridge state").complete = true;
 
-        let waker = Waker::from(Arc::new(NoopWake));
+        let waker = Waker::noop().clone();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(
             callback.poll_reporting(&mut cx, &backend),
@@ -1762,7 +1756,7 @@ mod tests {
         ));
         state.lock().expect("bridge state").complete = true;
 
-        let waker = Waker::from(Arc::new(NoopWake));
+        let waker = Waker::noop().clone();
         let mut cx = Context::from_waker(&waker);
         assert!(matches!(
             callback.poll_reporting(&mut cx, &backend),

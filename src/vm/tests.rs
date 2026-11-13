@@ -2645,11 +2645,6 @@ fn async_host_future_completion_error_cleans_up_bridge_operation_once() {
         }
     }
 
-    struct NoopWake;
-    impl std::task::Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     let cleanup_calls = Arc::new(Mutex::new(Vec::new()));
     let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
     vm.set_async_bridge(Box::new(FailingCompletionBridge {
@@ -2667,7 +2662,7 @@ fn async_host_future_completion_error_cleans_up_bridge_operation_once() {
     vm.set_waiting_host_op_with_return(op_id, WaitingHostOpSource::HostBridge, None, None)
         .expect("vm should wait on submitted operation");
 
-    let waker = Waker::from(Arc::new(NoopWake));
+    let waker = Waker::noop().clone();
     let mut cx = Context::from_waker(&waker);
     let result = vm.poll_waiting_host_op(&mut cx);
     assert!(
