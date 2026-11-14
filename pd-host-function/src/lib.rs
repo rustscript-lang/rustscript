@@ -1980,6 +1980,54 @@ mod tests {
     }
 
     #[test]
+    fn runtime_owned_pending_flag_applies_to_the_inferred_contract_path() {
+        let attr: Punctuated<Meta, Token![,]> =
+            parse_quote!(name = "runtime::sleep", runtime_owned_pending);
+        let item: ItemFn = parse_quote! {
+            /// Suspends until the generic runtime operation registry completes it.
+            fn sleep(vm: &mut Vm, ms: i64) -> VmResult<()> {
+                todo!()
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item).unwrap().to_string();
+        assert!(
+            expanded.contains("HostBindingKind :: StaticStackRuntimeOwned"),
+            "the dispatch flag must select the pending-owning binding class without a contract: {expanded}"
+        );
+        assert!(
+            expanded.contains("HostAdapterDescriptor :: StaticStackRuntimeOwned"),
+            "the dispatch flag must select the pending-owning adapter without a contract: {expanded}"
+        );
+        assert!(
+            !expanded.contains("declared_host_contract"),
+            "opting into the pending class must not switch the inferred path to a declared contract: {expanded}"
+        );
+        assert!(
+            expanded.contains("\"runtime::sleep\""),
+            "the inferred path must keep the attribute's guest name: {expanded}"
+        );
+    }
+
+    #[test]
+    fn runtime_owned_pending_flag_rejects_a_non_stack_inferred_signature() {
+        let attr: Punctuated<Meta, Token![,]> =
+            parse_quote!(name = "demo::count", runtime_owned_pending);
+        let item: ItemFn = parse_quote! {
+            /// An argument-only adapter cannot own a pending operation.
+            fn count(ms: i64) -> VmResult<i64> {
+                todo!()
+            }
+        };
+        let error = expand_pd_host_function(attr, item)
+            .expect_err("the pending flag must be rejected on an inferred argument-only signature");
+        assert_eq!(
+            error.to_string(),
+            "runtime_owned_pending requires a stack-dispatch signature (`&mut Vm` or a resource \
+             parameter)"
+        );
+    }
+
+    #[test]
     fn stack_signature_without_the_flag_still_generates_a_plain_stack_adapter() {
         let attr: Punctuated<Meta, Token![,]> =
             parse_quote!(name = "io::open", contract = io_open_contract);

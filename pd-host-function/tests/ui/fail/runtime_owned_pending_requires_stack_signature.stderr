@@ -1,0 +1,5 @@
+error: runtime_owned_pending requires a stack-dispatch signature (`&mut Vm` or a resource parameter)
+ --> tests/ui/fail/runtime_owned_pending_requires_stack_signature.rs:6:4
+  |
+6 | fn pending() -> VmResult<i64> {
+  |    ^^^^^^^
