@@ -336,42 +336,88 @@ fn start_close_io_handle_for_drop_with(
     }
 }
 
-type CloseIoFuture<'a> = Pin<Box<dyn Future<Output = VmResult<()>> + Send + 'a>>;
+/// Why one `io::close` did not reach completion.
+///
+/// The variants are classified where they are produced so the caller can keep
+/// the two guest-visible channels apart: a cleanup failure is a guest `Err`,
+/// while a broken runtime lease is a fatal `VmError`.
+#[derive(Debug)]
+enum CloseFailure {
+    /// The handle could not be flushed, or its process tree could not be
+    /// terminated: a recoverable guest error.
+    Cleanup(String),
+    /// Process cleanup was polled without a live Tokio runtime, so the
+    /// embedding's runtime lease is broken: fatal.
+    RuntimeRequired,
+}
+
+/// The outcome of a close whose handle was still present in the shared slot.
+#[derive(Debug)]
+enum SharedCloseOutcome {
+    /// The handle was flushed/terminated and detached from the slot.
+    Closed,
+    /// Flush or process termination failed. The handle was detached so `Drop`
+    /// still signals the process tree and the scope can retire, and the guest
+    /// receives the message.
+    CleanupFailed(String),
+}
+
+type CloseIoFuture<'a> = Pin<Box<dyn Future<Output = Result<(), CloseFailure>> + Send + 'a>>;
 
 fn close_io_handle_future(handle: &mut IoHandle) -> CloseIoFuture<'_> {
     Box::pin(close_io_handle(handle))
 }
 
+/// Closes the handle owned by `shared`, if it still owns one.
+///
+/// An already-closed slot is fatal and mutates nothing: the resource has
+/// already retired its handle, so there is nothing left to flush, signal, or
+/// retire again. Only a flush or process-termination failure detaches the
+/// handle and becomes the guest `Err` branch, mirroring the blocking backend's
+/// order of "fatal empty slot first, then cleanup outcome".
 async fn close_shared_io_handle_with(
     shared: Arc<Mutex<Option<IoHandle>>>,
     close: impl for<'a> FnOnce(&'a mut IoHandle) -> CloseIoFuture<'a>,
-) -> VmResult<()> {
+) -> VmResult<SharedCloseOutcome> {
     let mut slot = shared.lock().await;
     let handle = slot
         .as_mut()
         .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
-    close(handle).await?;
-    slot.take();
-    Ok(())
+    match close(handle).await {
+        Ok(()) => {
+            slot.take();
+            Ok(SharedCloseOutcome::Closed)
+        }
+        // The handle stays owned: the caller must not retire the scope.
+        Err(CloseFailure::RuntimeRequired) => Err(VmError::HostError(
+            "RuntimeRequired: io::close process cleanup must be polled from a live Tokio runtime"
+                .to_string(),
+        )),
+        // The handle survives a failed flush or a process that will not
+        // terminate. Detach it so the scope retirement can complete while
+        // `Drop` still signals the process tree, and report the failure to the
+        // guest instead of aborting the VM. The handle is gone afterwards, so a
+        // retried close reports a closed slot instead of repeating the cleanup.
+        Err(CloseFailure::Cleanup(message)) => {
+            slot.take();
+            Ok(SharedCloseOutcome::CleanupFailed(message))
+        }
+    }
 }
 
-async fn close_io_handle(handle: &mut IoHandle) -> VmResult<()> {
+async fn close_io_handle(handle: &mut IoHandle) -> Result<(), CloseFailure> {
     if matches!(
         handle,
         IoHandle::PopenRead { .. } | IoHandle::PopenWrite { .. }
     ) && tokio::runtime::Handle::try_current().is_err()
     {
-        return Err(VmError::HostError(
-            "RuntimeRequired: io::close process cleanup must be polled from a live Tokio runtime"
-                .to_string(),
-        ));
+        return Err(CloseFailure::RuntimeRequired);
     }
     match handle {
         IoHandle::File(file) => {
-            file.get_mut()
-                .flush()
-                .await
-                .map_err(|error| VmError::HostError(format!("io_close flush failed: {error}")))?;
+            file.get_mut().flush().await.map_err(|error| {
+                CloseFailure::Cleanup(format!("io_close flush failed: {error}"))
+            })?;
         }
         IoHandle::PopenRead { child, .. } => {
             terminate_child_tree(child).await?;
@@ -384,11 +430,11 @@ async fn close_io_handle(handle: &mut IoHandle) -> VmResult<()> {
     Ok(())
 }
 
-async fn terminate_child_tree(child: &mut Child) -> VmResult<()> {
+async fn terminate_child_tree(child: &mut Child) -> Result<(), CloseFailure> {
     let pid = child.id().unwrap_or(0);
     terminate_process_tree_and_leader(|| terminate_process_id(pid), || kill_and_reap_child(child))
         .await
-        .map_err(|error| VmError::HostError(format!("io_close popen terminate failed: {error}")))
+        .map_err(|error| CloseFailure::Cleanup(format!("io_close popen terminate failed: {error}")))
 }
 
 async fn kill_and_reap_child(child: &mut Child) -> io::Result<()> {
@@ -872,16 +918,16 @@ pub(crate) async fn builtin_io_close(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
 ) -> VmResult<HostFutureOutput<GuestResult<(), String>>> {
-    let closed =
-        close_shared_io_handle_with(Arc::clone(&context.handle), close_io_handle_future).await;
-    let mut close_failure = None;
-    if let Err(error) = closed {
-        // Take the failed handle out of the shared slot so the drop path
-        // signals the process tree and the scope can still retire it; the
-        // guest reports the cleanup failure instead of aborting the VM.
-        context.handle.lock().await.take();
-        close_failure = Some(error.to_string());
-    }
+    // A closed slot returns before any retirement: that handle is already gone,
+    // so retiring the scope again would corrupt the accounting the fatal error
+    // is reporting.
+    let close_failure =
+        match close_shared_io_handle_with(Arc::clone(&context.handle), close_io_handle_future)
+            .await?
+        {
+            SharedCloseOutcome::Closed => None,
+            SharedCloseOutcome::CleanupFailed(message) => Some(message),
+        };
     let resource = context.resource;
     Ok(HostFutureOutput::complete(move |vm| {
         let progress = vm
@@ -1094,23 +1140,31 @@ mod tests {
     fn pending_close<'a>(
         _handle: &'a mut IoHandle,
         started: Arc<StdMutex<bool>>,
-    ) -> Pin<Box<dyn Future<Output = VmResult<()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), CloseFailure>> + Send + 'a>> {
         Box::pin(async move {
             *started.lock().expect("started lock") = true;
             pending().await
         })
     }
 
+    /// Fails the close the way a real flush or process termination would.
+    fn failing_close<'a>(
+        _handle: &'a mut IoHandle,
+        message: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CloseFailure>> + Send + 'a>> {
+        Box::pin(async move { Err(CloseFailure::Cleanup(message.to_string())) })
+    }
+
     #[cfg(unix)]
     fn start_process_kill_then_pending<'a>(
         handle: &'a mut IoHandle,
         started: Arc<StdMutex<bool>>,
-    ) -> Pin<Box<dyn Future<Output = VmResult<()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), CloseFailure>> + Send + 'a>> {
         Box::pin(async move {
             match handle {
                 IoHandle::PopenRead { child, .. } | IoHandle::PopenWrite { child, .. } => {
                     child.start_kill().map_err(|error| {
-                        VmError::HostError(format!("test process kill failed: {error}"))
+                        CloseFailure::Cleanup(format!("test process kill failed: {error}"))
                     })?;
                 }
                 IoHandle::File(_) => panic!("expected process handle"),
@@ -1118,6 +1172,68 @@ mod tests {
             *started.lock().expect("started lock") = true;
             pending().await
         })
+    }
+
+    #[tokio::test]
+    async fn closed_slot_close_is_fatal_and_touches_nothing() {
+        let resource = file_resource();
+        let shared = Arc::clone(&resource.handle);
+        // The resource already retired its handle; the slot is empty.
+        shared.lock().await.take();
+        let ran = Arc::new(StdMutex::new(false));
+        let close_ran = Arc::clone(&ran);
+
+        let error = close_shared_io_handle_with(Arc::clone(&shared), move |handle| {
+            *close_ran.lock().expect("ran lock") = true;
+            failing_close(handle, "must not run")
+        })
+        .await
+        .expect_err("a closed slot must stay fatal instead of becoming a guest error");
+
+        assert!(
+            matches!(&error, VmError::HostError(message) if message == "io handle is closed"),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            !*ran.lock().expect("ran lock"),
+            "a closed slot must not reach the cleanup closure"
+        );
+        assert!(
+            shared.lock().await.is_none(),
+            "a closed slot must not take or restore a handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_detaches_the_handle_and_cannot_be_retried() {
+        let resource = file_resource();
+        let shared = Arc::clone(&resource.handle);
+
+        let outcome = close_shared_io_handle_with(Arc::clone(&shared), |handle| {
+            failing_close(handle, "io_close flush failed: fixture")
+        })
+        .await
+        .expect("a flush failure is a guest error, not a VM fault");
+        assert!(
+            matches!(
+                &outcome,
+                SharedCloseOutcome::CleanupFailed(message)
+                    if message == "io_close flush failed: fixture"
+            ),
+            "unexpected close outcome"
+        );
+        assert!(
+            shared.lock().await.is_none(),
+            "the failed handle must be detached so Drop signals and the scope can retire"
+        );
+
+        let error = close_shared_io_handle_with(Arc::clone(&shared), close_io_handle_future)
+            .await
+            .expect_err("a detached handle must not be closable twice");
+        assert!(
+            matches!(&error, VmError::HostError(message) if message == "io handle is closed"),
+            "the retry must report the closed slot, not repeat the cleanup: {error:?}"
+        );
     }
 
     #[tokio::test]

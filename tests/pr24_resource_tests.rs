@@ -15,6 +15,14 @@ fn key(name: &str) -> ResourceTypeKey {
     ResourceTypeKey::new(name).expect("test resource key")
 }
 
+/// The recoverable IO contract: the success payload, or a string error.
+fn io_result(ok: TypeSchema) -> TypeSchema {
+    TypeSchema::Result {
+        ok: Box::new(ok),
+        err: Box::new(TypeSchema::String),
+    }
+}
+
 #[test]
 fn resource_schema_is_nominal_and_preserves_its_key() {
     let schema = TypeSchema::Resource(key("sqlite.connection"));
@@ -95,7 +103,14 @@ fn standard_catalog_contains_exact_resource_close_schemas() {
             HostParamPassing::TakeOwned,
         )]
     );
-    assert_eq!(io_close.return_type, HostTypeSchema::Bool);
+    assert_eq!(
+        io_close.return_type,
+        HostTypeSchema::Result {
+            ok: Box::new(HostTypeSchema::Unit),
+            err: Box::new(HostTypeSchema::String),
+        },
+        "io::close reports the flush/terminate outcome as Result<(), string>"
+    );
 
     #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
     {
@@ -126,14 +141,18 @@ fn standard_catalog_resolves_open_then_close_with_nominal_ownership() {
         .expect("standard io::open resolves");
     assert_eq!(
         file.return_type,
-        TypeSchema::Resource(key("io.file")),
-        "io::open must produce the IO resource key"
+        io_result(TypeSchema::Resource(key("io.file"))),
+        "io::open must produce the IO resource key inside its Result contract"
     );
     let io_close = resolver
         .resolve("io::close", &[TypeSchema::Resource(key("io.file"))])
         .expect("standard io::close resolves");
     assert_eq!(io_close.passing, vec![HostParamPassing::TakeOwned]);
-    assert_eq!(io_close.return_type, TypeSchema::Bool);
+    assert_eq!(
+        io_close.return_type,
+        io_result(TypeSchema::Unit),
+        "io::close resolves to Result<(), string>"
+    );
 
     #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
     {
@@ -170,16 +189,24 @@ fn default_source_compilation_accepts_open_use_close_ownership_flow() {
     let source = r#"
         use io;
         use sqlite;
-        let file = io::open("Cargo.toml", "r");
-        io::close(file);
+        fn open_and_close() -> Result<bool, string> {
+            let file = io::open("Cargo.toml", "r")?;
+            io::close(file)?;
+            Result::Ok(true)
+        }
+        open_and_close();
         let connection = sqlite::open({});
         sqlite::close(connection);
     "#;
     #[cfg(not(all(feature = "sqlite", not(target_family = "wasm"))))]
     let source = r#"
         use io;
-        let file = io::open("Cargo.toml", "r");
-        io::close(file);
+        fn open_and_close() -> Result<bool, string> {
+            let file = io::open("Cargo.toml", "r")?;
+            io::close(file)?;
+            Result::Ok(true)
+        }
+        open_and_close();
     "#;
     compile_source_with_flavor_and_options(source, vm::SourceFlavor::RustScript, options)
         .expect("standard catalog must compile normal open/use/close ownership flow");
@@ -264,9 +291,13 @@ fn closure_capture_can_transfer_resource_to_take_owned_host_call() {
         CompileSourceFileOptions::new().with_host_api_catalog(vm::standard_host_catalog());
     let source = r#"
         use io;
-        let file = io::open("Cargo.toml", "r");
-        let close_file = || io::close(file);
-        close_file();
+        fn close_in_closure() -> Result<bool, string> {
+            let file = io::open("Cargo.toml", "r")?;
+            let close_file = || io::close(file);
+            close_file()?;
+            Result::Ok(true)
+        }
+        close_in_closure();
     "#;
     compile_source_with_flavor_and_options(source, vm::SourceFlavor::RustScript, options)
         .expect("a closure may move its captured resource into a TakeOwned host call");

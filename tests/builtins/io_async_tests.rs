@@ -599,3 +599,81 @@ fn async_io_write_reports_bytes_and_close_reports_unit() {
     );
     let _ = std::fs::remove_file(path);
 }
+
+/// A missing file is an ordinary guest outcome on the async backend: the call
+/// reports `Err(message)` and the VM keeps running.
+#[test]
+fn async_io_open_missing_file_is_a_guest_error() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should follow Unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "pd-vm-async-missing-{}-{nonce}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let stack = run_source(&format!(
+        r#"
+        match io::open("{path}", "r") {{
+            Result::Ok(handle) => "unexpected success",
+            Result::Err(message) => message,
+        }};
+        "#,
+        path = path.display()
+    ))
+    .expect("a missing file must not abort the async VM");
+
+    let Some(Value::String(message)) = stack.last() else {
+        panic!("a missing file must report a guest Err string, got {stack:?}");
+    };
+    assert!(
+        message.contains("io_open failed"),
+        "the guest error must keep the operating-system text: {message}"
+    );
+    assert!(
+        !path.exists(),
+        "a failed open must not create the missing path"
+    );
+}
+
+/// `io::close` takes the handle, so neither a successful close nor a close that
+/// reported a cleanup failure can be retried through the same guest handle: the
+/// second call is a fatal stale-handle error.
+#[test]
+fn async_io_close_cannot_be_retried_through_the_same_handle() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should follow Unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "pd-vm-async-close-retry-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::write(&path, "retry").expect("fixture should be written");
+
+    let error = run_source(&format!(
+        r#"
+        fn probe() -> Result<bool, string> {{
+            let handle = io::open("{path}", "r")?;
+            io::close(handle)?;
+            io::close(handle)?;
+            Result::Ok(true)
+        }}
+        probe();
+        "#,
+        path = path.display()
+    ))
+    .expect_err("a retried close must fail instead of repeating the cleanup");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("stale")
+            || message.contains("not found")
+            || message.contains("closed")
+            || message.contains("invalid"),
+        "a retried close must be rejected: {message}"
+    );
+    let _ = std::fs::remove_file(path);
+}
