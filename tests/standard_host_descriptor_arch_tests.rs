@@ -23,16 +23,28 @@ use std::path::{Path, PathBuf};
 const HTTP_SURFACE_ENABLED: bool = cfg!(all(feature = "http-client", not(target_family = "wasm")));
 
 // Current descriptor identities, selected for the actual native feature set.
+//
+// These were re-pinned when `timer::at` / `timer::every` moved from a fixed
+// `true` result to the logical Unit result: the timer module schema is part of
+// both the timer and the composed standard catalog identity. The composed
+// standard catalog also carries `runtime::sleep` (same Unit result) and the
+// `aot::compile` / `aot::clear` command hosts, so any result-type change to
+// those two surface families re-pins these values as well.
+//
+// They were re-pinned again when the `io` module reported its outcomes as
+// `Result` instead of sentinel values: `io` is composed into every build, so
+// its schema change moves both the `io` catalog identity and all four composed
+// standard identities.
 const SQLITE_SURFACE_ENABLED: bool = cfg!(all(feature = "sqlite", not(target_family = "wasm")));
-const STANDARD_CATALOG_FINGERPRINT_HTTP_SQLITE: &str = "b704c1210e3ab4a4";
-const STANDARD_CATALOG_FINGERPRINT_SQLITE: &str = "6cad8e423debdebd";
-const STANDARD_CATALOG_FINGERPRINT_HTTP: &str = "c9e705595cfd2cc7";
-const STANDARD_CATALOG_FINGERPRINT_BASE: &str = "8254b00d727494b4";
-const IO_CATALOG_FINGERPRINT: &str = "a16730bd11bf5e10";
+const STANDARD_CATALOG_FINGERPRINT_HTTP_SQLITE: &str = "2cd4d66a50e0cc47";
+const STANDARD_CATALOG_FINGERPRINT_SQLITE: &str = "34b88854300802c8";
+const STANDARD_CATALOG_FINGERPRINT_HTTP: &str = "48b693a20f1b92d0";
+const STANDARD_CATALOG_FINGERPRINT_BASE: &str = "8bf67281072b7f1d";
+const IO_CATALOG_FINGERPRINT: &str = "c8877c93e38dd831";
 #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
 const SQLITE_CATALOG_FINGERPRINT: &str = "740ab59ccb8fd09a";
 const JIT_CATALOG_FINGERPRINT: &str = "ae81318e8a018681";
-const TIMER_CATALOG_FINGERPRINT: &str = "7ecc0517cea3570b";
+const TIMER_CATALOG_FINGERPRINT: &str = "cf14ffffd6b39273";
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
 const HTTP_CATALOG_FINGERPRINT: &str = "41e6557a7dd03118";
 fn standard_catalog_fingerprint() -> &'static str {

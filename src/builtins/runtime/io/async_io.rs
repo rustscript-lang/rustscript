@@ -30,6 +30,7 @@ use crate::vm::resource::close::{CloseProgress, HostResource};
 use crate::vm::resource::error::{ResourceError, ResourceErrorCode, ResourceResult};
 use crate::vm::resource::{ResourceCloseReason, ResourceHandle};
 use crate::vm::{CaptureAsyncHostContext, HostFutureOutput, Value, Vm, VmError, VmResult};
+use crate::{GuestOption, GuestResult, ResourceOwned};
 
 /// A file / child-process backed IO handle.
 #[derive(Debug)]
@@ -335,42 +336,88 @@ fn start_close_io_handle_for_drop_with(
     }
 }
 
-type CloseIoFuture<'a> = Pin<Box<dyn Future<Output = VmResult<()>> + Send + 'a>>;
+/// Why one `io::close` did not reach completion.
+///
+/// The variants are classified where they are produced so the caller can keep
+/// the two guest-visible channels apart: a cleanup failure is a guest `Err`,
+/// while a broken runtime lease is a fatal `VmError`.
+#[derive(Debug)]
+enum CloseFailure {
+    /// The handle could not be flushed, or its process tree could not be
+    /// terminated: a recoverable guest error.
+    Cleanup(String),
+    /// Process cleanup was polled without a live Tokio runtime, so the
+    /// embedding's runtime lease is broken: fatal.
+    RuntimeRequired,
+}
+
+/// The outcome of a close whose handle was still present in the shared slot.
+#[derive(Debug)]
+enum SharedCloseOutcome {
+    /// The handle was flushed/terminated and detached from the slot.
+    Closed,
+    /// Flush or process termination failed. The handle was detached so `Drop`
+    /// still signals the process tree and the scope can retire, and the guest
+    /// receives the message.
+    CleanupFailed(String),
+}
+
+type CloseIoFuture<'a> = Pin<Box<dyn Future<Output = Result<(), CloseFailure>> + Send + 'a>>;
 
 fn close_io_handle_future(handle: &mut IoHandle) -> CloseIoFuture<'_> {
     Box::pin(close_io_handle(handle))
 }
 
+/// Closes the handle owned by `shared`, if it still owns one.
+///
+/// An already-closed slot is fatal and mutates nothing: the resource has
+/// already retired its handle, so there is nothing left to flush, signal, or
+/// retire again. Only a flush or process-termination failure detaches the
+/// handle and becomes the guest `Err` branch, mirroring the blocking backend's
+/// order of "fatal empty slot first, then cleanup outcome".
 async fn close_shared_io_handle_with(
     shared: Arc<Mutex<Option<IoHandle>>>,
     close: impl for<'a> FnOnce(&'a mut IoHandle) -> CloseIoFuture<'a>,
-) -> VmResult<()> {
+) -> VmResult<SharedCloseOutcome> {
     let mut slot = shared.lock().await;
     let handle = slot
         .as_mut()
         .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
-    close(handle).await?;
-    slot.take();
-    Ok(())
+    match close(handle).await {
+        Ok(()) => {
+            slot.take();
+            Ok(SharedCloseOutcome::Closed)
+        }
+        // The handle stays owned: the caller must not retire the scope.
+        Err(CloseFailure::RuntimeRequired) => Err(VmError::HostError(
+            "RuntimeRequired: io::close process cleanup must be polled from a live Tokio runtime"
+                .to_string(),
+        )),
+        // The handle survives a failed flush or a process that will not
+        // terminate. Detach it so the scope retirement can complete while
+        // `Drop` still signals the process tree, and report the failure to the
+        // guest instead of aborting the VM. The handle is gone afterwards, so a
+        // retried close reports a closed slot instead of repeating the cleanup.
+        Err(CloseFailure::Cleanup(message)) => {
+            slot.take();
+            Ok(SharedCloseOutcome::CleanupFailed(message))
+        }
+    }
 }
 
-async fn close_io_handle(handle: &mut IoHandle) -> VmResult<()> {
+async fn close_io_handle(handle: &mut IoHandle) -> Result<(), CloseFailure> {
     if matches!(
         handle,
         IoHandle::PopenRead { .. } | IoHandle::PopenWrite { .. }
     ) && tokio::runtime::Handle::try_current().is_err()
     {
-        return Err(VmError::HostError(
-            "RuntimeRequired: io::close process cleanup must be polled from a live Tokio runtime"
-                .to_string(),
-        ));
+        return Err(CloseFailure::RuntimeRequired);
     }
     match handle {
         IoHandle::File(file) => {
-            file.get_mut()
-                .flush()
-                .await
-                .map_err(|error| VmError::HostError(format!("io_close flush failed: {error}")))?;
+            file.get_mut().flush().await.map_err(|error| {
+                CloseFailure::Cleanup(format!("io_close flush failed: {error}"))
+            })?;
         }
         IoHandle::PopenRead { child, .. } => {
             terminate_child_tree(child).await?;
@@ -383,11 +430,11 @@ async fn close_io_handle(handle: &mut IoHandle) -> VmResult<()> {
     Ok(())
 }
 
-async fn terminate_child_tree(child: &mut Child) -> VmResult<()> {
+async fn terminate_child_tree(child: &mut Child) -> Result<(), CloseFailure> {
     let pid = child.id().unwrap_or(0);
     terminate_process_tree_and_leader(|| terminate_process_id(pid), || kill_and_reap_child(child))
         .await
-        .map_err(|error| VmError::HostError(format!("io_close popen terminate failed: {error}")))
+        .map_err(|error| CloseFailure::Cleanup(format!("io_close popen terminate failed: {error}")))
 }
 
 async fn kill_and_reap_child(child: &mut Child) -> io::Result<()> {
@@ -582,12 +629,22 @@ impl CaptureAsyncHostContext for IoHandleContext {
 }
 
 /// Opens a file handle for runtime I/O.
+///
+/// Only the `OpenOptions` failure is a guest error; an unsupported mode and a
+/// policy denial stay fatal.
+///
+/// The async adapter returns the guest `Value` carrier instead of
+/// `HostFutureOutput<GuestResult<ResourceOwned<IoResource>, String>>` because
+/// the host SDK rejects owned resources crossing a future publication. The
+/// declared contract is unchanged, and [`publish_open_handle`] reuses
+/// `publish_owned`, so ownership, schema validation and rollback stay
+/// identical to the blocking backend.
 #[pd_host_function(name = "io::open", contract = super::io_open_contract)]
 pub(crate) async fn builtin_io_open(
     #[pd_host_context] context: IoPolicyContext,
     path: String,
     mode: String,
-) -> VmResult<HostFutureOutput<i64>> {
+) -> VmResult<HostFutureOutput<Value>> {
     let writes = match mode.as_str() {
         "r" => false,
         "w" | "a" | "r+" | "w+" | "a+" => true,
@@ -620,27 +677,26 @@ pub(crate) async fn builtin_io_open(
         }
         _ => unreachable!("mode validated above"),
     }
-    let file = options
-        .open(path)
-        .await
-        .map_err(|error| VmError::HostError(format!("io_open failed: {error}")))?;
+    let file = match options.open(path).await {
+        Ok(file) => file,
+        Err(error) => return Ok(io_error_output("io_open", error)),
+    };
     let handle = IoHandle::File(BufReader::new(file));
     Ok(HostFutureOutput::complete(move |vm| {
-        let token = vm
-            .execution_scope()
-            .push_resource(IoResource::new(handle))
-            .map_err(|error| VmError::HostError(format!("io resource insert failed: {error}")))?;
-        Ok(token.into_handle().raw() as i64)
+        publish_open_handle(vm, handle, super::io_open_contract().return_type)
     }))
 }
 
 /// Starts a child process and returns a process-backed handle.
-#[pd_host_function(name = "io::popen")]
+///
+/// An unsupported mode and a disabled process capability stay fatal; a process
+/// that cannot be started or wired up is a guest error.
+#[pd_host_function(name = "io::popen", contract = super::io_popen_contract)]
 pub(crate) async fn builtin_io_popen(
     #[pd_host_context] context: IoPolicyContext,
     command: String,
     mode: String,
-) -> VmResult<HostFutureOutput<i64>> {
+) -> VmResult<HostFutureOutput<Value>> {
     if mode != "r" && mode != "w" {
         return Err(VmError::HostError(format!(
             "unsupported io_popen mode '{mode}', expected r or w"
@@ -655,28 +711,62 @@ pub(crate) async fn builtin_io_popen(
             "io_popen requires the process capability".to_string(),
         ));
     }
-    let handle = spawn_shell_command(&command, &mode)?;
+    let handle = match spawn_shell_command(&command, &mode) {
+        Ok(handle) => handle,
+        Err(message) => {
+            return Ok(HostFutureOutput::returning(crate::result::carrier(
+                false,
+                Value::string(&message),
+            )));
+        }
+    };
     Ok(HostFutureOutput::complete(move |vm| {
-        let token = vm
-            .execution_scope()
-            .push_resource(IoResource::new(handle))
-            .map_err(|error| VmError::HostError(format!("io resource insert failed: {error}")))?;
-        Ok(token.into_handle().raw() as i64)
+        publish_open_handle(vm, handle, super::io_popen_contract().return_type)
     }))
 }
 
+/// Publishes an opened handle as the `Ok` branch of `io.open` / `io.popen`.
+///
+/// `publish_owned` validates the assembled carrier against `schema`, inserts
+/// the resource into the execution scope and rolls the insertion back when
+/// assembly fails, so the async adapter keeps the blocking backend's ownership
+/// guarantees despite crossing the future boundary with a plain `Value`.
+fn publish_open_handle(
+    vm: &mut Vm,
+    handle: IoHandle,
+    schema: crate::HostTypeSchema,
+) -> VmResult<Value> {
+    crate::result::publish_owned::<IoResource, _>(
+        vm,
+        ResourceOwned::new(IoResource::new(handle)),
+        &schema,
+        |token| Ok(crate::result::carrier(true, token)),
+    )
+}
+
+/// The guest `Err` carrier of a recoverable IO failure.
+fn io_error_output(operation: &str, error: io::Error) -> HostFutureOutput<Value> {
+    HostFutureOutput::returning(crate::result::carrier(
+        false,
+        Value::string(super::io_failure(operation, error)),
+    ))
+}
+
 /// Reads all remaining text from an I/O handle.
+///
+/// A read failure is a guest error; an unusable handle kind and the read limit
+/// stay fatal.
 #[pd_host_function(name = "io::read_all", contract = super::io_read_all_contract)]
 pub(crate) async fn builtin_io_read_all(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
-) -> VmResult<HostFutureOutput<String>> {
+) -> VmResult<HostFutureOutput<GuestResult<String, String>>> {
     let mut slot = context.handle.lock().await;
     let handle = slot
         .as_mut()
         .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
     let mut out = String::new();
-    match handle {
+    let read = match handle {
         IoHandle::File(file) => file.read_to_string(&mut out).await,
         IoHandle::PopenRead { stdout, .. } => stdout.read_to_string(&mut out).await,
         IoHandle::PopenWrite { .. } => {
@@ -684,8 +774,12 @@ pub(crate) async fn builtin_io_read_all(
                 "io_read_all requires a readable handle".to_string(),
             ));
         }
+    };
+    if let Err(error) = read {
+        return Ok(HostFutureOutput::returning(GuestResult::Err(
+            super::io_failure("io_read_all", error),
+        )));
     }
-    .map_err(|error| VmError::HostError(format!("io_read_all failed: {error}")))?;
     if context
         .max_read_bytes
         .is_some_and(|limit| out.len() > limit)
@@ -694,21 +788,25 @@ pub(crate) async fn builtin_io_read_all(
             "io_read_all exceeded read limit".to_string(),
         ));
     }
-    Ok(HostFutureOutput::returning(out))
+    Ok(HostFutureOutput::returning(GuestResult::Ok(out)))
 }
 
 /// Reads a single line of text from an I/O handle.
-#[pd_host_function(name = "io::read_line")]
+///
+/// End of file is `Ok(None)` and an empty line is `Ok(Some(""))`: the returned
+/// line has its single trailing `\n` removed. A read failure is a guest error;
+/// an unusable handle kind and the read limit stay fatal.
+#[pd_host_function(name = "io::read_line", contract = super::io_read_line_contract)]
 pub(crate) async fn builtin_io_read_line(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
-) -> VmResult<HostFutureOutput<String>> {
+) -> VmResult<HostFutureOutput<GuestResult<GuestOption<String>, String>>> {
     let mut slot = context.handle.lock().await;
     let handle = slot
         .as_mut()
         .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
     let mut line = String::new();
-    match handle {
+    let read = match handle {
         IoHandle::File(file) => file.read_line(&mut line).await,
         IoHandle::PopenRead { stdout, .. } => stdout.read_line(&mut line).await,
         IoHandle::PopenWrite { .. } => {
@@ -716,8 +814,23 @@ pub(crate) async fn builtin_io_read_line(
                 "io_read_line requires a readable handle".to_string(),
             ));
         }
+    };
+    let read = match read {
+        Ok(read) => read,
+        Err(error) => {
+            return Ok(HostFutureOutput::returning(GuestResult::Err(
+                super::io_failure("io_read_line", error),
+            )));
+        }
+    };
+    if read == 0 {
+        return Ok(HostFutureOutput::returning(GuestResult::Ok(
+            GuestOption::None,
+        )));
     }
-    .map_err(|error| VmError::HostError(format!("io_read_line failed: {error}")))?;
+    if line.ends_with('\n') {
+        line.pop();
+    }
     if context
         .max_read_bytes
         .is_some_and(|limit| line.len() > limit)
@@ -726,16 +839,21 @@ pub(crate) async fn builtin_io_read_line(
             "io_read_line exceeded read limit".to_string(),
         ));
     }
-    Ok(HostFutureOutput::returning(line))
+    Ok(HostFutureOutput::returning(GuestResult::Ok(
+        GuestOption::Some(line),
+    )))
 }
 
 /// Writes text to an I/O handle.
-#[pd_host_function(name = "io::write")]
+///
+/// A write failure is a guest error; an unusable handle kind and the write
+/// limit stay fatal.
+#[pd_host_function(name = "io::write", contract = super::io_write_contract)]
 pub(crate) async fn builtin_io_write(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
     text: String,
-) -> VmResult<HostFutureOutput<i64>> {
+) -> VmResult<HostFutureOutput<GuestResult<i64, String>>> {
     if context
         .max_write_bytes
         .is_some_and(|limit| text.len() > limit)
@@ -756,37 +874,60 @@ pub(crate) async fn builtin_io_write(
                 "io_write requires a writable handle".to_string(),
             ));
         }
+    };
+    match written {
+        Ok(written) => Ok(HostFutureOutput::returning(GuestResult::Ok(written as i64))),
+        Err(error) => Ok(HostFutureOutput::returning(GuestResult::Err(
+            super::io_failure("io_write", error),
+        ))),
     }
-    .map_err(|error| VmError::HostError(format!("io_write failed: {error}")))?;
-    Ok(HostFutureOutput::returning(written as i64))
 }
 
 /// Flushes buffered output for an I/O handle.
-#[pd_host_function(name = "io::flush")]
+///
+/// A flush failure is a guest error; an unusable handle kind stays fatal.
+#[pd_host_function(name = "io::flush", contract = super::io_flush_contract)]
 pub(crate) async fn builtin_io_flush(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
-) -> VmResult<HostFutureOutput<bool>> {
+) -> VmResult<HostFutureOutput<GuestResult<(), String>>> {
     let mut slot = context.handle.lock().await;
     let handle = slot
         .as_mut()
         .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
-    match handle {
+    let flushed = match handle {
         IoHandle::File(file) => file.get_mut().flush().await,
         IoHandle::PopenWrite { stdin, .. } => stdin.flush().await,
         IoHandle::PopenRead { .. } => Ok(()),
+    };
+    match flushed {
+        Ok(()) => Ok(HostFutureOutput::returning(GuestResult::Ok(()))),
+        Err(error) => Ok(HostFutureOutput::returning(GuestResult::Err(
+            super::io_failure("io_flush", error),
+        ))),
     }
-    .map_err(|error| VmError::HostError(format!("io_flush failed: {error}")))?;
-    Ok(HostFutureOutput::returning(true))
 }
 
 /// Closes an I/O handle.
+///
+/// A cleanup (flush or process termination) failure is a guest error and still
+/// retires the scope resource; an already-closed handle and a pending scope
+/// retirement stay fatal.
 #[pd_host_function(name = "io::close", contract = super::io_close_contract)]
 pub(crate) async fn builtin_io_close(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
-) -> VmResult<HostFutureOutput<bool>> {
-    close_shared_io_handle_with(Arc::clone(&context.handle), close_io_handle_future).await?;
+) -> VmResult<HostFutureOutput<GuestResult<(), String>>> {
+    // A closed slot returns before any retirement: that handle is already gone,
+    // so retiring the scope again would corrupt the accounting the fatal error
+    // is reporting.
+    let close_failure =
+        match close_shared_io_handle_with(Arc::clone(&context.handle), close_io_handle_future)
+            .await?
+        {
+            SharedCloseOutcome::Closed => None,
+            SharedCloseOutcome::CleanupFailed(message) => Some(message),
+        };
     let resource = context.resource;
     Ok(HostFutureOutput::complete(move |vm| {
         let progress = vm
@@ -800,7 +941,10 @@ pub(crate) async fn builtin_io_close(
                 "io_close scope retirement is still pending".to_string(),
             ));
         }
-        Ok(true)
+        Ok(match close_failure {
+            Some(message) => GuestResult::Err(message),
+            None => GuestResult::Ok(()),
+        })
     }))
 }
 
@@ -913,7 +1057,10 @@ fn io_parse_handle(handle_id: i64) -> VmResult<ResourceHandle> {
         .map_err(|error| VmError::HostError(format!("invalid io handle id {handle_id}: {error}")))
 }
 
-fn spawn_shell_command(shell_command: &str, mode: &str) -> VmResult<IoHandle> {
+/// Starts the shell for a `popen` handle.
+///
+/// Failures are formatted for the guest error channel of [`builtin_io_popen`].
+fn spawn_shell_command(shell_command: &str, mode: &str) -> Result<IoHandle, String> {
     let mut process = if cfg!(windows) {
         let mut command = Command::new("cmd");
         command.arg("/C").arg(shell_command);
@@ -936,16 +1083,16 @@ fn spawn_shell_command(shell_command: &str, mode: &str) -> VmResult<IoHandle> {
     }
     let mut child = process
         .spawn()
-        .map_err(|error| VmError::HostError(format!("io_popen failed: {error}")))?;
+        .map_err(|error| super::io_failure("io_popen", error))?;
     if mode == "r" {
         let Some(stdout) = child.stdout.take() else {
             let cleanup = start_terminate_child_tree_for_drop(&mut child);
-            return Err(VmError::HostError(match cleanup {
+            return Err(match cleanup {
                 Ok(()) => "io_popen('r') did not provide stdout pipe".to_string(),
                 Err(error) => format!(
                     "io_popen('r') did not provide stdout pipe; process cleanup failed: {error}"
                 ),
-            }));
+            });
         };
         Ok(IoHandle::PopenRead {
             child,
@@ -954,12 +1101,12 @@ fn spawn_shell_command(shell_command: &str, mode: &str) -> VmResult<IoHandle> {
     } else {
         let Some(stdin) = child.stdin.take() else {
             let cleanup = start_terminate_child_tree_for_drop(&mut child);
-            return Err(VmError::HostError(match cleanup {
+            return Err(match cleanup {
                 Ok(()) => "io_popen('w') did not provide stdin pipe".to_string(),
                 Err(error) => format!(
                     "io_popen('w') did not provide stdin pipe; process cleanup failed: {error}"
                 ),
-            }));
+            });
         };
         Ok(IoHandle::PopenWrite { child, stdin })
     }
@@ -993,23 +1140,31 @@ mod tests {
     fn pending_close<'a>(
         _handle: &'a mut IoHandle,
         started: Arc<StdMutex<bool>>,
-    ) -> Pin<Box<dyn Future<Output = VmResult<()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), CloseFailure>> + Send + 'a>> {
         Box::pin(async move {
             *started.lock().expect("started lock") = true;
             pending().await
         })
     }
 
+    /// Fails the close the way a real flush or process termination would.
+    fn failing_close<'a>(
+        _handle: &'a mut IoHandle,
+        message: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), CloseFailure>> + Send + 'a>> {
+        Box::pin(async move { Err(CloseFailure::Cleanup(message.to_string())) })
+    }
+
     #[cfg(unix)]
     fn start_process_kill_then_pending<'a>(
         handle: &'a mut IoHandle,
         started: Arc<StdMutex<bool>>,
-    ) -> Pin<Box<dyn Future<Output = VmResult<()>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), CloseFailure>> + Send + 'a>> {
         Box::pin(async move {
             match handle {
                 IoHandle::PopenRead { child, .. } | IoHandle::PopenWrite { child, .. } => {
                     child.start_kill().map_err(|error| {
-                        VmError::HostError(format!("test process kill failed: {error}"))
+                        CloseFailure::Cleanup(format!("test process kill failed: {error}"))
                     })?;
                 }
                 IoHandle::File(_) => panic!("expected process handle"),
@@ -1017,6 +1172,214 @@ mod tests {
             *started.lock().expect("started lock") = true;
             pending().await
         })
+    }
+
+    #[tokio::test]
+    async fn closed_slot_close_is_fatal_and_touches_nothing() {
+        let resource = file_resource();
+        let shared = Arc::clone(&resource.handle);
+        // The resource already retired its handle; the slot is empty.
+        shared.lock().await.take();
+        let ran = Arc::new(StdMutex::new(false));
+        let close_ran = Arc::clone(&ran);
+
+        let error = close_shared_io_handle_with(Arc::clone(&shared), move |handle| {
+            *close_ran.lock().expect("ran lock") = true;
+            failing_close(handle, "must not run")
+        })
+        .await
+        .expect_err("a closed slot must stay fatal instead of becoming a guest error");
+
+        assert!(
+            matches!(&error, VmError::HostError(message) if message == "io handle is closed"),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            !*ran.lock().expect("ran lock"),
+            "a closed slot must not reach the cleanup closure"
+        );
+        assert!(
+            shared.lock().await.is_none(),
+            "a closed slot must not take or restore a handle"
+        );
+    }
+
+    /// Regression for the call site, not just the helper: a resource entry that
+    /// is still registered while the handle it owns is already gone must stay a
+    /// fatal `VmError` out of `builtin_io_close`'s body, before any retirement.
+    ///
+    /// `_impl` is the name `#[pd_host_function]` gives the authored body; the
+    /// generated wrapper only captures the context and submits the future, so
+    /// this drives the code that owns the `?`-before-retirement ordering.
+    ///
+    /// The state itself is not reachable from guest code in a correct build
+    /// (only the pre-fix double-retirement left an entry behind with an empty
+    /// slot), so the test installs it directly and asserts on the scope: no
+    /// `close_resource`, no entry dropped, no scope teardown.
+    #[tokio::test]
+    async fn builtin_close_keeps_an_empty_slot_resource_registered_and_fatal() {
+        let mut vm = Vm::new(crate::vm::Program::new(
+            Vec::new(),
+            vec![crate::vm::OpCode::Ret as u8],
+        ));
+        let resource = file_resource();
+        let shared = Arc::clone(&resource.handle);
+        let token = vm
+            .execution_scope()
+            .push_resource(resource)
+            .expect("resource insert");
+        let handle = token.handle();
+        // The handle is gone; the entry and its accounting are not.
+        shared.lock().await.take();
+
+        let close = builtin_io_close_impl(
+            IoHandleContext {
+                resource: handle,
+                handle: Arc::clone(&shared),
+                max_read_bytes: None,
+                max_write_bytes: None,
+            },
+            handle.raw() as i64,
+        )
+        .await;
+
+        let error = match close {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("a closed slot must stay fatal at the call site, not become a guest error")
+            }
+        };
+
+        assert!(
+            matches!(&error, VmError::HostError(message) if message == "io handle is closed"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            vm.execution_scope().resources().len(),
+            1,
+            "the fatal close must not call close_resource on the scope"
+        );
+        assert!(
+            vm.execution_scope()
+                .resources()
+                .get::<IoResource>(&token)
+                .is_ok(),
+            "the resource must still be registered, so its Drop never ran"
+        );
+        assert!(
+            !vm.execution_scope().is_closing(),
+            "the fatal close must not start scope teardown"
+        );
+        assert!(
+            shared.lock().await.is_none(),
+            "the fatal close must not take or restore a handle"
+        );
+    }
+
+    /// `CloseFailure::RuntimeRequired` is the one failure that keeps the handle:
+    /// the runtime lease broke before the close started, so nothing was flushed
+    /// or signalled and the caller must not retire its scope either.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_required_close_retains_the_process_handle() {
+        // Popens need a reactor, so spawn under one and then drop out of it:
+        // `Handle::try_current` is what decides the branch under test.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("spawn runtime should build");
+        let resource = runtime.block_on(async {
+            IoResource::new(spawn_shell_command("sleep 30", "r").expect("process should spawn"))
+        });
+        let shared = Arc::clone(&resource.handle);
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the close must be polled outside a runtime to reach RuntimeRequired"
+        );
+
+        let mut vm = Vm::new(crate::vm::Program::new(
+            Vec::new(),
+            vec![crate::vm::OpCode::Ret as u8],
+        ));
+        let token = vm
+            .execution_scope()
+            .push_resource(resource)
+            .expect("resource insert");
+        let handle = token.handle();
+        let mut close = Box::pin(builtin_io_close_impl(
+            IoHandleContext {
+                resource: handle,
+                handle: Arc::clone(&shared),
+                max_read_bytes: None,
+                max_write_bytes: None,
+            },
+            handle.raw() as i64,
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let error = match close.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(error)) => error,
+            Poll::Ready(Ok(_)) => panic!("an off-runtime close must not report a guest outcome"),
+            Poll::Pending => panic!("an off-runtime close must fail instead of waiting"),
+        };
+        assert!(
+            matches!(&error, VmError::HostError(message) if message.contains("RuntimeRequired")),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            shared.blocking_lock().is_some(),
+            "a broken runtime lease must leave the handle owned for a retry"
+        );
+        assert_eq!(
+            vm.execution_scope().resources().len(),
+            1,
+            "the fatal close must not call close_resource on the scope"
+        );
+
+        // The retained handle is still closable once a runtime is driven again.
+        drop(close);
+        runtime
+            .block_on(close_shared_io_handle_with(
+                Arc::clone(&shared),
+                close_io_handle_future,
+            ))
+            .expect("retry under a live runtime should close the retained process");
+        assert!(
+            shared.blocking_lock().is_none(),
+            "the retried close must detach the handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_detaches_the_handle_and_cannot_be_retried() {
+        let resource = file_resource();
+        let shared = Arc::clone(&resource.handle);
+
+        let outcome = close_shared_io_handle_with(Arc::clone(&shared), |handle| {
+            failing_close(handle, "io_close flush failed: fixture")
+        })
+        .await
+        .expect("a flush failure is a guest error, not a VM fault");
+        assert!(
+            matches!(
+                &outcome,
+                SharedCloseOutcome::CleanupFailed(message)
+                    if message == "io_close flush failed: fixture"
+            ),
+            "unexpected close outcome"
+        );
+        assert!(
+            shared.lock().await.is_none(),
+            "the failed handle must be detached so Drop signals and the scope can retire"
+        );
+
+        let error = close_shared_io_handle_with(Arc::clone(&shared), close_io_handle_future)
+            .await
+            .expect_err("a detached handle must not be closable twice");
+        assert!(
+            matches!(&error, VmError::HostError(message) if message == "io handle is closed"),
+            "the retry must report the closed slot, not repeat the cleanup: {error:?}"
+        );
     }
 
     #[tokio::test]

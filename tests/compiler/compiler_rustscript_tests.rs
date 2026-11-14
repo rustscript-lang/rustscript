@@ -100,11 +100,11 @@ fn rustscript_host_import_runtime_cases_work() {
                     use runtime;
                     runtime::sleep(41);
                 "#,
-                vec![Value::Bool(true)],
+                vec![Value::Null],
             ),
             bindings: vec![HostBindingCase {
                 name: "runtime::sleep",
-                factory: make_always_allow,
+                factory: make_runtime_sleep,
             }],
         },
         BoundRuntimeCase {
@@ -128,11 +128,11 @@ fn rustscript_host_import_runtime_cases_work() {
                     use runtime;
                     runtime::sleep(41);
                 "#,
-                vec![Value::Bool(true)],
+                vec![Value::Null],
             ),
             bindings: vec![HostBindingCase {
                 name: "runtime::sleep",
-                factory: make_always_allow,
+                factory: make_runtime_sleep,
             }],
         },
         BoundRuntimeCase {
@@ -156,11 +156,11 @@ fn rustscript_host_import_runtime_cases_work() {
                     use runtime as rt;
                     rt::sleep(41);
                 "#,
-                vec![Value::Bool(true)],
+                vec![Value::Null],
             ),
             bindings: vec![HostBindingCase {
                 name: "runtime::sleep",
-                factory: make_always_allow,
+                factory: make_runtime_sleep,
             }],
         },
     ];
@@ -573,7 +573,10 @@ fn compile_source_file_with_rustscript_complex_fixture() {
                 .expect("vm should complete host operation"),
         }
     }
-    assert_eq!(vm.stack(), &[Value::Int(12)]);
+    // The top of the stack is still the fixture's result value. The `runtime::sleep`
+    // statement below it contributes its logical Unit carrier (the internal Null),
+    // because a statement-position host call keeps its result on the operand stack.
+    assert_eq!(vm.stack(), &[Value::Null, Value::Int(12)]);
 }
 
 #[test]

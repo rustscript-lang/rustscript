@@ -1104,7 +1104,8 @@ fn runtime_sleep_host_import_is_available_by_default() {
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+    // `runtime::sleep` reports the logical Unit carrier, not a success `true`.
+    assert_eq!(vm.stack(), &[Value::Null]);
 }
 
 #[test]
@@ -1134,7 +1135,7 @@ fn runtime_sleep_host_import_can_be_overridden_by_host_binding() {
     impl HostFunction for RuntimeSleepOverride {
         fn call(&mut self, _vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, vm::VmError> {
             assert_eq!(args, &[Value::Int(3)]);
-            Ok(CallOutcome::Return(vec![Value::Bool(true)].into()))
+            Ok(CallOutcome::Return(vec![Value::Null].into()))
         }
     }
 
@@ -1150,7 +1151,7 @@ fn runtime_sleep_host_import_can_be_overridden_by_host_binding() {
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+    assert_eq!(vm.stack(), &[Value::Null]);
 }
 
 #[test]
@@ -1170,7 +1171,8 @@ fn host_function_registry_includes_default_runtime_sleep() {
 
     let status = vm.run().expect("vm should run");
     assert_eq!(status, VmStatus::Halted);
-    assert_eq!(vm.stack(), &[Value::Bool(true)]);
+    // The default binding reports the logical Unit carrier, not `true`.
+    assert_eq!(vm.stack(), &[Value::Null]);
 }
 
 #[test]

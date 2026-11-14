@@ -62,14 +62,16 @@ struct PayloadPartial {
 let payload_json = json::encode(payload);
 let payload_decoded = json::decode::<PayloadPartial>(payload_json);
 let json_score = payload_decoded.score;
-let sleep_ok = runtime::sleep(100);
+// `runtime::sleep` reports the logical Unit result, so there is no success value
+// to compare; the completed wait is the whole effect.
+runtime::sleep(100);
 let io_ok = if true => {
     io::exists(".")
 } else => {
     false
 };
 
-if regex_ok && io_ok && sleep_ok && json_score == matched {
+if regex_ok && io_ok && json_score == matched {
     print(closure_value);
 } else {
     print(0);

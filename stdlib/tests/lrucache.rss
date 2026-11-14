@@ -18,32 +18,55 @@ assert(initial_keys.length == 2);
 assert(initial_keys[0] == "a");
 assert(initial_keys[1] == "b");
 
-let mut peeked = peek::<string, int>(cache, "a");
-assert(peeked.found);
-let peeked_value: int = peeked.value.unwrap_or(0);
-assert(peeked_value == 1);
+// W01: `peek` reports presence with `Option<V>` and never promotes recency.
+let peeked_matches: bool = match peek::<string, int>(cache, "a") {
+    Option::Some(value) => value == 1,
+    Option::None => false,
+};
+assert(peeked_matches);
+let peeked_absent = match peek::<string, int>(cache, "missing") {
+    Option::Some(_) => false,
+    Option::None => true,
+};
+assert(peeked_absent);
 let mut still_initial = keys::<string, int>(cache);
 assert(still_initial[0] == "a");
 assert(still_initial[1] == "b");
 
+// `get` keeps the updated cache and the payload; the redundant `found` flag is
+// gone, so absence is read from the `Option` alone.
 let mut accessed = get::<string, int>(cache, "a");
-assert(accessed.found);
-let accessed_value: int = accessed.value.unwrap_or(0);
-assert(accessed_value == 1);
+let accessed_matches: bool = match accessed.value {
+    Option::Some(value) => value == 1,
+    Option::None => false,
+};
+assert(accessed_matches);
 cache = accessed.cache;
 let mut after_get = keys::<string, int>(cache);
 assert(after_get[0] == "b");
 assert(after_get[1] == "a");
 
-let mut lru_entry = oldest::<string, int>(cache);
-assert(lru_entry.found);
-assert(lru_entry.key.unwrap_or("") == "b");
-assert(lru_entry.value.unwrap_or(0) == 2);
+// `oldest` / `newest` report one key/value row, so the pair can never
+// disagree about presence.
+let oldest_key = match oldest::<string, int>(cache) {
+    Option::Some(row) => row.key,
+    Option::None => "missing",
+};
+assert(oldest_key == "b");
+match oldest::<string, int>(cache) {
+    Option::Some(row) => assert(row.value == 2),
+    Option::None => assert(false),
+};
 
-let mut mru_entry = newest::<string, int>(cache);
-assert(mru_entry.found);
-assert(mru_entry.key.unwrap_or("") == "a");
-assert(mru_entry.value.unwrap_or(0) == 1);
+let newest_key = match newest::<string, int>(cache) {
+    Option::Some(row) => row.key,
+    Option::None => "missing",
+};
+assert(newest_key == "a");
+match newest::<string, int>(cache) {
+    Option::Some(row) => assert(row.value == 1),
+    Option::None => assert(false),
+};
 
 cache = put::<string, int>(cache, "c", 3);
 let mut after_evict = keys::<string, int>(cache);
@@ -62,12 +85,17 @@ cache = put::<string, int>(cache, "a", 10);
 let mut after_update = keys::<string, int>(cache);
 assert(after_update[0] == "c");
 assert(after_update[1] == "a");
-let mut updated = peek::<string, int>(cache, "a");
-assert(updated.found);
-assert(updated.value.unwrap_or(0) == 10);
+match peek::<string, int>(cache, "a") {
+    Option::Some(value) => assert(value == 10),
+    Option::None => assert(false),
+};
 
 let mut missed = get::<string, int>(cache, "missing");
-assert(missed.found == false);
+let missed_is_none = match missed.value {
+    Option::Some(_) => false,
+    Option::None => true,
+};
+assert(missed_is_none);
 cache = missed.cache;
 let mut after_miss = keys::<string, int>(cache);
 assert(after_miss[0] == "c");
@@ -100,8 +128,16 @@ cache = clear::<string, int>(cache);
 assert(capacity::<string, int>(cache) == 2);
 assert(len::<string, int>(cache) == 0);
 assert(is_empty::<string, int>(cache));
-assert(oldest::<string, int>(cache).found == false);
-assert(newest::<string, int>(cache).found == false);
+let cleared_oldest = match oldest::<string, int>(cache) {
+    Option::Some(_) => false,
+    Option::None => true,
+};
+assert(cleared_oldest);
+let cleared_newest = match newest::<string, int>(cache) {
+    Option::Some(_) => false,
+    Option::None => true,
+};
+assert(cleared_newest);
 
 let mut disabled = new::<string, int>(0);
 disabled = put::<string, int>(disabled, "x", 1);
@@ -113,15 +149,18 @@ let mut feed_cache = new::<int, FeedItem>(2);
 feed_cache = put::<int, FeedItem>(feed_cache, 7, {slug: "alpha", score: 10});
 feed_cache = put::<int, FeedItem>(feed_cache, 8, {slug: "beta", score: 20});
 
-let mut cached_feed = peek::<int, FeedItem>(feed_cache, 7);
-assert(cached_feed.found);
-let cached_feed_value = cached_feed.value.unwrap_or({slug: "", score: 0}).copy();
+let cached_feed_value = match peek::<int, FeedItem>(feed_cache, 7) {
+    Option::Some(value) => value.copy(),
+    Option::None => {slug: "", score: 0},
+};
 assert(cached_feed_value.slug == "alpha");
 assert(cached_feed_value.score == 10);
 
 let mut accessed_feed = get::<int, FeedItem>(feed_cache, 7);
-assert(accessed_feed.found);
-let accessed_feed_value = accessed_feed.value.unwrap_or({slug: "", score: 0}).copy();
+let accessed_feed_value = match accessed_feed.value {
+    Option::Some(value) => value.copy(),
+    Option::None => {slug: "", score: 0},
+};
 assert(accessed_feed_value.slug == "alpha");
 feed_cache = accessed_feed.cache;
 
@@ -137,14 +176,64 @@ assert(first_feed_row.value.slug == "beta");
 assert(second_feed_row.key == 7);
 assert(second_feed_row.value.score == 10);
 
-let mut feed_oldest = oldest::<int, FeedItem>(feed_cache);
-assert(feed_oldest.found);
-assert(feed_oldest.key.unwrap_or(0) == 8);
-let feed_oldest_value = feed_oldest.value.unwrap_or({slug: "", score: 0}).copy();
+match oldest::<int, FeedItem>(feed_cache) {
+    Option::Some(row) => assert(row.key == 8),
+    Option::None => assert(false),
+};
+let feed_oldest_value = match oldest::<int, FeedItem>(feed_cache) {
+    Option::Some(row) => row.value.copy(),
+    Option::None => {slug: "", score: 0},
+};
 assert(feed_oldest_value.slug == "beta");
 
-let mut feed_newest = newest::<int, FeedItem>(feed_cache);
-assert(feed_newest.found);
-assert(feed_newest.key.unwrap_or(0) == 7);
-let feed_newest_value = feed_newest.value.unwrap_or({slug: "", score: 0}).copy();
+match newest::<int, FeedItem>(feed_cache) {
+    Option::Some(row) => assert(row.key == 7),
+    Option::None => assert(false),
+};
+let feed_newest_value = match newest::<int, FeedItem>(feed_cache) {
+    Option::Some(row) => row.value.copy(),
+    Option::None => {slug: "", score: 0},
+};
 assert(feed_newest_value.score == 10);
+
+// A false key with an empty-string payload is a real hit: `Option::Some(false)`
+// and `Option::Some("")` are distinct from `Option::None`.
+let mut flag_cache = new::<bool, string>(2);
+flag_cache = put::<bool, string>(flag_cache, false, "");
+let empty_payload_value = match peek::<bool, string>(flag_cache, false) {
+    Option::Some(value) => value,
+    Option::None => "missing",
+};
+assert(empty_payload_value == "");
+let false_key_absent = match peek::<bool, string>(flag_cache, true) {
+    Option::Some(_) => false,
+    Option::None => true,
+};
+assert(false_key_absent);
+let empty_payload_row = match oldest::<bool, string>(flag_cache) {
+    Option::Some(row) => row.value,
+    Option::None => "missing",
+};
+assert(empty_payload_row == "");
+
+// A cached zero payload is a hit as well: presence comes from the `Option`
+// variant, never from the payload's truthiness.
+let mut zero_cache = new::<string, int>(1);
+zero_cache = put::<string, int>(zero_cache, "zero", 0);
+let zero_value = match peek::<string, int>(zero_cache, "zero") {
+    Option::Some(value) => value,
+    Option::None => 99,
+};
+assert(zero_value == 0);
+let zero_absent = match peek::<string, int>(zero_cache, "missing") {
+    Option::Some(_) => false,
+    Option::None => true,
+};
+assert(zero_absent);
+let zero_get = get::<string, int>(zero_cache, "zero");
+let zero_get_value = match zero_get.value {
+    Option::Some(value) => value,
+    Option::None => 99,
+};
+assert(zero_get_value == 0);
+zero_cache = zero_get.cache;

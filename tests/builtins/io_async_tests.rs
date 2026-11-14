@@ -106,14 +106,19 @@ fn async_io_round_trips_file_operations_through_host_driver() {
 
     let stack = run_source(&format!(
         r#"
-        let handle = io::open("{}", "w");
-        io::write(handle, "host-driven");
-        io::flush(handle);
-        io::close(handle);
-        io::exists("{}");
+        fn round_trip() -> Result<bool, string> {{
+            let handle = io::open("{path}", "w")?;
+            io::write(handle, "host-driven")?;
+            io::flush(handle)?;
+            io::close(handle)?;
+            Result::Ok(io::exists("{path}"))
+        }}
+        match round_trip() {{
+            Result::Ok(value) => value,
+            Result::Err(message) => false,
+        }};
         "#,
-        path.display(),
-        path.display(),
+        path = path.display(),
     ))
     .expect("async io program should complete");
 
@@ -139,17 +144,35 @@ fn async_io_read_line_preserves_buffered_data_between_calls() {
 
     let stack = run_source(&format!(
         r#"
-        let handle = io::open("{}", "r");
-        io::read_line(handle);
-        let second = io::read_line(handle);
-        io::close(handle);
-        second;
+        fn read_two_lines() -> Result<string, string> {{
+            let handle = io::open("{path}", "r")?;
+            let first = io::read_line(handle)?;
+            let second = io::read_line(handle)?;
+            io::close(handle)?;
+            let line = match second {{
+                Option::Some(text) => text,
+                Option::None => "",
+            }};
+            let first_line = match first {{
+                Option::Some(text) => text,
+                Option::None => "missing",
+            }};
+            Result::Ok(line + first_line)
+        }}
+        match read_two_lines() {{
+            Result::Ok(line) => line,
+            Result::Err(message) => message,
+        }};
         "#,
-        path.display(),
+        path = path.display(),
     ))
     .expect("async read_line program should complete");
 
-    assert_eq!(stack.last(), Some(&Value::string("second\n")));
+    assert_eq!(
+        stack.last(),
+        Some(&Value::string("secondfirst")),
+        "read_line must strip the terminator and preserve buffered data"
+    );
     let _ = std::fs::remove_file(path);
 }
 
@@ -158,10 +181,16 @@ fn async_io_read_line_preserves_buffered_data_between_calls() {
 fn async_io_popen_reads_through_tokio_process_pipe() {
     let stack = run_source(
         r#"
-        let handle = io::popen("printf async-process", "r");
-        let output = io::read_all(handle);
-        io::close(handle);
-        output;
+        fn read_output() -> Result<string, string> {
+            let handle = io::popen("printf async-process", "r")?;
+            let output = io::read_all(handle)?;
+            io::close(handle)?;
+            Result::Ok(output)
+        }
+        match read_output() {
+            Result::Ok(output) => output,
+            Result::Err(message) => message,
+        };
         "#,
     )
     .expect("async popen program should complete");
@@ -253,9 +282,32 @@ fn process_tree_command(
     )
 }
 
+/// A guest program that opens a `popen` handle and then either reads it
+/// (`read`) or just keeps the process resource alive (`hold`).
 #[cfg(unix)]
-fn guest_popen_program(command: &str, expression: &str) -> String {
-    format!(r#"let h = io::popen("{command}", "r"); {expression}"#)
+fn guest_popen_program(command: &str, read: bool) -> String {
+    if read {
+        format!(
+            r#"
+            fn drive() -> Result<string, string> {{
+                let handle = io::popen("{command}", "r")?;
+                let output = io::read_all(handle)?;
+                Result::Ok(output)
+            }}
+            drive();
+            "#
+        )
+    } else {
+        format!(
+            r#"
+            fn drive() -> Result<bool, string> {{
+                let handle = io::popen("{command}", "r")?;
+                Result::Ok(true)
+            }}
+            drive();
+            "#
+        )
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -273,7 +325,7 @@ fn async_io_reset_kills_and_reaps_the_entire_popen_process_group() {
     let descendant_path = base.with_extension("descendant");
     let marker_path = base.with_extension("marker");
     let command = process_tree_command(&parent_path, &descendant_path, &marker_path);
-    let source = guest_popen_program(&command, "io::read_all(h);");
+    let source = guest_popen_program(&command, true);
 
     let compiled = compile_source(&format!("use io;\n{source}")).expect("source should compile");
     let mut vm = Vm::new(compiled.program);
@@ -373,7 +425,7 @@ fn async_io_vm_drop_terminates_live_popen_process_tree() {
     let descendant_path = base.with_extension("descendant");
     let marker_path = base.with_extension("marker");
     let command = process_tree_command(&parent_path, &descendant_path, &marker_path);
-    let source = guest_popen_program(&command, "h;");
+    let source = guest_popen_program(&command, false);
 
     let compiled = compile_source(&format!("use io;\n{source}")).expect("source should compile");
     let mut vm = Vm::new(compiled.program);
@@ -438,7 +490,7 @@ fn async_io_failed_resource_handoff_cleans_up_the_popen_process_group() {
     let descendant_path = base.with_extension("descendant");
     let marker_path = base.with_extension("marker");
     let command = process_tree_command(&parent_path, &descendant_path, &marker_path);
-    let source = guest_popen_program(&command, "h;");
+    let source = guest_popen_program(&command, false);
 
     let compiled = compile_source(&format!("use io;\n{source}")).expect("source should compile");
     let mut vm = Vm::new(compiled.program);
@@ -469,4 +521,165 @@ fn async_io_failed_resource_handoff_cleans_up_the_popen_process_group() {
     let _ = std::fs::remove_file(parent_path);
     let _ = std::fs::remove_file(descendant_path);
     let _ = std::fs::remove_file(marker_path);
+}
+
+#[test]
+fn async_io_read_line_at_eof_is_ok_none() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should follow Unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "pd-vm-async-read-line-eof-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::write(&path, "").expect("fixture should be written");
+
+    let stack = run_source(&format!(
+        r#"
+        fn probe() -> Result<bool, string> {{
+            let handle = io::open("{path}", "r")?;
+            let line = io::read_line(handle)?;
+            io::close(handle)?;
+            Result::Ok(match line {{
+                Option::Some(_) => false,
+                Option::None => true,
+            }})
+        }}
+        match probe() {{
+            Result::Ok(value) => value,
+            Result::Err(message) => false,
+        }};
+        "#,
+        path = path.display()
+    ))
+    .expect("async EOF must be a guest outcome");
+
+    assert_eq!(
+        stack.last(),
+        Some(&Value::Bool(true)),
+        "async end of file must be Ok(None)"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn async_io_write_reports_bytes_and_close_reports_unit() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should follow Unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "pd-vm-async-write-count-{}-{nonce}",
+        std::process::id()
+    ));
+
+    let stack = run_source(&format!(
+        r#"
+        fn probe() -> Result<bool, string> {{
+            let handle = io::open("{path}", "w")?;
+            let written = io::write(handle, "abcde")?;
+            io::flush(handle)?;
+            io::close(handle)?;
+            Result::Ok(written == 5)
+        }}
+        match probe() {{
+            Result::Ok(value) => value,
+            Result::Err(message) => false,
+        }};
+        "#,
+        path = path.display()
+    ))
+    .expect("async write must report its byte count");
+
+    assert_eq!(stack.last(), Some(&Value::Bool(true)));
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the written file must exist"),
+        "abcde"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+/// A missing file is an ordinary guest outcome on the async backend: the call
+/// reports `Err(message)` and the VM keeps running.
+#[test]
+fn async_io_open_missing_file_is_a_guest_error() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should follow Unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "pd-vm-async-missing-{}-{nonce}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let stack = run_source(&format!(
+        r#"
+        match io::open("{path}", "r") {{
+            Result::Ok(handle) => "unexpected success",
+            Result::Err(message) => message,
+        }};
+        "#,
+        path = path.display()
+    ))
+    .expect("a missing file must not abort the async VM");
+
+    let Some(Value::String(message)) = stack.last() else {
+        panic!("a missing file must report a guest Err string, got {stack:?}");
+    };
+    assert!(
+        message.contains("io_open failed"),
+        "the guest error must keep the operating-system text: {message}"
+    );
+    assert!(
+        !path.exists(),
+        "a failed open must not create the missing path"
+    );
+}
+
+/// A retried `io::close` on the same guest handle never reaches a close: the
+/// first call retired the `io.file` resource, so the second call fails while
+/// resolving the token against the scope (`io_handle_for_resource` in
+/// `async_io.rs` reports `resource_stale`) and the VM aborts with a fatal handle
+/// error.
+///
+/// This test covers that stale-capture path only. The empty-slot fatal branch and
+/// the cleanup-failure ("cannot be retried through the same handle") path are
+/// asserted by the `async_io.rs` unit tests.
+#[test]
+fn async_io_close_cannot_be_retried_through_the_same_handle() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should follow Unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "pd-vm-async-close-retry-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::write(&path, "retry").expect("fixture should be written");
+
+    let error = run_source(&format!(
+        r#"
+        fn probe() -> Result<bool, string> {{
+            let handle = io::open("{path}", "r")?;
+            io::close(handle)?;
+            io::close(handle)?;
+            Result::Ok(true)
+        }}
+        probe();
+        "#,
+        path = path.display()
+    ))
+    .expect_err("a retried close must fail instead of repeating the cleanup");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("stale")
+            || message.contains("not found")
+            || message.contains("closed")
+            || message.contains("invalid"),
+        "a retried close must be rejected: {message}"
+    );
+    let _ = std::fs::remove_file(path);
 }

@@ -2205,6 +2205,13 @@ mod runtime_tests {
             "expected stack to include trimmed string, got {:?}",
             report.stack
         );
+        assert_eq!(
+            report.stack.first().map(String::as_str),
+            Some("null"),
+            "the named runtime host must leave the Unit carrier in the sleep value slot, \
+             not a success bool; stack = {:?}",
+            report.stack
+        );
     }
 
     #[test]
@@ -2344,6 +2351,29 @@ mod runtime_tests {
             report.stack.iter().any(|value| value == "ok"),
             "expected stack to contain ok, got {:?}",
             report.stack
+        );
+    }
+
+    /// `runtime::sleep` declares the logical Unit result, so a completed sleep
+    /// must leave the Unit carrier (`null`) in the value slot. The wasm binding
+    /// is name-based and installs no import schema, so the Core return check
+    /// cannot catch a stray success `true` here — only this assertion can.
+    #[test]
+    fn sleep_completion_leaves_the_unit_carrier_on_the_stack() {
+        let source = r#"
+            use runtime;
+            runtime::sleep(0);
+        "#;
+        let report = run_source_with_flavor(source, SourceFlavor::RustScript);
+        assert!(
+            report.error.is_none(),
+            "expected runtime::sleep to succeed, got {:?}",
+            report.error
+        );
+        assert_eq!(
+            report.stack,
+            vec!["null".to_string()],
+            "a completed runtime::sleep must report Unit (null), not a success bool"
         );
     }
 

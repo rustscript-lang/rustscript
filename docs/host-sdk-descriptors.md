@@ -13,7 +13,7 @@ One host function declaration produces, in a single macro expansion:
 | Part | Meaning |
 |---|---|
 | `schema` | The guest ABI: parameter names, types, passing modes, return type. This is the only fingerprint input. |
-| `binding` | The dispatch class (`Static`, `StaticStack`, `StaticArgs`, `StaticNonYieldingArgs`, `Owned`). |
+| `binding` | The dispatch class (`Static`, `StaticStack`, `StaticStackRuntimeOwned`, `StaticArgs`, `StaticNonYieldingArgs`, `Owned`). |
 | `adapter` | The concrete adapter or owned-dispatch factory installed into a registry. |
 | `effects` | Guest resource effects (borrow/borrow-mut/take-owned/create) and hidden host-state read/write effects. Runtime-only metadata; excluded from the fingerprint. |
 | `resource_types` | The concrete resource-type declarations this function contributes. |
@@ -212,25 +212,47 @@ pub(crate) async fn builtin_io_open(
     #[pd_host_context] context: IoPolicyContext,
     path: String,
     mode: String,
-) -> VmResult<vm::HostFutureOutput<i64>> {
+) -> VmResult<vm::HostFutureOutput<Value>> {
     // Mode validation and `OpenOptions` setup are omitted here.
     let path = authorize_io_path(context.policy.as_ref(), &path, writes).await?;
-    let file = options
-        .open(path)
-        .await
-        .map_err(|error| VmError::HostError(format!("io_open failed: {error}")))?;
+    let file = match options.open(path).await {
+        Ok(file) => file,
+        // A recoverable failure is the contract's `Err` branch, never a VM fault.
+        Err(error) => return Ok(io_error_output("io_open", error)),
+    };
     let handle = IoHandle::File(BufReader::new(file));
     Ok(vm::HostFutureOutput::complete(move |vm| {
-        let token = vm
-            .execution_scope()
-            .push_resource(IoResource::new(handle))
-            .map_err(|error| VmError::HostError(format!(
-                "io resource insert failed: {error}"
-            )))?;
-        Ok(token.into_handle().raw() as i64)
+        publish_open_handle(vm, handle, super::io_open_contract().return_type)
     }))
 }
 ```
+
+A contract may also declare a fallible return. `io::open`, `io::popen`,
+`io::read_all`, `io::read_line`, `io::write`, `io::flush` and `io::close`
+declare `Result<T, string>`, where only ordinary file-system outcomes take the
+`Err` branch: invalid or closed handles, ownership/scope errors, policy denials,
+byte limits, unsupported modes and capability rejections stay fatal `VmError`s.
+
+An owned resource cannot cross the future boundary inside a `GuestResult` (the
+macro rejects it), so the async adapter returns the assembled guest carrier
+through `vm::HostFutureOutput<Value>` and publishes it with
+`crate::result::publish_owned`, which inserts the resource, validates the
+carrier against the declared contract and rolls the insertion back on failure.
+That path is specific to the successful branch: it is the one that must agree
+with `io::open` / `io::popen`'s `Ok(resource<io.file>)` outcome. The `Err`
+branches (an unopenable path, a process that cannot be started) are plain
+`Value` strings built by the adapter itself, so they carry no resource and are
+never routed through `publish_owned` — there is nothing to insert or roll back.
+They are not unchecked, though: every return, including these, still passes the
+generic `validate_host_call_return` check
+(`src/vm/host.rs:2141` → `validate_host_value`) when the operation completes,
+which validates the value against the declared `Result` schema. What they
+deliberately skip is resource ownership bookkeeping, not schema validation.
+
+`io::read_line`'s success payload is the line **without** its terminator: the
+adapter strips one trailing `\n`, so a file ending in `\r\n` leaves the `\r`
+in the payload. End of file is `Ok(None)`, and a present but empty line is
+`Ok(Some(""))`; the two are never conflated.
 
 When context depends on a resource-token argument, implement
 `capture_with_args(vm, args)` to validate the token and clone the owned resource
@@ -356,6 +378,41 @@ isolated owned-value execution VM. The owned path keeps its guarantees: exact
 operand draining, callback provenance, isolated callback VM, and transactional
 owned-resource transfer. Do not route an owned function through borrowed or
 static dispatch.
+
+### Runtime-owned pending dispatch
+
+A stack adapter whose call suspends — the HTTP request and SQLite statement
+families are the standard examples — resolves its pending operation from the
+generic VM operation/stream registries (submitted host operations and stream
+drivers) instead of from a per-function operation driver. Descriptors express
+that with `HostBindingKind::StaticStackRuntimeOwned` and the stack adapter:
+
+```rust
+HostFunctionDescriptor {
+    schema: http_request_contract(),
+    binding: HostBindingDescriptor { kind: HostBindingKind::StaticStackRuntimeOwned },
+    effects: vec![],
+    adapter: HostAdapterDescriptor::StaticStackRuntimeOwned(builtin_http_client_request),
+    resource_types: vec![],
+}
+```
+
+The adapter is a `StaticHostStackFunction`, exactly like `StaticStack`: the two
+classes register identically. The difference is the install step — after the
+import registers, the module install path calls
+`HostFunctionRegistry::mark_exact_runtime_owned_pending(&name)`, which fails
+closed for a name that is not registered:
+
+```
+cannot mark unregistered host import '<name>' as runtime-owned
+```
+
+The marker records no per-import state: submitted operations are keyed by their
+reserved host-operation id, so there is no parallel op-driver table to maintain.
+Choose `StaticStackRuntimeOwned` only when the call's pending operation is owned
+by those generic registries. A module that schedules its own concrete operation
+driver (the `io::*` family) keeps plain `StaticStack`, and an owned-dispatch
+function that transfers its operands keeps `Owned`.
 
 ## 6. Aggregation and feature gates
 

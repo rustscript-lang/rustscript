@@ -3,8 +3,17 @@ use io;
 
 assert(io::exists("stdlib/rss/strings.rss"));
 
-let mut handle = io::popen("echo rustscript_io_builtin", "r");
-let mut output = io::read_all(handle);
-let mut closed = io::close(handle);
-assert(closed);
-assert(string::contains(output, "rustscript_io_builtin"));
+// Runs a command, reads every byte it prints, and closes the handle, so a
+// failure at any step reaches the caller instead of an empty string.
+fn read_command_output(command: string) -> Result<string, string> {
+    let handle = io::popen(command, "r")?;
+    let output = io::read_all(handle)?;
+    io::close(handle)?;
+    Result::Ok(output)
+}
+
+let mut popen_ok = match read_command_output("echo rustscript_io_builtin") {
+    Result::Ok(output) => string::contains(output, "rustscript_io_builtin"),
+    Result::Err(message) => false,
+};
+assert(popen_ok);

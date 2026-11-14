@@ -41,20 +41,20 @@ pub fn ends_with(buf: bytes, suffix: bytes) -> bool {
     suffix_len <= buf.length && buf[(buf.length - suffix_len):buf.length] == suffix
 }
 
-// Returns the first index of needle in buf, or -1 when it is absent.
-pub fn index_of(buf: bytes, needle: bytes) -> int {
+// Returns the first index of needle in buf, or None when it is absent.
+pub fn index_of(buf: bytes, needle: bytes) -> Option<int> {
     let buf_len = buf.length;
     let needle_len = needle.length;
-    let out = if needle_len == 0 => {
-        0
+    let out: Option<int> = if needle_len == 0 => {
+        Option::Some(0)
     } else if needle_len > buf_len => {
-        -1
+        Option::None
     } else => {
-        let mut found = -1;
+        let mut found: Option<int> = Option::None;
         let limit = buf_len - needle_len + 1;
         for index in 0..limit {
             if buf[index:(index + needle_len)] == needle {
-                found = index;
+                found = Option::Some(index);
                 break;
             }
         }

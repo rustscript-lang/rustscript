@@ -652,9 +652,16 @@ async fn triple_domain_single_vm_typed_dataflow_uses_shared_catalog() {
         use sqlite;
         use bytes;
 
-        let source = io::open("{fixture_path}", "r");
-        let payload = io::read_all(&source);
-        let closed = io::close(source);
+        fn read_and_close(path: string) -> Result<string, string> {{
+            let source = io::open(path, "r")?;
+            let payload = io::read_all(source)?;
+            io::close(source)?;
+            Result::Ok(payload)
+        }}
+        let payload = match read_and_close("{fixture_path}") {{
+            Result::Ok(text) => text,
+            Result::Err(message) => message,
+        }};
 
         let mut request = http::request::new("POST", "http://127.0.0.1:{port}/echo");
         let unit: () = http::request::set_body_text(&mut request, payload);
@@ -718,7 +725,6 @@ async fn triple_domain_single_vm_typed_dataflow_uses_shared_catalog() {
         assert(absent_values.length == 0);
         assert(inserted.rows_affected == 1);
         assert(null_inserted.rows_affected == 1);
-        assert(closed == true);
         let close_unit: () = sqlite::close(db);
         stored;
         "#,
@@ -814,8 +820,14 @@ async fn triple_domain_error_cleanup_reset_and_reuse_keep_all_policies() {
         use http;
         use sqlite;
 
-        let source = io::open("{fixture_path}", "r");
-        let payload = io::read_all(&source);
+        fn read_payload(path: string) -> Result<string, string> {{
+            let source = io::open(path, "r")?;
+            io::read_all(source)
+        }}
+        let payload = match read_payload("{fixture_path}") {{
+            Result::Ok(text) => text,
+            Result::Err(message) => message,
+        }};
 
         let mut request = http::request::new("POST", "http://127.0.0.1:{port}/echo");
         let unit: () = http::request::set_body_text(&mut request, payload);
