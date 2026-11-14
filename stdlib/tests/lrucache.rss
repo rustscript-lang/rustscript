@@ -53,22 +53,20 @@ let oldest_key = match oldest::<string, int>(cache) {
     Option::None => "missing",
 };
 assert(oldest_key == "b");
-let oldest_value = match oldest::<string, int>(cache) {
-    Option::Some(row) => row.value,
-    Option::None => -1,
+match oldest::<string, int>(cache) {
+    Option::Some(row) => assert(row.value == 2),
+    Option::None => assert(false),
 };
-assert(oldest_value == 2);
 
 let newest_key = match newest::<string, int>(cache) {
     Option::Some(row) => row.key,
     Option::None => "missing",
 };
 assert(newest_key == "a");
-let newest_value = match newest::<string, int>(cache) {
-    Option::Some(row) => row.value,
-    Option::None => -1,
+match newest::<string, int>(cache) {
+    Option::Some(row) => assert(row.value == 1),
+    Option::None => assert(false),
 };
-assert(newest_value == 1);
 
 cache = put::<string, int>(cache, "c", 3);
 let mut after_evict = keys::<string, int>(cache);
@@ -87,11 +85,10 @@ cache = put::<string, int>(cache, "a", 10);
 let mut after_update = keys::<string, int>(cache);
 assert(after_update[0] == "c");
 assert(after_update[1] == "a");
-let updated_value = match peek::<string, int>(cache, "a") {
-    Option::Some(value) => value,
-    Option::None => -1,
+match peek::<string, int>(cache, "a") {
+    Option::Some(value) => assert(value == 10),
+    Option::None => assert(false),
 };
-assert(updated_value == 10);
 
 let mut missed = get::<string, int>(cache, "missing");
 let missed_is_none = match missed.value {
@@ -179,22 +176,20 @@ assert(first_feed_row.value.slug == "beta");
 assert(second_feed_row.key == 7);
 assert(second_feed_row.value.score == 10);
 
-let feed_oldest_key = match oldest::<int, FeedItem>(feed_cache) {
-    Option::Some(row) => row.key,
-    Option::None => -1,
+match oldest::<int, FeedItem>(feed_cache) {
+    Option::Some(row) => assert(row.key == 8),
+    Option::None => assert(false),
 };
-assert(feed_oldest_key == 8);
 let feed_oldest_value = match oldest::<int, FeedItem>(feed_cache) {
     Option::Some(row) => row.value.copy(),
     Option::None => {slug: "", score: 0},
 };
 assert(feed_oldest_value.slug == "beta");
 
-let feed_newest_key = match newest::<int, FeedItem>(feed_cache) {
-    Option::Some(row) => row.key,
-    Option::None => -1,
+match newest::<int, FeedItem>(feed_cache) {
+    Option::Some(row) => assert(row.key == 7),
+    Option::None => assert(false),
 };
-assert(feed_newest_key == 7);
 let feed_newest_value = match newest::<int, FeedItem>(feed_cache) {
     Option::Some(row) => row.value.copy(),
     Option::None => {slug: "", score: 0},
