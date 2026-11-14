@@ -19,11 +19,11 @@ assert(initial_keys[0] == "a");
 assert(initial_keys[1] == "b");
 
 // W01: `peek` reports presence with `Option<V>` and never promotes recency.
-let peeked_value = match peek::<string, int>(cache, "a") {
-    Option::Some(value) => value,
-    Option::None => -1,
+let peeked_matches: bool = match peek::<string, int>(cache, "a") {
+    Option::Some(value) => value == 1,
+    Option::None => false,
 };
-assert(peeked_value == 1);
+assert(peeked_matches);
 let peeked_absent = match peek::<string, int>(cache, "missing") {
     Option::Some(_) => false,
     Option::None => true,
@@ -36,11 +36,11 @@ assert(still_initial[1] == "b");
 // `get` keeps the updated cache and the payload; the redundant `found` flag is
 // gone, so absence is read from the `Option` alone.
 let mut accessed = get::<string, int>(cache, "a");
-let accessed_value = match accessed.value {
-    Option::Some(value) => value,
-    Option::None => -1,
+let accessed_matches: bool = match accessed.value {
+    Option::Some(value) => value == 1,
+    Option::None => false,
 };
-assert(accessed_value == 1);
+assert(accessed_matches);
 cache = accessed.cache;
 let mut after_get = keys::<string, int>(cache);
 assert(after_get[0] == "b");

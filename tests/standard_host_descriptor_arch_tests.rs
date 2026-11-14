@@ -26,7 +26,10 @@ const HTTP_SURFACE_ENABLED: bool = cfg!(all(feature = "http-client", not(target_
 //
 // These were re-pinned when `timer::at` / `timer::every` moved from a fixed
 // `true` result to the logical Unit result: the timer module schema is part of
-// both the timer and the composed standard catalog identity.
+// both the timer and the composed standard catalog identity. The composed
+// standard catalog also carries `runtime::sleep` (same Unit result) and the
+// `aot::compile` / `aot::clear` command hosts, so any result-type change to
+// those two surface families re-pins these values as well.
 const SQLITE_SURFACE_ENABLED: bool = cfg!(all(feature = "sqlite", not(target_family = "wasm")));
 const STANDARD_CATALOG_FINGERPRINT_HTTP_SQLITE: &str = "84cb7f8e3872bec4";
 const STANDARD_CATALOG_FINGERPRINT_SQLITE: &str = "b0d7ea2d8fb1c73d";
