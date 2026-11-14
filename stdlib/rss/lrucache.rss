@@ -29,20 +29,8 @@ struct LruCacheState<K, V> {
     nodes: map<LruNode<K, V>>
 }
 
-struct LruPeekResult<V> {
-    found: bool,
-    value: Option<V>
-}
-
 struct LruGetResult<K, V> {
     cache: LruCacheState<K, V>,
-    found: bool,
-    value: Option<V>
-}
-
-struct LruEntryReport<K, V> {
-    found: bool,
-    key: Option<K>,
     value: Option<V>
 }
 
@@ -216,12 +204,13 @@ fn evict_oldest<K, V>(
     out
 }
 
-fn entry_report<K, V>(cache: LruCacheState<K, V>, id: int) -> LruEntryReport<K, V> {
-    let out: LruEntryReport<K, V> = if id != 0 => {
+fn entry_report<K, V>(cache: LruCacheState<K, V>, id: int) -> Option<LruEntryRow<K, V>> {
+    let out: Option<LruEntryRow<K, V>> = if id != 0 => {
         let node: LruNode<K, V> =&((&cache).nodes[id]);
-        {found: true, key: Option::Some(node.key.copy()), value: Option::Some(node.value.copy())}
+        let row: LruEntryRow<K, V> = {key: node.key.copy(), value: node.value.copy()};
+        Option::Some(row)
     } else => {
-        {found: false, key: Option::None, value: Option::None}
+        Option::None
     };
     out
 }
@@ -257,15 +246,15 @@ pub fn has<K, V>(cache: LruCacheState<K, V>, key: K) -> bool {
 }
 
 // Returns the cached value without updating recency.
-pub fn peek<K, V>(cache: LruCacheState<K, V>, key: K) -> LruPeekResult<V> {
+pub fn peek<K, V>(cache: LruCacheState<K, V>, key: K) -> Option<V> {
     let state: LruCacheState<K, V> = cache;
     let lookup = state.lookup;
-    let out: LruPeekResult<V> = if lookup.has(key) => {
+    let out: Option<V> = if lookup.has(key) => {
         let id =(&lookup)[key];
         let node: LruNode<K, V> =&((&state.nodes)[id]);
-        {found: true, value: Option::Some(node.value.copy())}
+        Option::Some(node.value.copy())
     } else => {
-        {found: false, value: Option::None}
+        Option::None
     };
     out
 }
@@ -308,11 +297,10 @@ pub fn get<K, V>(cache: LruCacheState<K, V>, key: K) -> LruGetResult<K, V> {
                 relinked.nodes
             )
         };
-        {cache: next_cache, found: true, value: Option::Some(value)}
+        {cache: next_cache, value: Option::Some(value)}
     } else => {
         {
             cache: make_cache::<K, V>(limit, size, next_id, head, tail, lookup, nodes),
-            found: false,
             value: Option::None
         }
     };
@@ -522,14 +510,14 @@ pub fn entries<K, V>(cache: LruCacheState<K, V>) -> [LruEntryRow<K, V>] {
     out
 }
 
-// Returns the oldest cache entry report.
-pub fn oldest<K, V>(cache: LruCacheState<K, V>) -> LruEntryReport<K, V> {
+// Returns the oldest cache entry, or None when the cache is empty.
+pub fn oldest<K, V>(cache: LruCacheState<K, V>) -> Option<LruEntryRow<K, V>> {
     let state: LruCacheState<K, V> = cache;
     entry_report::<K, V>(state, state.head)
 }
 
-// Returns the newest cache entry report.
-pub fn newest<K, V>(cache: LruCacheState<K, V>) -> LruEntryReport<K, V> {
+// Returns the newest cache entry, or None when the cache is empty.
+pub fn newest<K, V>(cache: LruCacheState<K, V>) -> Option<LruEntryRow<K, V>> {
     let state: LruCacheState<K, V> = cache;
     entry_report::<K, V>(state, state.tail)
 }
