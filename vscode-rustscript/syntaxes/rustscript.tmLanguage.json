@@ -28,7 +28,7 @@
       "include": "#booleans"
     },
     {
-      "include": "#null-literal"
+      "include": "#unit-literal"
     },
     {
       "include": "#numbers"
@@ -38,6 +38,9 @@
     },
     {
       "include": "#wildcard-pattern"
+    },
+    {
+      "include": "#option-result-constructor"
     },
     {
       "include": "#namespace-call"
@@ -50,6 +53,12 @@
     },
     {
       "include": "#closure-pipes"
+    },
+    {
+      "include": "#optional-access-operator"
+    },
+    {
+      "include": "#propagation-operator"
     },
     {
       "include": "#operators"
@@ -411,9 +420,24 @@
       "name": "constant.language.boolean.rss",
       "match": "\\b(?:true|false)\\b"
     },
-    "null-literal": {
-      "name": "constant.language.null.rss",
-      "match": "\\bnull\\b"
+    "unit-literal": {
+      "name": "constant.language.unit.rss",
+      "match": "(?<![A-Za-z0-9_])\\(\\)"
+    },
+    "option-result-constructor": {
+      "name": "meta.constructor.rss",
+      "match": "\\b((?:Option)(?=\\s*::\\s*(?:Some|None))|(?:Result)(?=\\s*::\\s*(?:Ok|Err)))(\\s*)(::)(\\s*)(Some|None|Ok|Err)\\b",
+      "captures": {
+        "1": {
+          "name": "support.type.rss"
+        },
+        "3": {
+          "name": "punctuation.accessor.rss"
+        },
+        "5": {
+          "name": "support.constant.constructor.rss"
+        }
+      }
     },
     "numbers": {
       "name": "constant.numeric.rss",
@@ -574,7 +598,7 @@
       "patterns": [
         {
           "name": "entity.name.function.rss",
-          "match": "\\b(?!pub\\b|struct\\b|fn\\b|let\\b|mut\\b|for\\b|if\\b|else\\b|match\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b|null\\b)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(::)(\\s*)(<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)(?=\\s*\\()",
+          "match": "\\b(?!pub\\b|struct\\b|fn\\b|let\\b|mut\\b|for\\b|if\\b|else\\b|match\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b)([A-Za-z_][A-Za-z0-9_]*)(\\s*)(::)(\\s*)(<[^<>\\n]*(?:<[^<>\\n]*>[^<>\\n]*)*>)(?=\\s*\\()",
           "captures": {
             "1": {
               "name": "entity.name.function.rss"
@@ -589,7 +613,7 @@
         },
         {
           "name": "entity.name.function.rss",
-          "match": "\\b(?!pub\\b|struct\\b|fn\\b|let\\b|mut\\b|for\\b|if\\b|else\\b|match\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b|null\\b)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()"
+          "match": "\\b(?!pub\\b|struct\\b|fn\\b|let\\b|mut\\b|for\\b|if\\b|else\\b|match\\b|while\\b|break\\b|continue\\b|use\\b|as\\b|true\\b|false\\b)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()"
         }
       ]
     },
@@ -659,7 +683,15 @@
     },
     "operators": {
       "name": "keyword.operator.rss",
-      "match": "=>|==|!=|&&|\\|\\||&|=|\\+|-|\\*|/|%|<|>|!|\\?"
+      "match": "=>|==|!=|&&|\\|\\||&|=|\\+|-|\\*|/|%|<|>|!"
+    },
+    "propagation-operator": {
+      "name": "keyword.operator.propagation.rss",
+      "match": "\\?(?!\\.)"
+    },
+    "optional-access-operator": {
+      "name": "keyword.operator.optional-access.rss",
+      "match": "\\?\\."
     },
     "punctuation": {
       "name": "punctuation.separator.rss",
