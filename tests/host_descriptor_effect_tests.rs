@@ -1725,6 +1725,31 @@ fn runtime_owned_descriptor_installs_through_the_caller_catalog() {
         .mark_exact_runtime_owned_pending("demo::await_signal")
         .expect("the installed import is runtime-ownable");
 
+    // A restricted registry is still bounded by the caller catalogue: the
+    // runtime-owned binding class does not widen what may be installed, so a
+    // catalogue that does not declare the import must reject it and leave the
+    // registry untouched.
+    let other_module = HostModuleDescriptor {
+        name: "demo.other",
+        functions: &[add_descriptor],
+        resources: &[],
+    };
+    let foreign_catalog = other_module.catalog().expect("foreign module catalog");
+    let mut narrowed = vm::HostFunctionRegistry::restricted();
+    let plan_before = narrowed
+        .prepare_shared_plan(&[])
+        .expect("baseline plan should build");
+    let error = module
+        .install_from_catalog(&mut narrowed, &foreign_catalog)
+        .expect_err("an undeclared import must be rejected by a restricted registry");
+    assert!(
+        error
+            .to_string()
+            .contains("missing catalog member 'demo::await_signal'"),
+        "the rejection should report the undeclared import as missing, got {error}"
+    );
+    assert_registry_unmodified(&narrowed, &plan_before, &["demo::await_signal"]);
+
     // The same descriptor list installs through the aggregate path.
     let mut aggregate = vm::HostFunctionRegistry::empty();
     HostModuleDescriptor::install_descriptors(&mut aggregate, &[runtime_owned_descriptor()])

@@ -25,7 +25,7 @@ fn expand_pd_host_function(
     attr: Punctuated<Meta, Token![,]>,
     mut item: ItemFn,
 ) -> Result<proc_macro2::TokenStream, Error> {
-    let (guest_name, contract) = parse_function_args(&attr)?;
+    let (guest_name, contract, runtime_owned_pending) = parse_function_args(&attr)?;
     let is_async = item.sig.asyncness.is_some();
     let docs = doc_string(&item.attrs);
     let mut resource_params = Vec::<(String, ResourceSpec)>::new();
@@ -136,6 +136,7 @@ fn expand_pd_host_function(
         &resource_params,
         &state_params,
         contract.as_ref(),
+        runtime_owned_pending,
     )?;
     for input in &mut item.sig.inputs {
         if let FnArg::Typed(pat_type) = input {
@@ -266,21 +267,30 @@ fn is_async_owned_type(ty: &Type) -> bool {
 }
 
 /// Parses `#[pd_host_function(name = "...")]` plus the optional
-/// `contract = <path>` guest-schema override.
+/// `contract = <path>` guest-schema override and the optional
+/// `runtime_owned_pending` dispatch flag.
 ///
 /// `contract` names a zero-argument callable returning a
 /// [`HostFunctionSchema`](pd_host_schema) for functions whose guest contract
-/// cannot be inferred from the Rust signature alone (raw handle parameters,
+/// cannot be inferred from the Rust signature (raw-handle parameters, or
 /// fixed-shape map returns). The contract is declared next to the function it
 /// describes, so the adapter, binding class, and effects still come from one
 /// macro expansion and there is no parallel catalog entry.
+///
+/// `runtime_owned_pending` selects the stack dispatch class whose pending
+/// operation is owned by the generic runtime operation/stream registries
+/// instead of a registered operation driver.
 fn parse_function_args(
     args: &Punctuated<Meta, Token![,]>,
-) -> Result<(LitStr, Option<syn::Path>), Error> {
+) -> Result<(LitStr, Option<syn::Path>, bool), Error> {
     let mut name: Option<LitStr> = None;
     let mut contract: Option<syn::Path> = None;
+    let mut runtime_owned_pending = false;
     for meta in args {
         match meta {
+            Meta::Path(path) if path.is_ident("runtime_owned_pending") => {
+                runtime_owned_pending = true;
+            }
             Meta::NameValue(name_value) if name_value.path.is_ident("name") => {
                 let syn::Expr::Lit(expr_lit) = &name_value.value else {
                     return Err(Error::new_spanned(
@@ -321,7 +331,7 @@ fn parse_function_args(
                 return Err(Error::new_spanned(
                     other,
                     "#[pd_host_function] only supports name = \"...\", an optional \
-                     contract = <path>",
+                     contract = <path>, and the runtime_owned_pending dispatch flag",
                 ));
             }
         }
@@ -332,7 +342,7 @@ fn parse_function_args(
             "expected #[pd_host_function(name = \"...\")]",
         ));
     };
-    Ok((name, contract))
+    Ok((name, contract, runtime_owned_pending))
 }
 
 fn doc_string(attrs: &[syn::Attribute]) -> String {
@@ -1045,6 +1055,7 @@ fn generate_host_function_descriptor(
     resource_params: &[(String, ResourceSpec)],
     state_params: &[(String, StateSpec)],
     contract: Option<&syn::Path>,
+    runtime_owned_pending: bool,
 ) -> Result<proc_macro2::TokenStream, Error> {
     let descriptor_name =
         syn::Ident::new(&format!("{wrapper_name}_descriptor"), wrapper_name.span());
@@ -1064,6 +1075,7 @@ fn generate_host_function_descriptor(
             state_params,
             binding,
             item,
+            runtime_owned_pending,
         );
     }
 
@@ -1162,7 +1174,77 @@ fn generate_host_function_descriptor(
         resource_meta_tokens.push(meta);
     }
 
-    let (binding_kind, adapter, adapter_fn) = match binding {
+    let (binding_kind, adapter, adapter_fn) = generated_adapter_tokens(
+        &sdk,
+        &adapter_name,
+        wrapper_name,
+        binding,
+        runtime_owned_pending,
+        item,
+    )?;
+
+    Ok(quote! {
+        #adapter_fn
+
+        #[allow(dead_code)]
+        pub fn #descriptor_name() -> #sdk::host_extension::HostFunctionDescriptor {
+            #sdk::host_extension::HostFunctionDescriptor {
+                schema: #sdk::host_extension::HostFunctionSchema::with_return(
+                    #guest_name,
+                    vec![#(#param_tokens),*],
+                    #return_schema,
+                )
+                .with_description(#docs),
+                binding: #sdk::host_extension::HostBindingDescriptor {
+                    kind: #binding_kind,
+                },
+                effects: vec![#(#effect_tokens),*],
+                adapter: #adapter,
+                resource_types: vec![#(#resource_meta_tokens),*],
+            }
+        }
+    })
+}
+
+enum GeneratedBinding {
+    Stack,
+    Args,
+    NonYieldingArgs,
+}
+
+/// Adapter tokens for one generated binding class.
+///
+/// Returns `(binding kind, adapter value, adapter function)` so the inferred
+/// and contract-declared descriptor paths cannot diverge.
+///
+/// `runtime_owned_pending` upgrades a stack adapter to
+/// `HostBindingKind::StaticStackRuntimeOwned` so its pending operation resolves
+/// from the generic runtime operation/stream registries. The flag is only
+/// meaningful for a signature that already dispatches through the stack, so any
+/// other binding class is rejected here rather than silently ignored.
+fn generated_adapter_tokens(
+    sdk: &proc_macro2::TokenStream,
+    adapter_name: &syn::Ident,
+    wrapper_name: &syn::Ident,
+    binding: GeneratedBinding,
+    runtime_owned_pending: bool,
+    item: &ItemFn,
+) -> Result<
+    (
+        proc_macro2::TokenStream,
+        proc_macro2::TokenStream,
+        proc_macro2::TokenStream,
+    ),
+    Error,
+> {
+    if runtime_owned_pending && !matches!(binding, GeneratedBinding::Stack) {
+        return Err(Error::new_spanned(
+            &item.sig.ident,
+            "runtime_owned_pending requires a stack-dispatch signature (`&mut Vm` or a resource \
+             parameter)",
+        ));
+    }
+    let (mut binding_kind, mut adapter, adapter_fn) = match binding {
         GeneratedBinding::Stack => (
             quote!(#sdk::host_extension::HostBindingKind::StaticStack),
             quote!(#sdk::host_extension::HostAdapterDescriptor::StaticStack(#adapter_name)),
@@ -1203,91 +1285,16 @@ fn generate_host_function_descriptor(
             },
         ),
     };
-
-    Ok(quote! {
-        #adapter_fn
-
-        #[allow(dead_code)]
-        pub fn #descriptor_name() -> #sdk::host_extension::HostFunctionDescriptor {
-            #sdk::host_extension::HostFunctionDescriptor {
-                schema: #sdk::host_extension::HostFunctionSchema::with_return(
-                    #guest_name,
-                    vec![#(#param_tokens),*],
-                    #return_schema,
-                )
-                .with_description(#docs),
-                binding: #sdk::host_extension::HostBindingDescriptor {
-                    kind: #binding_kind,
-                },
-                effects: vec![#(#effect_tokens),*],
-                adapter: #adapter,
-                resource_types: vec![#(#resource_meta_tokens),*],
-            }
-        }
-    })
-}
-
-enum GeneratedBinding {
-    Stack,
-    Args,
-    NonYieldingArgs,
-}
-
-/// Adapter tokens for one generated binding class.
-///
-/// Returns `(binding kind, adapter value, adapter function)` so the inferred
-/// and contract-declared descriptor paths cannot diverge.
-fn generated_adapter_tokens(
-    sdk: &proc_macro2::TokenStream,
-    adapter_name: &syn::Ident,
-    wrapper_name: &syn::Ident,
-    binding: GeneratedBinding,
-) -> (
-    proc_macro2::TokenStream,
-    proc_macro2::TokenStream,
-    proc_macro2::TokenStream,
-) {
-    match binding {
-        GeneratedBinding::Stack => (
-            quote!(#sdk::host_extension::HostBindingKind::StaticStack),
-            quote!(#sdk::host_extension::HostAdapterDescriptor::StaticStack(#adapter_name)),
-            quote! {
-                #[allow(dead_code)]
-                fn #adapter_name(
-                    vm: &mut #sdk::Vm,
-                    args: &[#sdk::Value],
-                ) -> #sdk::VmResult<#sdk::CallOutcome> {
-                    #sdk::host_extension::host_descriptor_call_outcome(
-                        #wrapper_name(vm, args),
-                    )
-                }
-            },
-        ),
-        GeneratedBinding::Args => (
-            quote!(#sdk::host_extension::HostBindingKind::StaticArgs),
-            quote!(#sdk::host_extension::HostAdapterDescriptor::StaticArgs(#adapter_name)),
-            quote! {
-                #[allow(dead_code)]
-                fn #adapter_name(
-                    args: &[#sdk::Value],
-                ) -> #sdk::VmResult<#sdk::CallOutcome> {
-                    #sdk::host_extension::host_descriptor_call_outcome(#wrapper_name(args))
-                }
-            },
-        ),
-        GeneratedBinding::NonYieldingArgs => (
-            quote!(#sdk::host_extension::HostBindingKind::StaticNonYieldingArgs),
-            quote!(#sdk::host_extension::HostAdapterDescriptor::StaticNonYieldingArgs(#adapter_name)),
-            quote! {
-                #[allow(dead_code)]
-                fn #adapter_name(
-                    args: &[#sdk::Value],
-                ) -> #sdk::VmResult<#sdk::CallOutcome> {
-                    #sdk::host_extension::host_descriptor_call_outcome(#wrapper_name(args))
-                }
-            },
-        ),
+    if runtime_owned_pending {
+        // The adapter function itself stays a stack adapter; only the binding
+        // class and adapter marker record that the pending operation belongs to
+        // the generic runtime registries.
+        binding_kind = quote!(#sdk::host_extension::HostBindingKind::StaticStackRuntimeOwned);
+        adapter = quote!(#sdk::host_extension::HostAdapterDescriptor::StaticStackRuntimeOwned(
+            #adapter_name
+        ));
     }
+    Ok((binding_kind, adapter, adapter_fn))
 }
 
 /// Descriptor tokens for a function that declares its guest schema explicitly.
@@ -1311,6 +1318,7 @@ fn generate_contract_host_function_descriptor(
     state_params: &[(String, StateSpec)],
     binding: GeneratedBinding,
     item: &ItemFn,
+    runtime_owned_pending: bool,
 ) -> Result<proc_macro2::TokenStream, Error> {
     let mut state_effect_tokens = Vec::new();
     for input in &item.sig.inputs {
@@ -1337,8 +1345,14 @@ fn generate_contract_host_function_descriptor(
         });
     }
 
-    let (binding_kind, adapter, adapter_fn) =
-        generated_adapter_tokens(sdk, adapter_name, wrapper_name, binding);
+    let (binding_kind, adapter, adapter_fn) = generated_adapter_tokens(
+        sdk,
+        adapter_name,
+        wrapper_name,
+        binding,
+        runtime_owned_pending,
+        item,
+    )?;
 
     Ok(quote! {
         #adapter_fn
@@ -1912,6 +1926,81 @@ mod tests {
         assert!(
             expanded.contains("open_descriptor"),
             "the descriptor factory name is unchanged: {expanded}"
+        );
+    }
+
+    #[test]
+    fn runtime_owned_pending_flag_selects_the_pending_owning_stack_adapter() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(
+            name = "http::client::request",
+            contract = http_request_contract,
+            runtime_owned_pending
+        );
+        let item: ItemFn = parse_quote! {
+            /// Suspends until the generic runtime operation registry completes it.
+            fn request(vm: &mut Vm, request: VmMapHandle) -> VmResult<HostCallResult<VmMap>> {
+                todo!()
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item).unwrap().to_string();
+        assert!(
+            expanded.contains("HostBindingKind :: StaticStackRuntimeOwned"),
+            "the dispatch flag must select the pending-owning binding class: {expanded}"
+        );
+        assert!(
+            expanded.contains("HostAdapterDescriptor :: StaticStackRuntimeOwned"),
+            "the dispatch flag must select the pending-owning adapter: {expanded}"
+        );
+        assert!(
+            expanded.contains("declared_host_contract"),
+            "the guest contract is still declared on the same function: {expanded}"
+        );
+    }
+
+    #[test]
+    fn runtime_owned_pending_flag_requires_a_stack_dispatch_signature() {
+        let attr: Punctuated<Meta, Token![,]> = parse_quote!(
+            name = "demo::count",
+            contract = demo_count_contract,
+            runtime_owned_pending
+        );
+        let item: ItemFn = parse_quote! {
+            /// A non-yielding signature cannot own a pending operation.
+            fn count() -> i64 {
+                todo!()
+            }
+        };
+        let error = expand_pd_host_function(attr, item)
+            .expect_err("the pending flag requires a stack-dispatch signature");
+        assert_eq!(
+            error.to_string(),
+            "runtime_owned_pending requires a stack-dispatch signature (`&mut Vm` or a resource \
+             parameter)"
+        );
+    }
+
+    #[test]
+    fn stack_signature_without_the_flag_still_generates_a_plain_stack_adapter() {
+        let attr: Punctuated<Meta, Token![,]> =
+            parse_quote!(name = "io::open", contract = io_open_contract);
+        let item: ItemFn = parse_quote! {
+            /// Opens a raw handle whose guest contract is declared explicitly.
+            fn open(vm: &mut Vm, path: &str) -> VmResult<i64> {
+                todo!()
+            }
+        };
+        let expanded = expand_pd_host_function(attr, item).unwrap().to_string();
+        assert!(
+            expanded.contains("HostBindingKind :: StaticStack"),
+            "the default stack binding class must be unchanged: {expanded}"
+        );
+        assert!(
+            expanded.contains("HostAdapterDescriptor :: StaticStack ("),
+            "the default stack adapter must be unchanged: {expanded}"
+        );
+        assert!(
+            !expanded.contains("StaticStackRuntimeOwned"),
+            "a function that does not opt in must not become runtime-owned: {expanded}"
         );
     }
 
