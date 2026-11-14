@@ -77,7 +77,16 @@ assert(config_value_count == 3);
 
 let reversed_preview: [string] = collections::reverse::<string>(["world", "finance"]);
 let combined_names: [string] = reversed_preview + ["archive"];
-assert(collections::index_of::<string>(&combined_names, "archive") == 2);
+let archive_index: int = match collections::index_of::<string>(&combined_names, "archive") {
+    Option::Some(value) => value,
+    Option::None => -1,
+};
+assert(archive_index == 2);
+let missing_index: bool = match collections::index_of::<string>(&combined_names, "sports") {
+    Option::Some(_) => false,
+    Option::None => true,
+};
+assert(missing_index);
 assert(collections::contains::<string>(&combined_names, "world"));
 assert(collections::contains::<string>(combined_names, "sports") == false);
 

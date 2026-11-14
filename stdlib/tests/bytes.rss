@@ -36,9 +36,39 @@ assert(bytes_std::starts_with(hello, builtin_bytes::from_utf8("ll")) == false);
 assert(bytes_std::ends_with(hello, builtin_bytes::from_utf8("lo")));
 assert(bytes_std::ends_with(hello, builtin_bytes::from_utf8("he")) == false);
 
-assert(bytes_std::index_of(hello, builtin_bytes::from_utf8("")) == 0);
-assert(bytes_std::index_of(hello, builtin_bytes::from_utf8("ll")) == 2);
-assert(bytes_std::index_of(hello, builtin_bytes::from_utf8("zz")) == -1);
+// W02: `index_of` reports absence with `Option<int>`; an empty needle is still
+// a real match at offset 0.
+let empty_needle_index = match bytes_std::index_of(hello, builtin_bytes::from_utf8("")) {
+    Option::Some(value) => value,
+    Option::None => -1,
+};
+assert(empty_needle_index == 0);
+
+let middle_index = match bytes_std::index_of(hello, builtin_bytes::from_utf8("ll")) {
+    Option::Some(value) => value,
+    Option::None => -1,
+};
+assert(middle_index == 2);
+
+let last_index = match bytes_std::index_of(hello, builtin_bytes::from_utf8("o")) {
+    Option::Some(value) => value,
+    Option::None => -1,
+};
+assert(last_index == 4);
+
+let absent = bytes_std::index_of(hello, builtin_bytes::from_utf8("zz"));
+let absent_is_none = match absent {
+    Option::Some(_) => false,
+    Option::None => true,
+};
+assert(absent_is_none);
+
+let long_needle = bytes_std::index_of(hello, builtin_bytes::from_utf8("hello!"));
+let long_needle_is_none = match long_needle {
+    Option::Some(_) => false,
+    Option::None => true,
+};
+assert(long_needle_is_none);
 
 let with_tail = bytes_std::push_u8(builtin_bytes::from_hex("0102"), 255);
 assert(builtin_bytes::to_hex(with_tail) == "0102ff");
