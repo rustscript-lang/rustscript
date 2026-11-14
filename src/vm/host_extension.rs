@@ -111,6 +111,17 @@ pub enum HostBindingKind {
     Static,
     /// Stack-mutating adapter with `&mut Vm`.
     StaticStack,
+    /// Stack-mutating adapter whose pending operation is owned by the generic
+    /// runtime operation/stream registries rather than by a registered
+    /// operation driver.
+    ///
+    /// Installs exactly like [`Self::StaticStack`]; the install path
+    /// additionally marks the registered import runtime-owned through
+    /// [`super::host::HostFunctionRegistry::mark_exact_runtime_owned_pending`]
+    /// so a stack adapter that suspends resolves its pending operation from the
+    /// generic VM registries (submitted host ops / stream drivers) instead of a
+    /// per-function driver.
+    StaticStackRuntimeOwned,
     /// Args-slice adapter without `&mut Vm`.
     StaticArgs,
     /// Non-yielding args-slice adapter.
@@ -150,6 +161,10 @@ pub enum HostAdapterDescriptor {
     Static(super::host::StaticHostFunction),
     /// [`super::host::StaticHostStackFunction`].
     StaticStack(super::host::StaticHostStackFunction),
+    /// Pending-operation-owning [`super::host::StaticHostStackFunction`]:
+    /// installed as a stack adapter, then marked runtime-owned so its pending
+    /// operation resolves from the generic VM operation/stream registries.
+    StaticStackRuntimeOwned(super::host::StaticHostStackFunction),
     /// [`super::host::StaticHostArgsFunction`].
     StaticArgs(super::host::StaticHostArgsFunction),
     /// Non-yielding [`super::host::StaticHostArgsFunction`].
@@ -528,11 +543,21 @@ fn install_descriptor_adapter(
     descriptor: &HostFunctionDescriptor,
     schema: HostImportSchema,
 ) -> VmResult<()> {
+    let mut runtime_owned_pending: Option<String> = None;
     let result = match (&descriptor.binding.kind, &descriptor.adapter) {
         (HostBindingKind::Static, HostAdapterDescriptor::Static(function)) => {
             registry.register_catalog_static(schema, *function)
         }
         (HostBindingKind::StaticStack, HostAdapterDescriptor::StaticStack(function)) => {
+            registry.register_catalog_static_stack(schema, *function)
+        }
+        (
+            HostBindingKind::StaticStackRuntimeOwned,
+            HostAdapterDescriptor::StaticStackRuntimeOwned(function),
+        ) => {
+            // The adapter registers exactly like a stack adapter; the
+            // runtime-owned marker is applied only after the import exists.
+            runtime_owned_pending = Some(schema.name.clone());
             registry.register_catalog_static_stack(schema, *function)
         }
 
@@ -559,6 +584,14 @@ fn install_descriptor_adapter(
             descriptor.schema.name
         ))
     })?;
+    if let Some(name) = runtime_owned_pending {
+        // Pending dispatch for this import is resolved from the generic VM
+        // submitted-operation/stream registries, so the registered import is
+        // marked runtime-owned. The marker is a registration validation hook:
+        // the submitted-future model already routes those operations, and no
+        // per-function op driver is installed here.
+        registry.mark_exact_runtime_owned_pending(&name)?;
+    }
     let _ = registered;
     Ok(())
 }
@@ -1664,5 +1697,172 @@ mod tests {
             register(&mut registry, &catalog, "demo::overloaded", 1_u8),
             Err(CatalogRegistrationError::AmbiguousOverload { .. })
         ));
+    }
+
+    fn runtime_owned_noop(_vm: &mut Vm, _args: &[Value]) -> VmResult<CallOutcome> {
+        Ok(CallOutcome::Return(crate::vm::CallReturn::None))
+    }
+
+    fn runtime_owned_schema(name: &str) -> HostFunctionSchema {
+        HostFunctionSchema::with_return(
+            name,
+            vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+            HostTypeSchema::String,
+        )
+    }
+
+    fn runtime_owned_descriptor(name: &str) -> HostFunctionDescriptor {
+        HostFunctionDescriptor {
+            schema: runtime_owned_schema(name),
+            binding: HostBindingDescriptor {
+                kind: HostBindingKind::StaticStackRuntimeOwned,
+            },
+            effects: vec![],
+            adapter: HostAdapterDescriptor::StaticStackRuntimeOwned(runtime_owned_noop),
+            resource_types: vec![],
+        }
+    }
+
+    fn static_stack_descriptor(name: &str) -> HostFunctionDescriptor {
+        HostFunctionDescriptor {
+            schema: runtime_owned_schema(name),
+            binding: HostBindingDescriptor {
+                kind: HostBindingKind::StaticStack,
+            },
+            effects: vec![],
+            adapter: HostAdapterDescriptor::StaticStack(runtime_owned_noop),
+            resource_types: vec![],
+        }
+    }
+
+    #[test]
+    fn runtime_owned_descriptor_installs_and_marks_pending() {
+        fn descriptor() -> HostFunctionDescriptor {
+            runtime_owned_descriptor("demo::runtime_owned")
+        }
+        const FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[descriptor];
+        let module = HostModuleDescriptor {
+            name: "demo",
+            functions: FUNCTIONS,
+            resources: &[],
+        };
+        let catalog = module.catalog().expect("module catalog");
+
+        let mut via_module = HostFunctionRegistry::empty();
+        module.install(&mut via_module).expect("module install");
+        assert!(via_module.contains_name("demo::runtime_owned"));
+
+        let mut via_descriptors = HostFunctionRegistry::empty();
+        HostModuleDescriptor::install_descriptors(&mut via_descriptors, &[descriptor()])
+            .expect("explicit descriptor install");
+        assert!(via_descriptors.contains_name("demo::runtime_owned"));
+
+        let mut via_catalog = HostFunctionRegistry::empty();
+        let installed = module
+            .install_from_catalog(&mut via_catalog, &catalog)
+            .expect("catalog snapshot install");
+        assert_eq!(installed.fingerprint(), catalog.fingerprint());
+        assert!(via_catalog.contains_name("demo::runtime_owned"));
+        // The marker is a registration check, not one-shot state: an import
+        // installed through the descriptor path is runtime-ownable afterwards.
+        via_catalog
+            .mark_exact_runtime_owned_pending("demo::runtime_owned")
+            .expect("registered import stays runtime-ownable");
+    }
+
+    #[test]
+    fn runtime_owned_marker_rejects_unregistered_imports() {
+        let mut registry = HostFunctionRegistry::empty();
+        let error = registry
+            .mark_exact_runtime_owned_pending("demo::unregistered")
+            .expect_err("an unregistered import cannot be marked runtime-owned");
+        assert!(
+            matches!(
+                &error,
+                crate::vm::VmError::HostError(message)
+                    if message
+                        == "cannot mark unregistered host import 'demo::unregistered' as runtime-owned"
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(!registry.contains_name("demo::unregistered"));
+    }
+
+    #[test]
+    fn static_stack_descriptor_still_installs_without_the_runtime_owned_marker() {
+        fn descriptor() -> HostFunctionDescriptor {
+            static_stack_descriptor("demo::static_stack")
+        }
+        const FUNCTIONS: &[fn() -> HostFunctionDescriptor] = &[descriptor];
+        let module = HostModuleDescriptor {
+            name: "demo",
+            functions: FUNCTIONS,
+            resources: &[],
+        };
+        let catalog = module.catalog().expect("module catalog");
+
+        let mut registry = HostFunctionRegistry::empty();
+        HostModuleDescriptor::install_descriptors(&mut registry, &[descriptor()])
+            .expect("plain stack descriptor install");
+        assert!(registry.contains_name("demo::static_stack"));
+
+        let mut from_catalog = HostFunctionRegistry::empty();
+        module
+            .install_from_catalog(&mut from_catalog, &catalog)
+            .expect("plain stack catalog install");
+        assert!(from_catalog.contains_name("demo::static_stack"));
+    }
+
+    #[test]
+    fn runtime_owned_binding_requires_the_runtime_owned_adapter() {
+        fn descriptor() -> HostFunctionDescriptor {
+            HostFunctionDescriptor {
+                schema: runtime_owned_schema("demo::variant_mismatch"),
+                binding: HostBindingDescriptor {
+                    kind: HostBindingKind::StaticStackRuntimeOwned,
+                },
+                effects: vec![],
+                adapter: HostAdapterDescriptor::StaticStack(runtime_owned_noop),
+                resource_types: vec![],
+            }
+        }
+        fn mirrored() -> HostFunctionDescriptor {
+            HostFunctionDescriptor {
+                schema: runtime_owned_schema("demo::mirrored_mismatch"),
+                binding: HostBindingDescriptor {
+                    kind: HostBindingKind::StaticStack,
+                },
+                effects: vec![],
+                adapter: HostAdapterDescriptor::StaticStackRuntimeOwned(runtime_owned_noop),
+                resource_types: vec![],
+            }
+        }
+
+        for (factory, name) in [
+            (
+                descriptor as fn() -> HostFunctionDescriptor,
+                "demo::variant_mismatch",
+            ),
+            (
+                mirrored as fn() -> HostFunctionDescriptor,
+                "demo::mirrored_mismatch",
+            ),
+        ] {
+            let mut registry = HostFunctionRegistry::empty();
+            let error = HostModuleDescriptor::install_descriptors(&mut registry, &[factory()])
+                .expect_err("binding/adapter disagreement must fail");
+            assert!(
+                error.to_string().contains("binding/adapter mismatch"),
+                "unexpected error: {error}"
+            );
+            assert!(
+                error.to_string().contains(name),
+                "unexpected error: {error}"
+            );
+            assert!(
+                !registry.contains_name(name),
+                "a rejected install must leave `{name}` unbound"
+            );
+        }
     }
 }

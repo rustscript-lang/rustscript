@@ -13,7 +13,7 @@ One host function declaration produces, in a single macro expansion:
 | Part | Meaning |
 |---|---|
 | `schema` | The guest ABI: parameter names, types, passing modes, return type. This is the only fingerprint input. |
-| `binding` | The dispatch class (`Static`, `StaticStack`, `StaticArgs`, `StaticNonYieldingArgs`, `Owned`). |
+| `binding` | The dispatch class (`Static`, `StaticStack`, `StaticStackRuntimeOwned`, `StaticArgs`, `StaticNonYieldingArgs`, `Owned`). |
 | `adapter` | The concrete adapter or owned-dispatch factory installed into a registry. |
 | `effects` | Guest resource effects (borrow/borrow-mut/take-owned/create) and hidden host-state read/write effects. Runtime-only metadata; excluded from the fingerprint. |
 | `resource_types` | The concrete resource-type declarations this function contributes. |
@@ -378,6 +378,41 @@ isolated owned-value execution VM. The owned path keeps its guarantees: exact
 operand draining, callback provenance, isolated callback VM, and transactional
 owned-resource transfer. Do not route an owned function through borrowed or
 static dispatch.
+
+### Runtime-owned pending dispatch
+
+A stack adapter whose call suspends — the HTTP request and SQLite statement
+families are the standard examples — resolves its pending operation from the
+generic VM operation/stream registries (submitted host operations and stream
+drivers) instead of from a per-function operation driver. Descriptors express
+that with `HostBindingKind::StaticStackRuntimeOwned` and the stack adapter:
+
+```rust
+HostFunctionDescriptor {
+    schema: http_request_contract(),
+    binding: HostBindingDescriptor { kind: HostBindingKind::StaticStackRuntimeOwned },
+    effects: vec![],
+    adapter: HostAdapterDescriptor::StaticStackRuntimeOwned(builtin_http_client_request),
+    resource_types: vec![],
+}
+```
+
+The adapter is a `StaticHostStackFunction`, exactly like `StaticStack`: the two
+classes register identically. The difference is the install step — after the
+import registers, the module install path calls
+`HostFunctionRegistry::mark_exact_runtime_owned_pending(&name)`, which fails
+closed for a name that is not registered:
+
+```
+cannot mark unregistered host import '<name>' as runtime-owned
+```
+
+The marker records no per-import state: submitted operations are keyed by their
+reserved host-operation id, so there is no parallel op-driver table to maintain.
+Choose `StaticStackRuntimeOwned` only when the call's pending operation is owned
+by those generic registries. A module that schedules its own concrete operation
+driver (the `io::*` family) keeps plain `StaticStack`, and an owned-dispatch
+function that transfers its operands keeps `Owned`.
 
 ## 6. Aggregation and feature gates
 
