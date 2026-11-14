@@ -23,16 +23,20 @@ use std::path::{Path, PathBuf};
 const HTTP_SURFACE_ENABLED: bool = cfg!(all(feature = "http-client", not(target_family = "wasm")));
 
 // Current descriptor identities, selected for the actual native feature set.
+//
+// These were re-pinned when `timer::at` / `timer::every` moved from a fixed
+// `true` result to the logical Unit result: the timer module schema is part of
+// both the timer and the composed standard catalog identity.
 const SQLITE_SURFACE_ENABLED: bool = cfg!(all(feature = "sqlite", not(target_family = "wasm")));
-const STANDARD_CATALOG_FINGERPRINT_HTTP_SQLITE: &str = "b704c1210e3ab4a4";
-const STANDARD_CATALOG_FINGERPRINT_SQLITE: &str = "6cad8e423debdebd";
-const STANDARD_CATALOG_FINGERPRINT_HTTP: &str = "c9e705595cfd2cc7";
-const STANDARD_CATALOG_FINGERPRINT_BASE: &str = "8254b00d727494b4";
+const STANDARD_CATALOG_FINGERPRINT_HTTP_SQLITE: &str = "84cb7f8e3872bec4";
+const STANDARD_CATALOG_FINGERPRINT_SQLITE: &str = "b0d7ea2d8fb1c73d";
+const STANDARD_CATALOG_FINGERPRINT_HTTP: &str = "e49304b3042a55cf";
+const STANDARD_CATALOG_FINGERPRINT_BASE: &str = "9683c55f6e57531c";
 const IO_CATALOG_FINGERPRINT: &str = "a16730bd11bf5e10";
 #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
 const SQLITE_CATALOG_FINGERPRINT: &str = "740ab59ccb8fd09a";
 const JIT_CATALOG_FINGERPRINT: &str = "ae81318e8a018681";
-const TIMER_CATALOG_FINGERPRINT: &str = "7ecc0517cea3570b";
+const TIMER_CATALOG_FINGERPRINT: &str = "cf14ffffd6b39273";
 #[cfg(all(feature = "http-client", not(target_family = "wasm")))]
 const HTTP_CATALOG_FINGERPRINT: &str = "41e6557a7dd03118";
 fn standard_catalog_fingerprint() -> &'static str {

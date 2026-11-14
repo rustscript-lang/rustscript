@@ -734,8 +734,8 @@ fn compiler_type_inference_runtime_cases_cover_host_signature_flows() {
             "edge host namespace signatures propagate to comparisons",
             r#"
                 use runtime;
-                let slept = runtime::sleep(1);
-                slept == true;
+                let slept: () = runtime::sleep(1);
+                slept == ();
             "#,
             vec![Value::Bool(true)],
             vec![HostBindingCase {
@@ -744,7 +744,7 @@ fn compiler_type_inference_runtime_cases_cover_host_signature_flows() {
             }],
             &[TypeMetadataExpectation::LastExact {
                 opcode: OpCode::Ceq,
-                expected: (ValueType::Bool, ValueType::Bool),
+                expected: (ValueType::Null, ValueType::Null),
             }],
         ),
     ];

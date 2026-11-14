@@ -15,6 +15,12 @@ are `DEFAULT_MAX_PENDING_TIMERS` (1024) pending registrations and
 re-exported at the crate root, and an embedding can install different
 `TimerConfig` limits.
 
+`timer::at` / `timer::every` report the logical Unit result. A successful
+registration therefore has no payload to inspect: the callback transfer is the
+whole effect, and a rejected registration is the ordinary `VmResult` error
+(the callback operand returns to the guest exactly once). The synchronous count
+queries stay real `int` results.
+
 The callback parameter is typed `fn(bool) -> unknown`: the callback observes the
 `premature` flag and its **return value is discarded**, so the declared result
 is `unknown` — an `int`/`string`/`map`/`bool`/`()` body compiles and runs,
