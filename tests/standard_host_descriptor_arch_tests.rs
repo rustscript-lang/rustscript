@@ -30,12 +30,17 @@ const HTTP_SURFACE_ENABLED: bool = cfg!(all(feature = "http-client", not(target_
 // standard catalog also carries `runtime::sleep` (same Unit result) and the
 // `aot::compile` / `aot::clear` command hosts, so any result-type change to
 // those two surface families re-pins these values as well.
+//
+// They were re-pinned again when the `io` module reported its outcomes as
+// `Result` instead of sentinel values: `io` is composed into every build, so
+// its schema change moves both the `io` catalog identity and all four composed
+// standard identities.
 const SQLITE_SURFACE_ENABLED: bool = cfg!(all(feature = "sqlite", not(target_family = "wasm")));
-const STANDARD_CATALOG_FINGERPRINT_HTTP_SQLITE: &str = "84cb7f8e3872bec4";
-const STANDARD_CATALOG_FINGERPRINT_SQLITE: &str = "b0d7ea2d8fb1c73d";
-const STANDARD_CATALOG_FINGERPRINT_HTTP: &str = "e49304b3042a55cf";
-const STANDARD_CATALOG_FINGERPRINT_BASE: &str = "9683c55f6e57531c";
-const IO_CATALOG_FINGERPRINT: &str = "a16730bd11bf5e10";
+const STANDARD_CATALOG_FINGERPRINT_HTTP_SQLITE: &str = "2cd4d66a50e0cc47";
+const STANDARD_CATALOG_FINGERPRINT_SQLITE: &str = "34b88854300802c8";
+const STANDARD_CATALOG_FINGERPRINT_HTTP: &str = "48b693a20f1b92d0";
+const STANDARD_CATALOG_FINGERPRINT_BASE: &str = "8bf67281072b7f1d";
+const IO_CATALOG_FINGERPRINT: &str = "c8877c93e38dd831";
 #[cfg(all(feature = "sqlite", not(target_family = "wasm")))]
 const SQLITE_CATALOG_FINGERPRINT: &str = "740ab59ccb8fd09a";
 const JIT_CATALOG_FINGERPRINT: &str = "ae81318e8a018681";
