@@ -212,25 +212,32 @@ pub(crate) async fn builtin_io_open(
     #[pd_host_context] context: IoPolicyContext,
     path: String,
     mode: String,
-) -> VmResult<vm::HostFutureOutput<i64>> {
+) -> VmResult<vm::HostFutureOutput<Value>> {
     // Mode validation and `OpenOptions` setup are omitted here.
     let path = authorize_io_path(context.policy.as_ref(), &path, writes).await?;
-    let file = options
-        .open(path)
-        .await
-        .map_err(|error| VmError::HostError(format!("io_open failed: {error}")))?;
+    let file = match options.open(path).await {
+        Ok(file) => file,
+        // A recoverable failure is the contract's `Err` branch, never a VM fault.
+        Err(error) => return Ok(io_error_output("io_open", error)),
+    };
     let handle = IoHandle::File(BufReader::new(file));
     Ok(vm::HostFutureOutput::complete(move |vm| {
-        let token = vm
-            .execution_scope()
-            .push_resource(IoResource::new(handle))
-            .map_err(|error| VmError::HostError(format!(
-                "io resource insert failed: {error}"
-            )))?;
-        Ok(token.into_handle().raw() as i64)
+        publish_open_handle(vm, handle, super::io_open_contract().return_type)
     }))
 }
 ```
+
+A contract may also declare a fallible return. `io::open`, `io::popen`,
+`io::read_all`, `io::read_line`, `io::write`, `io::flush` and `io::close`
+declare `Result<T, string>`, where only ordinary file-system outcomes take the
+`Err` branch: invalid or closed handles, ownership/scope errors, policy denials,
+byte limits, unsupported modes and capability rejections stay fatal `VmError`s.
+
+An owned resource cannot cross the future boundary inside a `GuestResult` (the
+macro rejects it), so the async adapter returns the assembled guest carrier
+through `vm::HostFutureOutput<Value>` and publishes it with
+`crate::result::publish_owned`, which inserts the resource, validates the
+carrier against the declared contract and rolls the insertion back on failure.
 
 When context depends on a resource-token argument, implement
 `capture_with_args(vm, args)` to validate the token and clone the owned resource

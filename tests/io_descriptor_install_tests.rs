@@ -98,47 +98,12 @@ fn host_error(error: VmError) -> String {
     }
 }
 
-/// The IO guest contract has no nullable or void route: absence is a domain
-/// value (`false`, an empty string, or a host error), never an implicit
-/// `Option`/`Optional`/`Null` carrier, and every void-free call keeps its
-/// concrete return type.
-fn assert_no_nullable_or_void_route(path: &str, schema: &HostTypeSchema) {
-    match schema {
-        HostTypeSchema::Null | HostTypeSchema::Unit => {
-            panic!("io public schema {path} exposes a void/null route: {schema:?}")
-        }
-        HostTypeSchema::Optional(_) | HostTypeSchema::Option(_) => {
-            panic!("io public schema {path} exposes a nullable route: {schema:?}")
-        }
-        HostTypeSchema::Array(inner) => {
-            assert_no_nullable_or_void_route(&format!("{path}[]"), inner)
-        }
-        HostTypeSchema::Map(inner) => {
-            assert_no_nullable_or_void_route(&format!("{path}{{}}"), inner)
-        }
-        HostTypeSchema::Callable { params, result } => {
-            for (index, param) in params.iter().enumerate() {
-                assert_no_nullable_or_void_route(&format!("{path}.callback_param[{index}]"), param);
-            }
-            assert_no_nullable_or_void_route(&format!("{path}.callback_result"), result);
-        }
-        HostTypeSchema::Result { ok, err } => {
-            assert_no_nullable_or_void_route(&format!("{path}.ok"), ok);
-            assert_no_nullable_or_void_route(&format!("{path}.err"), err);
-        }
-        HostTypeSchema::Named { fields, .. } => {
-            for field in fields {
-                assert_no_nullable_or_void_route(&format!("{path}.{}", field.name), &field.ty);
-            }
-        }
-        HostTypeSchema::Unknown
-        | HostTypeSchema::Int
-        | HostTypeSchema::Float
-        | HostTypeSchema::Number
-        | HostTypeSchema::Bool
-        | HostTypeSchema::String
-        | HostTypeSchema::Bytes
-        | HostTypeSchema::Resource(_) => {}
+/// The recoverable IO contract: the success payload, or the formatted
+/// operating-system error message.
+fn io_result(ok: HostTypeSchema) -> HostTypeSchema {
+    HostTypeSchema::Result {
+        ok: Box::new(ok),
+        err: Box::new(HostTypeSchema::String),
     }
 }
 
@@ -179,11 +144,11 @@ fn io_module_descriptors_carry_coherent_schema_binding_and_effects() {
     );
 
     let key = io_file_key();
+    let open_result = io_result(HostTypeSchema::Resource(key.clone()));
     let open = &owned["io::open"];
     assert_eq!(
-        open.schema.return_type,
-        HostTypeSchema::Resource(key.clone()),
-        "io::open must return the typed io.file resource"
+        open.schema.return_type, open_result,
+        "io::open must return the typed io.file resource or a string error"
     );
     assert!(
         open.effects
@@ -272,30 +237,54 @@ fn io_module_descriptors_carry_coherent_schema_binding_and_effects() {
 // -------------------------------------------------------------------- install
 
 #[test]
-fn io_owned_public_schemas_have_no_nullable_or_void_route() {
+fn io_owned_public_schemas_declare_their_recoverable_routes() {
+    // Every fallible call reports a plain string error, and no handle parameter
+    // is ever a nullable route: ownership stays typed.
     for descriptor in owned_descriptors().values() {
-        assert_no_nullable_or_void_route(
-            &format!("{}(return)", descriptor.schema.name),
-            &descriptor.schema.return_type,
-        );
-        for param in &descriptor.schema.params {
-            assert_no_nullable_or_void_route(
-                &format!("{}({})", descriptor.schema.name, param.name),
-                &param.ty,
-            );
+        if descriptor.schema.name == "io::exists" {
+            continue;
+        }
+        match &descriptor.schema.return_type {
+            HostTypeSchema::Result { err, .. } => assert_eq!(
+                **err,
+                HostTypeSchema::String,
+                "`{}` must report a string error",
+                descriptor.schema.name
+            ),
+            other => panic!(
+                "`{}` must declare a Result contract, found {other:?}",
+                descriptor.schema.name
+            ),
         }
     }
 
-    // The domain keeps its actual present/absent policy: a missing path is
-    // `false`, an empty file is an empty string, and close reports its Boolean
-    // result. None of these is a logical nullable route.
+    // Recoverable outcomes are explicit in the contract: a missing path and a
+    // missing command stay Booleans/`Err`, an empty file is `Ok("")`, end of
+    // file is `Ok(None)`, and the command-style flush/close report `Ok(())`.
     let owned = owned_descriptors();
     assert_eq!(owned["io::exists"].schema.return_type, HostTypeSchema::Bool);
     assert_eq!(
         owned["io::read_all"].schema.return_type,
-        HostTypeSchema::String
+        io_result(HostTypeSchema::String)
     );
-    assert_eq!(owned["io::close"].schema.return_type, HostTypeSchema::Bool);
+    assert_eq!(
+        owned["io::read_line"].schema.return_type,
+        io_result(HostTypeSchema::Option(Box::new(HostTypeSchema::String))),
+        "io::read_line must distinguish end of file from an empty line"
+    );
+    assert_eq!(
+        owned["io::write"].schema.return_type,
+        io_result(HostTypeSchema::Int),
+        "io::write must report the bytes it wrote"
+    );
+    assert_eq!(
+        owned["io::flush"].schema.return_type,
+        io_result(HostTypeSchema::Unit)
+    );
+    assert_eq!(
+        owned["io::close"].schema.return_type,
+        io_result(HostTypeSchema::Unit)
+    );
 }
 
 #[test]
@@ -602,14 +591,20 @@ fn installed_io_descriptors_execute_open_write_read_close() {
     let inside = dir.join("payload.txt");
     let (mut vm, submitted) = vm_with_installed_io(&format!(
         r#"
-        let written = io::open("{inside}", "w");
-        io::write(written, "descriptor-installed");
-        io::flush(written);
-        let closed = io::close(written);
-        let read_back = io::open("{inside}", "r");
-        let contents = io::read_all(read_back);
-        let closed_again = io::close(read_back);
-        contents;
+        fn round_trip() -> Result<string, string> {{
+            let written = io::open("{inside}", "w")?;
+            io::write(written, "descriptor-installed")?;
+            io::flush(written)?;
+            io::close(written)?;
+            let read_back = io::open("{inside}", "r")?;
+            let contents = io::read_all(read_back)?;
+            io::close(read_back)?;
+            Result::Ok(contents)
+        }}
+        match round_trip() {{
+            Result::Ok(contents) => contents,
+            Result::Err(message) => message,
+        }};
         "#,
         inside = inside.display()
     ));
@@ -652,12 +647,18 @@ fn installed_io_descriptors_preserve_absent_false_and_empty_file_string() {
     fs::write(&empty, "").expect("the empty fixture should be writable");
     let (mut vm, submitted) = vm_with_installed_io(&format!(
         r#"
-        let present = io::exists("{empty}");
-        let absent = io::exists("{missing}");
-        let handle = io::open("{empty}", "r");
-        let contents = io::read_all(handle);
-        let closed = io::close(handle);
-        present && !absent && contents == "" && closed;
+        fn probe() -> Result<bool, string> {{
+            let present = io::exists("{empty}");
+            let absent = io::exists("{missing}");
+            let handle = io::open("{empty}", "r")?;
+            let contents = io::read_all(handle)?;
+            io::close(handle)?;
+            Result::Ok(present && !absent && contents == "")
+        }}
+        match probe() {{
+            Result::Ok(value) => value,
+            Result::Err(message) => false,
+        }};
         "#,
         empty = empty.display(),
         missing = missing.display()
@@ -697,9 +698,13 @@ fn installed_io_descriptors_reject_a_stale_handle_after_close() {
     fs::write(&inside, "ownership").expect("fixture file should be writable");
     let (mut vm, submitted) = vm_with_installed_io(&format!(
         r#"
-        let handle = io::open("{inside}", "r");
-        let closed = io::close(handle);
-        io::read_all(handle);
+        fn reuse_closed() -> Result<int, string> {{
+            let handle = io::open("{inside}", "r")?;
+            io::close(handle)?;
+            let contents = io::read_all(handle)?;
+            Result::Ok(contents.length)
+        }}
+        reuse_closed();
         "#,
         inside = inside.display()
     ));

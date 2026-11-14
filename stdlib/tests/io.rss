@@ -5,10 +5,22 @@ use io;
 let mut fixture_path = "stdlib/rss/strings.rss";
 assert(io::exists(fixture_path));
 
-let mut text = file_io::read_text(fixture_path);
-assert(string::contains(text, "pub fn contains"));
-assert(string::contains(text, "pub fn trim"));
+// The wrappers surface IO failure instead of returning an empty string: a
+// missing file is `Err`, and a real read is `Ok` with the file contents.
+let mut text_ok = match file_io::read_text(fixture_path) {
+    Result::Ok(text) => string::contains(text, "pub fn contains") && string::contains(text, "pub fn trim"),
+    Result::Err(message) => false,
+};
+assert(text_ok);
 
-let mut lines = file_io::read_lines(fixture_path);
-assert(lines.length > 10);
-assert(string::contains(lines[0], "String helpers"));
+let mut missing_is_err = match file_io::read_text("stdlib/rss/__missing_fixture__.rss") {
+    Result::Ok(text) => false,
+    Result::Err(message) => message.length > 0,
+};
+assert(missing_is_err);
+
+let mut lines_ok = match file_io::read_lines(fixture_path) {
+    Result::Ok(lines) => lines.length > 10 && string::contains(lines[0], "String helpers"),
+    Result::Err(message) => false,
+};
+assert(lines_ok);

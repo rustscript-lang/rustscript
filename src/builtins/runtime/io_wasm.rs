@@ -5,10 +5,20 @@
 //! only supplies the adapter implementations for a target without a file
 //! system. Every entry point fails closed with a host error, so the guest
 //! surface and the compiled contracts stay identical to the native backends.
+//!
+//! Every call declares its guest contract explicitly, so the guest-visible
+//! `Result` is the same on this target. The compiled signature keeps the raw
+//! physical carrier (a scope token, text, a Boolean) because no value is ever
+//! produced here — a capability rejection is a fatal host error, never a guest
+//! `Err` branch.
 
 use pd_host_function::pd_host_function;
 
-use super::{HostCallResult, IO_FILE_DESCRIPTION, IO_FILE_KEY};
+use super::{
+    HostCallResult, IO_FILE_DESCRIPTION, IO_FILE_KEY, io_close_contract, io_flush_contract,
+    io_open_contract, io_popen_contract, io_read_all_contract, io_read_line_contract,
+    io_write_contract,
+};
 use crate::vm::{Vm, VmError, VmResult};
 
 /// The wasm32 IO backend keeps no scope resource, but the guest-visible
@@ -29,7 +39,7 @@ pub(crate) fn io_file_resource() -> crate::host_extension::HostResourceTypeMeta 
 }
 
 /// Opens a file handle for runtime I/O.
-#[pd_host_function(name = "io::open", contract = super::io_open_contract)]
+#[pd_host_function(name = "io::open", contract = io_open_contract)]
 pub(super) fn builtin_io_open(
     _vm: &mut Vm,
     _path: &str,
@@ -41,7 +51,7 @@ pub(super) fn builtin_io_open(
 }
 
 /// Starts a child process and returns a process-backed handle.
-#[pd_host_function(name = "io::popen")]
+#[pd_host_function(name = "io::popen", contract = io_popen_contract)]
 pub(super) fn builtin_io_popen(
     _vm: &mut Vm,
     _command: &str,
@@ -53,7 +63,7 @@ pub(super) fn builtin_io_popen(
 }
 
 /// Reads all remaining text from an I/O handle.
-#[pd_host_function(name = "io::read_all", contract = super::io_read_all_contract)]
+#[pd_host_function(name = "io::read_all", contract = io_read_all_contract)]
 pub(super) fn builtin_io_read_all(
     _vm: &mut Vm,
     _handle_id: i64,
@@ -64,7 +74,7 @@ pub(super) fn builtin_io_read_all(
 }
 
 /// Reads a single line of text from an I/O handle.
-#[pd_host_function(name = "io::read_line")]
+#[pd_host_function(name = "io::read_line", contract = io_read_line_contract)]
 pub(super) fn builtin_io_read_line(
     _vm: &mut Vm,
     _handle_id: i64,
@@ -75,7 +85,7 @@ pub(super) fn builtin_io_read_line(
 }
 
 /// Writes text to an I/O handle.
-#[pd_host_function(name = "io::write")]
+#[pd_host_function(name = "io::write", contract = io_write_contract)]
 pub(super) fn builtin_io_write(
     _vm: &mut Vm,
     _handle_id: i64,
@@ -87,7 +97,7 @@ pub(super) fn builtin_io_write(
 }
 
 /// Flushes buffered output for an I/O handle.
-#[pd_host_function(name = "io::flush")]
+#[pd_host_function(name = "io::flush", contract = io_flush_contract)]
 pub(super) fn builtin_io_flush(_vm: &mut Vm, _handle_id: i64) -> VmResult<HostCallResult<bool>> {
     Err(VmError::HostError(
         "io::flush is unsupported on wasm32 runtime".to_string(),
@@ -95,7 +105,7 @@ pub(super) fn builtin_io_flush(_vm: &mut Vm, _handle_id: i64) -> VmResult<HostCa
 }
 
 /// Closes an I/O handle.
-#[pd_host_function(name = "io::close", contract = super::io_close_contract)]
+#[pd_host_function(name = "io::close", contract = io_close_contract)]
 pub(super) fn builtin_io_close(_vm: &mut Vm, _handle_id: i64) -> VmResult<HostCallResult<bool>> {
     Err(VmError::HostError(
         "io::close is unsupported on wasm32 runtime".to_string(),

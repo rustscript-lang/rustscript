@@ -52,18 +52,31 @@ fn vm_for(source: &str) -> Vm {
 
 #[test]
 fn inline_io_calls_complete_without_pending_operations() {
-    let mut vm = vm_for("let h = io::open(\"Cargo.toml\", \"r\"); io::close(h);");
+    let mut vm = vm_for(
+        r#"
+        fn probe() -> Result<bool, string> {
+            let handle = io::open("Cargo.toml", "r")?;
+            io::close(handle)?;
+            Result::Ok(true)
+        }
+        probe();
+        "#,
+    );
     assert!(vm.execution_scope().operations().is_empty());
     assert!(vm.execution_scope().resources().is_empty());
 }
 
 #[test]
-fn io_close_returns_true_and_closed_handle_is_stale() {
+fn io_close_reports_unit_and_a_closed_handle_is_stale() {
     let error = run_source_host_error(
         r#"
-        let handle = io::open("Cargo.toml", "r");
-        io::close(handle);
-        io::close(handle);
+        fn probe() -> Result<bool, string> {
+            let handle = io::open("Cargo.toml", "r")?;
+            io::close(handle)?;
+            io::close(handle)?;
+            Result::Ok(true)
+        }
+        probe();
         "#,
     );
     assert!(
@@ -79,9 +92,13 @@ fn io_close_returns_true_and_closed_handle_is_stale() {
 fn io_close_then_read_rejects_stale_handle() {
     let error = run_source_host_error(
         r#"
-        let handle = io::open("Cargo.toml", "r");
-        io::close(handle);
-        io::read_all(handle);
+        fn probe() -> Result<bool, string> {
+            let handle = io::open("Cargo.toml", "r")?;
+            io::close(handle)?;
+            let text = io::read_all(handle)?;
+            Result::Ok(text.length > 0)
+        }
+        probe();
         "#,
     );
     assert!(
@@ -100,9 +117,23 @@ fn io_close_on_non_positive_handle_is_rejected() {
 }
 
 #[test]
-fn io_open_read_mode_reports_missing_file() {
-    let error = run_source_host_error("io::open(\"__pd_vm_missing_file_for_test__.txt\", \"r\");");
-    assert!(error.contains("io_open failed"), "{error}");
+fn io_open_missing_file_is_a_guest_error() {
+    let stack = run_source(
+        r#"
+        match io::open("__pd_vm_missing_file_for_test__.txt", "r") {
+            Result::Ok(handle) => "",
+            Result::Err(message) => message,
+        };
+        "#,
+    )
+    .expect("a missing file must not abort the VM");
+    let Some(Value::String(message)) = stack.last() else {
+        panic!("a missing file must report a guest Err string, got {stack:?}");
+    };
+    assert!(
+        message.contains("io_open failed"),
+        "the guest error must keep the operating-system text: {message}"
+    );
 }
 
 #[test]
@@ -114,11 +145,14 @@ fn io_open_rejects_unsupported_mode() {
 #[test]
 fn io_rejects_foreign_scope_handles() {
     let foreign_handle = {
-        let vm = vm_for("let h = io::open(\"Cargo.toml\", \"r\"); h;");
-        let Value::Int(raw) = vm.stack().last().cloned().expect("handle on stack") else {
-            panic!("io::open must return an integer handle");
-        };
-        raw
+        let vm = vm_for("io::open(\"Cargo.toml\", \"r\");");
+        let value = vm.stack().last().cloned().expect("open result on stack");
+        let (ok, payload) =
+            vm::result::payload(&value).expect("io::open must return a Result carrier");
+        assert!(ok, "io::open on a readable file must succeed");
+        let handle = vm::result::resource_handle(&payload)
+            .expect("the Ok branch of io::open must carry the opened handle");
+        handle.raw() as i64
     };
     let error = run_source_host_error(&format!("io::close({foreign_handle});"));
     assert!(
@@ -149,7 +183,7 @@ fn generic_resource_types_remain_distinct() {
 
 #[test]
 fn reset_for_reuse_retires_io_resources_through_scope() {
-    let mut vm = vm_for("let h = io::open(\"Cargo.toml\", \"r\"); h;");
+    let mut vm = vm_for("io::open(\"Cargo.toml\", \"r\");");
     assert!(!vm.execution_scope().resources().is_empty());
     reset_for_reuse_to_ready(&mut vm).expect("reset should reach quiescence");
     assert!(vm.execution_scope().resources().is_empty());
@@ -239,7 +273,15 @@ fn reset_for_reuse_terminates_live_popen_process_tree() {
         "parent=$$; sleep 30 & child=$!; printf '%s %s' $parent $child > {}; wait $child",
         marker.display()
     );
-    let mut vm = vm_for(&format!("let h = io::popen(\"{command}\", \"r\"); h;"));
+    let mut vm = vm_for(&format!(
+        r#"
+        fn hold_process() -> Result<bool, string> {{
+            let handle = io::popen("{command}", "r")?;
+            Result::Ok(true)
+        }}
+        hold_process();
+        "#
+    ));
     let (leader, descendant) = read_process_marker(&marker);
     let _cleanup = ProcessTreeCleanup {
         leader,
@@ -265,7 +307,15 @@ fn vm_drop_signals_live_popen_process_tree_without_driving_close() {
         "parent=$$; sleep 30 & child=$!; printf '%s %s' $parent $child > {}; wait $child",
         marker.display()
     );
-    let vm = vm_for(&format!("let h = io::popen(\"{command}\", \"r\"); h;"));
+    let vm = vm_for(&format!(
+        r#"
+        fn hold_process() -> Result<bool, string> {{
+            let handle = io::popen("{command}", "r")?;
+            Result::Ok(true)
+        }}
+        hold_process();
+        "#
+    ));
     let (leader, descendant) = read_process_marker(&marker);
     let _cleanup = ProcessTreeCleanup {
         leader,

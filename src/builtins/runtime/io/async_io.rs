@@ -30,6 +30,7 @@ use crate::vm::resource::close::{CloseProgress, HostResource};
 use crate::vm::resource::error::{ResourceError, ResourceErrorCode, ResourceResult};
 use crate::vm::resource::{ResourceCloseReason, ResourceHandle};
 use crate::vm::{CaptureAsyncHostContext, HostFutureOutput, Value, Vm, VmError, VmResult};
+use crate::{GuestOption, GuestResult, ResourceOwned};
 
 /// A file / child-process backed IO handle.
 #[derive(Debug)]
@@ -582,12 +583,22 @@ impl CaptureAsyncHostContext for IoHandleContext {
 }
 
 /// Opens a file handle for runtime I/O.
+///
+/// Only the `OpenOptions` failure is a guest error; an unsupported mode and a
+/// policy denial stay fatal.
+///
+/// The async adapter returns the guest `Value` carrier instead of
+/// `HostFutureOutput<GuestResult<ResourceOwned<IoResource>, String>>` because
+/// the host SDK rejects owned resources crossing a future publication. The
+/// declared contract is unchanged, and [`publish_open_handle`] reuses
+/// `publish_owned`, so ownership, schema validation and rollback stay
+/// identical to the blocking backend.
 #[pd_host_function(name = "io::open", contract = super::io_open_contract)]
 pub(crate) async fn builtin_io_open(
     #[pd_host_context] context: IoPolicyContext,
     path: String,
     mode: String,
-) -> VmResult<HostFutureOutput<i64>> {
+) -> VmResult<HostFutureOutput<Value>> {
     let writes = match mode.as_str() {
         "r" => false,
         "w" | "a" | "r+" | "w+" | "a+" => true,
@@ -620,27 +631,26 @@ pub(crate) async fn builtin_io_open(
         }
         _ => unreachable!("mode validated above"),
     }
-    let file = options
-        .open(path)
-        .await
-        .map_err(|error| VmError::HostError(format!("io_open failed: {error}")))?;
+    let file = match options.open(path).await {
+        Ok(file) => file,
+        Err(error) => return Ok(io_error_output("io_open", error)),
+    };
     let handle = IoHandle::File(BufReader::new(file));
     Ok(HostFutureOutput::complete(move |vm| {
-        let token = vm
-            .execution_scope()
-            .push_resource(IoResource::new(handle))
-            .map_err(|error| VmError::HostError(format!("io resource insert failed: {error}")))?;
-        Ok(token.into_handle().raw() as i64)
+        publish_open_handle(vm, handle, super::io_open_contract().return_type)
     }))
 }
 
 /// Starts a child process and returns a process-backed handle.
-#[pd_host_function(name = "io::popen")]
+///
+/// An unsupported mode and a disabled process capability stay fatal; a process
+/// that cannot be started or wired up is a guest error.
+#[pd_host_function(name = "io::popen", contract = super::io_popen_contract)]
 pub(crate) async fn builtin_io_popen(
     #[pd_host_context] context: IoPolicyContext,
     command: String,
     mode: String,
-) -> VmResult<HostFutureOutput<i64>> {
+) -> VmResult<HostFutureOutput<Value>> {
     if mode != "r" && mode != "w" {
         return Err(VmError::HostError(format!(
             "unsupported io_popen mode '{mode}', expected r or w"
@@ -655,28 +665,62 @@ pub(crate) async fn builtin_io_popen(
             "io_popen requires the process capability".to_string(),
         ));
     }
-    let handle = spawn_shell_command(&command, &mode)?;
+    let handle = match spawn_shell_command(&command, &mode) {
+        Ok(handle) => handle,
+        Err(message) => {
+            return Ok(HostFutureOutput::returning(crate::result::carrier(
+                false,
+                Value::string(&message),
+            )));
+        }
+    };
     Ok(HostFutureOutput::complete(move |vm| {
-        let token = vm
-            .execution_scope()
-            .push_resource(IoResource::new(handle))
-            .map_err(|error| VmError::HostError(format!("io resource insert failed: {error}")))?;
-        Ok(token.into_handle().raw() as i64)
+        publish_open_handle(vm, handle, super::io_popen_contract().return_type)
     }))
 }
 
+/// Publishes an opened handle as the `Ok` branch of `io.open` / `io.popen`.
+///
+/// `publish_owned` validates the assembled carrier against `schema`, inserts
+/// the resource into the execution scope and rolls the insertion back when
+/// assembly fails, so the async adapter keeps the blocking backend's ownership
+/// guarantees despite crossing the future boundary with a plain `Value`.
+fn publish_open_handle(
+    vm: &mut Vm,
+    handle: IoHandle,
+    schema: crate::HostTypeSchema,
+) -> VmResult<Value> {
+    crate::result::publish_owned::<IoResource, _>(
+        vm,
+        ResourceOwned::new(IoResource::new(handle)),
+        &schema,
+        |token| Ok(crate::result::carrier(true, token)),
+    )
+}
+
+/// The guest `Err` carrier of a recoverable IO failure.
+fn io_error_output(operation: &str, error: io::Error) -> HostFutureOutput<Value> {
+    HostFutureOutput::returning(crate::result::carrier(
+        false,
+        Value::string(super::io_failure(operation, error)),
+    ))
+}
+
 /// Reads all remaining text from an I/O handle.
+///
+/// A read failure is a guest error; an unusable handle kind and the read limit
+/// stay fatal.
 #[pd_host_function(name = "io::read_all", contract = super::io_read_all_contract)]
 pub(crate) async fn builtin_io_read_all(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
-) -> VmResult<HostFutureOutput<String>> {
+) -> VmResult<HostFutureOutput<GuestResult<String, String>>> {
     let mut slot = context.handle.lock().await;
     let handle = slot
         .as_mut()
         .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
     let mut out = String::new();
-    match handle {
+    let read = match handle {
         IoHandle::File(file) => file.read_to_string(&mut out).await,
         IoHandle::PopenRead { stdout, .. } => stdout.read_to_string(&mut out).await,
         IoHandle::PopenWrite { .. } => {
@@ -684,8 +728,12 @@ pub(crate) async fn builtin_io_read_all(
                 "io_read_all requires a readable handle".to_string(),
             ));
         }
+    };
+    if let Err(error) = read {
+        return Ok(HostFutureOutput::returning(GuestResult::Err(
+            super::io_failure("io_read_all", error),
+        )));
     }
-    .map_err(|error| VmError::HostError(format!("io_read_all failed: {error}")))?;
     if context
         .max_read_bytes
         .is_some_and(|limit| out.len() > limit)
@@ -694,21 +742,25 @@ pub(crate) async fn builtin_io_read_all(
             "io_read_all exceeded read limit".to_string(),
         ));
     }
-    Ok(HostFutureOutput::returning(out))
+    Ok(HostFutureOutput::returning(GuestResult::Ok(out)))
 }
 
 /// Reads a single line of text from an I/O handle.
-#[pd_host_function(name = "io::read_line")]
+///
+/// End of file is `Ok(None)` and an empty line is `Ok(Some(""))`: the returned
+/// line has its single trailing `\n` removed. A read failure is a guest error;
+/// an unusable handle kind and the read limit stay fatal.
+#[pd_host_function(name = "io::read_line", contract = super::io_read_line_contract)]
 pub(crate) async fn builtin_io_read_line(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
-) -> VmResult<HostFutureOutput<String>> {
+) -> VmResult<HostFutureOutput<GuestResult<GuestOption<String>, String>>> {
     let mut slot = context.handle.lock().await;
     let handle = slot
         .as_mut()
         .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
     let mut line = String::new();
-    match handle {
+    let read = match handle {
         IoHandle::File(file) => file.read_line(&mut line).await,
         IoHandle::PopenRead { stdout, .. } => stdout.read_line(&mut line).await,
         IoHandle::PopenWrite { .. } => {
@@ -716,8 +768,23 @@ pub(crate) async fn builtin_io_read_line(
                 "io_read_line requires a readable handle".to_string(),
             ));
         }
+    };
+    let read = match read {
+        Ok(read) => read,
+        Err(error) => {
+            return Ok(HostFutureOutput::returning(GuestResult::Err(
+                super::io_failure("io_read_line", error),
+            )));
+        }
+    };
+    if read == 0 {
+        return Ok(HostFutureOutput::returning(GuestResult::Ok(
+            GuestOption::None,
+        )));
     }
-    .map_err(|error| VmError::HostError(format!("io_read_line failed: {error}")))?;
+    if line.ends_with('\n') {
+        line.pop();
+    }
     if context
         .max_read_bytes
         .is_some_and(|limit| line.len() > limit)
@@ -726,16 +793,21 @@ pub(crate) async fn builtin_io_read_line(
             "io_read_line exceeded read limit".to_string(),
         ));
     }
-    Ok(HostFutureOutput::returning(line))
+    Ok(HostFutureOutput::returning(GuestResult::Ok(
+        GuestOption::Some(line),
+    )))
 }
 
 /// Writes text to an I/O handle.
-#[pd_host_function(name = "io::write")]
+///
+/// A write failure is a guest error; an unusable handle kind and the write
+/// limit stay fatal.
+#[pd_host_function(name = "io::write", contract = super::io_write_contract)]
 pub(crate) async fn builtin_io_write(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
     text: String,
-) -> VmResult<HostFutureOutput<i64>> {
+) -> VmResult<HostFutureOutput<GuestResult<i64, String>>> {
     if context
         .max_write_bytes
         .is_some_and(|limit| text.len() > limit)
@@ -756,37 +828,60 @@ pub(crate) async fn builtin_io_write(
                 "io_write requires a writable handle".to_string(),
             ));
         }
+    };
+    match written {
+        Ok(written) => Ok(HostFutureOutput::returning(GuestResult::Ok(written as i64))),
+        Err(error) => Ok(HostFutureOutput::returning(GuestResult::Err(
+            super::io_failure("io_write", error),
+        ))),
     }
-    .map_err(|error| VmError::HostError(format!("io_write failed: {error}")))?;
-    Ok(HostFutureOutput::returning(written as i64))
 }
 
 /// Flushes buffered output for an I/O handle.
-#[pd_host_function(name = "io::flush")]
+///
+/// A flush failure is a guest error; an unusable handle kind stays fatal.
+#[pd_host_function(name = "io::flush", contract = super::io_flush_contract)]
 pub(crate) async fn builtin_io_flush(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
-) -> VmResult<HostFutureOutput<bool>> {
+) -> VmResult<HostFutureOutput<GuestResult<(), String>>> {
     let mut slot = context.handle.lock().await;
     let handle = slot
         .as_mut()
         .ok_or_else(|| VmError::HostError("io handle is closed".to_string()))?;
-    match handle {
+    let flushed = match handle {
         IoHandle::File(file) => file.get_mut().flush().await,
         IoHandle::PopenWrite { stdin, .. } => stdin.flush().await,
         IoHandle::PopenRead { .. } => Ok(()),
+    };
+    match flushed {
+        Ok(()) => Ok(HostFutureOutput::returning(GuestResult::Ok(()))),
+        Err(error) => Ok(HostFutureOutput::returning(GuestResult::Err(
+            super::io_failure("io_flush", error),
+        ))),
     }
-    .map_err(|error| VmError::HostError(format!("io_flush failed: {error}")))?;
-    Ok(HostFutureOutput::returning(true))
 }
 
 /// Closes an I/O handle.
+///
+/// A cleanup (flush or process termination) failure is a guest error and still
+/// retires the scope resource; an already-closed handle and a pending scope
+/// retirement stay fatal.
 #[pd_host_function(name = "io::close", contract = super::io_close_contract)]
 pub(crate) async fn builtin_io_close(
     #[pd_host_context] context: IoHandleContext,
     _handle_id: i64,
-) -> VmResult<HostFutureOutput<bool>> {
-    close_shared_io_handle_with(Arc::clone(&context.handle), close_io_handle_future).await?;
+) -> VmResult<HostFutureOutput<GuestResult<(), String>>> {
+    let closed =
+        close_shared_io_handle_with(Arc::clone(&context.handle), close_io_handle_future).await;
+    let mut close_failure = None;
+    if let Err(error) = closed {
+        // Take the failed handle out of the shared slot so the drop path
+        // signals the process tree and the scope can still retire it; the
+        // guest reports the cleanup failure instead of aborting the VM.
+        context.handle.lock().await.take();
+        close_failure = Some(error.to_string());
+    }
     let resource = context.resource;
     Ok(HostFutureOutput::complete(move |vm| {
         let progress = vm
@@ -800,7 +895,10 @@ pub(crate) async fn builtin_io_close(
                 "io_close scope retirement is still pending".to_string(),
             ));
         }
-        Ok(true)
+        Ok(match close_failure {
+            Some(message) => GuestResult::Err(message),
+            None => GuestResult::Ok(()),
+        })
     }))
 }
 
@@ -913,7 +1011,10 @@ fn io_parse_handle(handle_id: i64) -> VmResult<ResourceHandle> {
         .map_err(|error| VmError::HostError(format!("invalid io handle id {handle_id}: {error}")))
 }
 
-fn spawn_shell_command(shell_command: &str, mode: &str) -> VmResult<IoHandle> {
+/// Starts the shell for a `popen` handle.
+///
+/// Failures are formatted for the guest error channel of [`builtin_io_popen`].
+fn spawn_shell_command(shell_command: &str, mode: &str) -> Result<IoHandle, String> {
     let mut process = if cfg!(windows) {
         let mut command = Command::new("cmd");
         command.arg("/C").arg(shell_command);
@@ -936,16 +1037,16 @@ fn spawn_shell_command(shell_command: &str, mode: &str) -> VmResult<IoHandle> {
     }
     let mut child = process
         .spawn()
-        .map_err(|error| VmError::HostError(format!("io_popen failed: {error}")))?;
+        .map_err(|error| super::io_failure("io_popen", error))?;
     if mode == "r" {
         let Some(stdout) = child.stdout.take() else {
             let cleanup = start_terminate_child_tree_for_drop(&mut child);
-            return Err(VmError::HostError(match cleanup {
+            return Err(match cleanup {
                 Ok(()) => "io_popen('r') did not provide stdout pipe".to_string(),
                 Err(error) => format!(
                     "io_popen('r') did not provide stdout pipe; process cleanup failed: {error}"
                 ),
-            }));
+            });
         };
         Ok(IoHandle::PopenRead {
             child,
@@ -954,12 +1055,12 @@ fn spawn_shell_command(shell_command: &str, mode: &str) -> VmResult<IoHandle> {
     } else {
         let Some(stdin) = child.stdin.take() else {
             let cleanup = start_terminate_child_tree_for_drop(&mut child);
-            return Err(VmError::HostError(match cleanup {
+            return Err(match cleanup {
                 Ok(()) => "io_popen('w') did not provide stdin pipe".to_string(),
                 Err(error) => format!(
                     "io_popen('w') did not provide stdin pipe; process cleanup failed: {error}"
                 ),
-            }));
+            });
         };
         Ok(IoHandle::PopenWrite { child, stdin })
     }
