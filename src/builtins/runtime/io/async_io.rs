@@ -1204,6 +1204,152 @@ mod tests {
         );
     }
 
+    /// Regression for the call site, not just the helper: a resource entry that
+    /// is still registered while the handle it owns is already gone must stay a
+    /// fatal `VmError` out of `builtin_io_close`'s body, before any retirement.
+    ///
+    /// `_impl` is the name `#[pd_host_function]` gives the authored body; the
+    /// generated wrapper only captures the context and submits the future, so
+    /// this drives the code that owns the `?`-before-retirement ordering.
+    ///
+    /// The state itself is not reachable from guest code in a correct build
+    /// (only the pre-fix double-retirement left an entry behind with an empty
+    /// slot), so the test installs it directly and asserts on the scope: no
+    /// `close_resource`, no entry dropped, no scope teardown.
+    #[tokio::test]
+    async fn builtin_close_keeps_an_empty_slot_resource_registered_and_fatal() {
+        let mut vm = Vm::new(crate::vm::Program::new(
+            Vec::new(),
+            vec![crate::vm::OpCode::Ret as u8],
+        ));
+        let resource = file_resource();
+        let shared = Arc::clone(&resource.handle);
+        let token = vm
+            .execution_scope()
+            .push_resource(resource)
+            .expect("resource insert");
+        let handle = token.handle();
+        // The handle is gone; the entry and its accounting are not.
+        shared.lock().await.take();
+
+        let close = builtin_io_close_impl(
+            IoHandleContext {
+                resource: handle,
+                handle: Arc::clone(&shared),
+                max_read_bytes: None,
+                max_write_bytes: None,
+            },
+            handle.raw() as i64,
+        )
+        .await;
+
+        let error = match close {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("a closed slot must stay fatal at the call site, not become a guest error")
+            }
+        };
+
+        assert!(
+            matches!(&error, VmError::HostError(message) if message == "io handle is closed"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            vm.execution_scope().resources().len(),
+            1,
+            "the fatal close must not call close_resource on the scope"
+        );
+        assert!(
+            vm.execution_scope()
+                .resources()
+                .get::<IoResource>(&token)
+                .is_ok(),
+            "the resource must still be registered, so its Drop never ran"
+        );
+        assert!(
+            !vm.execution_scope().is_closing(),
+            "the fatal close must not start scope teardown"
+        );
+        assert!(
+            shared.lock().await.is_none(),
+            "the fatal close must not take or restore a handle"
+        );
+    }
+
+    /// `CloseFailure::RuntimeRequired` is the one failure that keeps the handle:
+    /// the runtime lease broke before the close started, so nothing was flushed
+    /// or signalled and the caller must not retire its scope either.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_required_close_retains_the_process_handle() {
+        // Popens need a reactor, so spawn under one and then drop out of it:
+        // `Handle::try_current` is what decides the branch under test.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("spawn runtime should build");
+        let resource = runtime.block_on(async {
+            IoResource::new(spawn_shell_command("sleep 30", "r").expect("process should spawn"))
+        });
+        let shared = Arc::clone(&resource.handle);
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the close must be polled outside a runtime to reach RuntimeRequired"
+        );
+
+        let mut vm = Vm::new(crate::vm::Program::new(
+            Vec::new(),
+            vec![crate::vm::OpCode::Ret as u8],
+        ));
+        let token = vm
+            .execution_scope()
+            .push_resource(resource)
+            .expect("resource insert");
+        let handle = token.handle();
+        let mut close = Box::pin(builtin_io_close_impl(
+            IoHandleContext {
+                resource: handle,
+                handle: Arc::clone(&shared),
+                max_read_bytes: None,
+                max_write_bytes: None,
+            },
+            handle.raw() as i64,
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let error = match close.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(error)) => error,
+            Poll::Ready(Ok(_)) => panic!("an off-runtime close must not report a guest outcome"),
+            Poll::Pending => panic!("an off-runtime close must fail instead of waiting"),
+        };
+        assert!(
+            matches!(&error, VmError::HostError(message) if message.contains("RuntimeRequired")),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            shared.blocking_lock().is_some(),
+            "a broken runtime lease must leave the handle owned for a retry"
+        );
+        assert_eq!(
+            vm.execution_scope().resources().len(),
+            1,
+            "the fatal close must not call close_resource on the scope"
+        );
+
+        // The retained handle is still closable once a runtime is driven again.
+        drop(close);
+        runtime
+            .block_on(close_shared_io_handle_with(
+                Arc::clone(&shared),
+                close_io_handle_future,
+            ))
+            .expect("retry under a live runtime should close the retained process");
+        assert!(
+            shared.blocking_lock().is_none(),
+            "the retried close must detach the handle"
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_failure_detaches_the_handle_and_cannot_be_retried() {
         let resource = file_resource();

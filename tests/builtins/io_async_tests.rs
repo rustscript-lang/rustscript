@@ -638,9 +638,15 @@ fn async_io_open_missing_file_is_a_guest_error() {
     );
 }
 
-/// `io::close` takes the handle, so neither a successful close nor a close that
-/// reported a cleanup failure can be retried through the same guest handle: the
-/// second call is a fatal stale-handle error.
+/// A retried `io::close` on the same guest handle never reaches a close: the
+/// first call retired the `io.file` resource, so the second call fails while
+/// resolving the token against the scope (`io_handle_for_resource` in
+/// `async_io.rs` reports `resource_stale`) and the VM aborts with a fatal handle
+/// error.
+///
+/// This test covers that stale-capture path only. The empty-slot fatal branch and
+/// the cleanup-failure ("cannot be retried through the same handle") path are
+/// asserted by the `async_io.rs` unit tests.
 #[test]
 fn async_io_close_cannot_be_retried_through_the_same_handle() {
     let nonce = SystemTime::now()

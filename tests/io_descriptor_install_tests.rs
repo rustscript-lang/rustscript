@@ -672,7 +672,7 @@ fn installed_io_descriptors_preserve_absent_false_and_empty_file_string() {
     assert_eq!(
         run.stack.last(),
         Some(&Value::Bool(true)),
-        "a present empty file stays an empty string, a missing path stays false, and close reports the Unit branch of Result<(), string>"
+        "a present empty file stays an empty string, a missing path stays false, and io::close's Unit payload only flows through `?` here (its declared Result<(), string> is pinned by the descriptor test in this file)"
     );
     assert_pending_ops_resolved_by_backend(&submitted, run.driven_ops, 5);
     assert_eq!(

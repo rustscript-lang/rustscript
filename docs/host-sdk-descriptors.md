@@ -238,12 +238,16 @@ macro rejects it), so the async adapter returns the assembled guest carrier
 through `vm::HostFutureOutput<Value>` and publishes it with
 `crate::result::publish_owned`, which inserts the resource, validates the
 carrier against the declared contract and rolls the insertion back on failure.
-That validation covers the success path only: it is the one that must agree
-with `io::open` / `io::popen`'s `Ok(resource<io.file>)` branch. The `Err`
+That path is specific to the successful branch: it is the one that must agree
+with `io::open` / `io::popen`'s `Ok(resource<io.file>)` outcome. The `Err`
 branches (an unopenable path, a process that cannot be started) are plain
 `Value` strings built by the adapter itself, so they carry no resource and are
-never routed through `publish_owned` — nothing validates them beyond the
-guest's own contract typing.
+never routed through `publish_owned` — there is nothing to insert or roll back.
+They are not unchecked, though: every return, including these, still passes the
+generic `validate_host_call_return` check
+(`src/vm/host.rs:2141` → `validate_host_value`) when the operation completes,
+which validates the value against the declared `Result` schema. What they
+deliberately skip is resource ownership bookkeeping, not schema validation.
 
 `io::read_line`'s success payload is the line **without** its terminator: the
 adapter strips one trailing `\n`, so a file ending in `\r\n` leaves the `\r`
