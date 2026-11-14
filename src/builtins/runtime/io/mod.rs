@@ -134,10 +134,34 @@ fn io_file_key() -> ResourceTypeKey {
     io_file_resource().schema.key
 }
 
+/// The guest contract of a fallible IO operation: the success payload, or the
+/// formatted OS error message.
+///
+/// Only ordinary file-system read/write/open failures travel through this
+/// channel. Invalid or closed handles, resource borrow/ownership/scope
+/// failures, policy denials, read/write limits, unsupported modes and
+/// wasm capability rejections stay fatal [`VmError`](crate::vm::VmError)s: they
+/// are programming or configuration errors, not recoverable IO outcomes.
+fn io_result(ok: HostTypeSchema) -> HostTypeSchema {
+    HostTypeSchema::Result {
+        ok: Box::new(ok),
+        err: Box::new(HostTypeSchema::String),
+    }
+}
+
+/// Formats a recoverable IO failure, keeping the operating-system text.
+///
+/// Every backend reports through this single formatter, so the guest sees one
+/// shape of message regardless of the target.
+#[cfg(not(target_family = "wasm"))]
+fn io_failure(operation: &str, error: impl std::fmt::Display) -> String {
+    format!("{operation} failed: {error}")
+}
+
 /// Guest contract for `io::open`.
 ///
-/// The runtime signature carries the raw scope-token `i64` for the opened
-/// handle; the guest contract is the typed `io.file` resource it denotes.
+/// The runtime signature carries the opened handle as an owned `io.file`
+/// resource; a failure is the formatted OS error.
 fn io_open_contract() -> HostFunctionSchema {
     HostFunctionSchema::with_return(
         "io::open",
@@ -145,7 +169,19 @@ fn io_open_contract() -> HostFunctionSchema {
             HostParamSchema::value("path", HostTypeSchema::String),
             HostParamSchema::value("mode", HostTypeSchema::String),
         ],
-        HostTypeSchema::Resource(io_file_key()),
+        io_result(HostTypeSchema::Resource(io_file_key())),
+    )
+}
+
+/// Guest contract for `io::popen`.
+fn io_popen_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        "io::popen",
+        vec![
+            HostParamSchema::value("command", HostTypeSchema::String),
+            HostParamSchema::value("mode", HostTypeSchema::String),
+        ],
+        io_result(HostTypeSchema::Resource(io_file_key())),
     )
 }
 
@@ -158,7 +194,53 @@ fn io_read_all_contract() -> HostFunctionSchema {
             HostTypeSchema::Resource(io_file_key()),
             HostParamPassing::Borrow,
         )],
-        HostTypeSchema::String,
+        io_result(HostTypeSchema::String),
+    )
+}
+
+/// Guest contract for `io::read_line`.
+///
+/// End of file is `Ok(None)`; a present but empty line is `Ok(Some(""))`.
+fn io_read_line_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        "io::read_line",
+        vec![HostParamSchema::with_passing(
+            "handle",
+            HostTypeSchema::Resource(io_file_key()),
+            HostParamPassing::Borrow,
+        )],
+        io_result(HostTypeSchema::Option(Box::new(HostTypeSchema::String))),
+    )
+}
+
+/// Guest contract for `io::write`.
+///
+/// The success payload is the number of bytes actually written.
+fn io_write_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        "io::write",
+        vec![
+            HostParamSchema::with_passing(
+                "handle",
+                HostTypeSchema::Resource(io_file_key()),
+                HostParamPassing::Borrow,
+            ),
+            HostParamSchema::value("text", HostTypeSchema::String),
+        ],
+        io_result(HostTypeSchema::Int),
+    )
+}
+
+/// Guest contract for `io::flush`.
+fn io_flush_contract() -> HostFunctionSchema {
+    HostFunctionSchema::with_return(
+        "io::flush",
+        vec![HostParamSchema::with_passing(
+            "handle",
+            HostTypeSchema::Resource(io_file_key()),
+            HostParamPassing::Borrow,
+        )],
+        io_result(HostTypeSchema::Unit),
     )
 }
 
@@ -171,7 +253,7 @@ fn io_close_contract() -> HostFunctionSchema {
             HostTypeSchema::Resource(io_file_key()),
             HostParamPassing::TakeOwned,
         )],
-        HostTypeSchema::Bool,
+        io_result(HostTypeSchema::Unit),
     )
 }
 
