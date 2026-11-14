@@ -2015,7 +2015,10 @@ impl<'a> TypeContext<'a> {
             BuiltinFunction::MathClamp if args.len() == 3 => {
                 self.infer_numeric_triplet_return_type(&args[0], &args[1], &args[2], state)
             }
-            _ => BoundType::from(builtin.static_return_type()),
+            _ => match builtin_guest_return_schema(builtin) {
+                Some(schema) => self.bound_type_for_schema(&schema),
+                None => BoundType::from(builtin.static_return_type()),
+            },
         }
     }
 
@@ -2077,7 +2080,7 @@ impl<'a> TypeContext<'a> {
                     _ => None,
                 }
             }
-            _ => None,
+            _ => builtin_guest_return_schema(builtin),
         }
     }
 
@@ -3754,6 +3757,24 @@ fn schema_instance_key(
             .collect::<Vec<_>>();
         format!("{name}<{}>", parts.join(", "))
     }
+}
+
+/// The guest return schema of a builtin whose result is a logical carrier
+/// (`Result<...>` or `Option<...>`), read from its published host descriptor.
+///
+/// Only carriers need this: a scalar return is already fully described by
+/// [`BuiltinFunction::static_return_type`], while a carrier's payloads (and the
+/// nominal resource keys inside them) are only available through the contract
+/// the module catalog publishes.
+#[cfg(feature = "runtime")]
+fn builtin_guest_return_schema(builtin: BuiltinFunction) -> Option<TypeSchema> {
+    let schema = builtin.guest_return_schema()?.to_compiler_schema();
+    (!matches!(schema, TypeSchema::Unknown)).then_some(schema)
+}
+
+#[cfg(not(feature = "runtime"))]
+fn builtin_guest_return_schema(_builtin: BuiltinFunction) -> Option<TypeSchema> {
+    None
 }
 
 fn builtin_generic_return_schema(
