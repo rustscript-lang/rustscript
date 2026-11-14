@@ -1,13 +1,39 @@
 use super::rss::collections::{contains, dedup, entries, get_or, has, index_of, merge, reverse, values};
 
+// W02: `index_of` reports absence with `Option<int>`, so every assertion below
+// distinguishes a found position from a miss instead of comparing against a -1
+// sentinel.
+fn index_of_int(values: [int], needle: int) -> Option<int> {
+    index_of::<int>(values, needle)
+}
+
+fn index_position(values: [int], needle: int, fallback: int) -> int {
+    match index_of_int(values, needle) {
+        Option::Some(value) => value,
+        Option::None => fallback,
+    }
+}
+
+fn index_is_some(values: [int], needle: int) -> bool {
+    match index_of_int(values, needle) {
+        Option::Some(_) => true,
+        Option::None => false,
+    }
+}
+
 let mut appended = [1, 2] + [3, 4];
 assert(appended.length == 4);
 assert(appended.copy()[0] == 1);
 assert(appended.copy()[3] == 4);
 
-assert(index_of::<int>(appended, 3) == 2);
-assert(index_of::<int>(appended, 9) ==-1);
-assert(contains::<int>(appended, 2));
+assert(index_is_some(appended, 1));
+assert(index_position(appended, 1, -1) == 0);
+assert(index_position(appended, 3, -1) == 2);
+assert(index_position(appended, 4, -1) == 3);
+assert(index_is_some(appended, 9) == false);
+assert(index_position(appended, 9, 99) == 99);
+assert(contains::<int>(appended, 1));
+assert(contains::<int>(appended, 4));
 assert(contains::<int>(appended, 9) == false);
 
 let mut reversed = reverse::<int>(appended);

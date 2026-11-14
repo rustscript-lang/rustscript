@@ -1,20 +1,23 @@
 // Collection helpers implemented in pure RustScript.
 
-// Returns the first index of a value in an array, or -1 when it is absent.
-pub fn index_of<T>(values: [T], needle: T) -> int {
-    let mut found =-1;
+// Returns the first index of a value in an array, or None when it is absent.
+pub fn index_of<T>(values: [T], needle: T) -> Option<int> {
+    let mut out: Option<int> = Option::None;
     for find_index in 0..values.length {
         if values[find_index] == needle {
-            found = find_index;
+            out = Option::Some(find_index);
             break;
         }
     }
-    found
+    out
 }
 
 // Returns whether an array contains a value.
 pub fn contains<T>(values: [T], needle: T) -> bool {
-    index_of::<T>(values, needle) >-1
+    match index_of::<T>(values, needle) {
+        Option::Some(_) => true,
+        Option::None => false,
+    }
 }
 
 // Returns a reversed copy of an array.
