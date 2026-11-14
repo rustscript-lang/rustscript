@@ -1627,6 +1627,25 @@ impl HostFunctionRegistry {
         self.invalidate_plan_cache();
     }
 
+    /// Marks an exact import as owning its pending operation.
+    ///
+    /// A runtime-owned stack adapter suspends into the generic VM
+    /// submitted-operation/stream registries instead of a registered
+    /// per-function operation driver; those registries are keyed by the
+    /// reserved host-operation id, so no per-import state is recorded here.
+    /// This method is deliberately a registration validation hook: it accepts
+    /// only an already-registered import and otherwise fails closed, which
+    /// keeps the descriptor install path honest without resurrecting the
+    /// retired parallel op-driver table.
+    pub fn mark_exact_runtime_owned_pending(&mut self, name: &str) -> VmResult<()> {
+        if !self.contains_name(name) {
+            return Err(VmError::HostError(format!(
+                "cannot mark unregistered host import '{name}' as runtime-owned"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn register_catalog_stack<F>(
         &mut self,
         schema: HostImportSchema,

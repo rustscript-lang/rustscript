@@ -1672,3 +1672,62 @@ fn module_install_from_catalog_keeps_caller_identity_and_restricted_policy() {
         "a rejected module must leave the registry unchanged: {error}"
     );
 }
+
+fn runtime_owned_descriptor() -> vm::host_extension::HostFunctionDescriptor {
+    use vm::host_extension::{
+        HostAdapterDescriptor, HostBindingDescriptor, HostBindingKind, HostFunctionDescriptor,
+    };
+    HostFunctionDescriptor {
+        schema: HostFunctionSchema::with_return(
+            "demo::await_signal",
+            vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+            HostTypeSchema::String,
+        ),
+        binding: HostBindingDescriptor {
+            kind: HostBindingKind::StaticStackRuntimeOwned,
+        },
+        effects: vec![],
+        adapter: HostAdapterDescriptor::StaticStackRuntimeOwned(noop_host),
+        resource_types: vec![],
+    }
+}
+
+#[test]
+fn runtime_owned_descriptor_installs_through_the_caller_catalog() {
+    use vm::host_extension::{HostAdapterDescriptor, HostBindingKind, HostModuleDescriptor};
+
+    let module = HostModuleDescriptor {
+        name: "demo.runtime_owned",
+        functions: &[runtime_owned_descriptor],
+        resources: &[],
+    };
+    let catalog = module.catalog().expect("module catalog");
+
+    // The descriptor keeps the runtime-owned binding class and the plain stack
+    // adapter: pending dispatch is resolved by the generic VM registries, so
+    // the adapter is a `StaticHostStackFunction` like `StaticStack`.
+    let descriptor = (module.functions[0])();
+    assert_eq!(
+        descriptor.binding.kind,
+        HostBindingKind::StaticStackRuntimeOwned
+    );
+    assert!(matches!(
+        descriptor.adapter,
+        HostAdapterDescriptor::StaticStackRuntimeOwned(_)
+    ));
+
+    let mut registry = vm::HostFunctionRegistry::restricted();
+    module
+        .install_from_catalog(&mut registry, &catalog)
+        .expect("a runtime-owned module installs against the caller catalog");
+    assert!(registry.contains_name("demo::await_signal"));
+    registry
+        .mark_exact_runtime_owned_pending("demo::await_signal")
+        .expect("the installed import is runtime-ownable");
+
+    // The same descriptor list installs through the aggregate path.
+    let mut aggregate = vm::HostFunctionRegistry::empty();
+    HostModuleDescriptor::install_descriptors(&mut aggregate, &[runtime_owned_descriptor()])
+        .expect("runtime-owned descriptors install without a module wrapper");
+    assert!(aggregate.contains_name("demo::await_signal"));
+}
