@@ -364,7 +364,9 @@ impl HostFunction for AlwaysAllow {
 
 impl HostFunction for RuntimeSleep {
     fn call(&mut self, _vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, vm::VmError> {
-        Ok(CallOutcome::Return(vec![Value::Bool(true)].into()))
+        // `runtime::sleep` declares the logical Unit result, so a stand-in host
+        // supplies the internal Null payload instead of a confirmation value.
+        Ok(CallOutcome::Return(vec![Value::Null].into()))
     }
 }
 

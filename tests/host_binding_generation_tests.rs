@@ -256,7 +256,7 @@ fn assert_runtime_sleep_loop_uses_native_host_call(bind_cached_registry: bool) {
             use runtime;
             let mut i = 0;
             while i < 100 {
-                let _ = runtime::sleep(0);
+                let slept: () = runtime::sleep(0);
                 i = i + 1;
             }
             i;
@@ -342,7 +342,7 @@ fn restricted_capabilities_disable_trace_jit_for_host_imports_and_builtins() {
             use runtime;
             let mut i = 0;
             while i < 4 {
-                let _ = runtime::sleep(0);
+                let slept: () = runtime::sleep(0);
                 i = i + 1;
             }
             i;

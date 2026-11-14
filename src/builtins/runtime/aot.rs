@@ -4,16 +4,16 @@ use crate::vm::{Value, Vm, VmError, VmResult};
 
 /// Compile and install a whole-program AOT artifact for the current VM program.
 #[pd_host_function(name = "aot::compile")]
-pub(super) fn builtin_aot_compile(vm: &mut Vm) -> VmResult<bool> {
+pub(super) fn builtin_aot_compile(vm: &mut Vm) -> VmResult<()> {
     vm.compile_aot()?;
-    Ok(true)
+    Ok(())
 }
 
 /// Clear the currently installed whole-program AOT artifact.
 #[pd_host_function(name = "aot::clear")]
-pub(super) fn builtin_aot_clear(vm: &mut Vm) -> VmResult<bool> {
+pub(super) fn builtin_aot_clear(vm: &mut Vm) -> VmResult<()> {
     vm.clear_aot();
-    Ok(false)
+    Ok(())
 }
 
 /// Return whether a whole-program AOT artifact is currently installed.
@@ -91,20 +91,16 @@ mod tests {
             "fresh vm should not have aot installed"
         );
 
-        assert!(
-            builtin_aot_compile(&mut vm, args).expect("compile should succeed"),
-            "compile should report success"
-        );
+        // Both commands now report the logical Unit result: `compile` no longer
+        // claims `true` and `clear` no longer reports a fake `false`.
+        builtin_aot_compile(&mut vm, args).expect("compile should succeed");
         assert!(vm.has_aot_program(), "aot program should be installed");
         assert_eq!(
             builtin_aot_resume_ips(&mut vm, args).expect("resume query should succeed"),
             vec![Value::Int(0)]
         );
 
-        assert!(
-            !builtin_aot_clear(&mut vm, args).expect("clear should succeed"),
-            "clear should report the disabled state"
-        );
+        builtin_aot_clear(&mut vm, args).expect("clear should succeed");
         assert!(!vm.has_aot_program(), "aot program should be cleared");
     }
 

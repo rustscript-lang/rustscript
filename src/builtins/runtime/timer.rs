@@ -456,6 +456,10 @@ fn timer_callback_schema() -> HostTypeSchema {
 /// adapter, so the module declares explicit descriptors. The descriptor still
 /// carries the schema, binding class, adapter factory, and effects, so there is
 /// no parallel catalog or registry glue.
+///
+/// The declared result is the logical Unit: a registration has nothing to
+/// confirm once the backend accepted the transferred callback, and a rejection
+/// is already the `VmResult` error channel.
 fn timer_register_contract(name: &'static str, delay_name: &'static str) -> HostFunctionSchema {
     HostFunctionSchema::with_return(
         name,
@@ -467,7 +471,7 @@ fn timer_register_contract(name: &'static str, delay_name: &'static str) -> Host
                 HostParamPassing::TakeOwned,
             ),
         ],
-        HostTypeSchema::Bool,
+        HostTypeSchema::Unit,
     )
     .with_description("Registers an owned timer callback")
 }
@@ -669,6 +673,9 @@ pub fn installed_timer_counts(vm: &mut Vm) -> VmResult<TimerCounts> {
 ///   and must be positive (a zero repeating interval is rejected).
 /// * Registration uses the installed [`TimerConfig`] limits, which travel with
 ///   every [`TimerRegistration`] as MUST-enforce backend obligations.
+/// * Success returns the logical Unit as its internal Null payload: a
+///   registration has no confirmation value, and absence/failure is already
+///   the outer `VmResult` error channel.
 ///
 /// The helper is name-independent and unit-independent: it never inspects the
 /// call's host name and never converts units. A milliseconds adapter
@@ -734,7 +741,7 @@ pub fn register_owned_timer(
         backend.register(registration)
     }));
     match result {
-        Ok(Ok(())) => Ok(CallOutcome::Return(CallReturn::one(Value::Bool(true)))),
+        Ok(Ok(())) => Ok(CallOutcome::Return(CallReturn::one(Value::Null))),
         Ok(Err(error)) => {
             call.restore_arg(callback_arg, rollback_callback)?;
             Err(error)
@@ -1041,7 +1048,7 @@ mod tests {
                     passing: HostParamPassing::TakeOwned,
                 },
             ],
-            return_type: HostTypeSchema::Bool,
+            return_type: HostTypeSchema::Unit,
             fingerprint: timer_host_catalog().fingerprint(),
         };
         let duplicate = registry

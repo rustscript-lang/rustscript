@@ -1820,7 +1820,9 @@ fn vendor_catalog() -> Arc<HostApiCatalog> {
                     HostParamPassing::TakeOwned,
                 ),
             ],
-            HostTypeSchema::Bool,
+            // The shared `register_owned_timer` seam reports logical Unit on
+            // success, so the downstream adapter must not keep a `true` schema.
+            HostTypeSchema::Unit,
         ));
     }
     builder.function(HostFunctionSchema::with_return(
@@ -1831,7 +1833,7 @@ fn vendor_catalog() -> Arc<HostApiCatalog> {
             // so the runtime type check (not the compiler) decides.
             HostParamSchema::value("callback", HostTypeSchema::Unknown),
         ],
-        HostTypeSchema::Bool,
+        HostTypeSchema::Unit,
     ));
     for name in ["vendor::pending", "vendor::running"] {
         builder.function(HostFunctionSchema::with_return(

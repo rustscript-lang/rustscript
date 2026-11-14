@@ -541,8 +541,15 @@ fn assert_timer_no_nullable_or_void(path: &str, schema: &HostTypeSchema) {
         HostTypeSchema::Optional(_) | HostTypeSchema::Option(_) => {
             panic!("timer public schema {path} exposes a nullable route: {schema:?}")
         }
-        HostTypeSchema::Null | HostTypeSchema::Unit => {
-            panic!("timer public schema {path} exposes a void/null route: {schema:?}")
+        HostTypeSchema::Null => {
+            panic!("timer public schema {path} exposes a null route: {schema:?}")
+        }
+        HostTypeSchema::Unit => {
+            // `timer::{at,every}` legitimately report logical Unit on success;
+            // the caller checks that top-level result explicitly. A Unit nested
+            // in an array, map, struct field, or callback would still be a
+            // shape regression, so the recursive helper keeps rejecting it.
+            panic!("timer public schema {path} exposes a nested void route: {schema:?}")
         }
         HostTypeSchema::Array(inner) => {
             assert_timer_no_nullable_or_void(&format!("{path}[]"), inner)
@@ -581,7 +588,7 @@ fn assert_timer_no_nullable_or_void(path: &str, schema: &HostTypeSchema) {
 }
 
 #[test]
-fn timer_public_contract_keeps_boolean_and_count_results_without_nullable_routes() {
+fn timer_public_contract_keeps_concrete_results_without_nullable_routes() {
     let catalog = vm::timer_host_catalog();
     for function in catalog.functions() {
         for param in &function.params {
@@ -590,14 +597,18 @@ fn timer_public_contract_keeps_boolean_and_count_results_without_nullable_routes
                 &param.ty,
             );
         }
-        assert_timer_no_nullable_or_void(
-            &format!("{} return", function.name),
-            &function.return_type,
-        );
+        // The registration commands report the logical Unit result; a
+        // registration has no confirmation value left to report.
+        if !matches!(function.name.as_str(), "timer::at" | "timer::every") {
+            assert_timer_no_nullable_or_void(
+                &format!("{} return", function.name),
+                &function.return_type,
+            );
+        }
     }
 
     let at = catalog.function("timer::at").expect("timer::at");
-    assert_eq!(at.return_type, HostTypeSchema::Bool);
+    assert_eq!(at.return_type, HostTypeSchema::Unit);
     assert_eq!(
         at.params[1].ty,
         HostTypeSchema::Callable {
@@ -618,6 +629,6 @@ fn timer_public_contract_keeps_boolean_and_count_results_without_nullable_routes
             .function("timer::every")
             .expect("timer::every")
             .return_type,
-        HostTypeSchema::Bool
+        HostTypeSchema::Unit
     );
 }

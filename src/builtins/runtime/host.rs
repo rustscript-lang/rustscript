@@ -47,13 +47,13 @@ fn sleep_duration(millis: i64) -> VmResult<Duration> {
 
 /// Sleeps for the requested milliseconds.
 #[pd_host_function(name = "runtime::sleep")]
-fn runtime_sleep_impl(ms: i64) -> VmResult<bool> {
+fn runtime_sleep_impl(ms: i64) -> VmResult<()> {
     let duration = sleep_duration(ms)?;
     #[cfg(not(target_family = "wasm"))]
     std::thread::sleep(duration);
     #[cfg(target_family = "wasm")]
     let _ = duration;
-    Ok(true)
+    Ok(())
 }
 
 /// Halts the current VM invocation immediately.
@@ -114,6 +114,11 @@ mod tests {
                 .contains("runtime::sleep expects non-negative milliseconds"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn runtime_sleep_returns_unit_on_success() {
+        runtime_sleep_impl(0).expect("zero millisecond sleep should succeed");
     }
 
     #[test]
