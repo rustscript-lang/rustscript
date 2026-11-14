@@ -751,6 +751,12 @@ fn at_registers_and_returns_then_callback_runs() {
     )
     .expect("registration succeeds");
     assert_eq!(vm.take_callable_result(), None);
+    assert_eq!(
+        vm.stack(),
+        &[Value::Null],
+        "a successful registration reports the Unit carrier in the value slot, \
+         not a success bool and not a missing value"
+    );
     assert_eq!(backend.pending_count(), 1);
 
     let mut registration = backend.pop();
@@ -812,12 +818,17 @@ fn default_limits_match_the_documented_contract() {
 #[test]
 fn every_marks_interval_and_preserves_callable_between_rounds() {
     let backend = Arc::new(ManualBackend::default());
-    run_with_backend(
+    let vm = run_with_backend(
         "use timer; timer::every(7, |premature| ());",
         Arc::clone(&backend),
         TimerConfig::default(),
     )
     .expect("registration succeeds");
+    assert_eq!(
+        vm.stack(),
+        &[Value::Null],
+        "a successful interval registration reports the Unit carrier in the value slot"
+    );
     let mut registration = backend.pop();
     assert_eq!(registration.delay, Duration::from_millis(7));
     assert_eq!(registration.interval, Some(Duration::from_millis(7)));

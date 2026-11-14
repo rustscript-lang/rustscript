@@ -290,7 +290,12 @@ impl HostAsyncBridge for BrowserAsyncBridge {
         };
         if current_time_ms() >= deadline_ms {
             state.deadlines_ms.remove(&op_id);
-            Poll::Ready(Ok(CallReturn::one(Value::Bool(true))))
+            // `runtime::sleep` declares the logical Unit result, so completion
+            // reports the Unit carrier (`Null`). Returning a success `true`
+            // would leak a Bool into the guest value slot: the Core return
+            // check rejects it for schema-bound binds, and the name-based wasm
+            // binding installs no import schema, so nothing would catch it.
+            Poll::Ready(Ok(CallReturn::one(Value::Null)))
         } else {
             Poll::Pending
         }
@@ -1390,5 +1395,39 @@ fn push_output_line(lines: &Arc<Mutex<Vec<String>>>, rendered: String) {
     let normalized = rendered.trim_end_matches('\n').to_string();
     if let Ok(mut guard) = lines.lock() {
         guard.push(normalized);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sleep_completion_is_the_unit_carrier() {
+        let state = Arc::new(Mutex::new(BrowserAsyncState::default()));
+        let op_id = 7;
+        state
+            .lock()
+            .expect("async state")
+            .deadlines_ms
+            .insert(op_id, 0.0);
+        let mut bridge = BrowserAsyncBridge::new(Arc::clone(&state));
+        let waker = Waker::noop().clone();
+        let mut cx = Context::from_waker(&waker);
+
+        let completed = bridge.poll_op(op_id, &mut cx);
+        match completed {
+            Poll::Ready(Ok(returned)) => assert_eq!(
+                returned,
+                CallReturn::one(Value::Null),
+                "a reached deadline must complete with the Unit carrier, not a success bool"
+            ),
+            Poll::Ready(Err(error)) => panic!("sleep completion must not fail: {error:?}"),
+            Poll::Pending => panic!("a reached deadline must complete, not stay pending"),
+        }
+        assert!(
+            state.lock().expect("async state").deadlines_ms.is_empty(),
+            "completion must drop the deadline entry"
+        );
     }
 }
