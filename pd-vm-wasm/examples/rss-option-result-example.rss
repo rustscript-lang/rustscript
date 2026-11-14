@@ -1,0 +1,243 @@
+// Canonical Unit / Option / Result example.
+//
+// Every check prints one named line, so downstream tests assert the
+// observable result instead of only the process exit status.
+fn nothing() {}
+
+fn explicit_unit() ->() {}
+
+fn unit_identity(value:()) ->() {
+    value
+}
+
+fn int_or(value: Option<int>, fallback: int) -> int {
+    match value {
+        Option::Some(inner) => inner,
+        Option::None => fallback,
+    }
+}
+
+fn option_relay(flag: bool) -> Option<int> {
+    let value: Option<int> = if flag => {
+        Option::Some(1)
+    } else => {
+        Option::None
+    };
+    let item = value?;
+    Option::Some(item + 1)
+}
+
+fn checked(flag: bool) -> Result<int, int> {
+    let out: Result<int, int> = if flag => {
+        Result::Ok(7)
+    } else => {
+        Result::Err(9)
+    };
+    out
+}
+
+fn forward(flag: bool) -> Result<string, int> {
+    let number = checked(flag)?;
+    Result::Ok("continued")
+}
+
+fn convert(error: string) -> int {
+    7
+}
+
+fn load() -> Result<int, string> {
+    Result::Err("bad")
+}
+
+fn relay_mapped() -> Result<int, int> {
+    let value: int = load().map_err(convert)?;
+    Result::Ok(value)
+}
+
+struct Record {
+    name: string,
+    tag: string
+}
+
+// ---- Unit ----
+let unit:() = ();
+let unit_from_fn:() = nothing();
+let unit_from_explicit:() = explicit_unit();
+let unit_roundtrip:() = unit_identity(unit);
+print("unit_literal={}\n", unit);
+print("unit_fn_returns_unit={}\n", unit_from_fn);
+print("unit_explicit_annotation={}\n", unit_from_explicit);
+print("unit_roundtrip={}\n", unit_roundtrip);
+
+// ---- Option construction and matching ----
+let some_zero: Option<int> = Option::Some(0);
+let none: Option<int> = Option::None;
+print("option_some_zero={}\n", int_or(some_zero, -1));
+print("option_none={}\n", int_or(none, -1));
+
+let some_false: Option<bool> = Option::Some(false);
+print("option_some_false={}\n", some_false.unwrap_or(true));
+
+let some_empty: Option<string> = Option::Some("");
+let empty_payload: string = some_empty.unwrap_or("missing");
+print("option_some_empty_is_empty={}\n", empty_payload == "");
+
+let matched_none: int = match none {
+    Option::Some(inner) => inner,
+    Option::None => -2,
+};
+print("option_match_none={}\n", matched_none);
+
+// ---- Option combinators ----
+let mapped: Option<int> = some_zero.map(|value| value + 1);
+let flattened: Option<int> = some_zero.and_then(|value| Option::Some(value + 2));
+let recovered_source: Option<int> = Option::None;
+let recovered: Option<int> = recovered_source.or_else(|| Option::Some(5));
+let lazy_source: Option<int> = Option::None;
+let lazy: int = lazy_source.unwrap_or_else(|| 4);
+print("option_map={}\n", mapped.unwrap_or(-1));
+print("option_and_then={}\n", flattened.unwrap_or(-1));
+print("option_or_else={}\n", recovered.unwrap_or(-1));
+print("option_unwrap_or_else={}\n", lazy);
+
+// ---- Option propagation ----
+print("option_relay_some={}\n", option_relay(true).unwrap_or(-1));
+print("option_relay_none={}\n", option_relay(false).unwrap_or(-1));
+
+// ---- Result construction and matching ----
+let ok_value: Result<int, string> = Result::Ok(21);
+let err_value: Result<int, string> = Result::Err("bad input");
+print("result_is_ok={}\n", ok_value.is_ok());
+print("result_is_err={}\n", err_value.is_err());
+
+let matched_ok: int = match ok_value {
+    Result::Ok(inner) => inner,
+    Result::Err(error) => -1,
+};
+print("result_match_ok={}\n", matched_ok);
+
+let matched_err: string = match err_value {
+    Result::Ok(inner) => "ok",
+    Result::Err(error) => error,
+};
+print("result_match_err={}\n", matched_err);
+
+// ---- Result combinators ----
+let build_ok: Result<int, string> = Result::Ok(2);
+let ok_mapped: Result<int, string> = build_ok.map(|item| item + 1);
+let ok_map_err: Result<int, int> = ok_mapped.map_err(|error| 8);
+let ok_and_then: Result<int, int> = ok_map_err.and_then(|item| Result::Ok(item * 3));
+let combined_ok: Result<int, int> = ok_and_then.or_else(|error| Result::Ok(error - 1));
+let ok_path: int = match combined_ok {
+    Result::Ok(inner) => inner,
+    Result::Err(error) => -1,
+};
+print("result_chain_ok={}\n", ok_path);
+
+let build_err: Result<int, string> = Result::Err("bad");
+let err_mapped: Result<int, string> = build_err.map(|item| item + 1);
+let err_map_err: Result<int, int> = err_mapped.map_err(|error| 8);
+let err_and_then: Result<int, int> = err_map_err.and_then(|item| Result::Ok(item * 3));
+let combined_err: Result<int, int> = err_and_then.or_else(|error| Result::Ok(error - 1));
+let err_path: int = match combined_err {
+    Result::Ok(inner) => inner,
+    Result::Err(error) => -1,
+};
+print("result_chain_err={}\n", err_path);
+
+let eager_ok_source: Result<int, int> = Result::Ok(11);
+let eager_err_source: Result<int, int> = Result::Err(2);
+let lazy_err_source: Result<int, int> = Result::Err(2);
+let eager_ok: int = eager_ok_source.unwrap_or(20);
+let eager_err: int = eager_err_source.unwrap_or(30);
+let lazy_err: int = lazy_err_source.unwrap_or_else(|error| error + 40);
+print("result_unwrap_or_ok={}\n", eager_ok);
+print("result_unwrap_or_err={}\n", eager_err);
+print("result_unwrap_or_else_err={}\n", lazy_err);
+
+// ---- Result propagation and error conversion ----
+let forwarded_ok: int = match forward(true) {
+    Result::Ok(text) => 0,
+    Result::Err(code) => code,
+};
+let forwarded_err: int = match forward(false) {
+    Result::Ok(text) => 0,
+    Result::Err(code) => code,
+};
+let mapped_error: int = match relay_mapped() {
+    Result::Ok(value) => value,
+    Result::Err(code) => code,
+};
+print("result_forward_ok={}\n", forwarded_ok);
+print("result_forward_err={}\n", forwarded_err);
+print("result_map_err_then_try={}\n", mapped_error);
+
+// ---- Result to Option ----
+let ok_source: Result<int, string> = Result::Ok(21);
+let ok_as_option: Option<int> = ok_source.ok();
+let ok_payload: int = match ok_as_option {
+    Option::Some(inner) => inner,
+    Option::None => -1,
+};
+print("result_ok_to_option={}\n", ok_payload);
+
+let err_source: Result<int, string> = Result::Err("bad input");
+let err_as_option: Option<string> = err_source.err();
+let err_payload: string = match err_as_option {
+    Option::Some(inner) => inner,
+    Option::None => "missing",
+};
+print("result_err_to_option={}\n", err_payload);
+
+let ok_err_source: Result<int, string> = Result::Ok(21);
+let absent_err: Option<string> = ok_err_source.err();
+let absent_err_is_none: bool = match absent_err {
+    Option::Some(inner) => false,
+    Option::None => true,
+};
+print("result_ok_err_is_none={}\n", absent_err_is_none);
+
+// ---- Fallible projection (`?.`) ----
+let record: Record = {name: "crab", tag: "shell"};
+let projected: string = match record?.name {
+    Option::Some(value) => value,
+    Option::None => "missing",
+};
+print("project_field={}\n", projected);
+
+let table: map<string> = {"a": "one"};
+let absent_key: string = match table?.["b"] {
+    Option::Some(value) => value,
+    Option::None => "missing",
+};
+let present_key: string = match table?.["a"] {
+    Option::Some(value) => value,
+    Option::None => "missing",
+};
+print("project_absent_key={}\n", absent_key);
+print("project_present_key={}\n", present_key);
+
+struct Grid {
+    cells: [int]
+}
+
+let grid: Grid = {cells: [10, 20]};
+let grid_cell: int = match grid?.cells?.[1] {
+    Option::Some(value) => value,
+    Option::None => -1,
+};
+print("project_array_index={}\n", grid_cell);
+
+let label: string = "abc";
+let label_letter: string = match label?.[1] {
+    Option::Some(value) => value,
+    Option::None => "missing",
+};
+print("project_string_index={}\n", label_letter);
+
+let missing_label: string = "";
+let missing_letter: string = match missing_label?.[1] {
+    Option::Some(value) => value,
+    Option::None => "missing",
+};
+print("project_missing_string_index={}\n", missing_letter);

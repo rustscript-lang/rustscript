@@ -1435,7 +1435,7 @@ mod runtime_tests {
         compile_source_with_flavor_and_options,
     };
 
-    fn rss_playground_examples() -> [(&'static str, &'static str); 6] {
+    fn rss_playground_examples() -> [(&'static str, &'static str); 7] {
         [
             ("Demo", include_str!("../examples/rss-complex-example.rss")),
             (
@@ -1457,6 +1457,10 @@ mod runtime_tests {
             (
                 "Strings and Regex Example",
                 include_str!("../examples/rss-strings-regex-example.rss"),
+            ),
+            (
+                "Option and Result Example",
+                include_str!("../examples/rss-option-result-example.rss"),
             ),
         ]
     }
