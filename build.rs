@@ -1284,6 +1284,9 @@ fn render_builtin_runtime_dispatch(
     .unwrap();
     writeln!(&mut out, "    }}").unwrap();
     writeln!(&mut out, "}}").unwrap();
+    writeln!(&mut out).unwrap();
+
+    render_builtin_guest_return_schema_method(&mut out, builtin_callables);
 
     out
 }
@@ -1644,6 +1647,79 @@ fn render_builtin_static_return_type_method(
     }
     writeln!(out, "        }}").unwrap();
     writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+}
+
+/// Emits `guest_return_schema` into the runtime dispatch unit: the guest
+/// return schema a namespaced builtin's published descriptor declares.
+///
+/// A carrier's coarse `ValueType` cannot express its payloads (and the nominal
+/// resource keys inside them), so the schema comes from the same descriptor the
+/// module catalog publishes — a declared contract when the function has one,
+/// otherwise the signature-derived schema. Only `Result` carriers are surfaced
+/// to the compiler; every other return keeps the `ValueType` inference.
+///
+/// The method lives in the dispatch unit because that unit owns the private
+/// backend modules (`io`, `math`, `host`, …) the descriptors are declared in.
+fn render_builtin_guest_return_schema_method(out: &mut String, builtin_callables: &[CallableDecl]) {
+    writeln!(out, "impl BuiltinFunction {{").unwrap();
+    writeln!(
+        out,
+        "    /// The guest return schema this builtin's published descriptor declares."
+    )
+    .unwrap();
+    writeln!(out, "    ///").unwrap();
+    writeln!(
+        out,
+        "    /// Only `Result` carriers are reported: a scalar return is already fully"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// described by `static_return_type`, while a carrier's payloads and the"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    /// nominal resource keys inside them only exist in the descriptor."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "    pub(crate) fn guest_return_schema(self) -> Option<crate::host_api::HostTypeSchema> {{"
+    )
+    .unwrap();
+    writeln!(out, "        let schema = match self {{").unwrap();
+    for callable in builtin_callables
+        .iter()
+        .filter(|callable| callable.wrapper.is_some())
+    {
+        let variant = builtin_variant_name(&callable.name);
+        let module = &callable.module;
+        let wrapper_name = callable
+            .rust_ident
+            .strip_suffix("_impl")
+            .unwrap_or(&callable.rust_ident);
+        writeln!(
+            out,
+            "            BuiltinFunction::{variant} => \
+             {module}::{wrapper_name}_descriptor().schema.return_type,"
+        )
+        .unwrap();
+    }
+    writeln!(
+        out,
+        "            _ => crate::host_api::HostTypeSchema::Unknown,"
+    )
+    .unwrap();
+    writeln!(out, "        }};").unwrap();
+    writeln!(
+        out,
+        "        matches!(schema, crate::host_api::HostTypeSchema::Result {{ .. }}).then_some(schema)"
+    )
+    .unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
     writeln!(out).unwrap();
 }
 
