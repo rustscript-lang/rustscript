@@ -19,6 +19,8 @@ for i in 0..4 {
     total = total + i;
 }
 
+// `runtime::sleep` declares the logical Unit result, so it stays a statement:
+// the call is never bound and its value is never inspected.
 runtime::sleep(100);
 
 let total = if !string::non_empty("rustscript") => {
