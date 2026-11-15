@@ -3974,7 +3974,6 @@ pub fn validate_host_import_schemas(
     validate_host_import_schema_iter(schemas.iter())
 }
 
-#[cfg(feature = "runtime")]
 pub(crate) fn validate_optional_host_import_schemas(
     schemas: &[Option<HostImportSchema>],
 ) -> Result<(), HostSchemaValidationError> {

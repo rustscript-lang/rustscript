@@ -8,6 +8,7 @@ use crate::bytecode::{
     FunctionRegion, MAX_FRAME_LOCAL_COUNT, RetCleanupLocal, RetCleanupPlan, RootCallableBinding,
     ScriptFunction, TypeMap, ValueType,
 };
+use crate::bytecode::{HostImport, OpCode, Program, Value};
 use crate::compiler::ir::{StructDecl, StructDeclOrigin, TypeSchema};
 use crate::debug_info::{ArgInfo, DebugFunction, DebugInfo, LineInfo, LocalInfo};
 use crate::host_api::{
@@ -16,7 +17,6 @@ use crate::host_api::{
     MAX_HOST_PARAMETER_NAME_LEN, MAX_HOST_RESOURCE_KEY_LEN, MAX_HOST_SCHEMA_DEPTH,
     MAX_HOST_SCHEMA_NODES, MAX_HOST_SCHEMA_PROPERTIES, ResourceTypeKey,
 };
-use crate::vm::{HostImport, OpCode, Program, Value};
 
 const MAGIC: [u8; 4] = *b"VMBC";
 const VERSION_V14: u16 = 14;
