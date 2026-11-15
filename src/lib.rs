@@ -24,7 +24,6 @@ pub mod jit {
 pub mod cli;
 #[cfg(feature = "runtime")]
 pub mod vm;
-#[cfg(feature = "runtime")]
 pub mod vmbc;
 
 pub use assembler::{AsmParseError, Assembler, AssemblerError, BytecodeBuilder, assemble};
@@ -198,7 +197,6 @@ pub use vm::{
     CaptureCertificationStats, CaptureQueryError, CaptureRootState, CheckedResourceCapture,
     ResourceCaptureRoot,
 };
-#[cfg(feature = "runtime")]
 pub use vmbc::{
     DisassembleOptions, ValidationError, WireError, decode_program, disassemble_program,
     disassemble_program_with_options, disassemble_vmbc, disassemble_vmbc_with_options,
