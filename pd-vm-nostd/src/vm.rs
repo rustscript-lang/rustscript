@@ -811,9 +811,10 @@ impl<C> Vm<C> {
     fn call_core_builtin(&mut self, index: u16, arity: u8) -> Option<VmResult<()>> {
         use super::generated_builtin_ids::{
             ARRAY_NEW_CALL_INDEX, ARRAY_PUSH_CALL_INDEX, BIND_CALLABLE_CALL_INDEX,
-            CONCAT_CALL_INDEX, DETACH_LOCAL_CALL_INDEX, GET_CALL_INDEX, HAS_CALL_INDEX,
-            JSON_DECODE_TYPED_CALL_INDEX, JSON_ENCODE_TYPED_CALL_INDEX, LOGICAL_RENDER_CALL_INDEX,
-            MAP_EDIT_CALL_INDEX, MAP_NEW_CALL_INDEX, SET_CALL_INDEX,
+            CHECKED_INT_FROM_NUMBER_CALL_INDEX, CONCAT_CALL_INDEX, DETACH_LOCAL_CALL_INDEX,
+            GET_CALL_INDEX, HAS_CALL_INDEX, JSON_DECODE_TYPED_CALL_INDEX,
+            JSON_ENCODE_TYPED_CALL_INDEX, LOGICAL_RENDER_CALL_INDEX, MAP_EDIT_CALL_INDEX,
+            MAP_NEW_CALL_INDEX, SET_CALL_INDEX,
         };
 
         Some(match index {
@@ -1041,6 +1042,28 @@ impl<C> Vm<C> {
             | LOGICAL_RENDER_CALL_INDEX => {
                 return Some(Err(VmError::InvalidCall(index)));
             }
+            CHECKED_INT_FROM_NUMBER_CALL_INDEX => {
+                if let Err(error) =
+                    self.require_builtin_arity("__checked_int_from_number", arity, 1)
+                {
+                    return Some(Err(error));
+                }
+                let start = match self.stack.len().checked_sub(1) {
+                    Some(start) => start,
+                    None => return Some(Err(VmError::StackUnderflow)),
+                };
+                let value = match self.stack.get(start) {
+                    Some(Value::Int(value)) => *value,
+                    Some(Value::Float(value)) => match checked_float_to_int(*value) {
+                        Some(value) => value,
+                        None => return Some(Err(VmError::HostError("assertion failed"))),
+                    },
+                    _ => return Some(Err(VmError::TypeMismatch("number"))),
+                };
+                self.stack.truncate(start);
+                self.stack.push(Value::Int(value));
+                Ok(())
+            }
             _ => return None,
         })
     }
@@ -1246,6 +1269,19 @@ fn as_float(value: NumericValue) -> f64 {
     }
 }
 
+/// Convert a finite, exactly representable float into a signed integer.
+///
+/// Mirrors the std conversion domain: `i64::MAX as f64` rounds up to 2^63, so
+/// the accepted upper bound is strict, and any fractional or subnormal value
+/// fails the exactness check after truncation.
+fn checked_float_to_int(value: f64) -> Option<i64> {
+    if !value.is_finite() || value < i64::MIN as f64 || value >= i64::MAX as f64 {
+        return None;
+    }
+    let converted = value as i64;
+    (converted as f64 == value).then_some(converted)
+}
+
 fn checked_int_div(lhs: i64, rhs: i64) -> VmResult<i64> {
     if rhs == 0 {
         return Err(VmError::DivisionByZero);
@@ -1352,5 +1388,93 @@ mod tests {
                 .any(|(key, value)| key == &Value::string("present") && value == &Value::Null),
             "no-std MapEdit must keep a null entry when remove is false"
         );
+    }
+    fn checked_int_program(value: Value) -> Program {
+        let mut code = vec![OpCode::Ldc as u8];
+        code.extend_from_slice(&0u32.to_le_bytes());
+        code.push(OpCode::Call as u8);
+        code.extend_from_slice(
+            &crate::generated_builtin_ids::CHECKED_INT_FROM_NUMBER_CALL_INDEX.to_le_bytes(),
+        );
+        code.push(1);
+        code.push(OpCode::Ret as u8);
+        Program::new(vec![value], code, Vec::new())
+    }
+
+    #[test]
+    fn checked_int_from_number_core_dispatch_preserves_tagged_int_and_exact_floats() {
+        let upper = i64::MAX as f64;
+        let below_upper = f64::from_bits(upper.to_bits() - 1);
+        let cases = [
+            (Value::Int((1_i64 << 53) + 1), Value::Int((1_i64 << 53) + 1)),
+            (Value::Int(i64::MAX), Value::Int(i64::MAX)),
+            (Value::Int(i64::MIN), Value::Int(i64::MIN)),
+            (Value::Float(-0.0), Value::Int(0)),
+            (Value::Float(i64::MIN as f64), Value::Int(i64::MIN)),
+            (Value::Float(below_upper), Value::Int(below_upper as i64)),
+        ];
+        for (input, expected) in cases {
+            let mut vm = Vm::new(checked_int_program(input));
+            vm.set_fuel(10_000_000);
+            assert_eq!(vm.run().unwrap(), VmStatus::Halted);
+            assert_eq!(vm.stack(), core::slice::from_ref(&expected));
+            assert!(
+                vm.fuel().is_some_and(|remaining| remaining <= 10_000_000),
+                "the guest entry must draw on the fresh fuel budget"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_int_from_number_core_dispatch_reports_std_error_parity() {
+        let upper = i64::MAX as f64;
+        for input in [
+            Value::Float(f64::NAN),
+            Value::Float(upper),
+            Value::Float(0.5),
+        ] {
+            let mut vm = Vm::new(checked_int_program(input));
+            vm.set_fuel(10_000_000);
+            let error = vm
+                .run()
+                .expect_err("non-finite or out-of-range float must fail");
+            assert_eq!(error, VmError::HostError("assertion failed"));
+            assert!(
+                vm.fuel().is_some_and(|remaining| remaining <= 10_000_000),
+                "the failing guest entry must report remaining fuel"
+            );
+        }
+        let mut vm = Vm::new(checked_int_program(Value::Bool(true)));
+        vm.set_fuel(10_000_000);
+        let error = vm.run().expect_err("non-number must fail");
+        assert_eq!(error, VmError::TypeMismatch("number"));
+        assert!(
+            vm.fuel().is_some_and(|remaining| remaining <= 10_000_000),
+            "the type-rejecting guest entry must report remaining fuel"
+        );
+    }
+
+    #[test]
+    fn checked_int_from_number_core_dispatch_rejects_invalid_arity() {
+        for (arity, constants) in [(0u8, Vec::new()), (2u8, vec![Value::Int(1), Value::Int(2)])] {
+            let mut code = Vec::new();
+            for index in 0..u32::from(arity) {
+                code.push(OpCode::Ldc as u8);
+                code.extend_from_slice(&index.to_le_bytes());
+            }
+            code.push(OpCode::Call as u8);
+            code.extend_from_slice(
+                &crate::generated_builtin_ids::CHECKED_INT_FROM_NUMBER_CALL_INDEX.to_le_bytes(),
+            );
+            code.push(arity);
+            code.push(OpCode::Ret as u8);
+            let mut vm = Vm::new(Program::new(constants, code, Vec::new()));
+            vm.set_fuel(10_000_000);
+            assert!(matches!(
+                vm.run(),
+                Err(VmError::InvalidCallArity { import, expected: 1, got })
+                    if import == "__checked_int_from_number" && got == arity
+            ));
+        }
     }
 }

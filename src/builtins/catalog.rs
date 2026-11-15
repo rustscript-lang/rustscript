@@ -145,6 +145,7 @@ builtin_id!(0xFF96, "__map_iter_take_value", MapIterTakeValue, Internal, none);
 builtin_id!(0xFF95, "__map_iter_close", MapIterClose, Internal, none);
 builtin_id!(0xFF94, "__bind_callable", BindCallable, Internal, none);
 builtin_id!(0xFF93, "__detach_local", DetachLocal, Internal, none);
+builtin_id!(0xFF90, "__checked_int_from_number", CheckedIntFromNumber, Internal, none);
 builtin_id!(0xFF8C, "__json_decode_typed", JsonDecodeTyped, Internal, none);
 builtin_id!(0xFF8D, "__json_encode_typed", JsonEncodeTyped, Internal, none);
 builtin_id!(0xFF8E, "__logical_render", LogicalRender, Internal, none);

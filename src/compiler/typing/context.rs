@@ -157,6 +157,26 @@ struct CallableBody<'a> {
     body_expr: &'a Expr,
 }
 
+/// Only fully known numeric array shapes may share a widened conditional schema.
+fn is_known_numeric_array_schema(schema: &TypeSchema) -> bool {
+    match schema {
+        TypeSchema::Array(inner) => matches!(
+            inner.as_ref(),
+            TypeSchema::Int | TypeSchema::Float | TypeSchema::Number
+        ),
+        TypeSchema::ArrayTuple(items) => {
+            !items.is_empty()
+                && items.iter().all(|item| {
+                    matches!(
+                        item,
+                        TypeSchema::Int | TypeSchema::Float | TypeSchema::Number
+                    )
+                })
+        }
+        _ => false,
+    }
+}
+
 impl<'a> TypeContext<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
@@ -1466,6 +1486,12 @@ impl<'a> TypeContext<'a> {
                     (Some(TypeSchema::Null), rhs) => rhs,
                     (lhs, Some(TypeSchema::Null)) => lhs,
                     (Some(lhs), Some(rhs)) if lhs == rhs => Some(lhs),
+                    (Some(lhs), Some(rhs))
+                        if is_known_numeric_array_schema(&lhs)
+                            && is_known_numeric_array_schema(&rhs) =>
+                    {
+                        Some(TypeSchema::Array(Box::new(TypeSchema::Number)))
+                    }
                     _ => None,
                 }
             }
@@ -4176,5 +4202,287 @@ mod tests {
         context
             .validate_call_argument_types(&annotated, &state, None, None)
             .expect("a catalog-resolved call must bypass the incompatible legacy signature");
+    }
+}
+#[cfg(test)]
+mod numeric_array_conditional_join_tests {
+    use super::*;
+
+    /// Rule: an `if` whose two branches are both known numeric arrays
+    /// (`[int]`, `[float]` or `[number]` elements, or a non-empty tuple whose
+    /// elements are all numeric) shares the result schema `[number]`. Equality
+    /// is decided first, so identical schemas keep their precise shape, and
+    /// bool/unknown/missing/heterogeneous branches stay at `None`.
+    #[test]
+    fn known_numeric_arrays_share_conditional_result_schema() {
+        let empty_impls: HashMap<u16, FunctionImpl> = HashMap::new();
+        let empty_decls: HashMap<u16, FunctionDecl> = HashMap::new();
+        let empty_structs: HashMap<String, StructDecl> = HashMap::new();
+        let empty_names: HashMap<u16, String> = HashMap::new();
+        let empty_returns: HashMap<u16, BoundType> = HashMap::new();
+        let empty_signatures: HashMap<u16, HostCallableSignature> = HashMap::new();
+        let mut context = TypeContext::new(
+            &empty_impls,
+            &empty_decls,
+            &empty_structs,
+            &empty_names,
+            &empty_returns,
+            &empty_signatures,
+            TypingMode::Strict,
+            None,
+        );
+
+        // Leaf facts are authored into the real state; both branches are
+        // `Expr::Var(slot)`, so `infer_expr_schema` reads the canonical
+        // `LocalTypeState` bindings instead of a hand-written inference stub.
+        let mut state = LocalTypeState::default();
+        state.set_with_schema_origin(
+            1,
+            BoundType::Array,
+            Some(TypeSchema::ArrayTuple(vec![TypeSchema::Number])),
+            false,
+        );
+        state.set_with_schema_origin(
+            2,
+            BoundType::Array,
+            Some(TypeSchema::ArrayTuple(vec![TypeSchema::Int])),
+            false,
+        );
+        state.set_with_schema_origin(
+            3,
+            BoundType::Array,
+            Some(TypeSchema::Array(Box::new(TypeSchema::Number))),
+            false,
+        );
+        state.set_with_schema_origin(
+            4,
+            BoundType::Array,
+            Some(TypeSchema::Array(Box::new(TypeSchema::Int))),
+            false,
+        );
+        state.set_with_schema_origin(
+            5,
+            BoundType::Array,
+            Some(TypeSchema::Array(Box::new(TypeSchema::Float))),
+            false,
+        );
+        state.set_with_schema_origin(
+            6,
+            BoundType::Array,
+            Some(TypeSchema::Array(Box::new(TypeSchema::Bool))),
+            false,
+        );
+        state.set_with_schema_origin(
+            7,
+            BoundType::Array,
+            Some(TypeSchema::Array(Box::new(TypeSchema::Unknown))),
+            false,
+        );
+        state.set_with_schema_origin(
+            8,
+            BoundType::Array,
+            Some(TypeSchema::ArrayTuple(vec![
+                TypeSchema::Int,
+                TypeSchema::Bool,
+            ])),
+            false,
+        );
+        // Slot 9 stays unbound: one branch of the last negative case has no
+        // known schema at all and must not be widened from the other side.
+
+        // Fixture precondition: the case-1 leaves really are the authored
+        // tuple shapes, so the join assertions below exercise the conditional
+        // rule rather than test setup.
+        assert_eq!(
+            state.schema(1),
+            Some(&TypeSchema::ArrayTuple(vec![TypeSchema::Number])),
+            "fixture: slot 1 must carry the authored [number] tuple"
+        );
+        assert_eq!(
+            state.schema(2),
+            Some(&TypeSchema::ArrayTuple(vec![TypeSchema::Int])),
+            "fixture: slot 2 must carry the authored [int] tuple"
+        );
+
+        let conditional = |then_slot: LocalSlot, else_slot: LocalSlot| Expr::IfElse {
+            condition: Box::new(Expr::Bool(true)),
+            then_expr: Box::new(Expr::Var(then_slot)),
+            else_expr: Box::new(Expr::Var(else_slot)),
+        };
+
+        let number_array = TypeSchema::Array(Box::new(TypeSchema::Number));
+        // Exactly eight cases, one real `infer_expr_schema` pipeline each: no
+        // extra recursive probes outside a case.
+        let cases: [(&str, LocalSlot, LocalSlot, Option<TypeSchema>); 8] = [
+            (
+                "number tuple vs int tuple",
+                1,
+                2,
+                Some(number_array.clone()),
+            ),
+            (
+                "number tuple vs array number",
+                1,
+                3,
+                Some(number_array.clone()),
+            ),
+            ("array int vs array float", 4, 5, Some(number_array.clone())),
+            (
+                "equal int tuple",
+                2,
+                2,
+                Some(TypeSchema::ArrayTuple(vec![TypeSchema::Int])),
+            ),
+            ("array bool vs array int", 6, 4, None),
+            ("array unknown vs array int", 7, 4, None),
+            ("missing branch vs int tuple", 9, 2, None),
+            ("heterogeneous tuple vs int tuple", 8, 2, None),
+        ];
+
+        let mut joined_by_case: Vec<(&str, Option<TypeSchema>)> = Vec::with_capacity(cases.len());
+        for (name, then_slot, else_slot, _) in &cases {
+            let expr = conditional(*then_slot, *else_slot);
+            let then_raw = state.schema(*then_slot).cloned();
+            let else_raw = state.schema(*else_slot).cloned();
+            let joined = context.infer_expr_schema(&expr, &state);
+            eprintln!(
+                "numeric-array conditional case `{name}`: then={then_raw:?} else={else_raw:?} joined={joined:?}"
+            );
+            joined_by_case.push((*name, joined));
+        }
+
+        // `[number]` joined with `[int]` yields the shared numeric supertype
+        // `[number]`.
+        assert_eq!(
+            &joined_by_case[0].1, &cases[0].3,
+            "known numeric tuple and int tuple must share the [number] conditional schema"
+        );
+        assert_eq!(
+            &joined_by_case[1].1, &cases[1].3,
+            "a [number] tuple and a [number] array must share the [number] conditional schema"
+        );
+        assert_eq!(
+            &joined_by_case[2].1, &cases[2].3,
+            "int and float numeric arrays must share the [number] conditional schema"
+        );
+        // Equality is decided first: an identical pair keeps its precise
+        // schema instead of being widened to `[number]`.
+        assert_eq!(
+            &joined_by_case[3].1, &cases[3].3,
+            "an identical int tuple must keep its precise tuple schema"
+        );
+        assert_eq!(
+            &joined_by_case[4].1, &cases[4].3,
+            "a bool array branch must not join against a numeric array"
+        );
+        assert_eq!(
+            &joined_by_case[5].1, &cases[5].3,
+            "an unknown-element array branch must not join against a numeric array"
+        );
+        assert_eq!(
+            &joined_by_case[6].1, &cases[6].3,
+            "a branch with no known schema must keep the conditional result unknown"
+        );
+        assert_eq!(
+            &joined_by_case[7].1, &cases[7].3,
+            "a heterogeneous tuple (with a bool element) must not join against a numeric tuple"
+        );
+    }
+
+    /// Every shape the numeric-array rule deliberately excludes is checked
+    /// through a real `Expr::IfElse` inference against a known numeric array
+    /// on the other branch; each must stay at `None`.
+    #[test]
+    fn excluded_shapes_do_not_join_numeric_array_conditionals() {
+        let empty_impls: HashMap<u16, FunctionImpl> = HashMap::new();
+        let empty_decls: HashMap<u16, FunctionDecl> = HashMap::new();
+        let empty_structs: HashMap<String, StructDecl> = HashMap::new();
+        let empty_names: HashMap<u16, String> = HashMap::new();
+        let empty_returns: HashMap<u16, BoundType> = HashMap::new();
+        let empty_signatures: HashMap<u16, HostCallableSignature> = HashMap::new();
+        let mut context = TypeContext::new(
+            &empty_impls,
+            &empty_decls,
+            &empty_structs,
+            &empty_names,
+            &empty_returns,
+            &empty_signatures,
+            TypingMode::Strict,
+            None,
+        );
+
+        let mut state = LocalTypeState::default();
+        state.set_with_schema_origin(
+            1,
+            BoundType::Array,
+            Some(TypeSchema::Array(Box::new(TypeSchema::Number))),
+            false,
+        );
+
+        // One real `infer_expr_schema` pipeline per excluded shape.
+        let shapes: [(&str, BoundType, TypeSchema); 8] = [
+            (
+                "empty tuple",
+                BoundType::Array,
+                TypeSchema::ArrayTuple(Vec::new()),
+            ),
+            (
+                "rest tuple",
+                BoundType::Array,
+                TypeSchema::ArrayTupleRest {
+                    prefix: vec![TypeSchema::Int],
+                    rest: Box::new(TypeSchema::Number),
+                },
+            ),
+            (
+                "optional numeric array",
+                BoundType::Unknown,
+                TypeSchema::Optional(Box::new(TypeSchema::Array(Box::new(TypeSchema::Number)))),
+            ),
+            (
+                "named instantiation",
+                BoundType::Unknown,
+                TypeSchema::Named("Numbers".to_string(), vec![TypeSchema::Number]),
+            ),
+            (
+                "generic parameter",
+                BoundType::Unknown,
+                TypeSchema::GenericParam("T".to_string()),
+            ),
+            (
+                "host resource",
+                BoundType::Unknown,
+                TypeSchema::Resource(crate::ResourceTypeKey::new("io.file").expect("valid key")),
+            ),
+            (
+                "nested int array",
+                BoundType::Array,
+                TypeSchema::Array(Box::new(TypeSchema::Array(Box::new(TypeSchema::Int)))),
+            ),
+            (
+                "string-element array",
+                BoundType::Array,
+                TypeSchema::Array(Box::new(TypeSchema::String)),
+            ),
+        ];
+
+        for (offset, (_, bound, schema)) in shapes.iter().enumerate() {
+            let slot = 2 + offset as LocalSlot;
+            state.set_with_schema_origin(slot, *bound, Some(schema.clone()), false);
+        }
+
+        for (offset, (name, _, _)) in shapes.iter().enumerate() {
+            let slot = 2 + offset as LocalSlot;
+            let expr = Expr::IfElse {
+                condition: Box::new(Expr::Bool(true)),
+                then_expr: Box::new(Expr::Var(1)),
+                else_expr: Box::new(Expr::Var(slot)),
+            };
+            let joined = context.infer_expr_schema(&expr, &state);
+            assert_eq!(
+                joined, None,
+                "excluded shape `{name}` must not join against a known numeric array"
+            );
+        }
     }
 }
