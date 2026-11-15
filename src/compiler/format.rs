@@ -55,6 +55,17 @@ mod tests {
     use crate::compiler::SourceFlavor;
 
     #[test]
+    fn formats_bare_option_constructors_and_match_arms() {
+        let source =
+            "let a:Option<int>=Some(1);let b:Option<int>=None;match a{Some(x)=>x,None=>0};";
+        let formatted = super::format_source(source).unwrap();
+        assert!(formatted.contains("Some(1)"), "{formatted}");
+        assert!(formatted.contains("None"), "{formatted}");
+        assert!(formatted.contains("Some(x) => x"), "{formatted}");
+        assert_eq!(super::format_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
     fn keeps_tail_expression_addition_on_one_line() {
         let input = "fn mix(seed) {\n    v\n        +\n        seed\n}\n";
         let formatted = format_source_with_flavor(input, SourceFlavor::RustScript)

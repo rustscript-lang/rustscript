@@ -542,7 +542,7 @@ mod tests {
             constants_contain(&encoded.program, &unit),
             "json encode descriptor bytes diverged from the pure codec"
         );
-        let printed = crate::compile_source("print(Option::Some(()));")
+        let printed = crate::compile_source("print(Some(()));")
             .expect("compiler-only presentation should compile");
         assert!(
             constants_contain(&printed.program, &option_unit),

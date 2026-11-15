@@ -648,8 +648,8 @@ fn optional_get_then_unwrap_consumes_owned_container_for_later_use_check() {
     let source = r#"
         let maybe: Option<map<resource<pr24.block>>> = test::make_optional_map();
         let handle = match maybe {
-            Option::Some(items) => items["resource"],
-            Option::None => test::make_block(),
+            Some(items) => items["resource"],
+            None => test::make_block(),
         };
         test::close_block(handle);
         maybe;
@@ -672,8 +672,8 @@ fn match_consumes_owned_scrutinee_for_later_use_check() {
     let source = r#"
         let maybe = test::make_optional();
         let handle = match maybe {
-            Option::Some(value) => value,
-            Option::None => test::make_block(),
+            Some(value) => value,
+            None => test::make_block(),
         };
         test::close_block(handle);
         maybe;
@@ -1469,7 +1469,7 @@ fn polex_aot_optional_null_baseline_probe() {
     let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     reset_exit_observers();
     let mut vm = run_result_source_backend(
-        "fn absent() -> Option<int> { Option::None } fn relay() -> Result<int,int> { let x = absent().unwrap_or(test::make_err_int()?); Result::Ok(0) } let carried = relay(); carried;",
+        "fn absent() -> Option<int> { None } fn relay() -> Result<int,int> { let x = absent().unwrap_or(test::make_err_int()?); Result::Ok(0) } let carried = relay(); carried;",
         2,
     );
     assert_eq!(err_payload_raw(vm.stack().last().unwrap()), 9);
@@ -1490,7 +1490,7 @@ fn aotnull_exact_scalar_interpreter_and_decoded_control() {
     for backend in [0, 1] {
         reset_exit_observers();
         let mut vm = run_result_source_backend(
-            "fn absent() -> Option<int> { Option::None } fn relay() -> Result<int,int> { let x = absent().unwrap_or(test::make_err_int()?); Result::Ok(0) } let carried = relay(); carried;",
+            "fn absent() -> Option<int> { None } fn relay() -> Result<int,int> { let x = absent().unwrap_or(test::make_err_int()?); Result::Ok(0) } let carried = relay(); carried;",
             backend,
         );
         assert_eq!(err_payload_raw(vm.stack().last().unwrap()), 9);
@@ -1534,9 +1534,9 @@ fn aotnull_nullable_payloads_and_fallback_effects() {
     ] {
         let absent = expression == "null";
         let rss_value = if absent {
-            "Option::None".to_string()
+            "None".to_string()
         } else {
-            format!("Option::Some({expression})")
+            format!("Some({expression})")
         };
         let present = if absent {
             match ty {
@@ -1560,7 +1560,7 @@ fn aotnull_nullable_payloads_and_fallback_effects() {
                     "fn pick() -> Option<{ty}> {{ {rss_value} }} let f = pick; f().unwrap_or_else(|| {fallback});"
                 ),
                 format!(
-                    "let f: fn() -> Option<{ty}> = || if {absent} => {{ Option::None }} else => {{ Option::Some({present}) }}; let value: Option<{ty}> = f(); value.unwrap_or_else(|| {fallback});"
+                    "let f: fn() -> Option<{ty}> = || if {absent} => {{ None }} else => {{ Some({present}) }}; let value: Option<{ty}> = f(); value.unwrap_or_else(|| {fallback});"
                 ),
             ] {
                 reset_exit_observers();
@@ -1595,14 +1595,14 @@ fn aotnull_fatal_fallback_is_not_guest_err() {
     }
     for expression in ["null", "0", "7"] {
         let rss_value = if expression == "null" {
-            "Option::None".to_string()
+            "None".to_string()
         } else {
-            format!("Option::Some({expression})")
+            format!("Some({expression})")
         };
         for backend in [0, 1, 2] {
             reset_exit_observers();
             let source = format!(
-                "fn pick() -> Option<int> {{ {rss_value} }} fn relay() -> Result<int,int> {{ let x = match pick() {{ Option::Some(v) => v, Option::None => test::make_err_int()?, }}; Result::Ok(x) }} relay();"
+                "fn pick() -> Option<int> {{ {rss_value} }} fn relay() -> Result<int,int> {{ let x = match pick() {{ Some(v) => v, None => test::make_err_int()?, }}; Result::Ok(x) }} relay();"
             );
             let options =
                 CompileSourceFileOptions::new().with_host_api_catalog(result_resource_catalog());
@@ -1654,7 +1654,7 @@ fn aotnull_fatal_fallback_is_not_guest_err() {
 #[test]
 fn aotnull_loop_jit_and_aot_fallback_effect_parity() {
     let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let source = "fn pick(i:int) -> Option<int> { if i < 50 => { Option::None } else => { Option::Some(0) } } fn relay() -> int { let mut total = 0; for i in 0..100 { total = total + pick(i).unwrap_or_else(|| test::later_arg()); } total } relay();";
+    let source = "fn pick(i:int) -> Option<int> { if i < 50 => { None } else => { Some(0) } } fn relay() -> int { let mut total = 0; for i in 0..100 { total = total + pick(i).unwrap_or_else(|| test::later_arg()); } total } relay();";
     for backend in [0, 1, 2, 4] {
         reset_exit_observers();
         let vm = run_result_source_backend(source, backend);
@@ -1686,7 +1686,7 @@ fn polex_optional_index() {
     let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // AOT does not support this Optional index's Get(String) instruction.
     assert_polex_err_backends(
-        "let arr: Option<array<int>> = Option::Some([1]); let items: array<int> = match arr { Option::Some(value) => value, Option::None => [0] }; let x = items[(if test::close_closure(owned) == () => { test::make_err_result()? } else => { 0 })];",
+        "let arr: Option<array<int>> = Some([1]); let items: array<int> = match arr { Some(value) => value, None => [0] }; let x = items[(if test::close_closure(owned) == () => { test::make_err_result()? } else => { 0 })];",
         1,
         1,
         &[0, 1],
@@ -1706,7 +1706,7 @@ fn polex_nested_match() {
     let _guard = CLOSURE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // Optional-pattern Ceq is outside AOT's admitted instruction set.
     assert_polex_err_backends(
-        "let x = 1 + (match test::take_null(owned) { Option::Some(v) => v, Option::None => test::make_err_result()?, });",
+        "let x = 1 + (match test::take_null(owned) { Some(v) => v, None => test::make_err_result()?, });",
         1,
         1,
         &[0, 1],
@@ -1778,7 +1778,7 @@ fn polex_optional_fallback_skipped_owner_is_not_definitely_moved() {
     for flag in [false, true] {
         assert_polex_err(
             &format!(
-                "let maybe: Option<int> = if {flag} => {{ Option::Some(1) }} else => {{ Option::None }}; let x = match maybe {{ Option::Some(v) => v, Option::None => if test::close_closure(owned) == () => {{ 2 }} else => {{ 3 }} }}; let v = test::make_err_result()?;"
+                "let maybe: Option<int> = if {flag} => {{ Some(1) }} else => {{ None }}; let x = match maybe {{ Some(v) => v, None => if test::close_closure(owned) == () => {{ 2 }} else => {{ 3 }} }}; let v = test::make_err_result()?;"
             ),
             1,
             1,

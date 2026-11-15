@@ -7,22 +7,30 @@ distinct from the VM's internal Null value and from the legacy nullable
 ## Option values
 
 ```rust
-let some: Option<int> = Option::Some(0);
-let none: Option<int> = Option::None;
+let some: Option<int> = Some(0);
+let none: Option<int> = None;
 
 let value = match some {
-    Option::Some(inner) => inner,
-    Option::None => -1,
+    Some(inner) => inner,
+    None => -1,
 };
 ```
 
-`Option::Some` may infer its payload type when the payload itself has a fully
-known schema. `Option::None` has no payload from which to infer `T`, so it
+`Some` may infer its payload type when the payload itself has a fully
+known schema. `None` has no payload from which to infer `T`, so it
 requires an `Option<T>` annotation or another contextual type. Missing type
 arguments are rejected instead of being invented as `Unknown`.
 
-A match on a logical Option must provide `Option::Some` and `Option::None`; the
-two arms are exhaustive. A wildcard arm may stand in for `Option::None` when the
+`Some` and `None` are reserved constructor names in RustScript expressions and
+patterns; they cannot be used as variable, parameter, or function names. Member
+access such as `obj.None` and a quoted map key such as `{"None": 1}` remain
+valid. The former `Option::Some` and `Option::None` spellings have been removed.
+In a match, `Some(TypeName)` now binds the Option payload to `TypeName`; it no
+longer performs a runtime type test. Other parser dialects retain their own
+legacy optional-slot patterns.
+
+A match on a logical Option must provide `Some` and `None`; the
+two arms are exhaustive. A wildcard arm may stand in for `None` when the
 Some arm is present. Duplicate arms, mixing Result construction arms into the
 same match, and ambiguous wildcard combinations are rejected.
 
@@ -124,12 +132,12 @@ the current no-std resource capability and is refused before execution.
 `unwrap_or_else`, `ok_or` and `ok_or_else`.
 
 ```rust
-let some: Option<int> = Option::Some(2);
-let absent: Option<int> = Option::None;
+let some: Option<int> = Some(2);
+let absent: Option<int> = None;
 
 let mapped = some.map(|value| value + 1);          // Option<int>, wraps U
-let flat = some.and_then(|value| Option::Some(value + 1)); // flattens one layer
-let kept = absent.or_else(|| Option::Some(3));     // zero-argument lazy fallback
+let flat = some.and_then(|value| Some(value + 1)); // flattens one layer
+let kept = absent.or_else(|| Some(3));     // zero-argument lazy fallback
 let eager = some.unwrap_or(0);                     // eager fallback, returns int
 let lazy = absent.unwrap_or_else(|| 4);            // lazy body, returns int
 let as_result = absent.ok_or("missing");           // Result<int, string>
@@ -169,9 +177,9 @@ declared cleanup. A None inside a closure does not return from its caller.
 
 ```rust
 fn relay(flag: bool) -> Option<int> {
-    let value: Option<int> = if flag => { Option::Some(1) } else => { Option::None };
+    let value: Option<int> = if flag => { Some(1) } else => { None };
     let item = value?;
-    Option::Some(item + 1)
+    Some(item + 1)
 }
 ```
 
@@ -191,10 +199,10 @@ A non-optional receiver performs one fallible projection. An Option receiver
 consumes exactly one and_then-equivalent receiver layer; the projected payload
 keeps its own schema, so a declared `Option<int>` leaf produces
 `Option<Option<int>>` rather than an arbitrary flattening. An absent dynamic key
-and a present key holding explicit `Option::None` remain distinct.
+and a present key holding explicit `None` remain distinct.
 
 Permitted omitted logical Option fields normalize to None at the RustScript
-boundary, while required fields are still checked. An explicit Option::None
+boundary, while required fields are still checked. An explicit None
 field is a tagged value, not a map deletion. The internal VM keeps its raw Null
 value and other frontends keep their legacy nullable contracts; RustScript
 itself rejects explicit null literals and legacy `T?` annotations.

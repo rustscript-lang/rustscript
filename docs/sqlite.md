@@ -29,18 +29,18 @@ Execution also requires an async host bridge and the SQLite module registered.
 ```rust
 use sqlite;
 
-let limits: SqliteLimits = { max_rows: Option::Some(100) };
+let limits: SqliteLimits = { max_rows: Some(100) };
 let options: SqliteOpenOptions = {
-    path: Option::Some(":memory:"),
-    mode: Option::Some("memory"),
-    limits: Option::Some(limits),
+    path: Some(":memory:"),
+    mode: Some("memory"),
+    limits: Some(limits),
 };
 let db = sqlite::open(options);
 ```
 
-Every field is a logical `Option`. `Option::None` keeps the host default; `Option::Some(value)`
+Every field is a logical `Option`. `None` keeps the host default; `Some(value)`
 explicitly supplies it, including `Some(false)`, `Some(0)`, and `Some("")`. A `path` of
-`Option::None` is still rejected at runtime for a usable connection.
+`None` is still rejected at runtime for a usable connection.
 
 | Field | Type | Runtime behavior |
 | --- | --- | --- |
@@ -53,7 +53,7 @@ Unknown fields are outside the named-struct contract; do not rely on them.
 
 ## Limits (`SqliteLimits`)
 
-Every limit is `Option<int>`. `Option::None` keeps the embedding ceiling; `Option::Some(0)` is a
+Every limit is `Option<int>`. `None` keeps the embedding ceiling; `Some(0)` is a
 provided invalid value rather than a default. Supplied limits must be positive and cannot exceed
 that ceiling.
 
@@ -89,21 +89,21 @@ The five `kind` values and their selected payloads are:
 
 | `kind` | Required payload | Other payloads |
 | --- | --- | --- |
-| `"null"` | none | all payloads `Option::None` |
-| `"int"` | `int_value` | other payloads `Option::None` |
-| `"float"` | `float_value` | other payloads `Option::None` |
-| `"text"` | `text_value` | other payloads `Option::None` |
-| `"blob"` | `blob_value` | other payloads `Option::None` |
+| `"null"` | none | all payloads `None` |
+| `"int"` | `int_value` | other payloads `None` |
+| `"float"` | `float_value` | other payloads `None` |
+| `"text"` | `text_value` | other payloads `None` |
+| `"blob"` | `blob_value` | other payloads `None` |
 
 For example:
 
 ```rust
 let values = [
     { kind: "null" },
-    { kind: "int", int_value: Option::Some(7) },
-    { kind: "float", float_value: Option::Some(1.5) },
-    { kind: "text", text_value: Option::Some("hello") },
-    { kind: "blob", blob_value: Option::Some(bytes::from_hex("000102")) },
+    { kind: "int", int_value: Some(7) },
+    { kind: "float", float_value: Some(1.5) },
+    { kind: "text", text_value: Some("hello") },
+    { kind: "blob", blob_value: Some(bytes::from_hex("000102")) },
 ];
 ```
 
@@ -116,14 +116,14 @@ with its original bytes.
 
 SQLite exposes three distinct absence forms and they are not interchangeable:
 
-- Configuration and statement entries use logical `Option`: `Option::None` keeps the
-  documented default and `Option::Some(value)` supplies it. A physical `null` scalar is
+- Configuration and statement entries use logical `Option`: `None` keeps the
+  documented default and `Some(value)` supplies it. A physical `null` scalar is
   not a second reading of a present public field.
 - A SQL `NULL` result cell remains the tagged `SqliteValue { kind: "null", ... }`
-  business value; its four payload slots are logical `Option::None`. It is not an
+  business value; its four payload slots are logical `None`. It is not an
   absent row and it is not rewritten into an option-of-cell.
 - Result-value absence uses logical `Option`: `SqliteQueryResult.next_cursor` and
-  the unselected `SqliteTransactionResult` branch are `Option::Some`/`Option::None`
+  the unselected `SqliteTransactionResult` branch are `Some`/`None`
   values, matched with `match` rather than a sentinel.
 
 ## Execute (`SqliteExecuteResult`)
@@ -134,7 +134,7 @@ SQLite exposes three distinct absence forms and they are not interchangeable:
 let inserted = sqlite::execute(
     &db,
     "INSERT INTO t (value) VALUES (?1)",
-    [{ kind: "int", int_value: Option::Some(7) }],
+    [{ kind: "int", int_value: Some(7) }],
 );
 let affected = inserted.rows_affected;
 let rowid = inserted.last_insert_rowid;
@@ -153,7 +153,7 @@ limits before the adapter call is awaited.
 `sqlite::query` takes an `array<SqliteValue>` and returns a `SqliteQueryResult`:
 
 ```rust
-let limits: SqliteLimits = { max_rows: Option::Some(32) };
+let limits: SqliteLimits = { max_rows: Some(32) };
 let queried = sqlite::query(&db, "SELECT value FROM t ORDER BY rowid", [], limits);
 
 let first_row = queried.rows[0];
@@ -174,13 +174,13 @@ Each `SqliteRow` has one field, `cells`, an array of `SqliteValue` in column ord
 limits are charged from the underlying column names and cell payloads, without counting the
 named-struct wrapper fields. `max_rows`, `max_columns`, and `max_result_bytes` can truncate a
 query; already accepted rows remain in the result. `next_cursor` is
-`Option::Some(first-column integer)` from the last accepted row, or `Option::None`
+`Some(first-column integer)` from the last accepted row, or `None`
 when no such value was accepted:
 
 ```rust
 let next = match queried.next_cursor {
-    Option::Some(cursor) => cursor,
-    Option::None => -1,
+    Some(cursor) => cursor,
+    None => -1,
 };
 ```
 
@@ -193,12 +193,12 @@ A transaction receives an array of named `SqliteStatement` values. Each statemen
 let results = sqlite::transaction(&db, [
     {
         sql: "INSERT INTO t (value) VALUES (?1)",
-        params: Option::Some([{ kind: "int", int_value: Option::Some(8) }]),
+        params: Some([{ kind: "int", int_value: Some(8) }]),
     },
     {
         sql: "SELECT value FROM t ORDER BY rowid",
-        query: Option::Some(true),
-        limits: Option::Some(limits),
+        query: Some(true),
+        limits: Some(limits),
     },
 ]);
 ```
@@ -220,15 +220,15 @@ SqliteTransactionResult {
 }
 ```
 
-An execute statement produces `{ kind: "execute", execute: Option::Some(...) }`; a query statement
-produces `{ kind: "query", query: Option::Some(...) }`. The unselected envelope field is
-`Option::None`. Discriminate with `kind` before matching `execute` or `query`:
+An execute statement produces `{ kind: "execute", execute: Some(...) }`; a query statement
+produces `{ kind: "query", query: Some(...) }`. The unselected envelope field is
+`None`. Discriminate with `kind` before matching `execute` or `query`:
 
 ```rust
 let result = results[0];
 let executed = match result.execute {
-    Option::Some(value) => value.rows_affected,
-    Option::None => -1,
+    Some(value) => value.rows_affected,
+    None => -1,
 };
 ``` The transaction remains atomic: statement order,
 rollback on failure, transaction deadlines, and result limits are preserved. A SQLite progress

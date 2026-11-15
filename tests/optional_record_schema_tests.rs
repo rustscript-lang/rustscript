@@ -127,10 +127,7 @@ fn all_frontends() -> [Option<&'static RecordPlugin>; 3] {
 
 #[test]
 fn present_valid_optional_record_field_runs_across_frontends() {
-    let source = OMITTED.replace(
-        "{ count: 42 }",
-        "{ count: 42, note: Option::Some(\"ready\") }",
-    );
+    let source = OMITTED.replace("{ count: 42 }", "{ count: 42, note: Some(\"ready\") }");
     for plugin in all_frontends() {
         assert_checked_run(&source, plugin);
     }
@@ -138,7 +135,7 @@ fn present_valid_optional_record_field_runs_across_frontends() {
 
 #[test]
 fn present_null_optional_record_field_runs_across_frontends() {
-    let source = OMITTED.replace("{ count: 42 }", "{ count: 42, note: Option::None }");
+    let source = OMITTED.replace("{ count: 42 }", "{ count: 42, note: None }");
     for plugin in all_frontends() {
         assert_checked_run(&source, plugin);
     }
@@ -178,7 +175,7 @@ fn assert_rejected(source: &str, detail: &str, plugin: Option<&'static RecordPlu
 
 #[test]
 fn omitted_required_record_field_remains_rejected_across_frontends() {
-    let source = OMITTED.replace("{ count: 42 }", "{ note: Option::None }");
+    let source = OMITTED.replace("{ count: 42 }", "{ note: None }");
     for plugin in all_frontends() {
         assert_rejected(
             &source,
@@ -202,7 +199,7 @@ fn wrong_present_optional_field_remains_rejected_across_frontends() {
 
 #[test]
 fn nested_required_generic_field_remains_rejected_across_frontends() {
-    let source = "struct Parcel<T> { value: T, extra: Option<T> }\nstruct Entry { parcel: Parcel<int>, note: Option<string> }\nlet entry: Entry = { parcel: { extra: Option::Some(7) } };\nentry.parcel.value;\n";
+    let source = "struct Parcel<T> { value: T, extra: Option<T> }\nstruct Entry { parcel: Parcel<int>, note: Option<string> }\nlet entry: Entry = { parcel: { extra: Some(7) } };\nentry.parcel.value;\n";
     for plugin in all_frontends() {
         assert_rejected(
             source,
@@ -214,11 +211,11 @@ fn nested_required_generic_field_remains_rejected_across_frontends() {
 
 #[test]
 fn nested_wrong_present_generic_optional_field_remains_rejected_across_frontends() {
-    let source = "struct Parcel<T> { value: T, extra: Option<T> }\nstruct Entry { parcel: Parcel<int>, note: Option<string> }\nlet entry: Entry = { parcel: { value: 42, extra: Option::Some(\"wrong\") } };\nentry.parcel.value;\n";
+    let source = "struct Parcel<T> { value: T, extra: Option<T> }\nstruct Entry { parcel: Parcel<int>, note: Option<string> }\nlet entry: Entry = { parcel: { value: 42, extra: Some(\"wrong\") } };\nentry.parcel.value;\n";
     for plugin in all_frontends() {
         assert_rejected(
             source,
-            "Option::Some payload: value is declared as schema type 'int' but was assigned string",
+            "Some payload: value is declared as schema type 'int' but was assigned string",
             plugin,
         );
     }
@@ -226,7 +223,7 @@ fn nested_wrong_present_generic_optional_field_remains_rejected_across_frontends
 
 #[test]
 fn omitted_required_resource_field_remains_rejected_across_frontends() {
-    let source = "struct Entry { handle: resource<neutral.handle>, note: Option<string> }\nlet entry: Entry = { note: Option::None };\n42;\n";
+    let source = "struct Entry { handle: resource<neutral.handle>, note: Option<string> }\nlet entry: Entry = { note: None };\n42;\n";
     for plugin in all_frontends() {
         assert_rejected(
             source,

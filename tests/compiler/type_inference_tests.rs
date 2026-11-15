@@ -550,8 +550,8 @@ fn compiler_type_inference_runtime_cases_cover_schema_and_optional_flows() {
                 let profile: Profile = { stats: { score: 41 } };
                 let score = profile?.stats?.score;
                 let narrowed = match score {
-                    Option::Some(value) => value + 1,
-                    Option::None => 0,
+                    Some(value) => value + 1,
+                    None => 0,
                 };
                 narrowed;
             "#,
@@ -564,8 +564,8 @@ fn compiler_type_inference_runtime_cases_cover_schema_and_optional_flows() {
                 struct Data { values: [int] }
                 let data: Data = { values: [41] };
                 let result = match data?.values?.[0] {
-                    Option::None => 0,
-                    Option::Some(value) => value + 1,
+                    None => 0,
+                    Some(value) => value + 1,
                 };
                 result;
             "#,

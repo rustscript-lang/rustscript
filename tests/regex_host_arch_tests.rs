@@ -305,16 +305,16 @@ mod logical_option_contract {
         let source = r#"
             use re;
             let present = match re::find("b+", "abbc") {
-                Option::Some(value) => value,
-                Option::None => "missing",
+                Some(value) => value,
+                None => "missing",
             };
             let absent = match re::find("z", "abc") {
-                Option::Some(value) => value,
-                Option::None => "none",
+                Some(value) => value,
+                None => "none",
             };
             let empty = match re::find("b*", "ac") {
-                Option::Some(value) => value,
-                Option::None => "fallback",
+                Some(value) => value,
+                None => "fallback",
             };
             present + "|" + absent + "|" + empty;
         "#;
@@ -327,21 +327,21 @@ mod logical_option_contract {
             use re;
             let groups = re::captures("(a)?(b)", "b");
             let group_zero = match groups[0] {
-                Option::Some(value) => value,
-                Option::None => "missing",
+                Some(value) => value,
+                None => "missing",
             };
             let unmatched = match groups[1] {
-                Option::Some(value) => value,
-                Option::None => "unmatched",
+                Some(value) => value,
+                None => "unmatched",
             };
             let present = match groups[2] {
-                Option::Some(value) => value,
-                Option::None => "missing",
+                Some(value) => value,
+                None => "missing",
             };
             let empty_groups = re::captures("(a)(b?)", "a");
             let empty = match empty_groups[2] {
-                Option::Some(value) => value,
-                Option::None => "missing",
+                Some(value) => value,
+                None => "missing",
             };
             let no_match = re::captures("(a)", "zzz");
             if group_zero == "b"
@@ -392,16 +392,16 @@ mod logical_option_contract {
             let via_closure: fn(string, string) -> Option<string> = find_first;
             let through_closure = via_closure("b", "abc");
             let direct_value = match direct {
-                Option::Some(value) => value,
-                Option::None => "none",
+                Some(value) => value,
+                None => "none",
             };
             let aliased_value = match aliased {
-                Option::Some(value) => value,
-                Option::None => "none",
+                Some(value) => value,
+                None => "none",
             };
             let closure_value = match through_closure {
-                Option::Some(value) => value,
-                Option::None => "none",
+                Some(value) => value,
+                None => "none",
             };
             if direct_value == "b" && aliased_value == "b" && closure_value == "b" {
                 1;
@@ -530,12 +530,12 @@ mod logical_option_contract {
             let groups = re::captures("(a)(b?)", "a");
             let parts = re::split(",", "a,b");
             let found_value = match found {
-                Option::Some(value) => value,
-                Option::None => "none",
+                Some(value) => value,
+                None => "none",
             };
             let group_value = match groups[2] {
-                Option::Some(value) => value,
-                Option::None => "missing",
+                Some(value) => value,
+                None => "missing",
             };
             if found_value == "bb" && group_value == "" && parts.length == 2 {
                 1;

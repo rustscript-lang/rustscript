@@ -96,7 +96,7 @@ struct Inner { c: int }
 struct Outer { b: Inner }
 
 let present: Outer = { b: { c: 7 } };
-let missing: Option<Outer> = Option::None;
+let missing: Option<Outer> = None;
 
 present?.b?.c.unwrap_or(0);
 missing?.b?.c.unwrap_or(0);

@@ -698,7 +698,7 @@ fn resolve_method(
     };
     // Shared combinator names are owned by the receiver's logical type. Peek
     // the receiver schema before applying a Result-only contextual hint so a
-    // bare `Option::None.unwrap_or(...)` is never typed as a Result constructor.
+    // bare `None.unwrap_or(...)` is never typed as a Result constructor.
     if let Some(option_method) = method.as_option_method() {
         let static_schema = authoritative_schema(&receiver, env);
         let syntactic_option = matches!(

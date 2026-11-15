@@ -887,7 +887,8 @@ impl Parser {
         let mut fields = HashMap::new();
         if !self.check(&TokenKind::RBrace) {
             loop {
-                let field = self.expect_ident("expected field name in object type schema")?;
+                let field =
+                    self.expect_namespace_segment("expected field name in object type schema")?;
                 self.expect(&TokenKind::Colon, "expected ':' after schema field name")?;
                 let field_schema = self.parse_declared_type_schema()?;
                 fields.insert(field, field_schema);

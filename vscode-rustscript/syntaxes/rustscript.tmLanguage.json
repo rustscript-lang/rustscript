@@ -425,19 +425,27 @@
       "match": "(?<![A-Za-z0-9_])\\(\\)"
     },
     "option-result-constructor": {
-      "name": "meta.constructor.rss",
-      "match": "\\b((?:Option)(?=\\s*::\\s*(?:Some|None))|(?:Result)(?=\\s*::\\s*(?:Ok|Err)))(\\s*)(::)(\\s*)(Some|None|Ok|Err)\\b",
-      "captures": {
-        "1": {
-          "name": "support.type.rss"
+      "patterns": [
+        {
+          "name": "support.constant.constructor.rss",
+          "match": "(?<![A-Za-z0-9_.:])\\b(?:Some(?=\\s*\\()|None)\\b"
         },
-        "3": {
-          "name": "punctuation.accessor.rss"
-        },
-        "5": {
-          "name": "support.constant.constructor.rss"
+        {
+          "name": "meta.constructor.rss",
+          "match": "\\b(Result)(\\s*)(::)(\\s*)(Ok|Err)\\b",
+          "captures": {
+            "1": {
+              "name": "support.type.rss"
+            },
+            "3": {
+              "name": "punctuation.accessor.rss"
+            },
+            "5": {
+              "name": "support.constant.constructor.rss"
+            }
+          }
         }
-      }
+      ]
     },
     "numbers": {
       "name": "constant.numeric.rss",

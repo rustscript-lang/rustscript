@@ -4,7 +4,7 @@ use vm::{ReplLocalBinding, ReplLocalState, compile_source_for_repl_with_state};
 #[test]
 fn root_result_join_optional_float_uses_expression_schema() {
     let compiled = vm::compile_source_for_repl_with_state_and_options(
-        "let maybe: Option<float> = Option::Some(2.5); let y = if true => { maybe } else => { Option::None };",
+        "let maybe: Option<float> = Some(2.5); let y = if true => { maybe } else => { None };",
         &[],
         vm::CompileSourceFileOptions::default(),
     )
@@ -58,7 +58,7 @@ fn root_result_join_optional_float_uses_expression_schema() {
     assert_eq!(
         execute_persistent_snippets(
             &[
-                "let maybe: Option<float> = Option::Some(2.5); let y = if true => { maybe } else => { Option::None };",
+                "let maybe: Option<float> = Some(2.5); let y = if true => { maybe } else => { None };",
                 "let following = y; following;",
             ],
             vm::CompileSourceFileOptions::default(),
@@ -104,14 +104,14 @@ fn root_result_join_optional_named_retains_checked_host_identity() {
         registry
     };
     for (expression, flag, expected) in [
-        ("if flag => { maybe } else => { Option::None }", true, 42),
-        ("if flag => { Option::None } else => { maybe }", false, 42),
-        ("if flag => { maybe } else => { Option::None }", false, 0),
-        ("if flag => { Option::None } else => { maybe }", true, 0),
-        ("match choice { 1 => maybe, _ => Option::None }", true, 42),
-        ("match choice { 1 => Option::None, _ => maybe }", false, 42),
-        ("match choice { 1 => maybe, _ => Option::None }", false, 0),
-        ("match choice { 1 => Option::None, _ => maybe }", true, 0),
+        ("if flag => { maybe } else => { None }", true, 42),
+        ("if flag => { None } else => { maybe }", false, 42),
+        ("if flag => { maybe } else => { None }", false, 0),
+        ("if flag => { None } else => { maybe }", true, 0),
+        ("match choice { 1 => maybe, _ => None }", true, 42),
+        ("match choice { 1 => None, _ => maybe }", false, 42),
+        ("match choice { 1 => maybe, _ => None }", false, 0),
+        ("match choice { 1 => None, _ => maybe }", true, 0),
     ] {
         let source = format!(
             "let flag = {flag}; let choice = if flag => {{ 1 }} else => {{ 2 }}; let maybe: Option<ResultJoinRoot> = resultjoin::origin(); let y = {expression};"
@@ -139,7 +139,7 @@ fn root_result_join_optional_named_retains_checked_host_identity() {
             })
             .collect::<Vec<_>>();
         let second = vm::compile_source_for_repl_with_state_and_options(
-            "let following = y; match following { Option::None => true, Option::Some(_) => false };",
+            "let following = y; match following { None => true, Some(_) => false };",
             &states,
             options.clone(),
         )
@@ -201,10 +201,10 @@ fn root_result_join_optional_named_retains_checked_host_identity() {
 #[test]
 fn root_result_join_match_uses_existing_expression_alternatives() {
     for expression in [
-        "match 1 { 1 => maybe, _ => Option::None }",
-        "match 2 { 1 => Option::None, _ => maybe }",
+        "match 1 { 1 => maybe, _ => None }",
+        "match 2 { 1 => None, _ => maybe }",
     ] {
-        let source = format!("let maybe: Option<float> = Option::Some(2.5); let y = {expression};");
+        let source = format!("let maybe: Option<float> = Some(2.5); let y = {expression};");
         let compiled = vm::compile_source_for_repl_with_state_and_options(
             &source,
             &[],
@@ -259,7 +259,7 @@ fn root_result_join_conservative_guards_preserve_optional_flags() {
         "match choice { 1 => left, _ => right }",
     ] {
         let source = format!(
-            "struct Left {{ value: int }} struct Right {{ value: int }} let flag = true; let choice = 1; let left: Option<Left> = Option::Some({{ value: 1 }}); let right: Option<Right> = Option::Some({{ value: 2 }}); let y = {expression};"
+            "struct Left {{ value: int }} struct Right {{ value: int }} let flag = true; let choice = 1; let left: Option<Left> = Some({{ value: 1 }}); let right: Option<Right> = Some({{ value: 2 }}); let y = {expression};"
         );
         let error = vm::compile_source_for_repl_with_state_and_options(
             &source,
@@ -281,11 +281,11 @@ fn root_result_join_conservative_guards_preserve_optional_flags() {
 #[test]
 fn root_result_join_nullable_result_keeps_binding_effects_separate() {
     for expression in [
-        "if flag => { x = 2.5; maybe } else => { x = 2.5; Option::None }",
-        "match choice { 1 => if flag => { x = 2.5; maybe } else => { x = 2.5; maybe }, _ => if flag => { x = 2.5; Option::None } else => { x = 2.5; Option::None } }",
+        "if flag => { x = 2.5; maybe } else => { x = 2.5; None }",
+        "match choice { 1 => if flag => { x = 2.5; maybe } else => { x = 2.5; maybe }, _ => if flag => { x = 2.5; None } else => { x = 2.5; None } }",
     ] {
         let source = format!(
-            "let flag = true; let choice = 1; let mut x = 1; let maybe: Option<float> = Option::Some(3.5); let y = {expression};"
+            "let flag = true; let choice = 1; let mut x = 1; let maybe: Option<float> = Some(3.5); let y = {expression};"
         );
         let compiled = vm::compile_source_for_repl_with_state_and_options(
             &source,
@@ -597,7 +597,7 @@ fn final_layout_named_optional_entry_seeds_follow_final_debug_slots() {
     ];
     let large = format!("use calibration; {}", sequential_callee_source());
     for source in [
-        "use calibration; root.value; match maybe { Option::None => true, Option::Some(_) => false }; calibration::value();",
+        "use calibration; root.value; match maybe { None => true, Some(_) => false }; calibration::value();",
         "use calibration; calibration::value();",
         large.as_str(),
         "use calibration; fn recurse(n: int) -> int { if n == 0 => { 0 } else => { 1 + recurse(n - 1) } } fn capture() -> int { let value = root.value; let add = |n| n + value; add(recurse(3)) } capture();",

@@ -28,15 +28,15 @@ fn parse_log_line(line) {
 
 fn is_some_string_equal(actual: Option<string>, expected: string) -> bool {
     match actual {
-        Option::Some(value) => value == expected,
-        Option::None => false
+        Some(value) => value == expected,
+        None => false
     }
 }
 
 fn string_or_empty(value: Option<string>) -> string {
     match value {
-        Option::Some(text) => text,
-        Option::None => ""
+        Some(text) => text,
+        None => ""
     }
 }
 
@@ -76,7 +76,7 @@ let id_groups = re::captures("id=([0-9]+)", error_message);
 let error_id: string = string_or_empty(if id_groups.length == 2 => {
     id_groups[1]
 } else => {
-    Option::None
+    None
 }
 );
 let levels = [first_level, warn_level, error_level];

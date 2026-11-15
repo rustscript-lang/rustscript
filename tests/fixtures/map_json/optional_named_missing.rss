@@ -1,1 +1,1 @@
-use json; struct Node { next: Option<Node> } let decoded: Node = json::decode::<Node>("{\"next\":{}}"); let ok = match decoded.next { Option::Some(inner) => match inner.next { Option::None => true, Option::Some(_) => false }, Option::None => false }; ok;
+use json; struct Node { next: Option<Node> } let decoded: Node = json::decode::<Node>("{\"next\":{}}"); let ok = match decoded.next { Some(inner) => match inner.next { None => true, Some(_) => false }, None => false }; ok;

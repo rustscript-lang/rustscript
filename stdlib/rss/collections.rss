@@ -2,10 +2,10 @@
 
 // Returns the first index of a value in an array, or None when it is absent.
 pub fn index_of<T>(values: [T], needle: T) -> Option<int> {
-    let mut out: Option<int> = Option::None;
+    let mut out: Option<int> = None;
     for find_index in 0..values.length {
         if values[find_index] == needle {
-            out = Option::Some(find_index);
+            out = Some(find_index);
             break;
         }
     }
@@ -15,8 +15,8 @@ pub fn index_of<T>(values: [T], needle: T) -> Option<int> {
 // Returns whether an array contains a value.
 pub fn contains<T>(values: [T], needle: T) -> bool {
     match index_of::<T>(values, needle) {
-        Option::Some(_) => true,
-        Option::None => false,
+        Some(_) => true,
+        None => false,
     }
 }
 

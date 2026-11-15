@@ -31,11 +31,11 @@ fn inferred_empty_map_keeps_unit_entry() {
 fn option_map_callback_encodes_nested_payload_as_natural_json() {
     let source = r#"
         use json;
-        let src: Option<Option<int>> = Option::Some(Option::Some(1));
+        let src: Option<Option<int>> = Some(Some(1));
         let encoded = src.map(|item| json::encode(item));
         match encoded {
-            Option::Some(text) => text == "1",
-            Option::None => false,
+            Some(text) => text == "1",
+            None => false,
         };
     "#;
     assert_eq!(eval(source), Value::Bool(true));
@@ -45,7 +45,7 @@ fn option_map_callback_encodes_nested_payload_as_natural_json() {
 fn result_map_callback_encodes_nested_payload_as_natural_json() {
     let source = r#"
         use json;
-        let src: Result<Option<int>, string> = Result::Ok(Option::Some(1));
+        let src: Result<Option<int>, string> = Result::Ok(Some(1));
         let encoded = src.map(|item| json::encode(item));
         match encoded {
             Result::Ok(text) => text == "1",
@@ -59,11 +59,11 @@ fn result_map_callback_encodes_nested_payload_as_natural_json() {
 fn option_and_then_callback_encodes_nested_payload_as_natural_json() {
     let source = r#"
         use json;
-        let src: Option<Option<int>> = Option::Some(Option::Some(1));
-        let encoded = src.and_then(|item| Option::Some(json::encode(item)));
+        let src: Option<Option<int>> = Some(Some(1));
+        let encoded = src.and_then(|item| Some(json::encode(item)));
         match encoded {
-            Option::Some(text) => text == "1",
-            Option::None => false,
+            Some(text) => text == "1",
+            None => false,
         };
     "#;
     assert_eq!(eval(source), Value::Bool(true));
@@ -161,13 +161,13 @@ fn closure_contextual_unit_map_store_keeps_entry() {
 
 #[test]
 fn pattern_moved_unit_map_store_keeps_entry() {
-    let source = r#"let maybe: Option<map<()>> = Option::Some({}); let ok = match maybe { Option::Some(m) => if true => { let mut values = m; values["x"] = (); values.has("x") } else => { false }, Option::None => false }; ok;"#;
+    let source = r#"let maybe: Option<map<()>> = Some({}); let ok = match maybe { Some(m) => if true => { let mut values = m; values["x"] = (); values.has("x") } else => { false }, None => false }; ok;"#;
     assert_eq!(eval(source), Value::Bool(true));
 }
 
 #[test]
 fn option_carrier_index_store_is_rejected() {
-    let source = r#"let mut o: Option<int> = Option::Some(1); o["x"] = ();"#;
+    let source = r#"let mut o: Option<int> = Some(1); o["x"] = ();"#;
     let message = match compile_source(source) {
         Err(error) => error.to_string(),
         Ok(_) => panic!("Option index store must be rejected"),
@@ -193,7 +193,7 @@ fn result_carrier_index_store_is_rejected() {
 
 #[test]
 fn option_carrier_stays_unmodified_without_store() {
-    let source = r#"let o: Option<int> = Option::Some(1); o.has("x");"#;
+    let source = r#"let o: Option<int> = Some(1); o.has("x");"#;
     assert_eq!(eval(source), Value::Bool(false));
 }
 
@@ -444,7 +444,7 @@ fn object_literal_remove_is_rejected() {
 #[test]
 fn option_and_result_remove_are_rejected() {
     reject(
-        r#"let carrier: Option<int> = Option::Some(1); carrier.remove("x");"#,
+        r#"let carrier: Option<int> = Some(1); carrier.remove("x");"#,
         "E_MAP_REMOVE_RECORD",
     );
     reject(
@@ -456,7 +456,7 @@ fn option_and_result_remove_are_rejected() {
 #[test]
 fn option_non_unit_and_result_unit_index_stores_are_rejected() {
     reject(
-        r#"let mut carrier: Option<int> = Option::Some(1); carrier["x"] = 2;"#,
+        r#"let mut carrier: Option<int> = Some(1); carrier["x"] = 2;"#,
         "cannot store into an Option or Result",
     );
     reject(
@@ -468,7 +468,7 @@ fn option_non_unit_and_result_unit_index_stores_are_rejected() {
 #[test]
 fn option_and_result_dot_stores_are_rejected() {
     reject(
-        r#"let mut carrier: Option<int> = Option::Some(1); carrier.x = ();"#,
+        r#"let mut carrier: Option<int> = Some(1); carrier.x = ();"#,
         "cannot store into an Option or Result",
     );
     reject(
@@ -480,11 +480,11 @@ fn option_and_result_dot_stores_are_rejected() {
 #[test]
 fn option_and_result_match_leave_payload_unmodified() {
     let source = r#"
-        let option_value: Option<int> = Option::Some(4);
+        let option_value: Option<int> = Some(4);
         let result_value: Result<int, string> = Result::Ok(5);
         let option_ok = match option_value {
-            Option::Some(value) => value,
-            Option::None => 0
+            Some(value) => value,
+            None => 0
         };
         let result_ok = match result_value {
             Result::Ok(value) => value,
@@ -498,10 +498,10 @@ fn option_and_result_match_leave_payload_unmodified() {
 #[test]
 fn option_map_combinator_keeps_payload() {
     let source = r#"
-        let mapped = Option::Some(3).map(|value| value + 1);
+        let mapped = Some(3).map(|value| value + 1);
         let shown = match mapped {
-            Option::Some(value) => value,
-            Option::None => 0
+            Some(value) => value,
+            None => 0
         };
         shown;
     "#;
@@ -577,14 +577,14 @@ fn option_unit_field_none_omits_and_some_encodes_null() {
     let source = r#"
         use json;
         struct Payload { value: Option<()> }
-        let absent: Payload = {value: Option::None};
-        let present: Payload = {value: Option::Some(())};
+        let absent: Payload = {value: None};
+        let present: Payload = {value: Some(())};
         let absent_text = json::encode(absent);
         let present_text = json::encode(present);
         let absent_back: Payload = json::decode::<Payload>(absent_text);
         let present_back: Payload = json::decode::<Payload>(present_text);
-        let absent_ok = match absent_back.value { Option::None => absent_text == "{}", Option::Some(_) => false };
-        let present_ok = match present_back.value { Option::Some(_) => present_text == "{\"value\":null}", Option::None => false };
+        let absent_ok = match absent_back.value { None => absent_text == "{}", Some(_) => false };
+        let present_ok = match present_back.value { Some(_) => present_text == "{\"value\":null}", None => false };
         absent_ok && present_ok;
     "#;
     assert_eq!(eval(source), Value::Bool(true));
@@ -601,15 +601,15 @@ fn option_int_field_distinguishes_none_zero_false_and_empty() {
         let encoded_missing = json::encode(json::decode::<Row>("{}"));
         let encoded_explicit = json::encode(json::decode::<Row>("{\"n\":0,\"flag\":false,\"text\":\"\"}"));
         let missing_ok = match missing.n {
-            Option::None => match missing.flag {
-                Option::None => match missing.text { Option::None => true, Option::Some(_) => false },
-                Option::Some(_) => false
+            None => match missing.flag {
+                None => match missing.text { None => true, Some(_) => false },
+                Some(_) => false
             },
-            Option::Some(_) => false
+            Some(_) => false
         };
         let explicit_ok = match explicit.n {
-            Option::Some(number) => number == 0 && match explicit.flag {
-                Option::Some(flag) => flag == false && match explicit.text { Option::Some(text) => text == "", _ => false },
+            Some(number) => number == 0 && match explicit.flag {
+                Some(flag) => flag == false && match explicit.text { Some(text) => text == "", _ => false },
                 _ => false
             },
             _ => false
@@ -643,8 +643,8 @@ fn mutual_recursion_and_generic_substitution_round_trip() {
         let encoded = json::encode(decoded);
         let again: Left = json::decode::<Left>(encoded);
         let left_ok = match again.right {
-            Option::Some(right) => right.n == 2 && match right.left { Option::None => true, Option::Some(_) => false },
-            Option::None => false
+            Some(right) => right.n == 2 && match right.left { None => true, Some(_) => false },
+            None => false
         };
         let boxed: Box<int> = json::decode::<Box<int>>("{\"value\":4}");
         left_ok && again.n == 1 && boxed.value == 4 && encoded == "{\"n\":1,\"right\":{\"n\":2}}";

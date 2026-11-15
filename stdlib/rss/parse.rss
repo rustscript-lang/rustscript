@@ -140,7 +140,7 @@ pub fn is_int_literal(value: string) -> bool {
 // Parses an integer literal for the given base and returns null on failure.
 pub fn try_parse_int_base(value: string, base: int) -> Option<int> {
     let text = trim(value);
-    let mut out: Option<int> = Option::None;
+    let mut out: Option<int> = None;
     if is_int_literal_base(text, base) {
         let mut sign = 1;
         let mut index = 0;
@@ -156,7 +156,7 @@ pub fn try_parse_int_base(value: string, base: int) -> Option<int> {
             parsed = parsed * base + digit_value((&text)[index:(index + 1)]);
             index = index + 1;
         }
-        out = Option::Some(parsed * sign);
+        out = Some(parsed * sign);
     }
     out
 }
@@ -169,16 +169,16 @@ pub fn try_parse_int(value: string) -> Option<int> {
 // Parses an integer literal for the given base or returns a fallback.
 pub fn parse_int_base_or(value: string, base: int, fallback: int) -> int {
     match try_parse_int_base(value, base) {
-        Option::Some(value) => value,
-        Option::None => fallback,
+        Some(value) => value,
+        None => fallback,
     }
 }
 
 // Parses a base-10 integer literal or returns a fallback.
 pub fn parse_int_or(value: string, fallback: int) -> int {
     match try_parse_int(value) {
-        Option::Some(value) => value,
-        Option::None => fallback,
+        Some(value) => value,
+        None => fallback,
     }
 }
 
@@ -192,16 +192,16 @@ pub fn is_bool_literal(value: string) -> bool {
 pub fn try_parse_bool(value: string) -> Option<bool> {
     let text = trim(value);
     match text {
-        "true" => Option::Some(true),
-        "false" => Option::Some(false),
-        _ => Option::None,
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
     }
 }
 
 // Parses a boolean literal or returns a fallback.
 pub fn parse_bool_or(value: string, fallback: bool) -> bool {
     match try_parse_bool(value) {
-        Option::Some(value) => value,
-        Option::None => fallback,
+        Some(value) => value,
+        None => fallback,
     }
 }

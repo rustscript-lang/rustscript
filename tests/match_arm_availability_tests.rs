@@ -28,14 +28,14 @@ fn match_arms_read_supplied_outer_parameters() {
     let source = r#"
         fn option_int(actual: Option<int>, expected: int) -> bool {
             match actual {
-                Option::Some(value) => value == expected,
-                Option::None => false
+                Some(value) => value == expected,
+                None => false
             }
         }
         fn option_string(actual: Option<string>, expected: string) -> bool {
             match actual {
-                Option::Some(value) => value == expected,
-                Option::None => false
+                Some(value) => value == expected,
+                None => false
             }
         }
         fn result_string(actual: Result<string, string>, expected: string) -> bool {
@@ -50,12 +50,12 @@ fn match_arms_read_supplied_outer_parameters() {
                 Result::Err(value) => value == expected
             }
         }
-        option_int(Option::Some(7), 7);
-        option_int(Option::Some(7), 8);
-        option_int(Option::None, 7);
-        option_string(Option::Some("same"), "same");
-        option_string(Option::Some("same"), "other");
-        option_string(Option::None, "same");
+        option_int(Some(7), 7);
+        option_int(Some(7), 8);
+        option_int(None, 7);
+        option_string(Some("same"), "same");
+        option_string(Some("same"), "other");
+        option_string(None, "same");
         result_string(Result::Ok("same"), "same");
         result_string(Result::Ok("same"), "other");
         result_string(Result::Err("missing"), "same");
@@ -88,34 +88,34 @@ fn match_arms_read_same_frame_lets_and_nested_matches() {
         fn same_frame(actual: Option<int>, expected: int) -> bool {
             let probe = expected;
             match actual {
-                Option::Some(value) => value == probe,
-                Option::None => false
+                Some(value) => value == probe,
+                None => false
             }
         }
         fn nested(actual: Option<Option<int>>, expected: int) -> bool {
             match actual {
-                Option::Some(inner) => match inner {
-                    Option::Some(value) => value == expected,
-                    Option::None => false
+                Some(inner) => match inner {
+                    Some(value) => value == expected,
+                    None => false
                 },
-                Option::None => false
+                None => false
             }
         }
         fn both_arms(actual: Option<int>, expected: int) -> int {
             match actual {
-                Option::Some(value) => value + expected,
-                Option::None => expected
+                Some(value) => value + expected,
+                None => expected
             }
         }
-        same_frame(Option::Some(7), 7);
-        same_frame(Option::Some(7), 8);
-        same_frame(Option::None, 7);
-        nested(Option::Some(Option::Some(7)), 7);
-        nested(Option::Some(Option::Some(7)), 8);
-        nested(Option::Some(Option::None), 7);
-        nested(Option::None, 7);
-        both_arms(Option::Some(7), 1);
-        both_arms(Option::None, 4);
+        same_frame(Some(7), 7);
+        same_frame(Some(7), 8);
+        same_frame(None, 7);
+        nested(Some(Some(7)), 7);
+        nested(Some(Some(7)), 8);
+        nested(Some(None), 7);
+        nested(None, 7);
+        both_arms(Some(7), 1);
+        both_arms(None, 4);
     "#;
     assert_eq!(
         run(source),
@@ -139,23 +139,23 @@ fn match_arm_keeps_real_captures_separate_from_same_frame_locals() {
         let outer = "same";
         fn captured_root(actual: Option<string>) -> bool {
             match actual {
-                Option::Some(value) => value == outer,
-                Option::None => false
+                Some(value) => value == outer,
+                None => false
             }
         }
         fn closure_over_parameter(actual: Option<string>, expected: string) -> bool {
             let check = |probe| probe == expected;
             match actual {
-                Option::Some(value) => check(value),
-                Option::None => false
+                Some(value) => check(value),
+                None => false
             }
         }
-        captured_root(Option::Some("same"));
-        captured_root(Option::Some("other"));
-        captured_root(Option::None);
-        closure_over_parameter(Option::Some("same"), "same");
-        closure_over_parameter(Option::Some("same"), "other");
-        closure_over_parameter(Option::None, "same");
+        captured_root(Some("same"));
+        captured_root(Some("other"));
+        captured_root(None);
+        closure_over_parameter(Some("same"), "same");
+        closure_over_parameter(Some("same"), "other");
+        closure_over_parameter(None, "same");
     "#;
     assert_eq!(
         run(source),
@@ -182,20 +182,20 @@ fn string_equality_reuse_matches_the_non_match_baseline() {
         }
         fn matched(actual: Option<string>, expected: string) -> bool {
             let first = match actual {
-                Option::Some(value) => value == expected,
-                Option::None => false
+                Some(value) => value == expected,
+                None => false
             };
             let second = match actual {
-                Option::Some(value) => value == expected,
-                Option::None => false
+                Some(value) => value == expected,
+                None => false
             };
             first && second
         }
         plain("same", "same");
         plain("same", "other");
-        matched(Option::Some("same"), "same");
-        matched(Option::Some("same"), "other");
-        matched(Option::None, "same");
+        matched(Some("same"), "same");
+        matched(Some("same"), "other");
+        matched(None, "same");
     "#;
     assert_eq!(
         run(source),
@@ -215,12 +215,12 @@ fn match_arm_availability_still_rejects_illegal_uses() {
         r#"
         fn compare(actual: Option<int>) -> int {
             match actual {
-                Option::Some(value) => value,
-                Option::None => 0
+                Some(value) => value,
+                None => 0
             };
             value
         }
-        compare(Option::Some(7));
+        compare(Some(7));
         "#,
     );
     assert!(
@@ -238,11 +238,11 @@ fn match_arm_availability_still_rejects_illegal_uses() {
                 0
             };
             match actual {
-                Option::Some(value) => value == expected,
-                Option::None => false
+                Some(value) => value == expected,
+                None => false
             }
         }
-        compare(Option::Some(7), true);
+        compare(Some(7), true);
         "#,
     );
     assert!(
@@ -254,8 +254,8 @@ fn match_arm_availability_still_rejects_illegal_uses() {
         r#"
         fn compare(actual: int, expected: int) -> bool {
             match actual {
-                Option::Some(value) => value == expected,
-                Option::None => false
+                Some(value) => value == expected,
+                None => false
             }
         }
         compare(7, 7);
@@ -269,7 +269,7 @@ fn match_arm_availability_still_rejects_illegal_uses() {
     let wrong_payload = reject(
         r#"
         fn bad() -> Option<int> {
-            Option::Some("no")
+            Some("no")
         }
         bad();
         "#,

@@ -46,15 +46,15 @@ pub fn index_of(buf: bytes, needle: bytes) -> Option<int> {
     let buf_len = buf.length;
     let needle_len = needle.length;
     let out: Option<int> = if needle_len == 0 => {
-        Option::Some(0)
+        Some(0)
     } else if needle_len > buf_len => {
-        Option::None
+        None
     } else => {
-        let mut found: Option<int> = Option::None;
+        let mut found: Option<int> = None;
         let limit = buf_len - needle_len + 1;
         for index in 0..limit {
             if buf[index:(index + needle_len)] == needle {
-                found = Option::Some(index);
+                found = Some(index);
                 break;
             }
         }

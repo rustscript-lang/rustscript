@@ -15,6 +15,16 @@ impl Parser {
     }
 
     pub(super) fn expect_ident(&mut self, message: &str) -> Result<String, ParseError> {
+        if self.dialect.allow_option_syntax()
+            && (self.check_ident_literal("Some") || self.check_ident_literal("None"))
+        {
+            return Err(ParseError {
+                line: self.current_line(),
+                message: "Some and None are reserved Option constructors".to_string(),
+                span: Some(self.current_span()),
+                code: None,
+            });
+        }
         if let Some(name) = self.match_ident() {
             Ok(name)
         } else {

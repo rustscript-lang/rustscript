@@ -108,8 +108,8 @@ fn generated_named_generic_result_catalog_declares_payload() {
 #[test]
 fn typed_array_optional_generated_roundtrip() {
     for (value, expected) in [
-        ("Result::Ok(Option::None)", -1),
-        ("Result::Ok(Option::Some([3, 4]))", 7),
+        ("Result::Ok(None)", -1),
+        ("Result::Ok(Some([3, 4]))", 7),
         ("Result::Err(\"typed error\")", -2),
     ] {
         let descriptors = vec![

@@ -320,8 +320,8 @@ fn io_read_line_at_eof_is_ok_none() {
             let line = io::read_line(handle)?;
             io::close(handle)?;
             Result::Ok(match line {{
-                Option::Some(_) => false,
-                Option::None => true,
+                Some(_) => false,
+                None => true,
             }})
         }}
         match probe() {{
@@ -352,16 +352,16 @@ fn io_read_line_reports_an_empty_line_as_ok_some_empty() {
             let third = io::read_line(handle)?;
             io::close(handle)?;
             let empty_line = match first {{
-                Option::Some(line) => line.length == 0,
-                Option::None => false,
+                Some(line) => line.length == 0,
+                None => false,
             }};
             let content = match second {{
-                Option::Some(line) => line == "second",
-                Option::None => false,
+                Some(line) => line == "second",
+                None => false,
             }};
             let eof = match third {{
-                Option::Some(_) => false,
-                Option::None => true,
+                Some(_) => false,
+                None => true,
             }};
             Result::Ok(empty_line && content && eof)
         }}

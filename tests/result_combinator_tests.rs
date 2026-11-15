@@ -378,8 +378,8 @@ fn named_payload_and_named_error_keep_their_declarations() {
 #[test]
 fn nullable_unwrap_or_keeps_the_existing_nullable_semantics() {
     let source = r#"
-        let present: Option<int> = Option::Some(3);
-        let missing: Option<int> = Option::None;
+        let present: Option<int> = Some(3);
+        let missing: Option<int> = None;
         let present_out = present.unwrap_or(9);
         let missing_out = missing.unwrap_or(8);
         present_out + missing_out;
@@ -1045,11 +1045,11 @@ fn result_map_known_named_ok_schema_materializes_omitted_option_field() {
         struct Entry { name: string, note: Option<int> }
         fn observe_note(note: Option<Option<int>>) -> int {
             match note {
-                Option::Some(inner_note) => match inner_note {
-                    Option::Some(value) => value,
-                    Option::None => 1,
+                Some(inner_note) => match inner_note {
+                    Some(value) => value,
+                    None => 1,
                 },
-                Option::None => -2,
+                None => -2,
             }
         }
         fn observe_entry(value: Entry) -> int {
@@ -1071,11 +1071,11 @@ fn result_map_err_known_named_error_schema_materializes_omitted_option_field() {
         struct Failure { code: int, detail: Option<int> }
         fn observe_note(note: Option<Option<int>>) -> int {
             match note {
-                Option::Some(inner_note) => match inner_note {
-                    Option::Some(value) => value,
-                    Option::None => 1,
+                Some(inner_note) => match inner_note {
+                    Some(value) => value,
+                    None => 1,
                 },
-                Option::None => -2,
+                None => -2,
             }
         }
         fn observe_failure(error: Failure) -> int {
@@ -1097,11 +1097,11 @@ fn result_unwrap_or_and_unwrap_or_else_known_named_payload_materialize_none() {
         struct Entry { name: string, note: Option<int> }
         fn observe_note(note: Option<Option<int>>) -> int {
             match note {
-                Option::Some(inner_note) => match inner_note {
-                    Option::Some(value) => value,
-                    Option::None => 1,
+                Some(inner_note) => match inner_note {
+                    Some(value) => value,
+                    None => 1,
                 },
-                Option::None => -2,
+                None => -2,
             }
         }
         fn observe_entry(value: Entry) -> int {
@@ -1121,11 +1121,11 @@ fn result_and_then_and_or_else_known_named_payloads_materialize_none() {
         struct Entry { name: string, note: Option<int> }
         fn observe_note(note: Option<Option<int>>) -> int {
             match note {
-                Option::Some(inner_note) => match inner_note {
-                    Option::Some(value) => value,
-                    Option::None => 1,
+                Some(inner_note) => match inner_note {
+                    Some(value) => value,
+                    None => 1,
                 },
-                Option::None => -2,
+                None => -2,
             }
         }
         fn observe_entry(value: Entry) -> int {
@@ -1201,7 +1201,7 @@ fn result_unwrap_or_keeps_a_previously_materialized_named_fallback() {
         let fallback: Entry = { name: "x" };
         let absent: Result<Entry, int> = Result::Err(3);
         let item: Entry = absent.unwrap_or(fallback);
-        match item.note { Option::Some(value) => value, Option::None => 0 };
+        match item.note { Some(value) => value, None => 0 };
     "#;
     assert_eq!(eval(source), Value::Int(0));
 }

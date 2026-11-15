@@ -58,7 +58,7 @@ pub(crate) fn native_re_match(vm: &mut Vm, pattern: &str, text: &str) -> VmResul
 /// Returns the first substring matched by a regular expression.
 ///
 /// The guest result is a logical `Option<String>`: a missing match is
-/// `Option::None`, while an empty match stays `Option::Some("")`.
+/// `None`, while an empty match stays `Some("")`.
 #[pd_host_function(name = "re::find")]
 pub(super) fn builtin_re_find(
     mut cache: HostStateMut<'_, RegexCache>,

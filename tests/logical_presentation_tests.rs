@@ -20,7 +20,7 @@ fn run_prints(source: &str) -> (Vec<String>, Vec<Value>) {
 fn direct_option_print_uses_the_expression_schema() {
     let (printed, stack) = run_prints(
         r#"
-        fn none() -> Option<int> { Option::None; }
+        fn none() -> Option<int> { None; }
         print(none());
         "#,
     );
@@ -32,8 +32,8 @@ fn direct_option_print_uses_the_expression_schema() {
 fn reassigned_option_prints_the_later_value() {
     let (printed, _) = run_prints(
         r#"
-        let mut value: Option<int> = Option::None;
-        value = Option::Some(7);
+        let mut value: Option<int> = None;
+        value = Some(7);
         print(value);
         "#,
     );
@@ -45,7 +45,7 @@ fn function_frame_prints_the_parameter_schema() {
     let (printed, _) = run_prints(
         r#"
         fn show(value: Option<int>) { print(value); }
-        show(Option::Some(3));
+        show(Some(3));
         "#,
     );
     assert_eq!(printed, ["Some(3)".to_string()]);
@@ -55,7 +55,7 @@ fn function_frame_prints_the_parameter_schema() {
 fn captured_option_prints_the_captured_schema() {
     let (printed, _) = run_prints(
         r#"
-        let value: Option<int> = Option::Some(4);
+        let value: Option<int> = Some(4);
         fn show() { print(value); }
         show();
         "#,
@@ -69,8 +69,8 @@ fn print_evaluates_a_logical_input_once() {
         r#"
         let mut n = 0;
         fn bump() -> int { n = n + 1; n; }
-        let printed: Option<int> = print(Option::Some(bump()));
-        match printed { Option::Some(value) => value, Option::None => 0 };
+        let printed: Option<int> = print(Some(bump()));
+        match printed { Some(value) => value, None => 0 };
         "#,
     );
     assert_eq!(printed, ["Some(1)".to_string()]);
@@ -79,7 +79,7 @@ fn print_evaluates_a_logical_input_once() {
 
 #[test]
 fn type_of_option_and_result_uses_the_logical_label() {
-    let (_, option_stack) = run_prints("let missing: Option<int> = Option::None; type(missing);");
+    let (_, option_stack) = run_prints("let missing: Option<int> = None; type(missing);");
     assert_eq!(option_stack.last(), Some(&Value::string("Option")));
     let (_, result_stack) =
         run_prints("let value: Result<int, string> = Result::Ok(1); type(value);");
@@ -88,8 +88,7 @@ fn type_of_option_and_result_uses_the_logical_label() {
 
 #[test]
 fn format_print_renders_option_payload() {
-    let (printed, _) =
-        run_prints("let missing: Option<int> = Option::None; print(\"{}\", missing);");
+    let (printed, _) = run_prints("let missing: Option<int> = None; print(\"{}\", missing);");
     assert_eq!(printed, ["None".to_string()]);
 }
 
@@ -113,15 +112,13 @@ fn repl_result_distinguishes_absence_unit_and_option() {
     let unit = compile_source_for_repl_with_state("();", &[]).expect("unit");
     assert!(matches!(unit.result_schema, Some(TypeSchema::Unit)));
 
-    let option = compile_source_for_repl_with_state(
-        "let missing: Option<int> = Option::None; missing;",
-        &[],
-    )
-    .expect("option");
+    let option =
+        compile_source_for_repl_with_state("let missing: Option<int> = None; missing;", &[])
+            .expect("option");
     assert!(matches!(option.result_schema, Some(TypeSchema::Option(_))));
 
     let trailing = compile_source_for_repl_with_state(
-        "let missing: Option<int> = Option::None; missing; let x = 1;",
+        "let missing: Option<int> = None; missing; let x = 1;",
         &[],
     )
     .expect("trailing let");
@@ -135,7 +132,7 @@ fn repl_result_distinguishes_absence_unit_and_option() {
 #[test]
 fn print_operand_keeps_checked_source_position_schema() {
     let source = "\
-let value: Option<int> = Option::Some(1);
+let value: Option<int> = Some(1);
 print(value);
 let plain = { tag: false };
 print(plain);

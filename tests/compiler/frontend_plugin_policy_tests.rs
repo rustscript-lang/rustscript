@@ -765,8 +765,8 @@ fn inferred_optional_callable_results_agree_across_native_and_neutral_queries() 
     ] {
         let options = || CompileSourceFileOptions::new().with_source_plugin(&OPTION_SCHEMA_PLUGIN);
         for source in [
-            "fn maybe(value: Option<int>) { value }\nlet g = maybe;\ng(Option::None);\n",
-            "let g: fn(Option<int>) -> Option<int> = |value| value;\ng(Option::None);\n",
+            "fn maybe(value: Option<int>) { value }\nlet g = maybe;\ng(None);\n",
+            "let g: fn(Option<int>) -> Option<int> = |value| value;\ng(None);\n",
         ] {
             let hints =
                 collect_inferred_local_type_hints_with_options(source, flavor, options()).unwrap();
@@ -894,7 +894,7 @@ fn finalized_named_and_contextual_callable_consumers_keep_authored_generic_decla
                 "f",
             ),
             (
-                "fn maybe(value: Option<int>) { value }\nlet g = maybe;\nmaybe(Option::None);\ng(Option::None);\n",
+                "fn maybe(value: Option<int>) { value }\nlet g = maybe;\nmaybe(None);\ng(None);\n",
                 "maybe",
                 TypeSchema::Option(Box::new(TypeSchema::Int)),
                 "g",
@@ -1006,7 +1006,7 @@ fn finalized_named_and_contextual_callable_consumers_keep_authored_generic_decla
         let mut machine = Vm::new(compiled.program);
         assert_eq!(machine.run().unwrap(), VmStatus::Halted);
         assert_eq!(machine.stack(), &[Value::Int(41)]);
-        let source = "let g: fn(Option<int>) -> Option<int> = |value| value;\ng(Option::None);\n";
+        let source = "let g: fn(Option<int>) -> Option<int> = |value| value;\ng(None);\n";
         let expected = TypeSchema::Callable {
             params: vec![TypeSchema::Option(Box::new(TypeSchema::Int))],
             result: Box::new(TypeSchema::Option(Box::new(TypeSchema::Int))),

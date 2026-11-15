@@ -9,15 +9,15 @@ fn index_of_int(values: [int], needle: int) -> Option<int> {
 
 fn index_position(values: [int], needle: int, fallback: int) -> int {
     match index_of_int(values, needle) {
-        Option::Some(value) => value,
-        Option::None => fallback,
+        Some(value) => value,
+        None => fallback,
     }
 }
 
 fn index_is_some(values: [int], needle: int) -> bool {
     match index_of_int(values, needle) {
-        Option::Some(_) => true,
-        Option::None => false,
+        Some(_) => true,
+        None => false,
     }
 }
 

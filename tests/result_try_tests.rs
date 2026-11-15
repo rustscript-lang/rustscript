@@ -134,7 +134,7 @@ fn optional_access_and_optional_type_remain_distinct_from_try() {
     "#;
     assert_eq!(eval(source), vm::Value::Int(41));
     let optional_type = r#"
-        let maybe: Option<int> = Option::Some(1);
+        let maybe: Option<int> = Some(1);
         maybe.unwrap_or(0);
     "#;
     assert_eq!(eval(optional_type), vm::Value::Int(1));
@@ -578,7 +578,7 @@ fn try_inside_executed_if_arm_and_loop_exits_the_function() {
 #[test]
 fn optional_success_payload_is_not_a_definite_scalar() {
     let arithmetic = r#"
-        fn maybe() -> Result<Option<int>, string> { Result::Ok(Option::None) }
+        fn maybe() -> Result<Option<int>, string> { Result::Ok(None) }
         fn relay() -> Result<int, string> {
             Result::Ok(maybe()? + 1)
         }
@@ -599,7 +599,7 @@ fn optional_success_payload_is_not_a_definite_scalar() {
 #[test]
 fn optional_success_payload_unwrap_keeps_null_and_nonnull() {
     let nonnull = r#"
-        fn maybe() -> Result<Option<int>, string> { Result::Ok(Option::Some(4)) }
+        fn maybe() -> Result<Option<int>, string> { Result::Ok(Some(4)) }
         fn relay() -> Result<int, string> {
             let inner: Option<int> = maybe()?;
             Result::Ok(inner.unwrap_or(0) + 1)
@@ -612,7 +612,7 @@ fn optional_success_payload_unwrap_keeps_null_and_nonnull() {
     "#;
     assert_eq!(eval(nonnull), vm::Value::Int(5));
     let null_ok = r#"
-        fn maybe() -> Result<Option<int>, string> { Result::Ok(Option::None) }
+        fn maybe() -> Result<Option<int>, string> { Result::Ok(None) }
         fn relay() -> Result<int, string> {
             let inner: Option<int> = maybe()?;
             Result::Ok(inner.unwrap_or(9))
@@ -644,7 +644,7 @@ fn optional_result_operand_is_rejected_at_try_boundary() {
 
 #[test]
 fn optional_try_payload_cannot_flow_to_required_let_or_argument() {
-    let head = "fn maybe() -> Result<Option<int>, string> { Result::Ok(Option::None) }\nfn take(n: int) -> int { n }\n";
+    let head = "fn maybe() -> Result<Option<int>, string> { Result::Ok(None) }\nfn take(n: int) -> int { n }\n";
     for body in [
         "let required: int = maybe()?; Result::Ok(required)",
         "Result::Ok(take(maybe()?))",
@@ -669,13 +669,13 @@ fn optional_try_payload_cannot_flow_to_required_let_or_argument() {
 
 #[test]
 fn optional_try_refinement_keeps_both_payload_states() {
-    for (payload, expected) in [("Option::None", 9), ("Option::Some(4)", 5)] {
+    for (payload, expected) in [("None", 9), ("Some(4)", 5)] {
         let source = format!(
             r#"
             fn maybe() -> Result<Option<int>, string> {{ Result::Ok({payload}) }}
             fn relay() -> Result<int, string> {{
                 let selected: Option<int> = maybe()?;
-                let n: int = match selected {{ Option::Some(v) => v + 1, Option::None => 9 }};
+                let n: int = match selected {{ Some(v) => v + 1, None => 9 }};
                 Result::Ok(n)
             }}
             let n = match relay() {{ Result::Ok(v) => v, Result::Err(_) => 0, }};
@@ -770,7 +770,7 @@ fn optional_entry_parameter_stays_optional_across_try_selection() {
             let required: int = carrier?;
             Result::Ok(required)
         }
-        relay(Option::None);
+        relay(None);
     "#;
     let error = reject(negative);
     assert!(
@@ -780,13 +780,13 @@ fn optional_entry_parameter_stays_optional_across_try_selection() {
             || detail(&error).contains("schema"),
         "{error:?}"
     );
-    for (payload, expected) in [("Option::None", 9), ("Option::Some(4)", 5)] {
+    for (payload, expected) in [("None", 9), ("Some(4)", 5)] {
         let source = format!(
             r#"
             fn relay(value: Option<int>) -> Result<int, string> {{
                 let carrier: Result<Option<int>, string> = Result::Ok(value);
                 let selected: Option<int> = carrier?;
-                let n: int = match selected {{ Option::Some(v) => v + 1, Option::None => 9 }};
+                let n: int = match selected {{ Some(v) => v + 1, None => 9 }};
                 Result::Ok(n)
             }}
             let n = match relay({payload}) {{ Result::Ok(v) => v, Result::Err(_) => 0, }};

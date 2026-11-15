@@ -12,19 +12,19 @@ fn unit_identity(value:()) ->() {
 
 fn int_or(value: Option<int>, fallback: int) -> int {
     match value {
-        Option::Some(inner) => inner,
-        Option::None => fallback,
+        Some(inner) => inner,
+        None => fallback,
     }
 }
 
 fn option_relay(flag: bool) -> Option<int> {
     let value: Option<int> = if flag => {
-        Option::Some(1)
+        Some(1)
     } else => {
-        Option::None
+        None
     };
     let item = value?;
-    Option::Some(item + 1)
+    Some(item + 1)
 }
 
 fn checked(flag: bool) -> Result<int, int> {
@@ -70,30 +70,30 @@ print("unit_explicit_annotation={}\n", unit_from_explicit);
 print("unit_roundtrip={}\n", unit_roundtrip);
 
 // ---- Option construction and matching ----
-let some_zero: Option<int> = Option::Some(0);
-let none: Option<int> = Option::None;
+let some_zero: Option<int> = Some(0);
+let none: Option<int> = None;
 print("option_some_zero={}\n", int_or(some_zero, -1));
 print("option_none={}\n", int_or(none, -1));
 
-let some_false: Option<bool> = Option::Some(false);
+let some_false: Option<bool> = Some(false);
 print("option_some_false={}\n", some_false.unwrap_or(true));
 
-let some_empty: Option<string> = Option::Some("");
+let some_empty: Option<string> = Some("");
 let empty_payload: string = some_empty.unwrap_or("missing");
 print("option_some_empty_is_empty={}\n", empty_payload == "");
 
 let matched_none: int = match none {
-    Option::Some(inner) => inner,
-    Option::None => -2,
+    Some(inner) => inner,
+    None => -2,
 };
 print("option_match_none={}\n", matched_none);
 
 // ---- Option combinators ----
 let mapped: Option<int> = some_zero.map(|value| value + 1);
-let flattened: Option<int> = some_zero.and_then(|value| Option::Some(value + 2));
-let recovered_source: Option<int> = Option::None;
-let recovered: Option<int> = recovered_source.or_else(|| Option::Some(5));
-let lazy_source: Option<int> = Option::None;
+let flattened: Option<int> = some_zero.and_then(|value| Some(value + 2));
+let recovered_source: Option<int> = None;
+let recovered: Option<int> = recovered_source.or_else(|| Some(5));
+let lazy_source: Option<int> = None;
 let lazy: int = lazy_source.unwrap_or_else(|| 4);
 print("option_map={}\n", mapped.unwrap_or(-1));
 print("option_and_then={}\n", flattened.unwrap_or(-1));
@@ -176,43 +176,43 @@ print("result_map_err_then_try={}\n", mapped_error);
 let ok_source: Result<int, string> = Result::Ok(21);
 let ok_as_option: Option<int> = ok_source.ok();
 let ok_payload: int = match ok_as_option {
-    Option::Some(inner) => inner,
-    Option::None => -1,
+    Some(inner) => inner,
+    None => -1,
 };
 print("result_ok_to_option={}\n", ok_payload);
 
 let err_source: Result<int, string> = Result::Err("bad input");
 let err_as_option: Option<string> = err_source.err();
 let err_payload: string = match err_as_option {
-    Option::Some(inner) => inner,
-    Option::None => "missing",
+    Some(inner) => inner,
+    None => "missing",
 };
 print("result_err_to_option={}\n", err_payload);
 
 let ok_err_source: Result<int, string> = Result::Ok(21);
 let absent_err: Option<string> = ok_err_source.err();
 let absent_err_is_none: bool = match absent_err {
-    Option::Some(inner) => false,
-    Option::None => true,
+    Some(inner) => false,
+    None => true,
 };
 print("result_ok_err_is_none={}\n", absent_err_is_none);
 
 // ---- Fallible projection (`?.`) ----
 let record: Record = {name: "crab", tag: "shell"};
 let projected: string = match record?.name {
-    Option::Some(value) => value,
-    Option::None => "missing",
+    Some(value) => value,
+    None => "missing",
 };
 print("project_field={}\n", projected);
 
 let table: map<string> = {"a": "one"};
 let absent_key: string = match table?.["b"] {
-    Option::Some(value) => value,
-    Option::None => "missing",
+    Some(value) => value,
+    None => "missing",
 };
 let present_key: string = match table?.["a"] {
-    Option::Some(value) => value,
-    Option::None => "missing",
+    Some(value) => value,
+    None => "missing",
 };
 print("project_absent_key={}\n", absent_key);
 print("project_present_key={}\n", present_key);
@@ -223,21 +223,21 @@ struct Grid {
 
 let grid: Grid = {cells: [10, 20]};
 let grid_cell: int = match grid?.cells?.[1] {
-    Option::Some(value) => value,
-    Option::None => -1,
+    Some(value) => value,
+    None => -1,
 };
 print("project_array_index={}\n", grid_cell);
 
 let label: string = "abc";
 let label_letter: string = match label?.[1] {
-    Option::Some(value) => value,
-    Option::None => "missing",
+    Some(value) => value,
+    None => "missing",
 };
 print("project_string_index={}\n", label_letter);
 
 let missing_label: string = "";
 let missing_letter: string = match missing_label?.[1] {
-    Option::Some(value) => value,
-    Option::None => "missing",
+    Some(value) => value,
+    None => "missing",
 };
 print("project_missing_string_index={}\n", missing_letter);

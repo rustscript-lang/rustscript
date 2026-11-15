@@ -923,7 +923,7 @@ pub enum Expr {
         span: Span,
         semantic_id: Option<SemanticNodeId>,
     },
-    /// `Option::Some(payload)` or `Option::None`. `some` selects the branch;
+    /// `Some(payload)` or `None`. `some` selects the branch;
     /// None has no payload. `option_schema` is filled by the Option resolver.
     OptionConstruct {
         some: bool,

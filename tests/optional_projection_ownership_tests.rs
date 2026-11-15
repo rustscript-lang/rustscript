@@ -603,7 +603,7 @@ fn optional_resource_projection_transfers_one_handle_without_record_clone() {
 
 #[test]
 fn native_logical_projection_moves_one_resource_child_and_closes_once() {
-    let source = "use neutral;\nstruct Entry { note: resource<neutral.projection> }\nlet entry: Entry = { note: neutral::make() };\nlet projected = entry?.note;\nmatch projected { Option::Some(handle) => neutral::close(handle), Option::None => 0 };\n42;";
+    let source = "use neutral;\nstruct Entry { note: resource<neutral.projection> }\nlet entry: Entry = { note: neutral::make() };\nlet projected = entry?.note;\nmatch projected { Some(handle) => neutral::close(handle), None => 0 };\n42;";
     let compiled = compile_source_with_flavor_and_options(
         source,
         SourceFlavor::RustScript,
@@ -703,7 +703,7 @@ fn imported_projection_preserves_intent_through_linking_and_slot_compaction() {
 fn native_borrowed_resource_receiver_still_rejects_escape_in_value_mode() {
     for receiver in ["(&entry)", "(&mut entry)"] {
         let source = format!(
-            "use neutral;\nstruct Entry {{ note: Option<resource<neutral.projection>> }}\nlet mut entry: Entry = {{ note: Option::Some(neutral::make()) }};\n{receiver}.note;"
+            "use neutral;\nstruct Entry {{ note: Option<resource<neutral.projection>> }}\nlet mut entry: Entry = {{ note: Some(neutral::make()) }};\n{receiver}.note;"
         );
         let error = compile_source_with_flavor_and_options(
             &source,
