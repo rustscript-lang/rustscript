@@ -2858,39 +2858,19 @@ fn rustscript_if_and_match_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
-            name: "match expression supports type patterns",
-            source: r#"
-                let a = match "value" {
-                    Some(String) => 1,
-                    _ => 0,
-                };
-                let b = match 7 {
-                    Some(Number) => 2,
-                    _ => 0,
-                };
-                let c = match true {
-                    Some(Number) => 100,
-                    _ => 3,
-                };
-                a + b + c;
-            "#,
-            flavor: SourceFlavor::RustScript,
-            expected_stack: vec![Value::Int(6)],
-            expected_locals: None,
-        },
-        RuntimeCase {
-            name: "match expression supports None and Some binding for optional values",
+            name: "match expression binds logical Option payloads",
             source: r#"
                 struct Data { values: [int] }
                 let data: Data = { values: [41] };
-
-                let present = match data?.values?.[0] {
-                    Option::None => 0,
-                    Option::Some(value) => value + 1,
+                let found: Option<int> = Some(data.values[0]);
+                let absent: Option<int> = None;
+                let present = match found {
+                    None => 0,
+                    Some(value) => value + 1,
                 };
-                let missing = match data?.values?.[1] {
-                    Option::None => 1,
-                    Option::Some(value) => value,
+                let missing = match absent {
+                    None => 1,
+                    Some(value) => value,
                 };
 
                 present + missing;
@@ -2925,7 +2905,7 @@ fn rustscript_if_and_match_parse_rejection_cases_work() {
                 };
             "#,
             flavor: SourceFlavor::RustScript,
-            expected_contains_all: &["int/string/null literals, None, Some(name), type patterns"],
+            expected_contains_all: &["match patterns currently support"],
         },
     ];
     for case in &cases {
@@ -3440,9 +3420,9 @@ fn rustscript_language_runtime_cases_work() {
         RuntimeCase {
             name: "option none is observable",
             source: r#"
-                let v: Option<int> = Option::None;
+                let v: Option<int> = None;
                 match v {
-                    Option::None => true,
+                    None => true,
                     _ => false,
                 };
             "#,
@@ -3451,32 +3431,33 @@ fn rustscript_language_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
-            name: "option none and type patterns are supported",
+            name: "option none and some bindings are supported",
             source: r#"
                 let some = 1 + 1;
-                let none: Option<int> = Option::None;
-                let some2 = 40;
+                let none: Option<int> = None;
+                let baseline = 40;
+                let some2: Option<int> = Some(baseline);
 
                 let a = match none {
-                    Option::None => 1,
+                    None => 1,
                     _ => 0,
                 };
-                let present: Option<int> = Option::Some(some);
+                let present: Option<int> = Some(some);
                 let b = match present {
-                    Option::None => 0,
+                    None => 0,
                     _ => 1,
                 };
                 let c = match some2 {
                     Some(Number) => 1,
-                    _ => 0,
+                    None => 0,
                 };
 
                 let saw_none = match none {
-                    Option::None => true,
+                    None => true,
                     _ => false,
                 };
                 if saw_none {
-                    (a + b + c) + some2;
+                    (a + b + c) + baseline;
                 } else {
                     0;
                 }
@@ -3486,12 +3467,13 @@ fn rustscript_language_runtime_cases_work() {
             expected_locals: None,
         },
         RuntimeCase {
-            name: "match type pattern is not shadowed by local name",
+            name: "Option binding shadows a same-named local in its arm",
             source: r#"
                 let String = 3;
-                let b = match "" {
-                    Some(String) => 2,
-                    _ => 3,
+                let value: Option<string> = Some("");
+                let b = match value {
+                    Some(String) => String.length + 2,
+                    None => 3,
                 };
                 b;
             "#,
@@ -3503,7 +3485,7 @@ fn rustscript_language_runtime_cases_work() {
             name: "option none can be used as map key",
             source: r#"
                 let mut m: map<int> = {};
-                let key: Option<int> = Option::None;
+                let key: Option<int> = None;
                 m[key] = 42;
                 m[key];
             "#,
@@ -3517,25 +3499,14 @@ fn rustscript_language_runtime_cases_work() {
 
 #[test]
 fn rustscript_language_parse_rejection_cases_work() {
-    let cases = vec![
-        ParseErrorCase {
-            name: "legacy option aliases are rejected",
-            source: r#"
-                let some = Some(1);
-                some;
-            "#,
-            flavor: SourceFlavor::RustScript,
-            expected_contains_all: &["unknown function 'Some'"],
-        },
-        ParseErrorCase {
-            name: "type name of val alias is rejected",
-            source: r#"
+    let cases = vec![ParseErrorCase {
+        name: "type name of val alias is rejected",
+        source: r#"
                 type_name_of_val(1);
             "#,
-            flavor: SourceFlavor::RustScript,
-            expected_contains_all: &["unknown function 'type_name_of_val'"],
-        },
-    ];
+        flavor: SourceFlavor::RustScript,
+        expected_contains_all: &["unknown function 'type_name_of_val'"],
+    }];
     for case in &cases {
         expect_parse_error_case(case);
     }
@@ -3759,7 +3730,7 @@ fn rustscript_optional_chain_requires_declared_schema_and_explicit_handling() {
             struct Profile { stats: Stats }
 
             let present: Profile = { stats: { score: 41 } };
-            let missing: Option<Profile> = Option::None;
+            let missing: Option<Profile> = None;
 
             let present_score = present?.stats?.score.unwrap_or(0);
             let missing_score = missing?.stats?.score.unwrap_or(0);
@@ -3814,20 +3785,6 @@ fn rustscript_optional_chain_requires_declared_schema_and_explicit_handling() {
             flavor: SourceFlavor::RustScript,
             expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
             expected_contains_all: &["optional value must be unwrapped before binary operation"],
-        },
-        SourceErrorCase {
-            name: "Some and None match patterns require an optional value",
-            source: r#"
-                let value = 41;
-                match value {
-                    None => 0,
-                    Some(found) => found + 1,
-                    _ => 0,
-                };
-            "#,
-            flavor: SourceFlavor::RustScript,
-            expected_kind: SourceErrorKind::Compile(CompileErrorKind::InvalidFieldAccess),
-            expected_contains_all: &["Some(...) and None match patterns require an optional value"],
         },
     ];
     run_source_error_cases(&error_cases);
@@ -3890,8 +3847,8 @@ fn rustscript_optional_chain_rejects_statistically_mismatched_declared_schemas()
 
                 let profile: Profile = { stats: { score: "oops" } };
                 match profile?.stats?.score {
-                    Option::None => 0,
-                    Option::Some(score) => score + 1,
+                    None => 0,
+                    Some(score) => score + 1,
                 };
             "#,
             flavor: SourceFlavor::RustScript,
@@ -3979,9 +3936,9 @@ fn rustscript_explicit_optional_type_annotations_work() {
             "optional local and return annotations preserve concrete inner typing",
             r#"
                 fn maybe_score(text: string) -> Option<int> {
-                    let mut out: Option<int> = Option::None;
+                    let mut out: Option<int> = None;
                     if text == "ok" {
-                        out = Option::Some(41);
+                        out = Some(41);
                     }
                     out
                 }
@@ -4942,8 +4899,8 @@ fn spawn_json_probe(probe_env: &str, test_name: &str, sentinel: &str) -> Result<
 fn json_encode_accepts_mutually_recursive_structs_inside_concrete_map() {
     // A `map<A>` whose inner schema is a mutually recursive struct pair
     // (A -> B -> A) must compile and encode. The cycle fields are
-    // `Option`, so the finite base is `Option::None` rather than an
-    // omitted required field. `Option::None` is omitted from the
+    // `Option`, so the finite base is `None` rather than an
+    // omitted required field. `None` is omitted from the
     // encoding, so the innermost object is `{}` and the value is
     // `{"x":{"b":{"a":{"b":{"a":{}}}}}}`.
     const PROBE: &str = "RUSTSCRIPT_JSON_PROBE_ACCEPT_RECURSIVE_MAP";
@@ -4954,7 +4911,7 @@ fn json_encode_accepts_mutually_recursive_structs_inside_concrete_map() {
             use json;
             struct A { b: Option<B> }
             struct B { a: Option<A> }
-            let payload: map<A> = { "x": { b: Option::Some({ a: Option::Some({ b: Option::Some({ a: Option::Some({ b: Option::None }) }) }) }) } };
+            let payload: map<A> = { "x": { b: Some({ a: Some({ b: Some({ a: Some({ b: None }) }) }) }) } };
             json::encode(payload);
             "#,
         ) {
@@ -5293,7 +5250,7 @@ fn json_encode_accepts_wrapped_recursion_in_concrete_map() {
             r#"
             use json;
             struct Node<T> { child: Option<Node<[T]>>, data: int }
-            let payload: map<Node<int>> = { "x": { child: Option::None, data: 1 } };
+            let payload: map<Node<int>> = { "x": { child: None, data: 1 } };
             json::encode(payload);
             "#,
         ) {

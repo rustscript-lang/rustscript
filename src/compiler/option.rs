@@ -728,7 +728,7 @@ fn resolve_construct(
         (Some(other), _) => {
             return Err(option_error(
                 span,
-                format!("Option::{} is not a value of type {other}", ctor_name(some)),
+                format!("{} is not a value of type {other}", ctor_name(some)),
             ));
         }
         (None, Some(explicit_schema)) => explicit_schema.clone(),
@@ -752,13 +752,13 @@ fn resolve_construct(
                 .ok_or_else(|| {
                     option_error(
                         span,
-                        "Option::Some payload type is unresolved; annotate Option<T>".to_string(),
+                        "Some payload type is unresolved; annotate Option<T>".to_string(),
                     )
                 })?;
             if schema_contains_unknown(&actual) || matches!(actual, TypeSchema::GenericParam(_)) {
                 return Err(option_error(
                     span,
-                    "Option::Some payload type is unresolved; annotate Option<T>".to_string(),
+                    "Some payload type is unresolved; annotate Option<T>".to_string(),
                 ));
             }
             *option_schema = TypeSchema::Option(Box::new(actual));
@@ -767,7 +767,7 @@ fn resolve_construct(
         (None, None) => {
             return Err(option_error(
                 span,
-                "Option::None needs an Option<T> annotation".to_string(),
+                "None needs an Option<T> annotation".to_string(),
             ));
         }
     };
@@ -779,7 +779,7 @@ fn resolve_construct(
         if matches!(inner, TypeSchema::Unknown) {
             return Err(option_error(
                 span,
-                "Option::None needs a resolved Option<T> annotation".to_string(),
+                "None needs a resolved Option<T> annotation".to_string(),
             ));
         }
         *option_schema = expected_schema;
@@ -800,13 +800,11 @@ fn resolve_construct(
                     &env.slots,
                 )
             })
-            .ok_or_else(|| {
-                option_error(span, "Option::Some payload type is unresolved".to_string())
-            })?;
+            .ok_or_else(|| option_error(span, "Some payload type is unresolved".to_string()))?;
         if schema_contains_unknown(&actual) || matches!(actual, TypeSchema::GenericParam(_)) {
             return Err(option_error(
                 span,
-                "Option::Some payload type is unresolved".to_string(),
+                "Some payload type is unresolved".to_string(),
             ));
         }
         actual
@@ -822,10 +820,7 @@ fn resolve_construct(
                 &env.slots,
             )
         {
-            return Err(option_error(
-                span,
-                format!("Option::Some payload: {detail}"),
-            ));
+            return Err(option_error(span, format!("Some payload: {detail}")));
         }
         inner
     };

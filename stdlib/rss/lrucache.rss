@@ -5,7 +5,7 @@
 // - `nodes`: node id -> LruNode<K, V>
 //
 // Node ids start at 1. The cache uses `0` as the internal "no link" sentinel.
-// Missing map entries are removed explicitly; absent result payloads are Option::None.
+// Missing map entries are removed explicitly; absent result payloads are None.
 struct LruNode<K, V> {
     key: K,
     value: V,
@@ -208,9 +208,9 @@ fn entry_report<K, V>(cache: LruCacheState<K, V>, id: int) -> Option<LruEntryRow
     let out: Option<LruEntryRow<K, V>> = if id != 0 => {
         let node: LruNode<K, V> =&((&cache).nodes[id]);
         let row: LruEntryRow<K, V> = {key: node.key.copy(), value: node.value.copy()};
-        Option::Some(row)
+        Some(row)
     } else => {
-        Option::None
+        None
     };
     out
 }
@@ -252,9 +252,9 @@ pub fn peek<K, V>(cache: LruCacheState<K, V>, key: K) -> Option<V> {
     let out: Option<V> = if lookup.has(key) => {
         let id =(&lookup)[key];
         let node: LruNode<K, V> =&((&state.nodes)[id]);
-        Option::Some(node.value.copy())
+        Some(node.value.copy())
     } else => {
-        Option::None
+        None
     };
     out
 }
@@ -297,11 +297,11 @@ pub fn get<K, V>(cache: LruCacheState<K, V>, key: K) -> LruGetResult<K, V> {
                 relinked.nodes
             )
         };
-        {cache: next_cache, value: Option::Some(value)}
+        {cache: next_cache, value: Some(value)}
     } else => {
         {
             cache: make_cache::<K, V>(limit, size, next_id, head, tail, lookup, nodes),
-            value: Option::None
+            value: None
         }
     };
     out

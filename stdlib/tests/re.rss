@@ -19,8 +19,8 @@ assert(assert_some_string(first_icase, "FoO"));
 
 let missing = re::find("z+", "foobarr");
 let missing_is_none = match missing {
-    Option::Some(_) => false,
-    Option::None => true,
+    Some(_) => false,
+    None => true,
 };
 assert(missing_is_none);
 
@@ -58,7 +58,7 @@ assert(no_groups.length == 0);
 let optional = re::captures("(a)?b", "b");
 assert(optional.length == 2);
 let unmatched_is_none = match optional[1] {
-    Option::Some(_) => false,
-    Option::None => true,
+    Some(_) => false,
+    None => true,
 };
 assert(unmatched_is_none);

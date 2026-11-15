@@ -81,8 +81,8 @@ fn module_call_omitted_option_field_argument_materializes() {
         struct Entry { name: string, note: Option<int> }
         pub fn take(entry: Entry) -> int {
             match entry.note {
-                Option::Some(value) => value,
-                Option::None => 7,
+                Some(value) => value,
+                None => 7,
             }
         }
     "#,

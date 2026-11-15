@@ -21,9 +21,9 @@ fn hint<'a>(response: &'a Value, name: &str) -> &'a Value {
 
 #[test]
 fn option_public_basic_hints_keep_option_and_unit_schemas() {
-    let source = "fn relay(value: Option<int>) -> Option<int> { match value { Option::Some(v) => Option::Some(v + 1), Option::None => Option::None } }\n\
-         let some: Option<int> = Option::Some(3);\n\
-         let none: Option<int> = Option::None;\n\
+    let source = "fn relay(value: Option<int>) -> Option<int> { match value { Some(v) => Some(v + 1), None => None } }\n\
+         let some: Option<int> = Some(3);\n\
+         let none: Option<int> = None;\n\
          let unit: () = ();\n\
          let relay_fn = relay;\n";
     let payload = response(local_type_hints_json_response(source, "rss"));
@@ -43,10 +43,10 @@ fn option_public_basic_hints_keep_option_and_unit_schemas() {
 
 #[test]
 fn option_public_hints_preserve_nested_result_and_resource_free_units() {
-    let source = "let nested: Option<Result<int, string>> = Option::Some(Result::Ok(1));\n\
-         let inner_unit: Option<()> = Option::Some(());\n\
-         let empty: Option<string> = Option::Some(\"\");\n\
-         let value: int = match nested { Option::Some(result) => match result { Result::Ok(v) => v, Result::Err(e) => -1 }, Option::None => -1 };\n";
+    let source = "let nested: Option<Result<int, string>> = Some(Result::Ok(1));\n\
+         let inner_unit: Option<()> = Some(());\n\
+         let empty: Option<string> = Some(\"\");\n\
+         let value: int = match nested { Some(result) => match result { Result::Ok(v) => v, Result::Err(e) => -1 }, None => -1 };\n";
     let payload = response(local_type_hints_json_response(source, "rss"));
     println!("OPTION_OBSERVATION nested-hints={payload}");
     let int = json!({"kind":"int"});
@@ -63,15 +63,15 @@ fn option_public_hints_preserve_nested_result_and_resource_free_units() {
 
 #[test]
 fn option_public_format_is_idempotent_and_preserves_unit_spelling() {
-    let source = "fn relay(value:Option<int>)->Option<int>{match value{Option::Some(v)=>Option::Some(v+1),Option::None=>Option::None}}\n\
-         let value:Option<()> =Option::Some(());\nlet result=relay(Option::Some(1));\n";
+    let source = "fn relay(value:Option<int>)->Option<int>{match value{Some(v)=>Some(v+1),None=>None}}\n\
+         let value:Option<()> =Some(());\nlet result=relay(Some(1));\n";
     let formatted = response(format_source_json_response(source, "rss"));
     println!("OPTION_OBSERVATION format={formatted}");
     assert_eq!(formatted["ok"], true);
     let text = formatted["formatted"].as_str().unwrap();
     assert!(text.contains("Option<int>"), "{text}");
     assert!(text.contains("Option<()>"), "{text}");
-    assert!(text.contains("Option::None"), "{text}");
+    assert!(text.contains("None"), "{text}");
     assert_eq!(
         response(format_source_json_response(text, "rss")),
         formatted
@@ -82,11 +82,11 @@ fn option_public_format_is_idempotent_and_preserves_unit_spelling() {
 #[test]
 fn option_native_runtime_response_json_keeps_all_states() {
     let source = r#"
-fn relay(value: Option<int>) -> Option<int> { match value { Option::Some(v) => Option::Some(v + 1), Option::None => Option::None } }
-let some = relay(Option::Some(7));
-let none = relay(Option::None);
-match some { Option::Some(value) => print("some:" + value), Option::None => print("some:none"), };
-match none { Option::Some(value) => print("none:some"), Option::None => print("none:none"), };
+fn relay(value: Option<int>) -> Option<int> { match value { Some(v) => Some(v + 1), None => None } }
+let some = relay(Some(7));
+let none = relay(None);
+match some { Some(value) => print("some:" + value), None => print("some:none"), };
+match none { Some(value) => print("none:some"), None => print("none:none"), };
 let unit: () = ();
 print("unit");
 "#;

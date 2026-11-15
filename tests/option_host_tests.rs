@@ -321,7 +321,7 @@ fn logical_option_and_result_signatures_do_not_interchange() {
     let result_catalog = Arc::new(builder.build().expect("result catalog"));
     let error = match vm::compile_source_with_flavor_and_options(
         "use mismatch;\n\
-         let value: Option<int[]> = Option::Some([3, 4]);\n\
+         let value: Option<int[]> = Some([3, 4]);\n\
          mismatch::result(value);",
         vm::SourceFlavor::RustScript,
         vm::CompileSourceFileOptions::default().with_host_api_catalog(result_catalog),
@@ -340,11 +340,11 @@ fn logical_option_and_result_signatures_do_not_interchange() {
 fn rust_option_roundtrips_through_generated_host_and_rss() {
     for (source, expected) in [
         (
-            "use option_sdk; let value: Option<int[]> = option_sdk::fixture(Option::Some([3, 4])); match value { Option::Some(items) => items[0] + items[1], Option::None => -1, };",
+            "use option_sdk; let value: Option<int[]> = option_sdk::fixture(Some([3, 4])); match value { Some(items) => items[0] + items[1], None => -1, };",
             7,
         ),
         (
-            "use option_sdk; let value: Option<int[]> = option_sdk::fixture(Option::None); match value { Option::Some(items) => 100, Option::None => -1, };",
+            "use option_sdk; let value: Option<int[]> = option_sdk::fixture(None); match value { Some(items) => 100, None => -1, };",
             -1,
         ),
     ] {
@@ -356,7 +356,7 @@ fn rust_option_roundtrips_through_generated_host_and_rss() {
     }
     // `Some([])` stays a selected Some with an empty payload; `inspect` proves
     // it is distinct from None without indexing an empty array.
-    let value = eval("use option_sdk; option_sdk::inspect(Option::Some([]));");
+    let value = eval("use option_sdk; option_sdk::inspect(Some([]));");
     assert_eq!(value, Value::Int(0));
 }
 
@@ -364,7 +364,7 @@ fn rust_option_roundtrips_through_generated_host_and_rss() {
 fn nested_option_states_cross_the_generated_host_boundary() {
     for (mode, expected) in [(0, 0), (1, 1), (2, 107)] {
         let value = eval(&format!(
-            "use option_sdk; let nested: Option<Option<OptionSdkBox>> = option_sdk::nested({mode}); match nested {{ Option::Some(inner) => match inner {{ Option::Some(boxed) => boxed.value + 100, Option::None => 1 }}, Option::None => 0 }};"
+            "use option_sdk; let nested: Option<Option<OptionSdkBox>> = option_sdk::nested({mode}); match nested {{ Some(inner) => match inner {{ Some(boxed) => boxed.value + 100, None => 1 }}, None => 0 }};"
         ));
         assert_eq!(value, Value::Int(expected), "mode {mode}");
     }
@@ -388,32 +388,32 @@ fn generated_host_roundtrips_callable_option_payloads() {
         fn announce() { }
         fn invoke_unit(f: fn() -> ()) -> int { f(); 5 }
         fn pick(value: int, scale: bool) -> int { if scale => { value * 2 } else => { value } }
-        let echoed: Option<fn(int) -> int> = option_sdk::callable_echo(Option::Some(double));
-        let doubled = match echoed { Option::Some(f) => f(4), Option::None => -1 };
-        let absent: Option<fn(int) -> int> = option_sdk::callable_echo(Option::None);
-        let skipped = match absent { Option::Some(f) => f(4), Option::None => -2 };
+        let echoed: Option<fn(int) -> int> = option_sdk::callable_echo(Some(double));
+        let doubled = match echoed { Some(f) => f(4), None => -1 };
+        let absent: Option<fn(int) -> int> = option_sdk::callable_echo(None);
+        let skipped = match absent { Some(f) => f(4), None => -2 };
         let picked: Option<fn(int) -> int> = option_sdk::callable_pick(true);
-        let from_host = match picked { Option::Some(f) => f(5), Option::None => -3 };
+        let from_host = match picked { Some(f) => f(5), None => -3 };
         let empty: Option<fn(int) -> int> = option_sdk::callable_pick(false);
-        let missing = match empty { Option::Some(f) => f(5), Option::None => -4 };
+        let missing = match empty { Some(f) => f(5), None => -4 };
         let offset = 10;
         let add: fn(int) -> int = |value| value + offset;
-        let carried: Option<fn(int) -> int> = option_sdk::callable_echo(Option::Some(add));
-        let captured = match carried { Option::Some(f) => f(6) + f(7), Option::None => -5 };
-        let unit_some: Option<fn() -> ()> = option_sdk::callable_unit_echo(Option::Some(announce));
-        let unit_result = match unit_some { Option::Some(f) => invoke_unit(f), Option::None => -6 };
-        let unit_none: Option<fn() -> ()> = option_sdk::callable_unit_echo(Option::None);
-        let unit_skipped = match unit_none { Option::Some(f) => invoke_unit(f), Option::None => -7 };
-        let pair: Option<fn(int, bool) -> int> = option_sdk::callable_pair_echo(Option::Some(pick));
-        let pair_result = match pair { Option::Some(f) => f(9, true), Option::None => -8 };
+        let carried: Option<fn(int) -> int> = option_sdk::callable_echo(Some(add));
+        let captured = match carried { Some(f) => f(6) + f(7), None => -5 };
+        let unit_some: Option<fn() -> ()> = option_sdk::callable_unit_echo(Some(announce));
+        let unit_result = match unit_some { Some(f) => invoke_unit(f), None => -6 };
+        let unit_none: Option<fn() -> ()> = option_sdk::callable_unit_echo(None);
+        let unit_skipped = match unit_none { Some(f) => invoke_unit(f), None => -7 };
+        let pair: Option<fn(int, bool) -> int> = option_sdk::callable_pair_echo(Some(pick));
+        let pair_result = match pair { Some(f) => f(9, true), None => -8 };
         doubled + skipped + from_host + missing + captured + unit_result + unit_skipped + pair_result;
     "#;
     assert_eq!(eval(source), Value::Int(61));
 
-    let none = eval("use option_sdk; option_sdk::callable_count(Option::None);");
+    let none = eval("use option_sdk; option_sdk::callable_count(None);");
     assert_eq!(none, Value::Int(0));
     let some = eval(
-        "use option_sdk; fn double(value: int) -> int { value + value } option_sdk::callable_count(Option::Some(double));",
+        "use option_sdk; fn double(value: int) -> int { value + value } option_sdk::callable_count(Some(double));",
     );
     assert_eq!(some, Value::Int(1));
 }
@@ -422,12 +422,12 @@ fn generated_host_roundtrips_callable_option_payloads() {
 fn generated_host_admits_and_invokes_bare_rust_callable_unit() {
     let source = r#"
         use option_sdk;
-        fn tick() { let total: int = option_sdk::inspect(Option::Some([2, 3])); }
+        fn tick() { let total: int = option_sdk::inspect(Some([2, 3])); }
         fn invoke_unit(f: fn() -> ()) -> int { f(); 5 }
-        let selected: Option<fn() -> ()> = option_sdk::callable_unit_default_echo(Option::Some(tick));
-        let called = match selected { Option::Some(f) => invoke_unit(f), Option::None => -1 };
-        let absent: Option<fn() -> ()> = option_sdk::callable_unit_default_echo(Option::None);
-        let skipped = match absent { Option::Some(f) => invoke_unit(f), Option::None => -6 };
+        let selected: Option<fn() -> ()> = option_sdk::callable_unit_default_echo(Some(tick));
+        let called = match selected { Some(f) => invoke_unit(f), None => -1 };
+        let absent: Option<fn() -> ()> = option_sdk::callable_unit_default_echo(None);
+        let skipped = match absent { Some(f) => invoke_unit(f), None => -6 };
         called + skipped;
     "#;
     let mut runtime = machine(source);
@@ -446,10 +446,10 @@ fn typed_rust_callback_accepts_returns_and_invokes_guest_option_callable() {
         "fn double(value: int) -> int { value + value }\n\
          fn announce() { }\n\
          fn pick(value: int, scale: bool) -> int { if scale => { value * 2 } else => { value } }\n\
-         pub fn make(present: bool) -> Option<fn(int) -> int> { let offset = 1; let add: fn(int) -> int = |value| value + offset; if present => { Option::Some(add) } else => { Option::None } }\n\
-         pub fn make_unit(present: bool) -> Option<fn() -> ()> { if present => { Option::Some(announce) } else => { Option::None } }\n\
-         pub fn make_pair(present: bool) -> Option<fn(int, bool) -> int> { if present => { Option::Some(pick) } else => { Option::None } }\n\
-         pub fn apply(value: Option<fn(int) -> int>) -> int { match value { Option::Some(f) => f(3), Option::None => -1 } }",
+         pub fn make(present: bool) -> Option<fn(int) -> int> { let offset = 1; let add: fn(int) -> int = |value| value + offset; if present => { Some(add) } else => { None } }\n\
+         pub fn make_unit(present: bool) -> Option<fn() -> ()> { if present => { Some(announce) } else => { None } }\n\
+         pub fn make_pair(present: bool) -> Option<fn(int, bool) -> int> { if present => { Some(pick) } else => { None } }\n\
+         pub fn apply(value: Option<fn(int) -> int>) -> int { match value { Some(f) => f(3), None => -1 } }",
     )
     .unwrap();
     let mut store = vm::Store::new(
@@ -570,7 +570,7 @@ fn callable_option_signature_mismatch_rejects_before_guest_side_effects() {
     let error = match vm::compile_source_with_flavor_and_options(
         "use option_sdk;\n\
          fn text(value: string) -> string { value }\n\
-         option_sdk::callable_echo(Option::Some(text));",
+         option_sdk::callable_echo(Some(text));",
         vm::SourceFlavor::RustScript,
         vm::CompileSourceFileOptions::default().with_host_api_catalog(catalog),
     ) {
@@ -609,23 +609,23 @@ fn callable_option_signature_mismatch_rejects_before_guest_side_effects() {
 #[test]
 fn result_and_option_nest_across_the_host_boundary() {
     let value = eval(
-        "use option_sdk; let some: Option<Result<int, string>> = option_sdk::option_result(Option::Some(Result::Ok(5))); match some { Option::Some(result) => match result { Result::Ok(v) => v, Result::Err(e) => -10 }, Option::None => -20 };",
+        "use option_sdk; let some: Option<Result<int, string>> = option_sdk::option_result(Some(Result::Ok(5))); match some { Some(result) => match result { Result::Ok(v) => v, Result::Err(e) => -10 }, None => -20 };",
     );
     assert_eq!(value, Value::Int(5));
     let value = eval(
-        "use option_sdk; let some: Option<Result<int, string>> = option_sdk::option_result(Option::Some(Result::Err(\"bad\"))); match some { Option::Some(result) => match result { Result::Ok(v) => v, Result::Err(e) => 2 }, Option::None => -20 };",
+        "use option_sdk; let some: Option<Result<int, string>> = option_sdk::option_result(Some(Result::Err(\"bad\"))); match some { Some(result) => match result { Result::Ok(v) => v, Result::Err(e) => 2 }, None => -20 };",
     );
     assert_eq!(value, Value::Int(2));
     let value = eval(
-        "use option_sdk; let absent: Option<Result<int, string>> = option_sdk::option_result(Option::None); match absent { Option::Some(result) => 10, Option::None => 3 };",
+        "use option_sdk; let absent: Option<Result<int, string>> = option_sdk::option_result(None); match absent { Some(result) => 10, None => 3 };",
     );
     assert_eq!(value, Value::Int(3));
     let value = eval(
-        "use option_sdk; let nested: Result<Option<int>, string> = option_sdk::result_option(Result::Ok(Option::Some(6))); match nested { Result::Ok(option) => match option { Option::Some(v) => v, Option::None => -1 }, Result::Err(e) => -2 };",
+        "use option_sdk; let nested: Result<Option<int>, string> = option_sdk::result_option(Result::Ok(Some(6))); match nested { Result::Ok(option) => match option { Some(v) => v, None => -1 }, Result::Err(e) => -2 };",
     );
     assert_eq!(value, Value::Int(6));
     let value = eval(
-        "use option_sdk; let nested: Result<Option<int>, string> = option_sdk::result_option(Result::Ok(Option::None)); match nested { Result::Ok(option) => match option { Option::Some(v) => 11, Option::None => 4 }, Result::Err(e) => -2 };",
+        "use option_sdk; let nested: Result<Option<int>, string> = option_sdk::result_option(Result::Ok(None)); match nested { Result::Ok(option) => match option { Some(v) => 11, None => 4 }, Result::Err(e) => -2 };",
     );
     assert_eq!(value, Value::Int(4));
 }
@@ -633,7 +633,7 @@ fn result_and_option_nest_across_the_host_boundary() {
 #[test]
 fn inspect_observes_selected_option_without_collapsing_states() {
     let mut machine = machine(
-        "use option_sdk; option_sdk::inspect(Option::None); option_sdk::inspect(Option::Some([])); option_sdk::inspect(Option::Some([9]));",
+        "use option_sdk; option_sdk::inspect(None); option_sdk::inspect(Some([])); option_sdk::inspect(Some([9]));",
     );
     assert_eq!(machine.run().unwrap(), VmStatus::Halted);
     assert_eq!(machine.host_context().module_state::<usize>(), Some(&3));
@@ -713,7 +713,7 @@ fn typed_conversions_preserve_some_none_unit_and_empty_containers() {
 fn ordinary_and_vm_aware_callbacks_preserve_option_and_unit() {
     let compiled = vm::compile_source(
         "pub fn echo(value: Option<int>) -> Option<int> { value }\n\
-         pub fn choose(mode: int) -> Option<int> { if mode == 0 => { Option::Some(0) } else => { Option::None } }\n\
+         pub fn choose(mode: int) -> Option<int> { if mode == 0 => { Some(0) } else => { None } }\n\
          pub fn unit() -> () { () }",
     )
     .unwrap();
@@ -926,8 +926,8 @@ fn rss_constructs_and_transfers_owned_option_resources() {
         let made: Option<resource<option.success>> = option_sdk::resource_make(true);
         let before = option_sdk::resource_observe();
         let taken = match made {
-            Option::Some(owner) => option_sdk::resource_take(Option::Some(owner)),
-            Option::None => -1,
+            Some(owner) => option_sdk::resource_take(Some(owner)),
+            None => -1,
         };
         let after = option_sdk::resource_observe();
         let absent: Option<resource<option.success>> = option_sdk::resource_make(false);
@@ -945,7 +945,7 @@ fn rss_constructs_and_transfers_owned_option_resources() {
 #[test]
 fn option_roundtrip_executes_in_native_aot() {
     let mut machine = machine(
-        "use option_sdk; let value: Option<int[]> = option_sdk::fixture(Option::Some([3, 4])); option_sdk::inspect(value);",
+        "use option_sdk; let value: Option<int[]> = option_sdk::fixture(Some([3, 4])); option_sdk::inspect(value);",
     );
     machine.compile_aot().unwrap();
     let dump = machine.dump_aot_info();
@@ -958,7 +958,7 @@ fn option_roundtrip_executes_in_native_aot() {
 
 #[test]
 fn option_roundtrip_executes_from_loaded_vmbc() {
-    let source = "use option_sdk; fn double(value: int) -> int { value + value } let value: Option<int[]> = option_sdk::fixture(Option::Some([3, 4])); let callable: Option<fn(int) -> int> = option_sdk::callable_echo(Option::Some(double)); let applied = match callable { Option::Some(f) => f(4), Option::None => -1 }; match value { Option::Some(items) => items[0] + items[1] + applied, Option::None => -1 };";
+    let source = "use option_sdk; fn double(value: int) -> int { value + value } let value: Option<int[]> = option_sdk::fixture(Some([3, 4])); let callable: Option<fn(int) -> int> = option_sdk::callable_echo(Some(double)); let applied = match callable { Some(f) => f(4), None => -1 }; match value { Some(items) => items[0] + items[1] + applied, None => -1 };";
     let descriptors = descriptors();
     let catalog = Arc::new(vm::HostFunctionDescriptor::collect_catalog(&descriptors).unwrap());
     let compiled = vm::compile_source_with_flavor_and_options(
@@ -981,13 +981,13 @@ fn option_roundtrip_executes_from_loaded_vmbc() {
 fn option_states_execute_in_trace_jit() {
     let source = r#"
         fn choose(index: int) -> Option<int> {
-            if index == 64 => { Option::None } else => { Option::Some(index) }
+            if index == 64 => { None } else => { Some(index) }
         }
         let mut index = 0;
         let mut total = 0;
         while index < 128 {
             let value: Option<int> = choose(index);
-            let selected = match value { Option::Some(inner) => inner, Option::None => 1 };
+            let selected = match value { Some(inner) => inner, None => 1 };
             total = total + selected;
             index = index + 1;
         }
@@ -1017,8 +1017,8 @@ fn option_combinators_and_projection_execute_in_trace_jit() {
         let mut index = 0;
         let mut total = 0;
         while index < 128 {
-            let base: Option<int> = Option::Some(index);
-            let mapped = base.map(|value| value + 1).and_then(|value| Option::Some(value + 1));
+            let base: Option<int> = Some(index);
+            let mapped = base.map(|value| value + 1).and_then(|value| Some(value + 1));
             let selected = mapped.unwrap_or(0);
             let projected = row?.value.unwrap_or(0);
             total = total + selected + projected;
@@ -1044,7 +1044,7 @@ fn option_combinators_and_projection_execute_in_trace_jit() {
 #[cfg(feature = "cranelift-jit")]
 #[test]
 fn option_roundtrip_executes_from_loaded_aot_artifact() {
-    let source = "use option_sdk; let value: Option<int[]> = option_sdk::fixture(Option::Some([3, 4])); option_sdk::inspect(value);";
+    let source = "use option_sdk; let value: Option<int[]> = option_sdk::fixture(Some([3, 4])); option_sdk::inspect(value);";
     let mut source_machine = machine(source);
     source_machine.compile_aot().unwrap();
     let artifact = source_machine.encode_aot_artifact().unwrap();

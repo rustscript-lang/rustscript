@@ -171,7 +171,7 @@ fn std_encoded_json_programs_fail_nostd_at_intended_ids() {
             vm::BuiltinFunction::JsonEncodeTyped.call_index(),
         ),
         (
-            "use json; struct Payload { value: Option<()> } let payload: Payload = {value: Option::Some(())}; json::encode(payload);",
+            "use json; struct Payload { value: Option<()> } let payload: Payload = {value: Some(())}; json::encode(payload);",
             vm::BuiltinFunction::JsonEncodeTyped.call_index(),
         ),
     ];

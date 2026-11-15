@@ -12,7 +12,7 @@ Supported syntax and features:
 
 - Statements: `use`, `fn`, `pub fn`, `let`, assignment, indexed/member assignment, `if`/`else`, `while`, C-style `for`, `break`, `continue`.
 - Expressions: literals (`int`, `float`, `bool`, `string`, `null`), arithmetic (`+ - * / %`), logical (`! && ||`), comparison (`== != < >`), function calls, closures (`|...| expr`), if-expression form (`if cond => { ... } else => { ... }`), match expressions.
-- Match patterns: int/string/null literals, wildcard `_`, `None`, non-null binding patterns `Some(name)`, and type constructors `Some(TypeName)` / `Option::Some(TypeName)`.
+- Match patterns in legacy parser dialects: int/string/null literals, wildcard `_`, `None`, non-null binding patterns `Some(name)`, and type constructors `Some(TypeName)` / `Option::Some(TypeName)`. RustScript instead reserves `Some`/`None` for logical Option constructors and match arms; `Some(TypeName)` binds the payload.
 - Collections: array literal `[]`, brace literals for arrays/maps, `obj.member`, `obj[key]`, optional chaining (`?.` and `?.[key]`), slice syntax (`[a:b]`, `[:b]`, `[a:]`), map key literals including `null`.
 - Host/runtime calls:
   - builtins via namespaces: `io::...`, `re::...`, `json::...`, `jit::...`, `math::...`

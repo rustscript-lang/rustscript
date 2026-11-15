@@ -39,7 +39,7 @@ fn result_public_basic_hints_keep_ok_err_and_callable_payload_schemas() {
 
 #[test]
 fn result_public_hints_preserve_recursive_types_module_identity_and_arm_bindings() {
-    let source = "// 中文\r\nuse self::lib as lib;\r\nlet returned = lib::make();\r\nlet matched = match returned { Result::Ok(value) => value.value, Result::Err(error) => 0 };\r\nlet nested: Result<[Option<Result<int, string>>], Result<Option<string>, int>> = Result::Ok([Option::None]);\r\nlet optional: Option<Result<int, string>> = Option::None;\r\nfn relay(input: Result<int, string>) -> Result<string, string> { let number = input?; Result::Ok(\"done\") }\r\nlet relay_fn = relay;\r\nlet propagated = relay(Result::Err(\"bad\"));\r\n";
+    let source = "// 中文\r\nuse self::lib as lib;\r\nlet returned = lib::make();\r\nlet matched = match returned { Result::Ok(value) => value.value, Result::Err(error) => 0 };\r\nlet nested: Result<[Option<Result<int, string>>], Result<Option<string>, int>> = Result::Ok([None]);\r\nlet optional: Option<Result<int, string>> = None;\r\nfn relay(input: Result<int, string>) -> Result<string, string> { let number = input?; Result::Ok(\"done\") }\r\nlet relay_fn = relay;\r\nlet propagated = relay(Result::Err(\"bad\"));\r\n";
     let library = "struct Box<T> { value: T }\npub fn make() -> Result<Box<int>, Box<string>> { Result::Ok({ value: 42 }) }\nlet failure: Result<int, string> = Result::Err(\"bad\");\n";
     let overrides = json!([{"path":"./lib.rss", "source":library}]).to_string();
     let payload = response(local_type_hints_json_with_context_response(

@@ -121,7 +121,7 @@ fn nostd_executes_std_encoded_result_ok_and_err_without_source() {
             EmbeddedValue::Bool(false),
         ),
         (
-            "let value: Result<string, Option<int>> = Result::Err(Option::None); match value { Result::Ok(s) => Option::Some(9), Result::Err(n) => n, };",
+            "let value: Result<string, Option<int>> = Result::Err(None); match value { Result::Ok(s) => Some(9), Result::Err(n) => n, };",
             EmbeddedValue::map(vec![(
                 EmbeddedValue::string("tag"),
                 EmbeddedValue::Bool(false),
@@ -167,36 +167,36 @@ fn nostd_executes_std_encoded_result_ok_and_err_without_source() {
 fn nostd_executes_std_encoded_option_and_unit_without_source() {
     let cases = [
         (
-            "let nested: Option<Option<int>> = Option::Some(Option::None); match nested { Option::Some(inner) => match inner { Option::Some(v) => v, Option::None => 0 }, Option::None => -1 };",
+            "let nested: Option<Option<int>> = Some(None); match nested { Some(inner) => match inner { Some(v) => v, None => 0 }, None => -1 };",
             EmbeddedValue::Int(0),
         ),
         (
-            "let value: Option<Result<int, string>> = Option::Some(Result::Ok(1)); match value { Option::Some(result) => match result { Result::Ok(v) => v, Result::Err(e) => -1 }, Option::None => -2 };",
+            "let value: Option<Result<int, string>> = Some(Result::Ok(1)); match value { Some(result) => match result { Result::Ok(v) => v, Result::Err(e) => -1 }, None => -2 };",
             EmbeddedValue::Int(1),
         ),
         (
-            "let value: Result<Option<int>, string> = Result::Ok(Option::Some(2)); match value { Result::Ok(option) => match option { Option::Some(v) => v, Option::None => -4 }, Result::Err(e) => -8 };",
+            "let value: Result<Option<int>, string> = Result::Ok(Some(2)); match value { Result::Ok(option) => match option { Some(v) => v, None => -4 }, Result::Err(e) => -8 };",
             EmbeddedValue::Int(2),
         ),
         (
-            "let value: Option<()> = Option::Some(()); match value { Option::Some(unit) => 7, Option::None => -1 };",
+            "let value: Option<()> = Some(()); match value { Some(unit) => 7, None => -1 };",
             EmbeddedValue::Int(7),
         ),
         (
-            "let value: Option<bool> = Option::Some(false); match value { Option::Some(flag) => flag, Option::None => true };",
+            "let value: Option<bool> = Some(false); match value { Some(flag) => flag, None => true };",
             EmbeddedValue::Bool(false),
         ),
         (
-            "let value: Option<int> = Option::Some(0); match value { Option::Some(v) => v, Option::None => 1 };",
+            "let value: Option<int> = Some(0); match value { Some(v) => v, None => 1 };",
             EmbeddedValue::Int(0),
         ),
         (
-            "let value: Option<string> = Option::Some(\"\"); match value { Option::Some(text) => text, Option::None => \"missing\" };",
+            "let value: Option<string> = Some(\"\"); match value { Some(text) => text, None => \"missing\" };",
             EmbeddedValue::string(""),
         ),
         ("let unit: () = (); unit;", EmbeddedValue::Null),
         (
-            "let value: Option<int> = Option::None; match value { Option::Some(v) => v, Option::None => 9 };",
+            "let value: Option<int> = None; match value { Some(v) => v, None => 9 };",
             EmbeddedValue::Int(9),
         ),
     ];
@@ -620,7 +620,7 @@ fn nostd_reads_option_cleanup_schema_and_refuses_the_resource_capability() {
     let catalog = Arc::new(builder.build().expect("catalog"));
     let source = r#"
         fn relay() -> Result<int, string> {
-            let local: Option<resource<pr24.closure>> = Option::Some(test::make_local());
+            let local: Option<resource<pr24.closure>> = Some(test::make_local());
             let value = test::fail()?;
             Result::Ok(value)
         }

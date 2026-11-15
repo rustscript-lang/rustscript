@@ -1,8 +1,8 @@
 use super::*;
 #[test]
 fn coherent_schema_json_preserves_optional_callable_named_and_module_byte_identity() {
-    let source = "// 中文\r\nuse self::lib as lib;\r\nlet optional: Option<int> = Option::None;\r\nlet value = lib::make();\r\nfn factory() { lib::make() }\r\nlet function = factory;\r\n";
-    let library = "struct Box { value: int }\npub fn make() -> Box { { value: 42 } }\nlet local: Option<int> = Option::None;\n";
+    let source = "// 中文\r\nuse self::lib as lib;\r\nlet optional: Option<int> = None;\r\nlet value = lib::make();\r\nfn factory() { lib::make() }\r\nlet function = factory;\r\n";
+    let library = "struct Box { value: int }\npub fn make() -> Box { { value: 42 } }\nlet local: Option<int> = None;\n";
     let overrides = serde_json::json!([{"path": "./lib.rss", "source": library}]).to_string();
     let response: serde_json::Value =
         serde_json::from_slice(&local_type_hints_json_with_context_response(
@@ -44,7 +44,7 @@ fn coherent_schema_json_preserves_optional_callable_named_and_module_byte_identi
 }
 #[test]
 fn coherent_recursive_json_keeps_distinct_module_nominals_and_instantiated_callable_contracts() {
-    let source = "// 中文\r\nuse self::left::lib as left;\r\nuse self::right::lib as right;\r\nlet left_value = left::make();\r\nlet right_value = right::make();\r\nfn identity<T>(value: T) -> T { value }\r\nlet specialized = identity::<int>;\r\nlet nested: map<[Option<int>]> = { \"one\": [Option::None, Option::Some(42)] };\r\nlet tuple: [Option<int>, fn(int) -> int] = [Option::None, specialized];\r\n";
+    let source = "// 中文\r\nuse self::left::lib as left;\r\nuse self::right::lib as right;\r\nlet left_value = left::make();\r\nlet right_value = right::make();\r\nfn identity<T>(value: T) -> T { value }\r\nlet specialized = identity::<int>;\r\nlet nested: map<[Option<int>]> = { \"one\": [None, Some(42)] };\r\nlet tuple: [Option<int>, fn(int) -> int] = [None, specialized];\r\n";
     let left = "struct Box<T> { value: T }\npub fn make() -> Box<int> { { value: 42 } }\n";
     let right =
         "struct Box<T> { value: T }\npub fn make() -> Box<string> { { value: \"label\" } }\n";
@@ -102,7 +102,7 @@ fn coherent_recursive_json_keeps_distinct_module_nominals_and_instantiated_calla
 
 #[test]
 fn coherent_inferred_callable_json_keeps_optional_results_and_per_call_generics() {
-    let source = "// 中文\r\nfn maybe(value: Option<int>) { value }\r\nlet g = maybe;\r\nlet closure: fn(Option<int>) -> Option<int> = |value| value;\r\nfn answer() { 42 }\r\nlet f = answer;\r\nfn identity<T>(value: T) -> T { value }\r\nlet output = identity::<int>(41);\r\ng(Option::None);\r\n";
+    let source = "// 中文\r\nfn maybe(value: Option<int>) { value }\r\nlet g = maybe;\r\nlet closure: fn(Option<int>) -> Option<int> = |value| value;\r\nfn answer() { 42 }\r\nlet f = answer;\r\nfn identity<T>(value: T) -> T { value }\r\nlet output = identity::<int>(41);\r\ng(None);\r\n";
     let response: serde_json::Value =
         serde_json::from_slice(&local_type_hints_json_with_context_response(
             source,

@@ -32,21 +32,15 @@ fn span_text<'a>(source: &'a str, error: &str) -> &'a str {
 fn rss_rejects_null_literal_with_migration_and_span() {
     let source = "null;";
     let error = rejection(source);
-    assert!(
-        error.contains("Option::None") && error.contains("()"),
-        "{error}"
-    );
+    assert!(error.contains("None") && error.contains("()"), "{error}");
     assert_eq!(span_text(source, &error), "null");
 }
 
 #[test]
 fn rss_rejects_null_pattern_with_migration_and_span() {
-    let source = "let value: Option<int> = Option::None; match value { null => 1, _ => 2 };";
+    let source = "let value: Option<int> = None; match value { null => 1, _ => 2 };";
     let error = rejection(source);
-    assert!(
-        error.contains("Option::None") && error.contains("()"),
-        "{error}"
-    );
+    assert!(error.contains("None") && error.contains("()"), "{error}");
     assert_eq!(span_text(source, &error), "null");
 }
 
@@ -70,10 +64,7 @@ fn rss_rejects_nullable_suffix_with_option_migration_and_span() {
 fn rss_rejects_null_map_key_with_span() {
     let source = "{ null: 1 };";
     let error = rejection(source);
-    assert!(
-        error.contains("Option::None") && error.contains("()"),
-        "{error}"
-    );
+    assert!(error.contains("None") && error.contains("()"), "{error}");
     assert_eq!(span_text(source, &error), "null");
 }
 
@@ -98,7 +89,7 @@ fn json_option_null_decodes_as_none() {
         r#"
         use json;
         let decoded: Option<int> = json::decode::<Option<int>>("null");
-        match decoded { Option::None => 0, Option::Some(value) => 1 + value };
+        match decoded { None => 0, Some(value) => 1 + value };
         "#,
     );
     assert_eq!(value, vm::Value::Int(0));
@@ -109,7 +100,7 @@ fn json_option_none_encodes_as_null() {
     let value = eval(
         r#"
         use json;
-        let missing: Option<int> = Option::None;
+        let missing: Option<int> = None;
         let encoded: string = json::encode::<Option<int>>(missing);
         encoded;
         "#,
@@ -123,7 +114,7 @@ fn println_option_returns_original_and_renders_none() {
         use json;
         let decoded: Option<int> = json::decode::<Option<int>>("null");
         let printed = println(decoded);
-        match printed { Option::None => 0, Option::Some(value) => 1 + value };
+        match printed { None => 0, Some(value) => 1 + value };
     "#;
     let compiled = compile_source(source)
         .unwrap_or_else(|error| panic!("logical print should compile: {source}\n{error}"));
@@ -187,7 +178,7 @@ fn rss_rejects_custom_host_unknown_return() {
 #[test]
 fn format_template_renders_option_from_checked_schema() {
     let source = r#"
-        let value: Option<int> = Option::None;
+        let value: Option<int> = None;
         println("{}", value);
         1;
     "#;
@@ -252,7 +243,7 @@ fn unannotated_decode_keeps_explicit_type_argument() {
 fn encode_infers_option_schema_without_type_arguments() {
     let source = r#"
         use json;
-        let value: Option<int> = Option::None;
+        let value: Option<int> = None;
         let encoded = json::encode(value);
         encoded;
     "#;
@@ -263,7 +254,7 @@ fn encode_infers_option_schema_without_type_arguments() {
 #[test]
 fn repl_result_schema_comes_from_the_expression_not_an_equal_local() {
     let compiled = vm::compile_source_for_repl_with_locals(
-        "let other: Option<string> = Option::None; let result: Option<int> = Option::None; result;",
+        "let other: Option<string> = None; let result: Option<int> = None; result;",
         &[],
     )
     .expect("repl compile");

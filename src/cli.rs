@@ -1964,17 +1964,17 @@ mod tests {
     fn root_result_join_float_production_sync_and_nullable_effects() {
         for (source, value, effect) in [
             (
-                "let maybe: Option<float> = Option::Some(2.5); let y = if true => { maybe } else => { Option::None };",
+                "let maybe: Option<float> = Some(2.5); let y = if true => { maybe } else => { None };",
                 crate::option::some_carrier(Value::Float(2.5)),
                 false,
             ),
             (
-                "let flag = true; let mut x = 1; let maybe: Option<float> = Option::Some(3.5); let y = if flag => { x = 2.5; maybe } else => { x = 2.5; Option::None };",
+                "let flag = true; let mut x = 1; let maybe: Option<float> = Some(3.5); let y = if flag => { x = 2.5; maybe } else => { x = 2.5; None };",
                 crate::option::some_carrier(Value::Float(3.5)),
                 true,
             ),
             (
-                "let flag = false; let mut x = 1; let maybe: Option<float> = Option::Some(3.5); let y = if flag => { x = 2.5; maybe } else => { x = 2.5; Option::None };",
+                "let flag = false; let mut x = 1; let maybe: Option<float> = Some(3.5); let y = if flag => { x = 2.5; maybe } else => { x = 2.5; None };",
                 crate::option::none_carrier(),
                 true,
             ),
@@ -2043,24 +2043,12 @@ mod tests {
             )
             .unwrap();
         for (expression, flag, is_null) in [
-            ("if flag => { maybe } else => { Option::None }", true, false),
-            (
-                "if flag => { Option::None } else => { maybe }",
-                false,
-                false,
-            ),
-            ("if flag => { maybe } else => { Option::None }", false, true),
-            ("if flag => { Option::None } else => { maybe }", true, true),
-            (
-                "match choice { 1 => maybe, _ => Option::None }",
-                true,
-                false,
-            ),
-            (
-                "match choice { 1 => Option::None, _ => maybe }",
-                false,
-                false,
-            ),
+            ("if flag => { maybe } else => { None }", true, false),
+            ("if flag => { None } else => { maybe }", false, false),
+            ("if flag => { maybe } else => { None }", false, true),
+            ("if flag => { None } else => { maybe }", true, true),
+            ("match choice { 1 => maybe, _ => None }", true, false),
+            ("match choice { 1 => None, _ => maybe }", false, false),
         ] {
             let source = format!(
                 "let flag = {flag}; let choice = if flag => {{ 1 }} else => {{ 2 }}; let maybe: Option<ResultJoinRoot> = resultjoin::origin(); let y = {expression};"
@@ -2068,7 +2056,7 @@ mod tests {
             let mut session = super::ReplSession::default();
             for snippet in [
                 source.as_str(),
-                "let following = y; match following { Option::None => true, Option::Some(_) => false };",
+                "let following = y; match following { None => true, Some(_) => false };",
             ] {
                 let compiled =
                     super::compile_repl_snippet_with_options(snippet, &session.locals, &options)
@@ -2254,11 +2242,11 @@ mod tests {
     #[test]
     fn root_expression_effects_optional_named_alternatives_remain_checked() {
         for assign in [
-            "let ignored = if true => { x = Option::Some(2.5); 0 } else => { x = Option::Some(2.5); 0 };",
-            "let ignored = if true => { x = Option::Some(2.5); 0 } else => { 0 };",
-            "let ignored = if false => { x = Option::Some(2.5); 0 } else => { 0 };",
+            "let ignored = if true => { x = Some(2.5); 0 } else => { x = Some(2.5); 0 };",
+            "let ignored = if true => { x = Some(2.5); 0 } else => { 0 };",
+            "let ignored = if false => { x = Some(2.5); 0 } else => { 0 };",
         ] {
-            let source = format!("let mut x: Option<float> = Option::None; {assign}");
+            let source = format!("let mut x: Option<float> = None; {assign}");
             let mut session = super::ReplSession::default();
             let compiled = super::compile_repl_snippet(&source, &session.locals).unwrap();
             let x = compiled.bindings.iter().find(|b| b.name == "x").unwrap();
@@ -2285,13 +2273,13 @@ mod tests {
         }
         for condition in ["true", "false"] {
             let source = format!(
-                "struct EffectRoot {{ value: int }} let mut x: Option<EffectRoot> = Option::None; let ignored = if {condition} => {{ x = Option::Some({{ value: 41 }}); 0 }} else => {{ 0 }};"
+                "struct EffectRoot {{ value: int }} let mut x: Option<EffectRoot> = None; let ignored = if {condition} => {{ x = Some({{ value: 41 }}); 0 }} else => {{ 0 }};"
             );
             let mut session = super::ReplSession::default();
             let compiled = super::compile_repl_snippet(&source, &session.locals).unwrap();
             let x = compiled.bindings.iter().find(|b| b.name == "x").unwrap();
             let control = super::compile_repl_snippet(
-                "struct EffectRoot { value: int } let mut x: Option<EffectRoot> = Option::None;",
+                "struct EffectRoot { value: int } let mut x: Option<EffectRoot> = None;",
                 &BTreeMap::new(),
             )
             .unwrap();
@@ -2312,10 +2300,7 @@ mod tests {
             run_repl_snippet_and_sync(&mut session, &source);
             assert_eq!(session.locals["x"].schema, x.schema);
             assert!(!session.locals["x"].optional);
-            run_repl_snippet_and_sync(
-                &mut session,
-                "match x { Option::None => true, Option::Some(_) => false };",
-            );
+            run_repl_snippet_and_sync(&mut session, "match x { None => true, Some(_) => false };");
         }
     }
 
@@ -3118,10 +3103,8 @@ mod tests {
     #[test]
     fn repl_session_preserves_optional_string_move_state() {
         let mut session = super::ReplSession::default();
-        let _ = run_repl_snippet_and_sync(
-            &mut session,
-            "let a: Option<string> = Option::Some(\"payload\");",
-        );
+        let _ =
+            run_repl_snippet_and_sync(&mut session, "let a: Option<string> = Some(\"payload\");");
         let _ = run_repl_snippet_and_sync(&mut session, "let b = a;");
 
         assert_eq!(session.locals.get("a").map(|local| local.moved), Some(true));
@@ -3245,7 +3228,7 @@ mod tests {
     #[test]
     fn repl_session_persists_option_none_between_entries() {
         let mut session = super::ReplSession::default();
-        let _ = run_repl_snippet_and_sync(&mut session, "let x: Option<int> = Option::None;");
+        let _ = run_repl_snippet_and_sync(&mut session, "let x: Option<int> = None;");
         let local = session.locals.get("x").expect("option binding");
         assert_eq!(local.value, crate::option::none_carrier());
         assert_eq!(

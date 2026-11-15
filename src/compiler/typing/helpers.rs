@@ -2163,7 +2163,7 @@ pub(super) fn refine_state_for_match_pattern(
 ) -> LocalTypeState {
     let mut refined = state.clone();
     if let Some(binding_slot) = pattern.binding_slot() {
-        // Option::Some binds the payload, not the Option carrier. The carrier's
+        // Some binds the payload, not the Option carrier. The carrier's
         // bound type is Map; projecting only that type makes `v + 1` untyped.
         let (ty, schema) = match (pattern, state.schema(value_slot)) {
             (MatchPattern::SomeBinding(_), Some(TypeSchema::Option(inner))) => {

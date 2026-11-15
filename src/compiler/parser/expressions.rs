@@ -330,7 +330,7 @@ impl Parser {
         if self.check(&TokenKind::Null) && self.dialect.reject_legacy_null() {
             return Err(super::legacy_null_error(
                 self,
-                "RSS rejects null literals; use Option::None or ()",
+                "RSS rejects null literals; use None or ()",
             ));
         }
         if self.match_kind(&TokenKind::Null) {
@@ -373,9 +373,8 @@ impl Parser {
                 let expr = self.parse_result_constructor(name_span)?;
                 return self.parse_postfix_access(expr, name_span);
             }
-            if self.dialect.allow_option_syntax() && name == "Option" && self.check_path_separator()
-            {
-                let expr = self.parse_option_constructor(name_span)?;
+            if self.dialect.allow_option_syntax() && (name == "Some" || name == "None") {
+                let expr = self.parse_option_constructor(&name, name_span)?;
                 return self.parse_postfix_access(expr, name_span);
             }
             if self.dialect.allow_dotted_call()
@@ -910,24 +909,16 @@ impl Parser {
             && self.check_kind_at(self.pos + 2, &TokenKind::Colon)
     }
 
-    pub(super) fn parse_option_constructor(&mut self, start: Span) -> Result<Expr, ParseError> {
-        if !self.match_path_separator() {
-            return Err(ParseError {
-                span: Some(start),
-                code: None,
-                line: self.current_line(),
-                message: "expected '::' after Option".to_string(),
-            });
-        }
-        let ctor = self.expect_ident("expected Option constructor 'Some' or 'None'")?;
-        let (some, payload) = match ctor.as_str() {
+    pub(super) fn parse_option_constructor(
+        &mut self,
+        ctor: &str,
+        start: Span,
+    ) -> Result<Expr, ParseError> {
+        let (some, payload) = match ctor {
             "Some" => {
-                self.expect(&TokenKind::LParen, "expected '(' after Option::Some")?;
+                self.expect(&TokenKind::LParen, "expected '(' after Some")?;
                 let payload = self.parse_expr()?;
-                self.expect(
-                    &TokenKind::RParen,
-                    "expected ')' after Option::Some payload",
-                )?;
+                self.expect(&TokenKind::RParen, "expected ')' after Some payload")?;
                 (true, Some(Box::new(payload)))
             }
             "None" => {
@@ -936,19 +927,12 @@ impl Parser {
                         span: Some(start),
                         code: None,
                         line: self.current_line(),
-                        message: "Option::None has no payload".to_string(),
+                        message: "None has no payload".to_string(),
                     });
                 }
                 (false, None)
             }
-            other => {
-                return Err(ParseError {
-                    span: Some(start),
-                    code: None,
-                    line: self.current_line(),
-                    message: format!("unknown Option constructor '{other}'"),
-                });
-            }
+            _ => unreachable!("only Option constructor names reach this parser"),
         };
         let hi = self
             .tokens
@@ -966,23 +950,12 @@ impl Parser {
 
     fn peek_option_constructor_pattern(&self) -> bool {
         self.dialect.allow_option_syntax()
-            && self.check_ident_literal("Option")
-            && self.check_kind_at(self.pos + 1, &TokenKind::Colon)
-            && self.check_kind_at(self.pos + 2, &TokenKind::Colon)
+            && (self.check_ident_literal("Some") || self.check_ident_literal("None"))
     }
 
     fn parse_option_constructor_pattern(&mut self) -> Result<ResultConstructorPattern, ParseError> {
         let start = self.current_span();
-        let name = self.expect_ident("expected Option")?;
-        if name != "Option" || !self.match_path_separator() {
-            return Err(ParseError {
-                span: Some(start),
-                code: None,
-                line: self.current_line(),
-                message: "expected Option::Some or Option::None match pattern".to_string(),
-            });
-        }
-        let ctor = self.expect_ident("expected Option constructor in match pattern")?;
+        let ctor = self.expect_namespace_segment("expected Option constructor in match pattern")?;
         match ctor.as_str() {
             "None" => {
                 if self.check(&TokenKind::LParen) {
@@ -990,7 +963,7 @@ impl Parser {
                         span: Some(start),
                         code: None,
                         line: self.current_line(),
-                        message: "Option::None match pattern has no payload".to_string(),
+                        message: "None match pattern has no payload".to_string(),
                     });
                 }
                 Ok((false, None))
@@ -1113,7 +1086,7 @@ impl Parser {
                             span: None,
                             code: None,
                             line: pattern_token_line,
-                            message: "duplicate Option::Some match arm".to_string(),
+                            message: "duplicate Some match arm".to_string(),
                         });
                     }
                     option_some = Some((binding.map(|(_, _, slot)| slot), arm_expr));
@@ -1123,7 +1096,7 @@ impl Parser {
                             span: None,
                             code: None,
                             line: pattern_token_line,
-                            message: "duplicate Option::None match arm".to_string(),
+                            message: "duplicate None match arm".to_string(),
                         });
                     }
                     option_none = Some(arm_expr);
@@ -1270,7 +1243,7 @@ impl Parser {
                     span: None,
                     code: None,
                     line: self.current_line(),
-                    message: "Option match is missing Option::Some arm".to_string(),
+                    message: "Option match is missing Some arm".to_string(),
                 });
             };
             let none_expr = if let Some(expr) = option_none {
@@ -1282,7 +1255,7 @@ impl Parser {
                     span: None,
                     code: None,
                     line: self.current_line(),
-                    message: "Option match is missing Option::None arm".to_string(),
+                    message: "Option match is missing None arm".to_string(),
                 });
             };
             let span = self.current_span();
@@ -1397,7 +1370,7 @@ impl Parser {
         if self.check(&TokenKind::Null) && self.dialect.reject_legacy_null() {
             return Err(super::legacy_null_error(
                 self,
-                "RSS rejects null patterns; use Option::None or ()",
+                "RSS rejects null patterns; use None or ()",
             ));
         }
         if self.match_kind(&TokenKind::Null) {
@@ -1416,9 +1389,12 @@ impl Parser {
         }
         Err(ParseError { span: None, code: None,
             line: self.current_line(),
-            message:
+            message: if self.dialect.allow_option_syntax() {
+                "match patterns currently support int/string literals, Some(name), None, and '_'"
+            } else {
                 "match patterns currently support int/string/null literals, None, Some(name), type patterns via Some(TypeName), and '_'"
-                    .to_string(),
+            }
+            .to_string(),
         })
     }
 
@@ -1429,7 +1405,7 @@ impl Parser {
         if head == "Some" {
             return self.parse_some_type_pattern();
         }
-        if head == "Option" && self.match_path_separator() {
+        if !self.dialect.allow_option_syntax() && head == "Option" && self.match_path_separator() {
             let variant =
                 self.expect_namespace_segment("expected 'Some' or 'None' after 'Option::'")?;
             if variant == "Some" {
@@ -2418,7 +2394,7 @@ impl Parser {
         if self.check(&TokenKind::Null) && self.dialect.reject_legacy_null() {
             return Err(super::legacy_null_error(
                 self,
-                "RSS rejects null map keys; use Option::None or ()",
+                "RSS rejects null map keys; use None or ()",
             ));
         }
         if self.match_kind(&TokenKind::Null) {
@@ -3305,7 +3281,7 @@ impl Parser {
             self.expect(&TokenKind::RBracket, "expected ']' after assignment index")?;
             key
         } else if self.match_kind(&TokenKind::Dot) {
-            Expr::String(self.expect_ident("expected member name after '.'")?)
+            Expr::String(self.expect_namespace_segment("expected member name after '.'")?)
         } else {
             return Err(ParseError {
                 span: None,

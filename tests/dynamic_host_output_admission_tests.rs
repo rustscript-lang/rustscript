@@ -43,7 +43,7 @@ fn rss_rejects_dynamic_host_output_inside_match_arm() {
 #[test]
 fn rss_rejects_dynamic_host_output_inside_option_payload() {
     reject_nested_dynamic_output(
-        "use demo;\nlet value = Option::Some(if true => { demo::missing(); 1 } else => { 2 });\nvalue;",
+        "use demo;\nlet value = Some(if true => { demo::missing(); 1 } else => { 2 });\nvalue;",
     );
 }
 
@@ -57,6 +57,6 @@ fn rss_rejects_dynamic_host_output_inside_result_arm() {
 #[test]
 fn rss_rejects_dynamic_host_output_inside_method_callback_body() {
     reject_nested_dynamic_output(
-        "use demo;\nlet value = Option::Some(1).map(|item| if true => { demo::missing(); item } else => { 0 });\nvalue;",
+        "use demo;\nlet value = Some(1).map(|item| if true => { demo::missing(); item } else => { 0 });\nvalue;",
     );
 }

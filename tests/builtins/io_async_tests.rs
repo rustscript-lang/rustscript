@@ -150,12 +150,12 @@ fn async_io_read_line_preserves_buffered_data_between_calls() {
             let second = io::read_line(handle)?;
             io::close(handle)?;
             let line = match second {{
-                Option::Some(text) => text,
-                Option::None => "",
+                Some(text) => text,
+                None => "",
             }};
             let first_line = match first {{
-                Option::Some(text) => text,
-                Option::None => "missing",
+                Some(text) => text,
+                None => "missing",
             }};
             Result::Ok(line + first_line)
         }}
@@ -542,8 +542,8 @@ fn async_io_read_line_at_eof_is_ok_none() {
             let line = io::read_line(handle)?;
             io::close(handle)?;
             Result::Ok(match line {{
-                Option::Some(_) => false,
-                Option::None => true,
+                Some(_) => false,
+                None => true,
             }})
         }}
         match probe() {{

@@ -107,7 +107,7 @@ pub trait ParserDialect {
         false
     }
 
-    /// Logical `Option<T>`, `Option::Some`/`Option::None`, `()` and the Unit
+    /// Logical `Option<T>`, `Some`/`None`, `()` and the Unit
     /// block facts. Default off so other frontends keep their contracts.
     fn allow_option_syntax(&self) -> bool {
         false

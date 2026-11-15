@@ -673,12 +673,12 @@ async fn triple_domain_single_vm_typed_dataflow_uses_shared_catalog() {
         let absent_values = http::response::header_values(&response, "x-absent");
 
         let limits: SqliteLimits = {{}};
-        let options: SqliteOpenOptions = {{ path: Option::Some("state.db"), mode: Option::Some("read_write_create"), limits: Option::Some(limits) }};
+        let options: SqliteOpenOptions = {{ path: Some("state.db"), mode: Some("read_write_create"), limits: Some(limits) }};
         let db = sqlite::open(options);
         let no_params: [SqliteValue] = [];
         sqlite::execute(&db, "CREATE TABLE payloads (id INTEGER PRIMARY KEY, value TEXT)", no_params);
 
-        let text_value: SqliteValue = {{ kind: "text", text_value: Option::Some(echoed) }};
+        let text_value: SqliteValue = {{ kind: "text", text_value: Some(echoed) }};
         let text_params: [SqliteValue] = [text_value];
         let inserted = sqlite::execute(&db, "INSERT INTO payloads (id, value) VALUES (1, ?1)", text_params);
 
@@ -686,7 +686,7 @@ async fn triple_domain_single_vm_typed_dataflow_uses_shared_catalog() {
         let null_params: [SqliteValue] = [null_value];
         let null_inserted = sqlite::execute(&db, "INSERT INTO payloads (id, value) VALUES (2, ?1)", null_params);
 
-        let empty_value: SqliteValue = {{ kind: "text", text_value: Option::Some("") }};
+        let empty_value: SqliteValue = {{ kind: "text", text_value: Some("") }};
         let empty_params: [SqliteValue] = [empty_value];
         sqlite::execute(&db, "INSERT INTO payloads (id, value) VALUES (3, ?1)", empty_params);
 
@@ -695,28 +695,28 @@ async fn triple_domain_single_vm_typed_dataflow_uses_shared_catalog() {
         let rows = queried.rows;
         assert(rows.length == 3);
         let text_cell = rows[0].cells[1];
-        let stored = match text_cell.text_value {{ Option::Some(value) => value, Option::None => "" }};
+        let stored = match text_cell.text_value {{ Some(value) => value, None => "" }};
         let null_cell = rows[1].cells[1];
         assert(null_cell.kind == "null");
-        let null_int_absent = match null_cell.int_value {{ Option::Some(value) => false, Option::None => true }};
-        let null_float_absent = match null_cell.float_value {{ Option::Some(value) => false, Option::None => true }};
-        let null_text_absent = match null_cell.text_value {{ Option::Some(value) => false, Option::None => true }};
-        let null_blob_absent = match null_cell.blob_value {{ Option::Some(value) => false, Option::None => true }};
+        let null_int_absent = match null_cell.int_value {{ Some(value) => false, None => true }};
+        let null_float_absent = match null_cell.float_value {{ Some(value) => false, None => true }};
+        let null_text_absent = match null_cell.text_value {{ Some(value) => false, None => true }};
+        let null_blob_absent = match null_cell.blob_value {{ Some(value) => false, None => true }};
         assert(null_int_absent);
         assert(null_float_absent);
         assert(null_text_absent);
         assert(null_blob_absent);
         let empty_cell = rows[2].cells[1];
         assert(empty_cell.kind == "text");
-        let empty_present = match empty_cell.text_value {{ Option::Some(value) => value == "", Option::None => false }};
+        let empty_present = match empty_cell.text_value {{ Some(value) => value == "", None => false }};
         assert(empty_present);
-        let cursor = match queried.next_cursor {{ Option::Some(value) => value, Option::None => -1 }};
+        let cursor = match queried.next_cursor {{ Some(value) => value, None => -1 }};
         assert(cursor == 3);
 
         let missing_limits: SqliteLimits = {{}};
         let missing = sqlite::query(&db, "SELECT id, value FROM payloads WHERE id = 99", [], missing_limits);
         assert(missing.rows.length == 0);
-        let missing_absent = match missing.next_cursor {{ Option::Some(value) => false, Option::None => true }};
+        let missing_absent = match missing.next_cursor {{ Some(value) => false, None => true }};
         assert(missing_absent);
 
         assert(status == 200);
@@ -835,7 +835,7 @@ async fn triple_domain_error_cleanup_reset_and_reuse_keep_all_policies() {
         let status = http::response::status(&response);
 
         let limits: SqliteLimits = {{}};
-        let options: SqliteOpenOptions = {{ path: Option::Some("state.db"), mode: Option::Some("read_write_create"), limits: Option::Some(limits) }};
+        let options: SqliteOpenOptions = {{ path: Some("state.db"), mode: Some("read_write_create"), limits: Some(limits) }};
         let db = sqlite::open(options);
         let no_params: [SqliteValue] = [];
         sqlite::execute(&db, "CREATE TABLE IF NOT EXISTS items (value TEXT)", no_params);

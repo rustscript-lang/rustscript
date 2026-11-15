@@ -16,17 +16,17 @@ fn main() {
 const EXPLICIT: &str = r#"use sqlite;
 fn main() {
     let db = sqlite::open({
-        path: Option::Some(""),
-        mode: Option::Some(""),
-        root: Option::Some(""),
-        limits: Option::Some({ max_rows: Option::Some(0), busy_timeout_ms: Option::Some(0) })
+        path: Some(""),
+        mode: Some(""),
+        root: Some(""),
+        limits: Some({ max_rows: Some(0), busy_timeout_ms: Some(0) })
     });
-    sqlite::query(&db, "SELECT 1", [], { max_rows: Option::Some(0), busy_timeout_ms: Option::Some(0) });
+    sqlite::query(&db, "SELECT 1", [], { max_rows: Some(0), busy_timeout_ms: Some(0) });
     let statement: SqliteStatement = {
         sql: "SELECT 1",
-        query: Option::Some(false),
-        params: Option::None,
-        limits: Option::None
+        query: Some(false),
+        params: None,
+        limits: None
     };
     statement.sql == "SELECT 1";
 }
@@ -34,7 +34,7 @@ fn main() {
 
 const WRONG_TYPE: &str = r#"use sqlite;
 fn main() {
-    sqlite::open({ path: Option::Some(false) });
+    sqlite::open({ path: Some(false) });
     true;
 }
 "#;

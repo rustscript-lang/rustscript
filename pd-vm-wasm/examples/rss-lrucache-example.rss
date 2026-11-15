@@ -8,7 +8,7 @@ use re;
 // - `nodes`: node id -> LruNode<K, V>
 //
 // Node ids start at 1. The cache uses `0` as the internal "no link" sentinel.
-// Missing map entries are removed explicitly; absent result payloads are Option::None.
+// Missing map entries are removed explicitly; absent result payloads are None.
 struct LruNode<K, V> {
     key: K,
     value: V,
@@ -211,9 +211,9 @@ fn entry_report<K, V>(cache: LruCacheState<K, V>, id: int) -> Option<LruEntryRow
     let out: Option<LruEntryRow<K, V>> = if id != 0 => {
         let node: LruNode<K, V> = &((&cache).nodes[id]);
         let row: LruEntryRow<K, V> = {key: node.key.copy(), value: node.value.copy()};
-        Option::Some(row)
+        Some(row)
     } else => {
-        Option::None
+        None
     };
     out
 }
@@ -255,9 +255,9 @@ pub fn peek<K, V>(cache: LruCacheState<K, V>, key: K) -> Option<V> {
     let out: Option<V> = if lookup.has(key) => {
         let id = (&lookup)[key];
         let node: LruNode<K, V> = &((&state.nodes)[id]);
-        Option::Some(node.value.copy())
+        Some(node.value.copy())
     } else => {
-        Option::None
+        None
     };
     out
 }
@@ -300,11 +300,11 @@ pub fn get<K, V>(cache: LruCacheState<K, V>, key: K) -> LruGetResult<K, V> {
                 relinked.nodes
             )
         };
-        {cache: next_cache, value: Option::Some(value)}
+        {cache: next_cache, value: Some(value)}
     } else => {
         {
             cache: make_cache::<K, V>(limit, size, next_id, head, tail, lookup, nodes),
-            value: Option::None
+            value: None
         }
     };
     out
@@ -597,8 +597,8 @@ assert(world_peek.unwrap_or({
 
 let absent_peek: Option<FeedCacheItem> = peek::<string, FeedCacheItem>(cache, "markets");
 let absent_peek_is_none = match absent_peek {
-    Option::Some(item) => false,
-    Option::None => true,
+    Some(item) => false,
+    None => true,
 };
 assert(absent_peek_is_none);
 
@@ -607,12 +607,12 @@ cache = touch::<string, FeedCacheItem>(cache, "build-ops");
 let oldest_entry: Option<LruEntryRow<string, FeedCacheItem>> = oldest::<string, FeedCacheItem>(cache);
 let newest_entry: Option<LruEntryRow<string, FeedCacheItem>> = newest::<string, FeedCacheItem>(cache);
 let oldest_key: string = match oldest_entry {
-    Option::Some(entry) => entry.key.copy(),
-    Option::None => "",
+    Some(entry) => entry.key.copy(),
+    None => "",
 };
 let newest_key: string = match newest_entry {
-    Option::Some(entry) => entry.key.copy(),
-    Option::None => "",
+    Some(entry) => entry.key.copy(),
+    None => "",
 };
 assert(oldest_key == "world-news");
 assert(newest_key == "build-ops");

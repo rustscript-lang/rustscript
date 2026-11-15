@@ -1197,9 +1197,9 @@ fn result_schema_roundtrip_rejects_non_current_unknown_tags_and_excess_depth() {
 #[test]
 fn option_and_unit_compiler_schemas_roundtrip_on_the_current_wire() {
     let compiled = compile_source(
-        "let nested: Option<Option<int>> = Option::Some(Option::None);\n\
+        "let nested: Option<Option<int>> = Some(None);\n\
          let unit: () = ();\n\
-         let value = match nested { Option::Some(inner) => match inner { Option::Some(v) => v, Option::None => 0 }, Option::None => -1 };\n\
+         let value = match nested { Some(inner) => match inner { Some(v) => v, None => 0 }, None => -1 };\n\
          value;",
     )
     .expect("Option source should compile");
@@ -1229,10 +1229,10 @@ fn option_and_unit_compiler_schemas_roundtrip_on_the_current_wire() {
 #[test]
 fn nested_option_result_schemas_roundtrip_on_the_current_wire() {
     let compiled = compile_source(
-        "let option_result: Option<Result<int, string>> = Option::Some(Result::Ok(1));\n\
-         let result_option: Result<Option<int>, string> = Result::Ok(Option::Some(2));\n\
-         let first = match option_result { Option::Some(result) => match result { Result::Ok(value) => value, Result::Err(error) => -1 }, Option::None => -2 };\n\
-         let second = match result_option { Result::Ok(option) => match option { Option::Some(value) => value, Option::None => -4 }, Result::Err(error) => -8 };\n\
+        "let option_result: Option<Result<int, string>> = Some(Result::Ok(1));\n\
+         let result_option: Result<Option<int>, string> = Result::Ok(Some(2));\n\
+         let first = match option_result { Some(result) => match result { Result::Ok(value) => value, Result::Err(error) => -1 }, None => -2 };\n\
+         let second = match result_option { Result::Ok(option) => match option { Some(value) => value, None => -4 }, Result::Err(error) => -8 };\n\
          first + second;",
     )
     .expect("nested Option/Result source should compile");

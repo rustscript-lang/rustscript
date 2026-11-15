@@ -168,7 +168,7 @@ becomes `None`.
 let value: Result<int, string> = Result::Ok(21);
 let ok_value = value.ok();
 let err_value = value.err();
-let selected = match ok_value { Option::Some(inner) => inner, Option::None => -1 };
+let selected = match ok_value { Some(inner) => inner, None => -1 };
 selected;
 ```
 

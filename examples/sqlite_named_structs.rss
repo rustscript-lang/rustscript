@@ -1,11 +1,11 @@
 use sqlite;
 use bytes;
 
-let limits: SqliteLimits = { max_rows: Option::Some(32) };
+let limits: SqliteLimits = { max_rows: Some(32) };
 let options: SqliteOpenOptions = {
-    path: Option::Some(":memory:"),
-    mode: Option::Some("memory"),
-    limits: Option::Some(limits)
+    path: Some(":memory:"),
+    mode: Some("memory"),
+    limits: Some(limits)
 };
 let db = sqlite::open(options);
 
@@ -13,8 +13,8 @@ let empty: [SqliteValue] = [];
 sqlite::execute(&db, "CREATE TABLE t (value, payload)", empty);
 let blob_payload = bytes::from_hex("000102");
 let inserted = sqlite::execute(&db, "INSERT INTO t VALUES (?1, ?2)", [
-    { kind: "int", int_value: Option::Some(7) },
-    { kind: "blob", blob_value: Option::Some(blob_payload) }
+    { kind: "int", int_value: Some(7) },
+    { kind: "blob", blob_value: Some(blob_payload) }
 ]);
 let affected = inserted.rows_affected;
 assert(affected == 1);
@@ -27,18 +27,18 @@ let first_value = first.int_value.unwrap_or(-1);
 assert(first_value == 7);
 
 let insert_params: [SqliteValue] = [
-    { kind: "text", text_value: Option::Some("hello") },
+    { kind: "text", text_value: Some("hello") },
     { kind: "null" }
 ];
 let statements: [SqliteStatement] = [
     {
         sql: "INSERT INTO t VALUES (?1, ?2)",
-        params: Option::Some(insert_params)
+        params: Some(insert_params)
     },
     {
         sql: "SELECT value, payload FROM t ORDER BY rowid",
-        query: Option::Some(true),
-        limits: Option::Some(limits)
+        query: Some(true),
+        limits: Some(limits)
     }
 ];
 let results = sqlite::transaction(&db, statements);

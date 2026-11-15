@@ -31,14 +31,14 @@ fn reject(source: &str) -> String {
 fn question_mark_passes_some_payload_and_stops_after_none() {
     let source = r#"
         fn load(flag: bool) -> Option<int> {
-            if flag => { Option::Some(21) } else => { Option::None }
+            if flag => { Some(21) } else => { None }
         }
         fn relay(flag: bool) -> Option<int> {
             let value = load(flag)?;
-            Option::Some(value + 1)
+            Some(value + 1)
         }
-        let present = match relay(true) { Option::Some(v) => v, Option::None => -1 };
-        let absent = match relay(false) { Option::Some(v) => 100, Option::None => 2 };
+        let present = match relay(true) { Some(v) => v, None => -1 };
+        let absent = match relay(false) { Some(v) => 100, None => 2 };
         present + absent;
     "#;
     // Some(21) continues as 22; None exits only this Option-returning function.
@@ -53,16 +53,16 @@ fn none_stops_later_arguments_and_side_effects() {
             let mut continuation = [0];
             let step: fn() -> Option<int> = || if flag => {
                 step_calls[0] = step_calls[0].copy() + 1;
-                Option::Some(1)
-            } else => { Option::None };
+                Some(1)
+            } else => { None };
             let first = step()?;
             continuation[0] = continuation[0].copy() + 10;
             let second = step()?;
             continuation[0] = continuation[0].copy() + 100;
-            Option::Some(first + second + continuation[0].copy() + step_calls[0].copy())
+            Some(first + second + continuation[0].copy() + step_calls[0].copy())
         }
-        let present = match relay(true) { Option::Some(v) => v, Option::None => -1 };
-        let absent = match relay(false) { Option::Some(v) => 100, Option::None => 2 };
+        let present = match relay(true) { Some(v) => v, None => -1 };
+        let absent = match relay(false) { Some(v) => 100, None => 2 };
         present + absent;
     "#;
     // Present: 1 + 1 + 110 + 2 = 114; absent exits before any continuation.
@@ -74,17 +74,17 @@ fn none_in_a_closure_returns_only_from_that_closure() {
     let source = r#"
         let mut calls = [0];
         let inner: fn() -> Option<int> = || if true => {
-            let absent: Option<int> = Option::None;
+            let absent: Option<int> = None;
             let value = absent?;
             calls[0] = calls[0].copy() + 100;
-            Option::Some(value)
-        } else => { Option::None };
+            Some(value)
+        } else => { None };
         let outer: fn() -> Option<int> = || if true => {
             let inside = inner();
             calls[0] = calls[0].copy() + 1;
             inside
-        } else => { Option::None };
-        let observed = match outer() { Option::Some(v) => v, Option::None => -1 };
+        } else => { None };
+        let observed = match outer() { Some(v) => v, None => -1 };
         observed + calls[0].copy();
     "#;
     // The caller continues after the inner closure's None: -1 + 1 == 0.
@@ -95,18 +95,18 @@ fn none_in_a_closure_returns_only_from_that_closure() {
 fn question_mark_covers_named_functions_aliases_and_finite_recursion() {
     let source = r#"
         fn countdown(value: int) -> Option<int> {
-            if value <= 0 => { Option::Some(0) }
+            if value <= 0 => { Some(0) }
             else => {
                 let next = countdown(value - 1)?;
-                Option::Some(next + 1)
+                Some(next + 1)
             }
         }
         fn relay(value: int) -> Option<int> {
             let alias = countdown;
             let forwarded = alias(value)?;
-            Option::Some(forwarded + 1)
+            Some(forwarded + 1)
         }
-        match relay(4) { Option::Some(v) => v, Option::None => -1 };
+        match relay(4) { Some(v) => v, None => -1 };
     "#;
     // Four recursive steps plus the relay increment.
     assert_eq!(eval(source), Value::Int(5));
@@ -116,11 +116,11 @@ fn question_mark_covers_named_functions_aliases_and_finite_recursion() {
 fn option_try_accepts_a_wider_option_return_payload() {
     let source = r#"
         fn widen() -> Option<string> {
-            let absent: Option<int> = Option::None;
+            let absent: Option<int> = None;
             let value = absent?;
-            Option::Some("done")
+            Some("done")
         }
-        match widen() { Option::Some(v) => 4, Option::None => 7 };
+        match widen() { Some(v) => 4, None => 7 };
     "#;
     // None carries no payload, so the enclosing Option<String> receives None.
     assert_eq!(eval(source), Value::Int(7));
@@ -130,7 +130,7 @@ fn option_try_accepts_a_wider_option_return_payload() {
 fn explicit_ok_or_and_ok_or_else_convert_before_result_propagation() {
     let source = r#"
         fn load(flag: bool) -> Option<int> {
-            if flag => { Option::Some(4) } else => { Option::None }
+            if flag => { Some(4) } else => { None }
         }
         fn runtime_error() -> string { "missing" }
         fn relay(flag: bool) -> Result<int, string> {
@@ -154,10 +154,10 @@ fn explicit_result_ok_converts_before_option_propagation() {
         }
         fn relay(flag: bool) -> Option<int> {
             let value = load(flag).ok()?;
-            Option::Some(value + 1)
+            Some(value + 1)
         }
-        let present = match relay(true) { Option::Some(v) => v, Option::None => -1 };
-        let absent = match relay(false) { Option::Some(v) => 100, Option::None => 5 };
+        let present = match relay(true) { Some(v) => v, None => -1 };
+        let absent = match relay(false) { Some(v) => 100, None => 5 };
         present + absent;
     "#;
     // Ok(3) -> Some(4); Err -> None.
@@ -183,7 +183,7 @@ fn mixed_option_and_result_propagation_without_conversion_is_rejected() {
     let diagnostic = reject(
         r#"
         fn bad() -> Result<int, string> {
-            let value: Option<int> = Option::None;
+            let value: Option<int> = None;
             let unwrapped = value?;
             Result::Ok(unwrapped)
         }
@@ -199,7 +199,7 @@ fn mixed_option_and_result_propagation_without_conversion_is_rejected() {
         fn bad() -> Option<int> {
             let value: Result<int, string> = Result::Err("bad");
             let unwrapped = value?;
-            Option::Some(unwrapped)
+            Some(unwrapped)
         }
         bad();
     "#,
@@ -215,7 +215,7 @@ fn question_mark_outside_option_or_result_context_reports_the_owner() {
     let diagnostic = reject(
         r#"
         fn plain() -> int {
-            let value: Option<int> = Option::None;
+            let value: Option<int> = None;
             let unwrapped = value?;
             unwrapped
         }
@@ -232,12 +232,12 @@ fn question_mark_outside_option_or_result_context_reports_the_owner() {
 fn unwrap_returns_the_nested_payload_not_an_outer_option() {
     let source = r#"
         fn relay() -> Option<int> {
-            let nested: Option<Option<int>> = Option::Some(Option::None);
-            let inner = nested.unwrap_or(Option::None);
+            let nested: Option<Option<int>> = Some(None);
+            let inner = nested.unwrap_or(None);
             let value = inner?;
-            Option::Some(value + 1)
+            Some(value + 1)
         }
-        match relay() { Option::Some(v) => 8, Option::None => 9 };
+        match relay() { Some(v) => 8, None => 9 };
     "#;
     assert_eq!(eval(source), Value::Int(9));
 }
@@ -248,13 +248,13 @@ fn unwrap_returns_the_nested_payload_not_an_outer_option() {
 fn option_methods_and_projection_execute_from_loaded_vmbc() {
     let source = r#"
         struct Entry { note: Option<int> }
-        let entry: Entry = { note: Option::Some(4) };
-        let mapped = entry?.note.unwrap_or(Option::None);
+        let entry: Entry = { note: Some(4) };
+        let mapped = entry?.note.unwrap_or(None);
         let converted = mapped.ok_or("missing").map_err(|error| error.length);
         let recovered = match converted { Result::Ok(value) => value, Result::Err(length) => length };
-        let absent: Option<int> = Option::None;
-        let fallback = absent.or_else(|| Option::Some(3));
-        let final_value = match fallback { Option::Some(value) => value, Option::None => -1 };
+        let absent: Option<int> = None;
+        let fallback = absent.or_else(|| Some(3));
+        let final_value = match fallback { Some(value) => value, None => -1 };
         recovered + final_value;
     "#;
     let compiled = compile_source(source).expect("loaded-VMBC Option source should compile");
@@ -270,33 +270,33 @@ fn option_methods_and_projection_execute_from_loaded_vmbc() {
 fn optional_projection_preserves_none_some_none_and_some_some() {
     let source = r#"
         struct Entry { name: string, note: Option<int> }
-        let present: Entry = { name: "first", note: Option::Some(0) };
-        let explicit_none: Entry = { name: "second", note: Option::None };
+        let present: Entry = { name: "first", note: Some(0) };
+        let explicit_none: Entry = { name: "second", note: None };
         let omitted: Entry = { name: "third" };
 
         let projected_some = present?.note;
         let a = match projected_some {
-            Option::Some(inner) => match inner {
-                Option::Some(value) => value + 10,
-                Option::None => 11,
+            Some(inner) => match inner {
+                Some(value) => value + 10,
+                None => 11,
             },
-            Option::None => 12,
+            None => 12,
         };
         let projected_none = explicit_none?.note;
         let b = match projected_none {
-            Option::Some(inner) => match inner {
-                Option::Some(value) => 100,
-                Option::None => 13,
+            Some(inner) => match inner {
+                Some(value) => 100,
+                None => 13,
             },
-            Option::None => 14,
+            None => 14,
         };
         let projected_missing = omitted?.note;
         let c = match projected_missing {
-            Option::Some(inner) => match inner {
-                Option::Some(value) => 200,
-                Option::None => 15,
+            Some(inner) => match inner {
+                Some(value) => 200,
+                None => 15,
             },
-            Option::None => 16,
+            None => 16,
         };
         a + b + c;
     "#;
@@ -311,7 +311,7 @@ fn omitted_option_field_direct_access_observes_explicit_none() {
         struct Entry { name: string, note: Option<int> }
         let entry: Entry = { name: "x" };
         let note = entry.note;
-        match note { Option::Some(value) => value, Option::None => 7 };
+        match note { Some(value) => value, None => 7 };
     "#;
     assert_eq!(eval(source), Value::Int(7));
 }
@@ -319,19 +319,19 @@ fn omitted_option_field_direct_access_observes_explicit_none() {
 #[test]
 fn optional_projection_distinguishes_absent_dynamic_key_from_present_none() {
     let source = r#"
-        let values: map<Option<int>> = { inner: Option::None, some: Option::Some(3) };
+        let values: map<Option<int>> = { inner: None, some: Some(3) };
         let present_none = values?.["inner"];
         let present_some = values?.["some"];
         let absent = values?.["absent"];
         let a = match present_none {
-            Option::Some(inner) => match inner { Option::Some(v) => 100, Option::None => 1 },
-            Option::None => 1000,
+            Some(inner) => match inner { Some(v) => 100, None => 1 },
+            None => 1000,
         };
         let b = match present_some {
-            Option::Some(inner) => match inner { Option::Some(v) => v, Option::None => 200 },
-            Option::None => 300,
+            Some(inner) => match inner { Some(v) => v, None => 200 },
+            None => 300,
         };
-        let c = match absent { Option::Some(inner) => 400, Option::None => 10 };
+        let c = match absent { Some(inner) => 400, None => 10 };
         a + b + c;
     "#;
     // present None = 1, present Some(3) = 3, absent = None -> 10.
@@ -344,12 +344,12 @@ fn optional_projection_of_unit_and_out_of_range_indexes_stays_typed() {
         struct UnitEntry { value: () }
         let units: UnitEntry = { value: () };
         let projected_unit = units?.value;
-        let unit_state = match projected_unit { Option::Some(value) => 1, Option::None => 2 };
+        let unit_state = match projected_unit { Some(value) => 1, None => 2 };
         let text: string = "ab";
         let outside = text?.[10];
-        let outside_state = match outside { Option::Some(value) => 100, Option::None => 3 };
+        let outside_state = match outside { Some(value) => 100, None => 3 };
         let inside = text?.[1];
-        let inside_state = match inside { Option::Some(value) => if value == "b" => { 4 } else => { 5 }, Option::None => 6 };
+        let inside_state = match inside { Some(value) => if value == "b" => { 4 } else => { 5 }, None => 6 };
         unit_state + outside_state + inside_state;
     "#;
     // Unit payload is Some(Unit), an out-of-range index is None, and a valid
@@ -361,15 +361,15 @@ fn optional_projection_of_unit_and_out_of_range_indexes_stays_typed() {
 fn optional_receiver_and_then_projects_one_layer_without_flattening_payload_options() {
     let source = r#"
         struct Entry { note: Option<int> }
-        let some_entry: Option<Entry> = Option::Some({ note: Option::Some(7) });
-        let none_entry: Option<Entry> = Option::None;
+        let some_entry: Option<Entry> = Some({ note: Some(7) });
+        let none_entry: Option<Entry> = None;
         let from_some = some_entry?.note;
         let from_none = none_entry?.note;
         let a = match from_some {
-            Option::Some(inner) => match inner { Option::Some(v) => v, Option::None => -1 },
-            Option::None => -2,
+            Some(inner) => match inner { Some(v) => v, None => -1 },
+            None => -2,
         };
-        let b = match from_none { Option::Some(inner) => 100, Option::None => 3 };
+        let b = match from_none { Some(inner) => 100, None => 3 };
         a + b;
     "#;
     // Some(Entry) projects its child without an extra outer layer; None
@@ -381,7 +381,7 @@ fn optional_receiver_and_then_projects_one_layer_without_flattening_payload_opti
 fn optional_projection_keeps_struct_required_field_checks() {
     let diagnostic = match compile_source(
         r#"struct Entry { name: string, note: Option<int> }
-let entry: Entry = { note: Option::None };
+let entry: Entry = { note: None };
 entry?.name;"#,
     ) {
         Ok(_) => panic!("missing required field must still reject"),
@@ -399,7 +399,7 @@ fn optional_projection_does_not_implicitly_convert_option_and_result() {
         r#"fn out() -> Option<int> {
 let value: Result<int, string> = Result::Ok(1);
 let projected = value?;
-Option::Some(projected)
+Some(projected)
 }
 out();"#,
     ) {
@@ -420,8 +420,8 @@ fn typed_construction_generic_named_omitted_option_field_materializes() {
             let item: Box<int> = {};
             let observed = item.value;
             match observed {
-                Option::Some(value) => value,
-                Option::None => 7,
+                Some(value) => value,
+                None => 7,
             }
         }
         probe();
@@ -451,11 +451,11 @@ fn typed_construction_materialized_generic_field_projects_as_some_none() {
         let item: Box<int> = {};
         let projected = item?.value;
         match projected {
-            Option::Some(inner) => match inner {
-                Option::Some(value) => value,
-                Option::None => 7,
+            Some(inner) => match inner {
+                Some(value) => value,
+                None => 7,
             },
-            Option::None => 100,
+            None => 100,
         };
     "#;
     assert_eq!(eval(source), Value::Int(7));
@@ -467,8 +467,8 @@ fn typed_construction_function_argument_omitted_option_field_materializes() {
         struct Entry { name: string, note: Option<int> }
         fn take(entry: Entry) -> int {
             match entry.note {
-                Option::Some(value) => value,
-                Option::None => 7,
+                Some(value) => value,
+                None => 7,
             }
         }
         take({ name: "x" });
@@ -480,11 +480,11 @@ fn typed_construction_function_argument_omitted_option_field_materializes() {
 fn typed_construction_assignment_omitted_option_field_materializes() {
     let source = r#"
         struct Entry { name: string, note: Option<int> }
-        let mut entry: Entry = { name: "first", note: Option::Some(3) };
+        let mut entry: Entry = { name: "first", note: Some(3) };
         entry = { name: "second" };
         match entry.note {
-            Option::Some(value) => value,
-            Option::None => 7,
+            Some(value) => value,
+            None => 7,
         };
     "#;
     assert_eq!(eval(source), Value::Int(7));
@@ -497,8 +497,8 @@ fn typed_construction_nested_record_field_materializes() {
         struct Outer { name: string, inner: Inner }
         let outer: Outer = { name: "x", inner: {} };
         match outer.inner.note {
-            Option::Some(value) => value,
-            Option::None => 7,
+            Some(value) => value,
+            None => 7,
         };
     "#;
     assert_eq!(eval(source), Value::Int(7));
@@ -508,27 +508,27 @@ fn typed_construction_nested_record_field_materializes() {
 fn typed_construction_option_and_result_payloads_materialize() {
     let source = r#"
         struct Entry { name: string, note: Option<int> }
-        let maybe: Option<Entry> = Option::Some({ name: "some" });
+        let maybe: Option<Entry> = Some({ name: "some" });
         let ok: Result<Entry, string> = Result::Ok({ name: "ok" });
         let err: Result<string, Entry> = Result::Err({ name: "err" });
         let a = match maybe {
-            Option::Some(entry) => match entry.note {
-                Option::Some(value) => value,
-                Option::None => 7,
+            Some(entry) => match entry.note {
+                Some(value) => value,
+                None => 7,
             },
-            Option::None => 100,
+            None => 100,
         };
         let b = match ok {
             Result::Ok(entry) => match entry.note {
-                Option::Some(value) => value,
-                Option::None => 7,
+                Some(value) => value,
+                None => 7,
             },
             Result::Err(_) => 200,
         };
         let c = match err {
             Result::Err(entry) => match entry.note {
-                Option::Some(value) => value,
-                Option::None => 7,
+                Some(value) => value,
+                None => 7,
             },
             Result::Ok(_) => 300,
         };
@@ -543,8 +543,8 @@ fn typed_construction_local_callable_argument_materializes() {
         struct Entry { name: string, note: Option<int> }
         fn take(entry: Entry) -> int {
             match entry.note {
-                Option::Some(value) => value,
-                Option::None => 7,
+                Some(value) => value,
+                None => 7,
             }
         }
         let callable: fn(Entry) -> int = take;
@@ -560,12 +560,12 @@ fn typed_construction_array_and_tuple_elements_materialize() {
         let entries: [Entry] = [{ name: "array" }];
         let pair: [int, Entry] = [1, { name: "tuple" }];
         let from_array = match entries[0].note {
-            Option::Some(value) => value,
-            Option::None => 7,
+            Some(value) => value,
+            None => 7,
         };
         let from_tuple = match pair[1].note {
-            Option::Some(value) => value,
-            Option::None => 7,
+            Some(value) => value,
+            None => 7,
         };
         from_array + from_tuple;
     "#;
@@ -581,13 +581,13 @@ fn typed_construction_return_branch_and_closure_tails_materialize() {
         }
         let direct = make(true);
         let state_a = match direct.note {
-            Option::Some(value) => value,
-            Option::None => 7,
+            Some(value) => value,
+            None => 7,
         };
         let make_closure: fn() -> Entry = || if true => { { name: "closure" } } else => { { name: "other" } };
         let state_b = match make_closure().note {
-            Option::Some(value) => value,
-            Option::None => 7,
+            Some(value) => value,
+            None => 7,
         };
         state_a + state_b;
     "#;
@@ -604,10 +604,10 @@ fn typed_construction_required_field_and_wrong_option_payload_still_reject() {
         "generic required-field check must remain: {required}"
     );
     let wrong = reject(
-        r#"struct Box<T> { value: Option<T> } let item: Box<int> = { value: Option::Some("text") }; item.value;"#,
+        r#"struct Box<T> { value: Option<T> } let item: Box<int> = { value: Some("text") }; item.value;"#,
     );
     assert!(
-        wrong.contains("Option::Some payload"),
+        wrong.contains("Some payload"),
         "wrong generic Option payload must reject at that obligation: {wrong}"
     );
 }
@@ -628,9 +628,9 @@ fn named_function_capture_counter_matches_plain_int_baseline() {
 fn option_some_from_captured_int_matches_plain_capture_counter() {
     let source = r#"
         let mut n = 0;
-        fn next() -> Option<int> { n = n + 1; Option::Some(n) }
-        let first = match next() { Option::Some(v) => v, Option::None => -1 };
-        let second = match next() { Option::Some(v) => v, Option::None => -1 };
+        fn next() -> Option<int> { n = n + 1; Some(n) }
+        let first = match next() { Some(v) => v, None => -1 };
+        let second = match next() { Some(v) => v, None => -1 };
         first * 10 + second;
     "#;
     assert_eq!(eval(source), Value::Int(12));
@@ -642,11 +642,11 @@ fn option_some_from_captured_string_keeps_source_identity() {
         let mut label = "a";
         fn next() -> Option<string> {
             label = label + "b";
-            Option::Some(label)
+            Some(label)
         }
         let flag = match next() {
-            Option::Some(v) => if v == "ab" => { 1 } else => { 0 },
-            Option::None => -1,
+            Some(v) => if v == "ab" => { 1 } else => { 0 },
+            None => -1,
         };
         flag;
     "#;
@@ -657,10 +657,10 @@ fn option_some_from_captured_string_keeps_source_identity() {
 fn option_some_capture_keeps_param_and_root_slots_distinct() {
     let source = r#"
         let mut n = 1;
-        fn from_param(n: int) -> Option<int> { Option::Some(n) }
-        fn from_capture() -> Option<int> { Option::Some(n) }
-        let param_value = match from_param(9) { Option::Some(v) => v, Option::None => -1 };
-        let captured = match from_capture() { Option::Some(v) => v, Option::None => -1 };
+        fn from_param(n: int) -> Option<int> { Some(n) }
+        fn from_capture() -> Option<int> { Some(n) }
+        let param_value = match from_param(9) { Some(v) => v, None => -1 };
+        let captured = match from_capture() { Some(v) => v, None => -1 };
         param_value * 10 + captured;
     "#;
     assert_eq!(eval(source), Value::Int(91));
@@ -671,9 +671,9 @@ fn nested_function_option_some_uses_enclosing_capture_schema() {
     let source = r#"
         fn outer() -> int {
             let mut n = 0;
-            fn next() -> Option<int> { n = n + 1; Option::Some(n) }
-            let first = match next() { Option::Some(v) => v, Option::None => -1 };
-            let second = match next() { Option::Some(v) => v, Option::None => -1 };
+            fn next() -> Option<int> { n = n + 1; Some(n) }
+            let first = match next() { Some(v) => v, None => -1 };
+            let second = match next() { Some(v) => v, None => -1 };
             first * 10 + second
         }
         outer();
@@ -686,9 +686,9 @@ fn captured_option_constructor_in_method_position_uses_capture_schema() {
     let source = r#"
         let base = 1;
         fn next() -> Option<int> {
-            Option::Some(base).map(|v| v + 1)
+            Some(base).map(|v| v + 1)
         }
-        match next() { Option::Some(v) => v, Option::None => -1 };
+        match next() { Some(v) => v, None => -1 };
     "#;
     assert_eq!(eval(source), Value::Int(2));
 }
@@ -697,11 +697,11 @@ fn captured_option_constructor_in_method_position_uses_capture_schema() {
 fn captured_record_schema_materializes_omitted_option_field_in_assignment() {
     let source = r#"
         struct Record { value: Option<int> }
-        let seed: Record = {value: Option::None};
+        let seed: Record = {value: None};
         fn build() -> int {
             let mut target = seed;
             target = {};
-            match target.value { Option::Some(v) => v, Option::None => 0 }
+            match target.value { Some(v) => v, None => 0 }
         }
         build();
     "#;
@@ -713,12 +713,12 @@ fn nested_owner_local_captured_record_materializes_omitted_option_field() {
     let source = r#"
         struct Record { value: Option<int> }
         fn outer() -> int {
-            let mut seed: Record = { value: Option::Some(7) };
+            let mut seed: Record = { value: Some(7) };
             fn clear() -> int {
                 seed = {};
                 match seed.value {
-                    Option::None => 0,
-                    Option::Some(n) => n
+                    None => 0,
+                    Some(n) => n
                 }
             }
             clear()
