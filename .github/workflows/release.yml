@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '[0-9]*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target
+
+jobs:
+  pd-vm-cli:
+    name: pd-vm CLI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Release builds every platform. The JIT path filter in ci.yml is a
+        # test-speed optimization only and must never decide release contents.
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+      - name: Build pd-vm CLI
+        run: cargo build -p pd-vm --bin pd-vm-run --release
+      - name: Stage pd-vm CLI artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          suffix=""
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then suffix=".exe"; fi
+          cp "target/release/pd-vm-run${suffix}" "dist/pd-vm-run-${RUNNER_OS}-${RUNNER_ARCH}${suffix}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pd-vm-cli-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*
+
+  vscode-extension:
+    name: VS Code extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - name: Check the runtime for wasm32
+        run: cargo check -p pd-vm-wasm --target wasm32-unknown-unknown --features runtime
+      - name: Build language service wasm
+        run: cargo build -p pd-vm-wasm --target wasm32-unknown-unknown --release
+      - name: Stage language service wasm
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p vscode-rustscript/wasm
+          cp target/wasm32-unknown-unknown/release/pd_vm_wasm.wasm vscode-rustscript/wasm/pd_vm_wasm.wasm
+      - name: Package VS Code extension
+        working-directory: vscode-rustscript
+        run: |
+          mkdir -p dist
+          npx --yes @vscode/vsce package --out dist/rustscript-vscode.vsix
+      - name: Verify VS Code grammar registration
+        run: python3 scripts/verify_vscode_extension.py --vsix vscode-rustscript/dist/rustscript-vscode.vsix
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rustscript-vscode-extension
+          path: vscode-rustscript/dist/*.vsix
+
+  publish:
+    name: Publish release
+    needs:
+      - pd-vm-cli
+      - vscode-extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*)
+          if (( ${#assets[@]} == 0 )); then
+            echo "no release assets were downloaded" >&2
+            exit 1
+          fi
+          printf 'Release assets:\n'
+          printf '  %s\n' "${assets[@]#dist/}"
+
+          # Artifact transport can drop the executable bit on Unix binaries.
+          for binary in dist/pd-vm-run-Linux-* dist/pd-vm-run-macOS-*; do
+            if [[ -f "$binary" ]]; then
+              chmod +x "$binary"
+            fi
+          done
+
+          if gh release view "$TAG" --json isDraft >/dev/null 2>&1; then
+            is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft')
+            if [[ "$is_draft" != "true" ]]; then
+              # Published releases are immutable. A rerun is only safe when
+              # every asset from this build is already attached.
+              existing=$(mktemp)
+              gh release view "$TAG" --json assets --jq '.assets[].name' > "$existing"
+              missing=0
+              for asset in "${assets[@]}"; do
+                if ! grep -Fxq "$(basename "$asset")" "$existing"; then
+                  missing=1
+                fi
+              done
+              if (( missing == 0 )); then
+                echo "release $TAG is already published with all assets; nothing to do"
+                exit 0
+              fi
+              echo "release $TAG is published but is missing assets; cannot modify an immutable release" >&2
+              exit 1
+            fi
+          else
+            gh release create "$TAG" --draft --generate-notes --title "$TAG"
+          fi
+
+          gh release upload "$TAG" "${assets[@]}" --clobber
+          gh release edit "$TAG" --draft=false --latest
