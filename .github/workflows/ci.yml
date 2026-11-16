@@ -98,22 +98,50 @@ jobs:
         with:
           name: pd-vm-cli-${{ runner.os }}-${{ runner.arch }}
           path: rustscript/dist/*
-      - name: Check release draft state
-        id: pd_vm_release_state
+      - name: Ensure draft release exists
+        id: pd_vm_release
         if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
         run: |
-          if gh release view "${{ github.ref_name }}" --json isDraft --jq '.isDraft' >/tmp/release_is_draft; then
-            echo "is_draft=$(cat /tmp/release_is_draft)" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          # Published releases are immutable, so assets may only be attached
+          # while the release is still a draft. Never publish it from CI, and
+          # tolerate other matrix jobs creating the same draft concurrently.
+          if is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            echo "release $TAG already exists (isDraft=$is_draft)"
+          elif gh release create "$TAG" --draft --generate-notes --title "$TAG"; then
+            is_draft=true
+            echo "created draft release $TAG"
+          elif is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            echo "release $TAG was created concurrently (isDraft=$is_draft)"
           else
-            echo "is_draft=true" >> "$GITHUB_OUTPUT"
+            echo "could not create or find release $TAG" >&2
+            exit 1
           fi
+          if [[ "$is_draft" != "true" ]]; then
+            echo "::warning::release $TAG is already published and immutable; skipping pd-vm CLI asset upload"
+          fi
+          echo "is_draft=$is_draft" >> "$GITHUB_OUTPUT"
       - name: Upload pd-vm CLI release asset
-        if: startsWith(github.ref, 'refs/tags/') && steps.pd_vm_release_state.outputs.is_draft == 'true'
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
-        with:
-          files: rustscript/dist/*
+        if: startsWith(github.ref, 'refs/tags/') && steps.pd_vm_release.outputs.is_draft == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(rustscript/dist/*)
+          if (( ${#assets[@]} == 0 )); then
+            echo "no pd-vm CLI assets staged in rustscript/dist" >&2
+            exit 1
+          fi
+          gh release upload "$TAG" "${assets[@]}" --clobber
 
   vscode-extension:
     name: VS Code extension
@@ -146,19 +174,46 @@ jobs:
         with:
           name: rustscript-vscode-extension
           path: vscode-rustscript/dist/*.vsix
-      - name: Check VS Code release draft state
-        id: vscode_release_state
+      - name: Ensure draft release exists
+        id: vscode_release
         if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
         run: |
-          if gh release view "${{ github.ref_name }}" --json isDraft --jq '.isDraft' >/tmp/release_is_draft; then
-            echo "is_draft=$(cat /tmp/release_is_draft)" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          # Published releases are immutable, so assets may only be attached
+          # while the release is still a draft. Never publish it from CI.
+          if is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            echo "release $TAG already exists (isDraft=$is_draft)"
+          elif gh release create "$TAG" --draft --generate-notes --title "$TAG"; then
+            is_draft=true
+            echo "created draft release $TAG"
+          elif is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            echo "release $TAG was created concurrently (isDraft=$is_draft)"
           else
-            echo "is_draft=true" >> "$GITHUB_OUTPUT"
+            echo "could not create or find release $TAG" >&2
+            exit 1
           fi
+          if [[ "$is_draft" != "true" ]]; then
+            echo "::warning::release $TAG is already published and immutable; skipping VS Code extension asset upload"
+          fi
+          echo "is_draft=$is_draft" >> "$GITHUB_OUTPUT"
       - name: Upload VS Code extension release asset
-        if: startsWith(github.ref, 'refs/tags/') && steps.vscode_release_state.outputs.is_draft == 'true'
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
-        with:
-          files: vscode-rustscript/dist/*.vsix
+        if: startsWith(github.ref, 'refs/tags/') && steps.vscode_release.outputs.is_draft == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(vscode-rustscript/dist/*.vsix)
+          if (( ${#assets[@]} == 0 )); then
+            echo "no VS Code extension assets staged in vscode-rustscript/dist" >&2
+            exit 1
+          fi
+          gh release upload "$TAG" "${assets[@]}" --clobber
