@@ -8,6 +8,7 @@ use crate::assembler::AssemblerError;
 #[cfg(feature = "runtime")]
 use crate::vm::Vm;
 
+mod assign_declaration;
 pub(crate) mod capture_certification;
 pub use capture_certification::CertifiedCompilation;
 mod codegen;

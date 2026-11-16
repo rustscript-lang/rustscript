@@ -1160,6 +1160,7 @@ fn compile_owned_ir_with_capture_output(
     // value identities, so the classification is strictly more precise on
     // the unallocated IR.
     let callable_use_facts = materialization::classify_named_callables(&parsed);
+    let assign_declarations = super::assign_declaration::capture(&parsed);
     let (parsed, entry_local_types, root_slots) = match local_layout {
         LocalLayoutPolicy::Compact if origins.is_none() => (
             lifetime::allocate_local_slots(parsed).map_err(SourceError::Parse)?,
@@ -1298,6 +1299,7 @@ fn compile_owned_ir_with_capture_output(
     let host_import_signatures = typing::build_host_import_signatures(&functions, &function_impls);
 
     let mut compiler = Compiler::new();
+    compiler.set_assign_declarations(assign_declarations);
     compiler.set_type_inference(type_info);
     compiler.set_typing_mode(typing_mode);
     compiler.set_source(source);
