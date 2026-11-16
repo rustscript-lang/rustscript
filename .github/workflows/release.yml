@@ -111,6 +111,13 @@ jobs:
           printf 'Release assets:\n'
           printf '  %s\n' "${assets[@]#dist/}"
 
+          # Artifact transport can drop the executable bit on Unix binaries.
+          for binary in dist/pd-vm-run-Linux-* dist/pd-vm-run-macOS-*; do
+            if [[ -f "$binary" ]]; then
+              chmod +x "$binary"
+            fi
+          done
+
           if gh release view "$TAG" --json isDraft >/dev/null 2>&1; then
             is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft')
             if [[ "$is_draft" != "true" ]]; then
