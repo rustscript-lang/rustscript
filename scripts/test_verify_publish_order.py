@@ -23,12 +23,13 @@ def workspace(*packages: tuple[str, dict[str, tuple[str, ...]]]) -> dict[str, di
     return result
 
 
-ORDER = ["pd-host-function", "pd-vm", "pd-vm-nostd", "rustscript"]
+ORDER = ["pd-host-schema", "pd-host-function", "pd-vm", "pd-vm-nostd", "rustscript"]
 
 
 class VerifyPublishOrderTests(unittest.TestCase):
     def test_dev_dependency_does_not_constrain_publish_order(self) -> None:
         packages = workspace(
+            ("pd-host-schema", {}),
             ("pd-host-function", {"normal": ("pd-host-schema",), "dev": ("pd-vm",)}),
             ("pd-vm", {}),
             ("pd-vm-nostd", {"normal": ("pd-vm",)}),
@@ -38,6 +39,28 @@ class VerifyPublishOrderTests(unittest.TestCase):
         self.assertEqual(
             verify_publish_order.publish_order_errors(packages, ORDER),
             [],
+        )
+
+    def test_build_dependency_missing_from_order_is_rejected(self) -> None:
+        # 0.31.2 published straight into `failed to select a version for the
+        # requirement pd-host-schema = "^0.1.0"` because the order omitted the
+        # build dependency that the publish tree had to rewrite.
+        packages = workspace(
+            ("pd-host-schema", {}),
+            ("pd-host-function", {"normal": ("pd-host-schema",)}),
+            ("pd-vm", {"build": ("pd-host-schema",)}),
+        )
+
+        errors = verify_publish_order.publish_order_errors(
+            packages,
+            ["pd-host-function", "pd-vm"],
+        )
+
+        self.assertEqual(len(errors), 2)
+        self.assertIn(
+            "pd-vm has a build dependency on workspace package pd-host-schema, "
+            "so pd-host-schema must be published first",
+            errors,
         )
 
     def test_normal_dependency_must_be_published_first(self) -> None:

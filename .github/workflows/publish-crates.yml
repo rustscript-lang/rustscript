@@ -33,7 +33,7 @@ jobs:
     permissions:
       contents: read
     env:
-      PACKAGE_ORDER: pd-host-function pd-vm pd-vm-nostd rustscript
+      PACKAGE_ORDER: pd-host-schema pd-host-function pd-vm pd-vm-nostd rustscript
     steps:
       - name: Checkout rustscript
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5

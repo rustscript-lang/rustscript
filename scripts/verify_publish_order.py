@@ -49,6 +49,12 @@ def publish_order_errors(packages: dict[str, dict], order: list[str]) -> list[st
                 continue
             dependency_name = dependency["name"]
             if dependency_name not in positions:
+                if dependency_name in packages:
+                    errors.append(
+                        f"{package_name} has a {kind} dependency on workspace "
+                        f"package {dependency_name}, so {dependency_name} must be "
+                        "published first"
+                    )
                 continue
             if positions[dependency_name] > positions[package_name]:
                 errors.append(
