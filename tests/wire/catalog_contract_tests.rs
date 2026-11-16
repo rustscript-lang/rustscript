@@ -34,7 +34,8 @@ const SQLITE_RESERVED_TOP_END: u16 = u16::MAX;
 
 /// Reserved sentinel gap inside the special-call block (see the catalog docs
 /// and `core.rs::internal_builtins_have_unique_reserved_call_indices`).
-const RESERVED_GAP_START: u16 = 0xFF90;
+/// `0xFF90` is owned by `__checked_int_from_number`.
+const RESERVED_GAP_START: u16 = 0xFF91;
 const RESERVED_GAP_END: u16 = 0xFF92;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,7 +197,7 @@ fn static_builtin_ids_are_frozen() {
     }
 
     // Reserved sentinel ranges stay empty: the extension block (future
-    // builtins and host imports) and the 0xFF90..=0xFF92 gap.
+    // builtins and host imports) and the 0xFF91..=0xFF92 gap.
     for entry in &entries {
         assert!(
             entry.id > EXTENSION_BLOCK_END,
@@ -426,5 +427,39 @@ fn appending_or_reordering_catalog_entries_does_not_renumber_existing_ids() {
                 entry.source_name
             );
         }
+    }
+}
+
+/// The checked Number-to-Int internal builtin owns the sentinel-adjacent
+/// 0xFF90 slot with one explicit catalog ID: source name, Rust variant, class,
+/// generated enum name, and reverse lookup all agree, and the remaining
+/// sentinel slots stay free.
+#[test]
+fn checked_int_from_number_owns_explicit_sentinel_adjacent_id() {
+    let entries = parse_catalog(&catalog_source());
+    let entry = entries
+        .iter()
+        .find(|entry| entry.id == 0xFF90)
+        .expect("0xFF90 must be assigned to the checked number-to-int builtin");
+    assert_eq!(entry.source_name, "__checked_int_from_number");
+    assert_eq!(entry.variant, "CheckedIntFromNumber");
+    assert_eq!(entry.class, "Internal");
+    assert_eq!(entry.feature_gate, "none");
+
+    // Internal names remain unavailable through the guest-facing source lookup.
+    assert_eq!(builtin_call_index("__checked_int_from_number"), None);
+    assert_eq!(
+        BUILTIN_CATALOG
+            .iter()
+            .find(|builtin| builtin.call_index() == 0xFF90)
+            .map(|builtin| builtin.name()),
+        Some("__checked_int_from_number")
+    );
+
+    for reserved in [RESERVED_GAP_START, RESERVED_GAP_END] {
+        assert!(
+            entries.iter().all(|entry| entry.id != reserved),
+            "sentinel slot 0x{reserved:04X} must stay unassigned"
+        );
     }
 }

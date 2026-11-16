@@ -207,6 +207,9 @@ pub(crate) fn execute_builtin_call(
             .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
         BuiltinFunction::FormatTemplate => core::builtin_format_template(args)
             .map(IntoBuiltinCallOutcome::into_builtin_call_outcome),
+        BuiltinFunction::CheckedIntFromNumber => {
+            core::builtin_checked_int_from_number(args).map(BuiltinCallOutcome::Return)
+        }
         BuiltinFunction::ToString => {
             core::builtin_to_string(args).map(IntoBuiltinCallOutcome::into_builtin_call_outcome)
         }
@@ -250,6 +253,41 @@ mod tests {
             }
             BuiltinCallOutcome::Pending(op_id) => {
                 panic!("assert should not yield pending host op {op_id}")
+            }
+        }
+    }
+
+    #[test]
+    fn checked_int_from_number_preserves_large_int_input() {
+        let builtin = BuiltinFunction::from_call_index(0xFF90)
+            .expect("checked number-to-int builtin must exist at call index 0xFF90");
+        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        // 2^53 + 1 is not exactly representable as an f64, so any f64 round trip
+        // would round it to 2^53 and lose the low bit.
+        let expected = Value::Int((1_i64 << 53) + 1);
+        let mut args = [expected.clone()];
+
+        let outcome = execute_builtin_call(&mut vm, builtin, &mut args)
+            .expect("checked number-to-int should accept a tagged Int");
+
+        match outcome {
+            BuiltinCallOutcome::Return(values) => {
+                let returned = values.as_slice();
+                assert_eq!(
+                    returned.len(),
+                    1,
+                    "checked number-to-int must return exactly one value"
+                );
+                assert_eq!(
+                    returned[0], expected,
+                    "checked number-to-int must preserve the tagged Int without an f64 round trip"
+                );
+            }
+            BuiltinCallOutcome::Halt => {
+                panic!("checked number-to-int should not halt builtin execution");
+            }
+            BuiltinCallOutcome::Pending(op_id) => {
+                panic!("checked number-to-int should not yield pending host op {op_id}");
             }
         }
     }

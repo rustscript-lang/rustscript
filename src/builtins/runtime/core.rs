@@ -2,7 +2,7 @@ use super::typed::{
     VmArrayHandle, VmArrayRef, VmBytesHandle, VmBytesRef, VmMapHandle, VmMapRef, VmStringRef,
     VmValueOwned, VmValueRef, take_arg,
 };
-use super::{AnyValue, UnknownValue, VmArray, VmBytes, VmMap, arg, return_one};
+use super::{AnyValue, NumberValue, UnknownValue, VmArray, VmBytes, VmMap, arg, return_one};
 use crate::bytecode::{SharedArray, SharedMap};
 use crate::vm::{CallReturn, Value, VmError, VmResult};
 use pd_host_function::pd_host_function;
@@ -20,6 +20,48 @@ fn builtin_bind_callable_metadata(_prototype_id: i64, captures: VmArrayRef<'_>) 
 #[allow(dead_code)]
 #[pd_host_function(name = "__detach_local")]
 fn builtin_detach_local_metadata(_slot: i64) {}
+
+/// Convert a generic number into a checked signed integer.
+///
+/// Metadata-only: no other runtime builtin dispatches through this adapter.
+#[allow(dead_code)]
+#[pd_host_function(name = "__checked_int_from_number")]
+fn builtin_checked_int_from_number_metadata(number: NumberValue) -> VmResult<i64> {
+    checked_number_to_int(number)
+}
+
+/// Convert a VM number into a signed integer without an `f64` round trip.
+///
+/// A tagged `Int` is already the exact value, so it is returned unchanged.
+/// A `Float` is accepted only when it is finite, inside the half-open
+/// `[-2^63, 2^63)` range, and exactly representable as an `i64`. Any other
+/// float fails with the same host-error payload as a failed `assert`.
+fn checked_number_to_int(number: NumberValue) -> VmResult<i64> {
+    match number {
+        NumberValue::Int(value) => Ok(value),
+        NumberValue::Float(value) => {
+            // `i64::MAX as f64` rounds up to exactly 2^63, one past the largest
+            // representable integer, so the accepted upper bound is strict.
+            if !value.is_finite() || value < i64::MIN as f64 || value >= i64::MAX as f64 {
+                return Err(checked_int_assertion_failure());
+            }
+            let converted = value as i64;
+            if converted as f64 != value {
+                return Err(checked_int_assertion_failure());
+            }
+            Ok(converted)
+        }
+    }
+}
+
+fn checked_int_assertion_failure() -> VmError {
+    VmError::HostError("assertion failed".to_string())
+}
+
+pub(super) fn builtin_checked_int_from_number(args: &[Value]) -> VmResult<CallReturn> {
+    let number = arg::<NumberValue>(args, 0, "number")?;
+    checked_number_to_int(number).map(return_one)
+}
 
 /// Return the length of a string, array, or map.
 #[pd_host_function(name = "len")]
@@ -980,6 +1022,7 @@ pub(super) fn core_host_module() -> super::host_modules::StandardHostModule {
     const OWNED: &[fn() -> crate::host_extension::HostFunctionDescriptor] = &[
         builtin_bind_callable_metadata_descriptor,
         builtin_detach_local_metadata_descriptor,
+        builtin_checked_int_from_number_metadata_descriptor,
         builtin_len_string_descriptor,
         builtin_len_array_descriptor,
         builtin_len_bytes_descriptor,
@@ -1031,11 +1074,14 @@ pub(super) fn core_host_module() -> super::host_modules::StandardHostModule {
 mod tests {
     use super::*;
     use crate::builtins::BuiltinFunction;
+    use crate::vm::Vm;
+    use crate::{BytecodeBuilder, OpCode, Program};
     use std::sync::Arc;
 
     #[test]
     fn internal_builtins_have_unique_reserved_call_indices() {
         let reserved = [
+            (BuiltinFunction::CheckedIntFromNumber, 0xFF90),
             (BuiltinFunction::MapIterInit, 0xFF99),
             (BuiltinFunction::MapIterNext, 0xFF98),
             (BuiltinFunction::MapIterTakeKey, 0xFF97),
@@ -1049,7 +1095,11 @@ mod tests {
             assert_eq!(builtin.call_index(), index);
             assert_eq!(BuiltinFunction::from_call_index(index), Some(builtin));
         }
-        for name in ["__bind_callable", "__detach_local"] {
+        for name in [
+            "__bind_callable",
+            "__detach_local",
+            "__checked_int_from_number",
+        ] {
             assert!(
                 !crate::builtins::language_builtin_specs()
                     .iter()
@@ -1057,7 +1107,7 @@ mod tests {
                 "internal callable metadata operation must not be language-visible: {name}"
             );
         }
-        for reserved_index in 0xFF90..=0xFF92 {
+        for reserved_index in 0xFF91..=0xFF92 {
             assert_eq!(BuiltinFunction::from_call_index(reserved_index), None);
         }
     }
@@ -1235,5 +1285,175 @@ mod tests {
             panic!("expected int result");
         };
         assert_eq!(*map_count, 2);
+    }
+
+    fn assert_assertion_failure(error: &VmError) {
+        assert!(
+            matches!(error, VmError::HostError(message) if message == "assertion failed"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn checked_int_from_number_preserves_all_tagged_int_inputs() {
+        for expected in [
+            i64::MIN,
+            i64::MAX,
+            9_007_199_254_740_993, // 2^53 + 1, not exactly representable as f64
+            0,
+            65_536,
+        ] {
+            assert_eq!(
+                checked_number_to_int(NumberValue::Int(expected)).expect("tagged Int must pass"),
+                expected,
+                "tagged Int {expected} must be preserved without an f64 round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_int_from_number_accepts_exact_finite_floats() {
+        let lower = i64::MIN as f64;
+        let upper = i64::MAX as f64;
+        let largest_below_upper = f64::from_bits(upper.to_bits() - 1);
+        for (input, expected) in [(0.0, 0), (-0.0, 0), (-1.0, -1), (lower, i64::MIN)] {
+            assert_eq!(
+                checked_number_to_int(NumberValue::Float(input))
+                    .expect("exact finite float must pass"),
+                expected,
+                "float {input} must convert exactly"
+            );
+        }
+        assert_eq!(
+            checked_number_to_int(NumberValue::Float(largest_below_upper))
+                .expect("largest f64 below 2^63 must pass"),
+            largest_below_upper as i64
+        );
+    }
+
+    #[test]
+    fn checked_int_from_number_rejects_non_finite_and_out_of_range_floats() {
+        let upper = i64::MAX as f64; // rounds up to 2^63, one past i64::MAX
+        let lower = i64::MIN as f64; // -2^63, exactly representable
+        let below_lower = f64::from_bits(lower.to_bits() + 1);
+        for input in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            upper,
+            below_lower,
+        ] {
+            let Err(error) = checked_number_to_int(NumberValue::Float(input)) else {
+                panic!("float {input} must not convert");
+            };
+            assert_assertion_failure(&error);
+        }
+    }
+
+    #[test]
+    fn checked_int_from_number_rejects_inexact_floats_like_a_failed_assert() {
+        for input in [0.5, -0.5, 65_535.5, f64::from_bits(1)] {
+            let Err(error) = checked_number_to_int(NumberValue::Float(input)) else {
+                panic!("inexact float {input} must not convert");
+            };
+            assert_assertion_failure(&error);
+        }
+
+        let mut vm = Vm::new(Program::new(Vec::new(), vec![OpCode::Ret as u8]));
+        let Err(conversion) = crate::builtins::runtime::execute_builtin_call(
+            &mut vm,
+            BuiltinFunction::CheckedIntFromNumber,
+            &mut [Value::Float(f64::NAN)],
+        ) else {
+            panic!("non-finite float must fail through the builtin dispatch");
+        };
+        let Err(assertion) = crate::builtins::runtime::execute_builtin_call(
+            &mut vm,
+            BuiltinFunction::Assert,
+            &mut [Value::Bool(false)],
+        ) else {
+            panic!("a false assert must fail");
+        };
+        assert_eq!(
+            format!("{conversion:?}"),
+            format!("{assertion:?}"),
+            "the conversion failure must reuse the builtin assert error payload"
+        );
+    }
+
+    #[test]
+    fn checked_int_from_number_rejects_non_number_values() {
+        for value in [Value::Bool(true), Value::Null, Value::string("1")] {
+            let Err(error) = builtin_checked_int_from_number(&[value]) else {
+                panic!("non-number input must not convert");
+            };
+            assert!(
+                matches!(error, VmError::TypeMismatch("number")),
+                "non-number input must keep the number type mismatch: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_int_from_number_id_name_signature_and_arity_are_explicit() {
+        let builtin = BuiltinFunction::from_call_index(0xFF90)
+            .expect("checked number-to-int builtin must exist at call index 0xFF90");
+        assert_eq!(builtin, BuiltinFunction::CheckedIntFromNumber);
+        assert_eq!(builtin.call_index(), 0xFF90);
+        assert_eq!(builtin.name(), "__checked_int_from_number");
+        assert_eq!(builtin.arity(), 1);
+
+        let signatures = builtin.callable_signatures();
+        assert_eq!(signatures.len(), 1, "one callable schema is published");
+        let signature = signatures[0];
+        assert_eq!(signature.params.len(), 1);
+        assert_eq!(
+            signature.params[0].ty,
+            crate::builtins::CallableParamType::Number
+        );
+        assert_eq!(signature.return_type, "int");
+
+        for (argc, constants) in [(0u8, Vec::new()), (2u8, vec![Value::Int(1), Value::Int(1)])] {
+            let mut code = BytecodeBuilder::new();
+            for index in 0..argc {
+                code.ldc(u32::from(index));
+            }
+            code.call(0xFF90, argc);
+            code.ret();
+            let mut vm = Vm::new(Program::new(constants, code.finish()));
+            vm.set_jit_config(crate::JitConfig {
+                enabled: false,
+                hot_loop_threshold: 1,
+                max_trace_len: 512,
+            });
+            vm.set_fuel(10_000_000);
+            let Err(error) = vm.run() else {
+                panic!("arity {argc} must be rejected");
+            };
+            match error {
+                VmError::InvalidCallArity {
+                    import,
+                    expected,
+                    got,
+                } => {
+                    assert_eq!(import, "__checked_int_from_number");
+                    assert_eq!((expected, got), (1, argc));
+                }
+                other => panic!("unexpected arity error: {other:?}"),
+            }
+            assert_eq!(
+                vm.aot_exec_count(),
+                0,
+                "the arity rejection must not enter the AOT backend"
+            );
+            assert_eq!(
+                vm.jit_native_exec_count(),
+                0,
+                "the arity rejection must not enter native JIT"
+            );
+            vm.reset_for_reuse()
+                .expect("the rejected arity VM must reset for reuse");
+            assert_eq!(vm.host_context().resource_count(), 0);
+        }
     }
 }
