@@ -16,6 +16,7 @@
 
 #[cfg(test)]
 use std::cell::RefCell;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
@@ -593,6 +594,9 @@ fn sqlite_error_message(error: rusqlite::Error) -> String {
 }
 
 fn sqlite_error(error: rusqlite::Error) -> VmError {
+    if matches!(error, rusqlite::Error::MultipleStatement) {
+        return VmError::HostError("multiple SQLite statements are not allowed".to_string());
+    }
     VmError::HostError(sqlite_error_message(error))
 }
 
@@ -1008,7 +1012,6 @@ fn normalized_sql(sql: &str) -> VmResult<String> {
     let mut out = String::with_capacity(sql.len());
     let mut index = 0;
     let mut quote = None;
-    let mut statement_ended = false;
     while index < bytes.len() {
         let byte = bytes[index];
         if let Some(active_quote) = quote {
@@ -1022,8 +1025,8 @@ fn normalized_sql(sql: &str) -> VmResult<String> {
             index += 1;
             continue;
         }
-        if matches!(byte, b'\'' | b'"' | b'`') {
-            quote = Some(byte);
+        if matches!(byte, b'\'' | b'"' | b'`' | b'[') {
+            quote = Some(if byte == b'[' { b']' } else { byte });
             out.push(' ');
             index += 1;
             continue;
@@ -1051,14 +1054,9 @@ fn normalized_sql(sql: &str) -> VmResult<String> {
             continue;
         }
         if byte == b';' {
-            statement_ended = true;
+            out.push(' ');
             index += 1;
             continue;
-        }
-        if statement_ended && !byte.is_ascii_whitespace() {
-            return Err(VmError::HostError(
-                "multiple SQLite statements are not allowed".to_string(),
-            ));
         }
         out.push((byte as char).to_ascii_lowercase());
         index += 1;
@@ -1340,12 +1338,89 @@ fn value_from_row(
     }
 }
 
+/// Probe exactly one statement on the executing connection, under its current
+/// authorizer, limits and progress handler. Never step the probe. In particular,
+/// a trigger's body semicolons belong to SQLite's grammar, not a host SQL lexer.
+fn check_single_statement(connection: &Connection, sql: &str) -> Result<(), rusqlite::Error> {
+    let text = CString::new(sql).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let length = i32::try_from(sql.len()).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let mut statement = std::ptr::null_mut();
+    let mut tail = std::ptr::null();
+    // SAFETY: the worker exclusively owns this live connection while holding
+    // its connection lock. `text` is NUL-terminated, contains `length` SQL bytes,
+    // and outlives prepare. SQLite writes only our two output pointers. No
+    // statement escapes this block: finalize (also valid for NULL) runs on both
+    // success and error, before any Rust error return or tail validation. No
+    // callback can access the connection; the installed hooks only inspect
+    // authorization context / atomic cancellation state.
+    let (has_statement, consumed) = unsafe {
+        let handle = connection.handle();
+        let rc = rusqlite::ffi::sqlite3_prepare_v2(
+            handle,
+            text.as_ptr(),
+            length,
+            &mut statement,
+            &mut tail,
+        );
+        let has_statement = !statement.is_null();
+        rusqlite::ffi::sqlite3_finalize(statement);
+        if rc != rusqlite::ffi::SQLITE_OK {
+            // SQLite owns a non-null, NUL-terminated error string for the
+            // lifetime of this live handle; copy it before the next API call.
+            let message = CStr::from_ptr(rusqlite::ffi::sqlite3_errmsg(handle))
+                .to_string_lossy()
+                .into_owned();
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rc),
+                Some(message),
+            ));
+        }
+        (
+            has_statement,
+            (tail as usize).checked_sub(text.as_ptr() as usize),
+        )
+    };
+    let consumed = consumed
+        .filter(|offset| *offset <= sql.len())
+        .ok_or(rusqlite::Error::InvalidQuery)?;
+    if !has_statement {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    // Only whitespace and complete comments may follow the parsed statement.
+    // This linear tail scan is deliberately not a second SQL grammar/parser.
+    let bytes = sql.as_bytes();
+    let mut index = consumed;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+        } else if bytes[index..].starts_with(b"--") {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+        } else if bytes[index..].starts_with(b"/*") {
+            index += 2;
+            while index + 1 < bytes.len() && !bytes[index..].starts_with(b"*/") {
+                index += 1;
+            }
+            if index + 1 >= bytes.len() {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            index += 2;
+        } else {
+            return Err(rusqlite::Error::MultipleStatement);
+        }
+    }
+    Ok(())
+}
+
 fn query_with_connection(
     connection: &Connection,
     sql: &str,
     params: &[SqlValue],
     limits: SqliteLimits,
 ) -> Result<VmMap, rusqlite::Error> {
+    check_single_statement(connection, sql)?;
     let mut statement = connection.prepare(sql)?;
     let columns = statement
         .column_names()
@@ -1410,6 +1485,7 @@ fn execute_with_connection(
     sql: &str,
     params: &[SqlValue],
 ) -> Result<VmMap, rusqlite::Error> {
+    check_single_statement(connection, sql)?;
     let mut statement = connection.prepare(sql)?;
     let rows_affected = statement.execute(params_from_iter(params.iter()))?;
     drop(statement);
@@ -2646,5 +2722,75 @@ mod tests {
             0,
             "adapter send failure must drop the closure-owned operation slot"
         );
+    }
+
+    #[test]
+    fn single_statement_gate_accepts_trigger_bodies_and_rejects_tails() {
+        let connection = Connection::open_in_memory().expect("test connection should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE messages (id INTEGER); CREATE TABLE revisions (revision INTEGER);",
+            )
+            .expect("trigger targets should exist before prepare");
+        let trigger = "CREATE TRIGGER revision_insert AFTER INSERT ON messages \
+             BEGIN UPDATE revisions SET revision=revision+1; END";
+        check_single_statement(&connection, trigger)
+            .expect("a trigger body's semicolons belong to SQLite's grammar");
+        check_single_statement(&connection, trigger)
+            .expect("a repeated probe must not depend on prior state");
+        let with_trailing_comment = format!("{trigger} /* trailing comment */   ");
+        check_single_statement(&connection, &with_trailing_comment)
+            .expect("whitespace and a complete comment may follow the statement");
+        let with_line_comment = format!("{trigger} -- trailing comment\n");
+        check_single_statement(&connection, &with_line_comment)
+            .expect("a line comment may follow the statement");
+        let two_statements = "CREATE TABLE a (id INTEGER); CREATE TABLE b (id INTEGER)";
+        assert!(
+            matches!(
+                check_single_statement(&connection, two_statements),
+                Err(rusqlite::Error::MultipleStatement)
+            ),
+            "a second statement after the trigger must be rejected"
+        );
+        let tail_after_trigger = format!("{trigger}; DROP TABLE messages");
+        assert!(
+            matches!(
+                check_single_statement(&connection, &tail_after_trigger),
+                Err(rusqlite::Error::MultipleStatement)
+            ),
+            "the gate must reject DDL that follows a trigger body"
+        );
+        assert!(
+            matches!(
+                check_single_statement(&connection, "   "),
+                Err(rusqlite::Error::InvalidQuery)
+            ),
+            "an empty statement must not be treated as a parsed statement"
+        );
+    }
+
+    #[test]
+    fn trigger_body_executes_and_bumps_the_stored_revision() {
+        let connection = Connection::open_in_memory().expect("test connection should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE messages (id INTEGER);
+                 CREATE TABLE revisions (revision INTEGER);
+                 INSERT INTO revisions VALUES (0);
+                 CREATE TRIGGER revision_insert AFTER INSERT ON messages
+                 BEGIN UPDATE revisions SET revision=revision+1; END;",
+            )
+            .expect("trigger schema should be created");
+        let trigger = "CREATE TRIGGER revision_second AFTER INSERT ON messages \
+             BEGIN UPDATE revisions SET revision=revision+1; END";
+        check_single_statement(&connection, trigger).expect("single trigger statement");
+        execute_with_connection(&connection, trigger, &[])
+            .expect("the gated execute path must accept a trigger body");
+        execute_with_connection(&connection, "INSERT INTO messages VALUES (1)", &[])
+            .expect("insert must fire both triggers");
+        let revision: i64 = connection
+            .query_row("SELECT revision FROM revisions", [], |row| row.get(0))
+            .expect("revision row should be readable");
+        assert_eq!(revision, 2, "both revision triggers must have fired");
     }
 }
