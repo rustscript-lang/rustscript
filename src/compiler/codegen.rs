@@ -70,6 +70,9 @@ pub struct Compiler {
     in_callable: bool,
     /// Err-path `Ret` sites and the owned locals to close before the frame drain.
     ret_cleanups: Vec<crate::RetCleanupPlan>,
+    assign_declarations: super::assign_declaration::AssignDeclarationSidecar,
+    assign_declaration_map: super::assign_declaration::AssignDeclarationMap,
+    pending_closure_schemas: Vec<Vec<Option<TypeSchema>>>,
 }
 
 struct LoopContext {
@@ -137,6 +140,9 @@ impl Compiler {
             closure_param_hints: HashMap::new(),
             in_callable: false,
             ret_cleanups: Vec::new(),
+            assign_declarations: super::assign_declaration::AssignDeclarationSidecar::default(),
+            assign_declaration_map: super::assign_declaration::AssignDeclarationMap::default(),
+            pending_closure_schemas: Vec::new(),
         }
     }
 
@@ -167,6 +173,13 @@ impl Compiler {
 
     pub fn set_root_local_count(&mut self, root_local_count: usize) {
         self.root_local_count = root_local_count;
+    }
+
+    pub(super) fn set_assign_declarations(
+        &mut self,
+        declarations: super::assign_declaration::AssignDeclarationSidecar,
+    ) {
+        self.assign_declarations = declarations;
     }
 
     pub fn set_function_impls(&mut self, function_impls: HashMap<u16, FunctionImpl>) {
@@ -249,6 +262,8 @@ impl Compiler {
         )>,
     ) -> Result<Program, CompileError> {
         let named_functions = self.prepare_named_callables()?;
+        self.assign_declaration_map =
+            super::assign_declaration::bind_stmts(&self.assign_declarations, stmts);
         for (index, stmt) in stmts.iter().enumerate() {
             self.capture_owner = Some(super::capture_certification::CaptureOwner::RootStatement(
                 index,
@@ -272,6 +287,9 @@ impl Compiler {
         let mut closure_index = 0usize;
         while closure_index < self.pending_closures.len() {
             let (prototype_id, closure) = self.pending_closures[closure_index].clone();
+            let schemas = self.pending_closure_schemas[closure_index].clone();
+            self.assign_declaration_map =
+                super::assign_declaration::bind_preorder(&closure, &schemas);
             self.compile_closure_body(prototype_id, &closure)?;
             closure_index += 1;
         }
@@ -498,6 +516,12 @@ impl Compiler {
             .get(&function_index)
             .cloned()
             .expect("prepared function implementation must exist");
+        self.assign_declaration_map = super::assign_declaration::bind_function(
+            &self.assign_declarations,
+            function_index,
+            &function_impl.body_stmts,
+            &function_impl.body_expr,
+        );
         let prototype_id = self.function_prototype_ids[&function_index];
         let entry_ip = self.assembler.position();
         let callable_snapshot = self.callable_bindings.clone();
@@ -612,8 +636,9 @@ impl Compiler {
             Stmt::Assign {
                 index, expr, line, ..
             } => {
+                let declared = self.assign_declaration_map.schema_of(stmt).cloned();
                 self.assembler.mark_line(*line);
-                self.assign_expr_to_slot(*index, None, expr)?;
+                self.assign_expr_to_slot(*index, declared.as_ref(), expr)?;
             }
             Stmt::ClosureLet { line, .. } => {
                 self.assembler.mark_line(*line);
@@ -814,6 +839,10 @@ impl Compiler {
             Stmt::Drop { index, line } => {
                 self.assembler.mark_line(*line);
                 self.assign_expr_to_slot(*index, None, &Expr::Null)?;
+                // The Null store retires the physical value. Clear schema and
+                // declared origin too, matching typing's Drop, so a later
+                // occupant of this slot cannot inherit the dead value's schema.
+                self.type_state.set(*index, typing::BoundType::Null);
             }
         }
         Ok(())
@@ -2365,6 +2394,11 @@ impl Compiler {
             }),
         });
         self.pending_closures.push((prototype_id, closure.clone()));
+        self.pending_closure_schemas
+            .push(super::assign_declaration::preorder_schemas(
+                closure,
+                &self.assign_declaration_map,
+            ));
         self.emit_bind_callable(
             prototype_id,
             closure.capture_copies.iter().map(|(source, target)| {

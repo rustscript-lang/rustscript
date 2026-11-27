@@ -448,3 +448,155 @@ fn number_parameter_relational_comparison_is_native() {
         &[Value::Bool(true)],
     );
 }
+
+const CHECKED_INT_BUILTIN: &str = "__checked_int_from_number";
+
+fn checked_int_call_index() -> u16 {
+    vm::BUILTIN_CATALOG
+        .iter()
+        .find(|builtin| builtin.name() == CHECKED_INT_BUILTIN)
+        .expect("the checked number-to-int builtin must be catalogued")
+        .call_index()
+}
+
+fn checked_int_program(value: Value) -> Program {
+    let mut code = BytecodeBuilder::new();
+    code.ldc(0);
+    code.call(checked_int_call_index(), 1);
+    code.ret();
+    Program::new(vec![value], code.finish())
+}
+
+fn checked_int_machine(program: Program) -> Vm {
+    let mut machine = Vm::new_with_jit_config(
+        program,
+        JitConfig {
+            enabled: false,
+            hot_loop_threshold: 1,
+            max_trace_len: 512,
+        },
+    );
+    machine.set_fuel(10_000_000);
+    machine
+}
+
+#[test]
+fn checked_int_from_number_direct_and_loaded_bytecode_preserve_tagged_int() {
+    let expected = Value::Int((1_i64 << 53) + 1);
+    let program = checked_int_program(expected.clone());
+
+    let mut direct = checked_int_machine(program.clone());
+    assert_eq!(direct.run().unwrap(), VmStatus::Halted);
+    assert_eq!(direct.stack(), std::slice::from_ref(&expected));
+    assert_eq!(
+        direct.aot_exec_count(),
+        0,
+        "the reference path is the interpreter"
+    );
+    direct
+        .reset_for_reuse()
+        .expect("the direct reference VM must reset for reuse");
+    assert_eq!(direct.host_context().resource_count(), 0);
+
+    let encoded = vm::encode_program(&program).expect("checked int program must encode");
+    let decoded = vm::decode_program(&encoded).expect("checked int program must decode");
+    let mut loaded = checked_int_machine(decoded);
+    assert_eq!(loaded.run().unwrap(), VmStatus::Halted);
+    assert_eq!(loaded.stack(), std::slice::from_ref(&expected));
+    loaded
+        .reset_for_reuse()
+        .expect("the loaded reference VM must reset for reuse");
+    assert_eq!(loaded.host_context().resource_count(), 0);
+}
+
+#[test]
+fn checked_int_from_number_generic_native_parity_preserves_tagged_int() {
+    for (value, expected) in [
+        (Value::Int((1_i64 << 53) + 1), Value::Int((1_i64 << 53) + 1)),
+        (Value::Int(i64::MAX), Value::Int(i64::MAX)),
+        (Value::Float(42.0), Value::Int(42)),
+    ] {
+        let program = checked_int_program(value);
+
+        let mut reference = checked_int_machine(program.clone());
+        assert_eq!(reference.run().unwrap(), VmStatus::Halted);
+        assert_eq!(reference.stack(), std::slice::from_ref(&expected));
+        assert_eq!(reference.aot_exec_count(), 0);
+        reference
+            .reset_for_reuse()
+            .expect("the reference VM must reset for reuse");
+        assert_eq!(reference.host_context().resource_count(), 0);
+
+        let mut native = checked_int_machine(program);
+        native
+            .compile_aot()
+            .expect("a generic builtin call must lower to a native call boundary");
+        assert_ssa(&native);
+        assert_eq!(native.run().unwrap(), VmStatus::Halted);
+        assert_eq!(native.stack(), std::slice::from_ref(&expected));
+        assert!(
+            native.aot_exec_count() > 0,
+            "the native call boundary must actually execute"
+        );
+        native
+            .reset_for_reuse()
+            .expect("the native VM must reset for reuse");
+        assert_eq!(native.host_context().resource_count(), 0);
+    }
+}
+
+#[test]
+fn checked_int_from_number_native_boundary_reports_the_assert_failure() {
+    // i64::MAX as f64 rounds up to 2^63, which is outside the checked domain.
+    let program = checked_int_program(Value::Float(i64::MAX as f64));
+
+    let mut reference = checked_int_machine(program.clone());
+    let reference_error = reference
+        .run()
+        .expect_err("2^63 is not a representable i64");
+    assert!(
+        matches!(
+            reference_error,
+            VmError::HostError(ref message) if message == "assertion failed"
+        ),
+        "{reference_error:?}"
+    );
+    reference
+        .reset_for_reuse()
+        .expect("the failing reference VM must reset for reuse");
+    assert_eq!(reference.host_context().resource_count(), 0);
+
+    let mut native = checked_int_machine(program);
+    native
+        .compile_aot()
+        .expect("a generic builtin call must lower to a native call boundary");
+    assert_ssa(&native);
+    let native_error = native
+        .run()
+        .expect_err("the native boundary must fail rather than succeed");
+    assert!(
+        format!("{native_error}").contains("assertion failed"),
+        "the native boundary must preserve the host error: {native_error:?}"
+    );
+    assert!(
+        native.aot_exec_count() > 0,
+        "the native call boundary must actually execute before failing"
+    );
+    native
+        .reset_for_reuse()
+        .expect("the failing native VM must reset for reuse");
+    assert_eq!(native.host_context().resource_count(), 0);
+}
+
+#[test]
+fn checked_int_from_number_rejects_non_number_through_vm() {
+    let mut machine = checked_int_machine(checked_int_program(Value::Bool(true)));
+    assert!(matches!(
+        machine.run(),
+        Err(VmError::TypeMismatch("number"))
+    ));
+    machine
+        .reset_for_reuse()
+        .expect("the rejected VM must reset");
+    assert_eq!(machine.host_context().resource_count(), 0);
+}

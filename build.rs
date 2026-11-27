@@ -1876,6 +1876,7 @@ fn appended_builtin_order() -> &'static [&'static str] {
         "__map_iter_close",
         "__bind_callable",
         "__detach_local",
+        "__checked_int_from_number",
         "__json_decode_typed",
         "__json_encode_typed",
         "__logical_render",
@@ -1911,6 +1912,7 @@ fn required_internal_builtin_stubs() -> &'static [&'static str] {
         "__to_string",
         "__bind_callable",
         "__detach_local",
+        "__checked_int_from_number",
     ]
 }
 
