@@ -93,23 +93,63 @@ impl Default for CliConfig {
     }
 }
 
+/// Selects how a CLI entry binds a VM's host imports.
+///
+/// The legacy entry keeps the historical schema-less CLI registry and REPL.
+/// The file runner entry binds through the host callback and the full catalog
+/// schemas carried by the compiled program.
+#[derive(Clone, Copy)]
+enum CliHostBinding {
+    Legacy,
+    FileRunner(fn(&mut HostFunctionRegistry) -> vm::VmResult<()>),
+}
+
+impl CliHostBinding {
+    fn is_file_runner(self) -> bool {
+        matches!(self, Self::FileRunner(_))
+    }
+}
+
 pub fn main(runtime: CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
-    if let Err(err) = run_main(&runtime) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Err(err) = run_main_with_args(&runtime, &args, CliHostBinding::Legacy) {
         eprintln!("{err}");
         std::process::exit(1);
     }
     Ok(())
 }
 
-fn run_main(runtime: &CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
+/// Runs the file-oriented CLI surface.
+///
+/// The runner never starts the RustScript REPL, requires an explicit source
+/// path for source execution, and binds host imports exactly once through
+/// `register` plus the program's full catalog schemas.
+pub fn main_file_runner(
+    runtime: CliRuntime,
+    register: fn(&mut HostFunctionRegistry) -> vm::VmResult<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cli = parse_cli_args(&args).map_err(io::Error::other)?;
+    run_main_with_args(&runtime, &args, CliHostBinding::FileRunner(register))
+}
+
+fn run_main_with_args(
+    runtime: &CliRuntime,
+    args: &[String],
+    host_binding: CliHostBinding,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cli = parse_cli_args(args).map_err(io::Error::other)?;
+    if host_binding.is_file_runner() && cli.repl {
+        return Err(io::Error::other(
+            "file runner mode requires a source path; REPL mode is not available",
+        )
+        .into());
+    }
     if cli.version {
         println!("{}", binary_version_text(runtime.binary_name));
         return Ok(());
     }
     if cli.help {
-        print_usage(runtime.binary_name);
+        print_usage(runtime.binary_name, host_binding.is_file_runner());
         return Ok(());
     }
     if cli.fmt {
@@ -135,7 +175,18 @@ fn run_main(runtime: &CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if let Some(mut vm) = try_new_cli_vm_from_standalone_aot(&cli)? {
+    if host_binding.is_file_runner()
+        && cli.aot_load_path.is_some()
+        && cli.source.is_none()
+        && cli.emit_vmbc_path.is_some()
+    {
+        return Err(io::Error::other(
+            "file runner mode does not support --emit-vmbc with standalone --aot-load",
+        )
+        .into());
+    }
+
+    if let Some(mut vm) = try_new_cli_vm_from_standalone_aot(&cli, host_binding)? {
         if let Some(output_path) = cli.emit_vmbc_path.as_ref() {
             let encoded = encode_program(vm.program())?;
             std::fs::write(output_path, &encoded)?;
@@ -169,8 +220,7 @@ fn run_main(runtime: &CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
     let recording_program = cli.record_path.as_ref().map(|_| compiled.program.clone());
     let mut vm = new_cli_vm(compiled.program.with_local_count(compiled.locals), &cli);
     apply_runtime_flags(&mut vm, &cli)?;
-    let imports = vm.program().imports.clone();
-    register_imports(&mut vm, &imports)?;
+    bind_cli_imports(&mut vm, host_binding)?;
     prepare_aot_for_cli(&mut vm, &cli)?;
 
     if let Some(record_path) = cli.record_path.as_ref() {
@@ -217,7 +267,10 @@ fn run_main(runtime: &CliRuntime) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn try_new_cli_vm_from_standalone_aot(cli: &CliConfig) -> Result<Option<Vm>, io::Error> {
+fn try_new_cli_vm_from_standalone_aot(
+    cli: &CliConfig,
+    host_binding: CliHostBinding,
+) -> Result<Option<Vm>, io::Error> {
     let Some(path) = cli.aot_load_path.as_deref() else {
         return Ok(None);
     };
@@ -228,8 +281,7 @@ fn try_new_cli_vm_from_standalone_aot(cli: &CliConfig) -> Result<Option<Vm>, io:
     let mut vm = Vm::new_from_aot_artifact_file_with_jit_config(path, cli_jit_config(cli))
         .map_err(io::Error::other)?;
     configure_cli_vm(&mut vm);
-    let imports = vm.program().imports.clone();
-    register_imports(&mut vm, &imports)?;
+    bind_cli_imports(&mut vm, host_binding)?;
 
     if let Some(save_path) = cli.aot_save_path.as_deref() {
         vm.save_aot_artifact_to_file(save_path)
@@ -856,6 +908,46 @@ fn register_imports(vm: &mut Vm, imports: &[HostImport]) -> Result<(), io::Error
     Ok(())
 }
 
+fn bind_cli_imports(vm: &mut Vm, host_binding: CliHostBinding) -> Result<(), io::Error> {
+    let imports = vm.program().imports.clone();
+    match host_binding {
+        CliHostBinding::Legacy => register_imports(vm, &imports),
+        CliHostBinding::FileRunner(register) => bind_file_runner_imports(vm, &imports, register),
+    }
+}
+
+fn bind_file_runner_imports(
+    vm: &mut Vm,
+    imports: &[HostImport],
+    register: fn(&mut HostFunctionRegistry) -> vm::VmResult<()>,
+) -> Result<(), io::Error> {
+    for import in imports {
+        if import.name.starts_with("http::") {
+            return Err(io::Error::other(format!(
+                "host function '{}' requires pd-edge runtime context",
+                import.name,
+            )));
+        }
+    }
+    if imports.is_empty() {
+        return Ok(());
+    }
+
+    let mut registry = HostFunctionRegistry::new();
+    registry.register_static("add_one", 1, add_one_host_function);
+    registry.register_static("echo", 1, echo_host_function);
+    register(&mut registry).map_err(|err| io::Error::other(render_vm_error(vm, &err)))?;
+
+    let schemas = vm.program().host_import_schemas().to_vec();
+    let plan = registry
+        .prepare_shared_plan_with_schemas(imports, &schemas)
+        .map_err(|err| io::Error::other(render_vm_error(vm, &err)))?;
+    registry
+        .bind_vm_with_plan(vm, &plan)
+        .map_err(|err| io::Error::other(render_vm_error(vm, &err)))?;
+    Ok(())
+}
+
 fn new_cli_vm(program: Program, cli: &CliConfig) -> Vm {
     let mut vm = Vm::new_with_jit_config(program, cli_jit_config(cli));
     configure_cli_vm(&mut vm);
@@ -886,40 +978,101 @@ fn cli_host_registry() -> &'static HostFunctionRegistry {
     })
 }
 
-fn print_usage(binary_name: &str) {
-    println!("features: {}", cli_build_feature_summary());
-    println!();
-    println!("Usage:");
-    println!("  {binary_name}                  (defaults to REPL)");
-    println!("  {binary_name} --version");
-    println!("  {binary_name} [source_path]");
-    println!("  {binary_name} fmt [--check] <source_path>");
-    println!("  {binary_name} --repl");
-    println!("  {binary_name} repl");
-    println!("  {binary_name} --emit-vmbc <output.vmbc> [source_path]");
-    println!("  {binary_name} --disasm-vmbc <input.vmbc> [--show-source]");
-    println!("  {binary_name} --record <output.pdr> [source_path]");
-    println!("  {binary_name} --view-record <input.pdr>");
-    println!("  {binary_name} --debug [--stop-on-entry|--no-stop-on-entry] [source_path]");
-    println!("  {binary_name} --debug --tcp <addr> [source_path]");
-    println!(
-        "  {binary_name} [--aot|--aot-load <artifact.pat>] [--aot-save <artifact.pat>] [--aot-dump] [source_path]"
+fn print_usage(binary_name: &str, file_runner: bool) {
+    print!("{}", usage_text(binary_name, file_runner));
+}
+
+fn usage_text(binary_name: &str, file_runner: bool) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("features: {}\n\n", cli_build_feature_summary()));
+    out.push_str("Usage:\n");
+    if file_runner {
+        out.push_str(&format!("  {binary_name} <source_path>\n"));
+        out.push_str(&format!("  {binary_name} --version\n"));
+        out.push_str(&format!("  {binary_name} fmt [--check] <source_path>\n"));
+        out.push_str(&format!(
+            "  {binary_name} --emit-vmbc <output.vmbc> <source_path>\n"
+        ));
+        out.push_str(&format!(
+            "  {binary_name} --disasm-vmbc <input.vmbc> [--show-source]\n"
+        ));
+        out.push_str(&format!(
+            "  {binary_name} --record <output.pdr> <source_path>\n"
+        ));
+        out.push_str(&format!("  {binary_name} --view-record <input.pdr>\n"));
+        out.push_str(&format!(
+            "  {binary_name} --debug [--stop-on-entry|--no-stop-on-entry] <source_path>\n"
+        ));
+        out.push_str(&format!(
+            "  {binary_name} --debug --tcp <addr> <source_path>\n"
+        ));
+        out.push_str(&format!("  {binary_name} --aot-load <artifact.pat>\n"));
+        out.push_str(&format!(
+            "  {binary_name} [--aot|--aot-save <artifact.pat>] [--aot-dump] <source_path>\n"
+        ));
+        out.push_str(&format!(
+            "  {binary_name} [--jit-hot-loop <n>] [--jit-dump|--dump-jit] [--jit-dump-no-code] [--emit-vmbc <output.vmbc>] <source_path>\n"
+        ));
+        out.push_str(&format!(
+            "  {binary_name} [--max-call-depth <n>] [--fuel <n>|--epoch-deadline <n>] [--epoch-check-interval <n>] <source_path>\n"
+        ));
+        out.push_str(&format!(
+            "  {binary_name} debug [--tcp <addr>] <source_path>\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "  {binary_name}                  (defaults to REPL)\n"
+        ));
+        out.push_str(&format!("  {binary_name} --version\n"));
+        out.push_str(&format!("  {binary_name} [source_path]\n"));
+        out.push_str(&format!("  {binary_name} fmt [--check] <source_path>\n"));
+        out.push_str(&format!("  {binary_name} --repl\n"));
+        out.push_str(&format!("  {binary_name} repl\n"));
+        out.push_str(&format!(
+            "  {binary_name} --emit-vmbc <output.vmbc> [source_path]\n"
+        ));
+        out.push_str(&format!(
+            "  {binary_name} --disasm-vmbc <input.vmbc> [--show-source]\n"
+        ));
+        out.push_str(&format!(
+            "  {binary_name} --record <output.pdr> [source_path]\n"
+        ));
+        out.push_str(&format!("  {binary_name} --view-record <input.pdr>\n"));
+        out.push_str(&format!(
+            "  {binary_name} --debug [--stop-on-entry|--no-stop-on-entry] [source_path]\n"
+        ));
+        out.push_str(&format!(
+            "  {binary_name} --debug --tcp <addr> [source_path]\n"
+        ));
+        out.push_str(&format!(
+            "  {binary_name} [--aot|--aot-load <artifact.pat>] [--aot-save <artifact.pat>] [--aot-dump] [source_path]\n"
+        ));
+        out.push_str(&format!(
+            "  {binary_name} [--jit-hot-loop <n>] [--jit-dump|--dump-jit] [--jit-dump-no-code] [--emit-vmbc <output.vmbc>] [source_path]\n"
+        ));
+        out.push_str(&format!(
+            "  {binary_name} [--max-call-depth <n>] [--fuel <n>|--epoch-deadline <n>] [--epoch-check-interval <n>] [source_path]\n"
+        ));
+        out.push_str(&format!(
+            "  {binary_name} debug [--tcp <addr>] [source_path]\n"
+        ));
+    }
+    out.push('\n');
+    out.push_str("Options:\n");
+    out.push_str("  -V, --version              Show version with git metadata\n");
+    out.push_str("  -h, --help                 Show this help\n");
+    out.push_str(
+        "      --check                In fmt mode, fail if formatting would change the file\n",
     );
-    println!(
-        "  {binary_name} [--jit-hot-loop <n>] [--jit-dump|--dump-jit] [--jit-dump-no-code] [--emit-vmbc <output.vmbc>] [source_path]"
+    out.push_str(
+        "      --max-call-depth <n>   Set the positive script call-frame limit (default: 1024)\n",
     );
-    println!(
-        "  {binary_name} [--max-call-depth <n>] [--fuel <n>|--epoch-deadline <n>] [--epoch-check-interval <n>] [source_path]"
-    );
-    println!("  {binary_name} debug [--tcp <addr>] [source_path]");
-    println!();
-    println!("Options:");
-    println!("  -V, --version              Show version with git metadata");
-    println!("  -h, --help                 Show this help");
-    println!("      --check                In fmt mode, fail if formatting would change the file");
-    println!(
-        "      --max-call-depth <n>   Set the positive script call-frame limit (default: 1024)"
-    );
+    if file_runner {
+        out.push_str(
+            "      --emit-vmbc <path>     Write VMBC; cannot be combined with standalone --aot-load\n",
+        );
+    }
+    out
 }
 
 fn cli_build_features() -> Vec<String> {
@@ -1619,14 +1772,18 @@ fn hex_nibble(value: u8) -> char {
 mod tests {
     use crate as vm;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        CliConfig, parse_cli_args, prepare_aot_for_cli, register_imports,
-        try_new_cli_vm_from_standalone_aot,
+        CliConfig, CliHostBinding, bind_file_runner_imports, parse_cli_args, prepare_aot_for_cli,
+        register_imports, run_main_with_args, try_new_cli_vm_from_standalone_aot, usage_text,
     };
     use vm::{
-        CompileSourceFileOptions, HostImport, OpCode, Program, Value, ValueType, Vm, VmStatus,
+        CallOutcome, CallReturn, CompileSourceFileOptions, HostApiBuilder, HostApiCatalog,
+        HostFunctionRegistry, HostFunctionSchema, HostImport, HostImportSchema, HostParamSchema,
+        HostTypeSchema, OpCode, Program, SourceFlavor, Value, ValueType, Vm, VmError, VmStatus,
     };
 
     fn s(value: &str) -> String {
@@ -1730,6 +1887,496 @@ mod tests {
         let mut second = Vm::new(program);
         register_imports(&mut second, &imports).expect("second vm should reuse cached plan");
         assert_eq!(second.bound_function_count(), 2);
+    }
+
+    fn schema_catalog() -> Arc<HostApiCatalog> {
+        static CATALOG: OnceLock<Arc<HostApiCatalog>> = OnceLock::new();
+        Arc::clone(CATALOG.get_or_init(|| {
+            let mut builder = HostApiBuilder::new();
+            builder.function(HostFunctionSchema::with_return(
+                "acme::triple",
+                vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+                HostTypeSchema::Int,
+            ));
+            builder.function(HostFunctionSchema::with_return(
+                "acme::sink",
+                vec![HostParamSchema::value("value", HostTypeSchema::Int)],
+                HostTypeSchema::Unknown,
+            ));
+            builder.function(HostFunctionSchema::new("acme::mark", vec![]));
+            Arc::new(builder.build().expect("test catalog must be valid"))
+        }))
+    }
+
+    fn schema_options() -> CompileSourceFileOptions {
+        CompileSourceFileOptions::default().with_host_api_catalog(schema_catalog())
+    }
+
+    fn file_runner_runtime() -> super::CliRuntime {
+        super::CliRuntime {
+            binary_name: "pd-vm-file-runner-test",
+            default_source: "examples/example.rss",
+            compile_options: schema_options,
+        }
+    }
+
+    fn exact_schema(name: &str) -> HostImportSchema {
+        let catalog = schema_catalog();
+        let function = catalog
+            .function(name)
+            .expect("test catalog function should exist");
+        HostImportSchema::from_function(&catalog, function)
+    }
+
+    fn compile_exact_fixture() -> Program {
+        let compiled = vm::compile_source_with_flavor_and_options(
+            "use acme;\nlet value = acme::triple(14);\nacme::sink(value);\n",
+            SourceFlavor::RustScript,
+            schema_options(),
+        )
+        .expect("exact catalog fixture should compile");
+        compiled.program.with_local_count(compiled.locals)
+    }
+
+    fn triple_adapter(_vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
+        Ok(CallOutcome::Return(CallReturn::one(Value::Int(42))))
+    }
+
+    static SINK_VALUE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+
+    fn sink_adapter(_vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
+        let value = match args.first() {
+            Some(Value::Int(value)) => *value,
+            _ => return Err(VmError::TypeMismatch("int")),
+        };
+        SINK_VALUE.store(value, Ordering::SeqCst);
+        Ok(CallOutcome::Return(CallReturn::one(Value::Null)))
+    }
+
+    fn register_triple(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+        registry.register_exact_static(
+            "acme::triple",
+            1,
+            exact_schema("acme::triple"),
+            triple_adapter,
+        )?;
+        Ok(())
+    }
+
+    fn register_flow_exact(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+        register_triple(registry)?;
+        registry.register_exact_static(
+            "acme::sink",
+            1,
+            exact_schema("acme::sink"),
+            sink_adapter,
+        )?;
+        Ok(())
+    }
+
+    fn register_triple_wrong_fingerprint(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+        let mut schema = exact_schema("acme::triple");
+        schema.fingerprint =
+            vm::HostApiFingerprint::from_wire(schema.fingerprint.as_u64().wrapping_add(1));
+        registry.register_exact_static("acme::triple", 1, schema, triple_adapter)?;
+        Ok(())
+    }
+
+    fn register_flow_wrong_triple_fingerprint(
+        registry: &mut HostFunctionRegistry,
+    ) -> vm::VmResult<()> {
+        register_triple_wrong_fingerprint(registry)?;
+        registry.register_exact_static(
+            "acme::sink",
+            1,
+            exact_schema("acme::sink"),
+            sink_adapter,
+        )?;
+        Ok(())
+    }
+
+    static EMIT_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    fn register_for_emit(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+        EMIT_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        register_triple(registry)
+    }
+
+    static AOT_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    fn register_for_aot(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+        AOT_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        register_flow_exact(registry)
+    }
+
+    static RECORD_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    fn register_for_record(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+        RECORD_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        register_flow_exact(registry)
+    }
+
+    static HTTP_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    fn register_for_http(_registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+        HTTP_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    static EMPTY_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    fn register_for_empty(_registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+        EMPTY_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    static MARK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn mark_adapter(_vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
+        MARK_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(CallOutcome::Return(CallReturn::one(Value::Null)))
+    }
+
+    fn failing_register(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+        registry.register_exact_static(
+            "acme::mark",
+            0,
+            exact_schema("acme::mark"),
+            mark_adapter,
+        )?;
+        Err(VmError::HostError("callback refused".to_string()))
+    }
+
+    fn temp_cli_path(stem: &str, extension: &str) -> std::path::PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "pd-vm-file-runner-{stem}-{}-{}.{extension}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
+    #[test]
+    fn file_runner_usage_and_argument_gates() {
+        let runtime = file_runner_runtime();
+        for args in [vec![], vec![s("repl")], vec![s("--repl")]] {
+            let error =
+                run_main_with_args(&runtime, &args, CliHostBinding::FileRunner(register_triple))
+                    .expect_err("file runner must reject a missing source or REPL mode");
+            assert!(
+                error.to_string().contains("requires a source path"),
+                "unexpected file runner gate error: {error}"
+            );
+        }
+
+        let error = run_main_with_args(
+            &runtime,
+            &[
+                s("--aot-load"),
+                s("missing.pat"),
+                s("--emit-vmbc"),
+                s("out.vmbc"),
+            ],
+            CliHostBinding::FileRunner(register_triple),
+        )
+        .expect_err("file runner must reject standalone aot load with emit");
+        assert!(
+            error.to_string().contains("standalone --aot-load"),
+            "unexpected aot/emit gate error: {error}"
+        );
+
+        let usage = usage_text("pd-vm-file-runner-test", true);
+        assert!(
+            !usage.contains("REPL") && !usage.contains("repl"),
+            "file runner help must not advertise REPL: {usage}"
+        );
+        assert!(
+            usage.contains("--emit-vmbc"),
+            "file runner help should list emit mode: {usage}"
+        );
+    }
+
+    #[test]
+    fn file_runner_emit_vmbc_skips_host_callback() {
+        let source_path = temp_cli_path("emit-source", "rss");
+        let output_path = temp_cli_path("emit-output", "vmbc");
+        std::fs::write(&source_path, "let value = 1 + 1;\nvalue;\n")
+            .expect("emit fixture should write");
+        let before = EMIT_CALLBACKS.load(Ordering::SeqCst);
+
+        run_main_with_args(
+            &file_runner_runtime(),
+            &[
+                s("--emit-vmbc"),
+                output_path.display().to_string(),
+                source_path.display().to_string(),
+            ],
+            CliHostBinding::FileRunner(register_for_emit),
+        )
+        .expect("source emit should compile without host binding");
+
+        assert_eq!(
+            EMIT_CALLBACKS.load(Ordering::SeqCst),
+            before,
+            "source emit must not call the host callback"
+        );
+        assert!(
+            std::fs::metadata(&output_path)
+                .expect("emit output should exist")
+                .len()
+                > 0,
+            "emit output should not be empty"
+        );
+        std::fs::remove_file(&source_path).expect("emit fixture cleanup");
+        std::fs::remove_file(&output_path).expect("emit output cleanup");
+    }
+
+    #[test]
+    fn file_runner_binder_binds_exact_catalog_import_through_register() {
+        let program = compile_exact_fixture();
+        assert_eq!(program.imports.len(), 2);
+        assert!(
+            program.host_import_schemas().iter().all(Option::is_some),
+            "compiled catalog imports should retain their full schemas"
+        );
+        let imports = program.imports.clone();
+
+        let mut legacy_vm = Vm::new(program.clone());
+        let legacy_error = register_imports(&mut legacy_vm, &imports)
+            .expect_err("schema-less legacy binding must not resolve an exact import");
+        assert!(
+            legacy_error
+                .to_string()
+                .contains("unbound host import 'acme::triple'"),
+            "unexpected legacy binding error: {legacy_error}"
+        );
+
+        let mut vm = Vm::new(program);
+        SINK_VALUE.store(i64::MIN, Ordering::SeqCst);
+        bind_file_runner_imports(&mut vm, &imports, register_flow_exact)
+            .expect("file runner binder should bind the exact registry entries");
+        assert_eq!(
+            vm.run().expect("exact host call should run"),
+            VmStatus::Halted
+        );
+        assert_eq!(
+            SINK_VALUE.load(Ordering::SeqCst),
+            42,
+            "the guest should observe the adapter return value"
+        );
+    }
+
+    #[test]
+    fn file_runner_binder_rejects_schema_less_or_wrong_fingerprint_entries() {
+        let mut schema_less = compile_exact_fixture();
+        schema_less.host_import_schemas.clear();
+        let imports = schema_less.imports.clone();
+        let mut vm = Vm::new(schema_less);
+        let error = bind_file_runner_imports(&mut vm, &imports, register_flow_exact)
+            .expect_err("exact registry entries require the full import schema");
+        assert!(
+            error
+                .to_string()
+                .contains("full schema and fingerprint are required"),
+            "unexpected schema-less error: {error}"
+        );
+
+        let program = compile_exact_fixture();
+        let imports = program.imports.clone();
+        let mut vm = Vm::new(program);
+        let error =
+            bind_file_runner_imports(&mut vm, &imports, register_flow_wrong_triple_fingerprint)
+                .expect_err("a mismatched catalog fingerprint must not bind");
+        assert!(
+            error
+                .to_string()
+                .contains("unbound host import 'acme::triple'"),
+            "unexpected wrong-fingerprint error: {error}"
+        );
+    }
+
+    #[test]
+    fn file_runner_binder_binds_legacy_and_exact_imports_together() {
+        let mut code = vm::BytecodeBuilder::new();
+        code.ldc(0);
+        code.call(0, 1);
+        code.ldc(1);
+        code.call(1, 1);
+        code.ret();
+        let program = Program::with_imports_and_debug(
+            vec![Value::Int(7), Value::Int(14)],
+            code.finish(),
+            vec![
+                HostImport {
+                    name: "echo".to_string(),
+                    arity: 1,
+                    return_type: ValueType::Unknown,
+                },
+                HostImport {
+                    name: "acme::triple".to_string(),
+                    arity: 1,
+                    return_type: ValueType::Int,
+                },
+            ],
+            None,
+        )
+        .with_optional_host_import_schemas(vec![None, Some(exact_schema("acme::triple"))]);
+        let imports = program.imports.clone();
+
+        let mut vm = Vm::new(program);
+        bind_file_runner_imports(&mut vm, &imports, register_triple)
+            .expect("mixed legacy and exact imports should bind");
+        assert_eq!(vm.run().expect("mixed guest should run"), VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(7), Value::Int(42)]);
+    }
+
+    #[test]
+    fn file_runner_binder_skips_register_for_empty_imports() {
+        let program = Program::new(
+            vec![Value::Int(2)],
+            vec![OpCode::Ldc as u8, 0, 0, 0, 0, OpCode::Ret as u8],
+        );
+        let mut vm = Vm::new(program);
+        bind_file_runner_imports(&mut vm, &[], register_for_empty)
+            .expect("empty imports should early-return");
+        assert_eq!(
+            EMPTY_CALLBACKS.load(Ordering::SeqCst),
+            0,
+            "empty imports must not call the host callback"
+        );
+        assert_eq!(vm.bound_function_count(), 0);
+        assert_eq!(vm.run().expect("guest should run"), VmStatus::Halted);
+        assert_eq!(vm.stack(), &[Value::Int(2)]);
+    }
+
+    #[test]
+    fn file_runner_binder_rejects_http_import_before_register() {
+        let program = Program::with_imports_and_debug(
+            vec![],
+            vec![OpCode::Ret as u8],
+            vec![HostImport {
+                name: "http::get".to_string(),
+                arity: 1,
+                return_type: ValueType::Unknown,
+            }],
+            None,
+        );
+        let imports = program.imports.clone();
+        let mut vm = Vm::new(program);
+        let error = bind_file_runner_imports(&mut vm, &imports, register_for_http)
+            .expect_err("http imports need the pd-edge runtime context");
+        assert!(
+            error
+                .to_string()
+                .contains("requires pd-edge runtime context"),
+            "unexpected http rejection: {error}"
+        );
+        assert_eq!(
+            HTTP_CALLBACKS.load(Ordering::SeqCst),
+            0,
+            "http rejection must happen before the host callback"
+        );
+    }
+
+    #[test]
+    fn file_runner_binder_does_not_run_guest_when_register_fails() {
+        let mut code = vm::BytecodeBuilder::new();
+        code.call(0, 0);
+        code.ret();
+        let program = Program::with_imports_and_debug(
+            vec![],
+            code.finish(),
+            vec![HostImport {
+                name: "acme::mark".to_string(),
+                arity: 0,
+                return_type: ValueType::Unknown,
+            }],
+            None,
+        )
+        .with_host_import_schemas(vec![exact_schema("acme::mark")])
+        .expect("mark schema should align");
+        let imports = program.imports.clone();
+
+        let mut vm = Vm::new(program);
+        let error = bind_file_runner_imports(&mut vm, &imports, failing_register)
+            .expect_err("callback failure must abort binding");
+        assert!(
+            error.to_string().contains("callback refused"),
+            "unexpected callback failure: {error}"
+        );
+        assert_eq!(
+            MARK_CALLS.load(Ordering::SeqCst),
+            0,
+            "guest must not execute after a callback failure"
+        );
+    }
+
+    #[test]
+    fn file_runner_standalone_aot_load_binds_through_register() {
+        if !native_aot_supported() {
+            return;
+        }
+
+        let mut builder_vm = Vm::new(compile_exact_fixture());
+        builder_vm
+            .compile_aot()
+            .expect("aot compile should succeed");
+        let artifact = builder_vm
+            .encode_aot_artifact()
+            .expect("aot artifact should encode");
+        let artifact_path = temp_cli_path("standalone-aot", "pat");
+        std::fs::write(&artifact_path, artifact).expect("aot artifact should write");
+
+        run_main_with_args(
+            &file_runner_runtime(),
+            &[s("--aot-load"), artifact_path.display().to_string()],
+            CliHostBinding::FileRunner(register_for_aot),
+        )
+        .expect("standalone aot load should bind and run through the callback");
+
+        assert_eq!(
+            AOT_CALLBACKS.load(Ordering::SeqCst),
+            1,
+            "standalone aot load must call the host callback exactly once"
+        );
+        std::fs::remove_file(&artifact_path).expect("aot artifact cleanup");
+    }
+
+    #[test]
+    fn file_runner_record_mode_binds_through_register() {
+        let source_path = temp_cli_path("record-source", "rss");
+        let record_path = temp_cli_path("record-output", "pdr");
+        std::fs::write(
+            &source_path,
+            "use acme;\nlet value = acme::triple(14);\nacme::sink(value);\n",
+        )
+        .expect("record fixture should write");
+
+        run_main_with_args(
+            &file_runner_runtime(),
+            &[
+                s("--record"),
+                record_path.display().to_string(),
+                source_path.display().to_string(),
+            ],
+            CliHostBinding::FileRunner(register_for_record),
+        )
+        .expect("record mode should bind and run through the callback");
+
+        assert_eq!(
+            RECORD_CALLBACKS.load(Ordering::SeqCst),
+            1,
+            "record mode must call the host callback exactly once"
+        );
+        assert!(
+            std::fs::metadata(&record_path)
+                .expect("recording should exist")
+                .len()
+                > 0,
+            "recording output should not be empty"
+        );
+        std::fs::remove_file(&source_path).expect("record fixture cleanup");
+        std::fs::remove_file(&record_path).expect("recording cleanup");
     }
 
     #[test]
@@ -2139,7 +2786,7 @@ mod tests {
             aot_load_path: Some(artifact_path.display().to_string()),
             ..CliConfig::default()
         };
-        let mut loaded_vm = try_new_cli_vm_from_standalone_aot(&load_cfg)
+        let mut loaded_vm = try_new_cli_vm_from_standalone_aot(&load_cfg, CliHostBinding::Legacy)
             .expect("standalone load should succeed")
             .expect("standalone load should create a vm");
 
