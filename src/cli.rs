@@ -208,6 +208,10 @@ fn run_main_with_args(
         return Ok(());
     }
 
+    if host_binding.is_file_runner() && cli.source.is_none() {
+        return Err(io::Error::other("file runner mode requires an explicit source path").into());
+    }
+
     let source_path = resolve_source_path(cli.source.as_deref(), runtime.default_source)?;
     let compiled = compile_source_file_with_options(&source_path, (runtime.compile_options)())
         .map_err(|err| io::Error::other(render_source_path_error(&source_path, &err)))?;
@@ -936,7 +940,7 @@ fn bind_file_runner_imports(
     let mut registry = HostFunctionRegistry::new();
     registry.register_static("add_one", 1, add_one_host_function);
     registry.register_static("echo", 1, echo_host_function);
-    register(&mut registry).map_err(|err| io::Error::other(render_vm_error(vm, &err)))?;
+    register(&mut registry).map_err(|err| io::Error::other(err.to_string()))?;
 
     let schemas = vm.program().host_import_schemas().to_vec();
     let plan = registry
@@ -1928,9 +1932,13 @@ mod tests {
         HostImportSchema::from_function(&catalog, function)
     }
 
+    fn exact_guest_source() -> &'static str {
+        "use acme;\nlet value = acme::triple(14);\nacme::sink(value);\n"
+    }
+
     fn compile_exact_fixture() -> Program {
         let compiled = vm::compile_source_with_flavor_and_options(
-            "use acme;\nlet value = acme::triple(14);\nacme::sink(value);\n",
+            exact_guest_source(),
             SourceFlavor::RustScript,
             schema_options(),
         )
@@ -2100,8 +2108,7 @@ mod tests {
     fn file_runner_emit_vmbc_skips_host_callback() {
         let source_path = temp_cli_path("emit-source", "rss");
         let output_path = temp_cli_path("emit-output", "vmbc");
-        std::fs::write(&source_path, "let value = 1 + 1;\nvalue;\n")
-            .expect("emit fixture should write");
+        std::fs::write(&source_path, exact_guest_source()).expect("emit fixture should write");
         let before = EMIT_CALLBACKS.load(Ordering::SeqCst);
 
         run_main_with_args(
@@ -2120,15 +2127,236 @@ mod tests {
             before,
             "source emit must not call the host callback"
         );
-        assert!(
-            std::fs::metadata(&output_path)
-                .expect("emit output should exist")
-                .len()
-                > 0,
-            "emit output should not be empty"
+        let encoded = std::fs::read(&output_path).expect("emit output should read");
+        assert!(!encoded.is_empty(), "emit output should not be empty");
+        let decoded = vm::decode_program(&encoded).expect("emitted vmbc should decode");
+        let expected = [exact_schema("acme::triple"), exact_schema("acme::sink")];
+        assert_eq!(
+            decoded
+                .imports
+                .iter()
+                .map(|import| import.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["acme::triple", "acme::sink"],
+            "emitted vmbc must keep the exact catalog imports"
         );
+        let schemas = decoded.host_import_schemas();
+        assert_eq!(schemas.len(), expected.len());
+        for (decoded_schema, expected_schema) in schemas.iter().zip(expected.iter()) {
+            let decoded_schema = decoded_schema
+                .as_ref()
+                .expect("emitted import must keep its full schema");
+            assert_eq!(decoded_schema, expected_schema);
+            assert_eq!(
+                decoded_schema.fingerprint, expected_schema.fingerprint,
+                "emitted import {} must keep the catalog fingerprint",
+                expected_schema.name
+            );
+        }
         std::fs::remove_file(&source_path).expect("emit fixture cleanup");
         std::fs::remove_file(&output_path).expect("emit output cleanup");
+    }
+
+    fn leaked_path(path: &std::path::Path) -> &'static str {
+        Box::leak(path.display().to_string().into_boxed_str())
+    }
+
+    fn runtime_with_default_source(default_source: &'static str) -> super::CliRuntime {
+        super::CliRuntime {
+            binary_name: "pd-vm-file-runner-test",
+            default_source,
+            compile_options: schema_options,
+        }
+    }
+
+    #[test]
+    fn file_runner_rejects_source_execution_without_explicit_source() {
+        let source_path = temp_cli_path("default-guest", "rss");
+        std::fs::write(&source_path, exact_guest_source()).expect("default guest should write");
+        let runtime = runtime_with_default_source(leaked_path(&source_path));
+
+        let legacy_record = temp_cli_path("legacy-default-record", "pdr");
+        let legacy = run_main_with_args(
+            &runtime,
+            &[s("--record"), legacy_record.display().to_string()],
+            CliHostBinding::Legacy,
+        );
+        let legacy_error =
+            legacy.expect_err("legacy registry cannot bind the exact catalog import");
+        assert!(
+            legacy_error
+                .to_string()
+                .contains("unbound host import 'acme::triple'"),
+            "legacy --record without a source must still fall back to default_source: {legacy_error}"
+        );
+        assert!(
+            !legacy_record.exists(),
+            "legacy bind failure must not write a recording"
+        );
+
+        let record_path = temp_cli_path("rejected-record", "pdr");
+        let emit_path = temp_cli_path("rejected-emit", "vmbc");
+        let aot_save_path = temp_cli_path("rejected-aot", "pat");
+        let modes = [
+            (
+                "--record",
+                vec![s("--record"), record_path.display().to_string()],
+                Some(record_path.clone()),
+            ),
+            (
+                "--emit-vmbc",
+                vec![s("--emit-vmbc"), emit_path.display().to_string()],
+                Some(emit_path.clone()),
+            ),
+            (
+                "--aot-save",
+                vec![s("--aot-save"), aot_save_path.display().to_string()],
+                Some(aot_save_path.clone()),
+            ),
+            ("--fuel", vec![s("--fuel"), s("8")], None),
+            (
+                "--max-call-depth",
+                vec![s("--max-call-depth"), s("4")],
+                None,
+            ),
+        ];
+
+        SINK_VALUE.store(i64::MIN, Ordering::SeqCst);
+        let callbacks_before = RECORD_CALLBACKS.load(Ordering::SeqCst);
+        for (mode, args, artifact) in modes {
+            let result = run_main_with_args(
+                &runtime,
+                &args,
+                CliHostBinding::FileRunner(register_for_record),
+            );
+            let callbacks = RECORD_CALLBACKS.load(Ordering::SeqCst);
+            let sink = SINK_VALUE.load(Ordering::SeqCst);
+            let artifact_exists = artifact.as_ref().is_some_and(|path| path.exists());
+            assert!(
+                result.is_err()
+                    && callbacks == callbacks_before
+                    && sink == i64::MIN
+                    && !artifact_exists,
+                "file runner {mode} without an explicit source must reject before default guest execution; result={result:?} callbacks={callbacks} sink={sink} artifact={artifact_exists}"
+            );
+            let error = result.expect_err("rejection already checked");
+            assert!(
+                error.to_string().contains("explicit source path"),
+                "unexpected {mode} rejection: {error}"
+            );
+        }
+
+        run_main_with_args(
+            &runtime,
+            &[s("--help")],
+            CliHostBinding::FileRunner(register_for_record),
+        )
+        .expect("file runner help must not require a source path");
+        run_main_with_args(
+            &runtime,
+            &[s("--version")],
+            CliHostBinding::FileRunner(register_for_record),
+        )
+        .expect("file runner version must not require a source path");
+
+        let disasm_program = Program::new(vec![], vec![OpCode::Ret as u8]);
+        let disasm_path = temp_cli_path("disasm-input", "vmbc");
+        std::fs::write(
+            &disasm_path,
+            vm::encode_program(&disasm_program).expect("disasm fixture should encode"),
+        )
+        .expect("disasm fixture should write");
+        run_main_with_args(
+            &runtime,
+            &[s("--disasm-vmbc"), disasm_path.display().to_string()],
+            CliHostBinding::FileRunner(register_for_record),
+        )
+        .expect("file runner disassembly must not require a source path");
+
+        let view_path = temp_cli_path("view-input", "pdr");
+        vm::VmRecording {
+            program: disasm_program,
+            frames: Vec::new(),
+            terminal_status: Some(VmStatus::Halted),
+        }
+        .save_to_file(&view_path)
+        .expect("view-record fixture should write");
+        run_main_with_args(
+            &runtime,
+            &[s("--view-record"), view_path.display().to_string()],
+            CliHostBinding::FileRunner(register_for_record),
+        )
+        .expect("file runner view-record must not require a source path");
+
+        assert_eq!(RECORD_CALLBACKS.load(Ordering::SeqCst), callbacks_before);
+        assert_eq!(SINK_VALUE.load(Ordering::SeqCst), i64::MIN);
+        std::fs::remove_file(&source_path).expect("default guest cleanup");
+        std::fs::remove_file(&disasm_path).expect("disasm fixture cleanup");
+        std::fs::remove_file(&view_path).expect("view-record fixture cleanup");
+    }
+
+    static DISPATCH_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    fn register_dispatch_fail(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+        DISPATCH_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        register_flow_exact(registry)?;
+        Err(VmError::HostError("callback refused".to_string()))
+    }
+
+    fn register_dispatch_ok(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
+        DISPATCH_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        register_flow_exact(registry)
+    }
+
+    #[test]
+    fn file_runner_dispatcher_register_failure_propagates_unchanged() {
+        let source_path = temp_cli_path("dispatch-guest", "rss");
+        std::fs::write(&source_path, exact_guest_source()).expect("dispatch guest should write");
+        let source_arg = source_path.display().to_string();
+        let runtime = file_runner_runtime();
+        SINK_VALUE.store(i64::MIN, Ordering::SeqCst);
+        DISPATCH_CALLBACKS.store(0, Ordering::SeqCst);
+
+        let error = run_main_with_args(
+            &runtime,
+            &[s(&source_arg)],
+            CliHostBinding::FileRunner(register_dispatch_fail),
+        )
+        .expect_err("callback failure must propagate through the file runner");
+        let expected = VmError::HostError("callback refused".to_string()).to_string();
+        assert_eq!(
+            error.to_string(),
+            expected,
+            "callback error must propagate unchanged"
+        );
+        assert_eq!(
+            DISPATCH_CALLBACKS.load(Ordering::SeqCst),
+            1,
+            "the file runner must call the register callback exactly once"
+        );
+        assert_eq!(
+            SINK_VALUE.load(Ordering::SeqCst),
+            i64::MIN,
+            "a callback failure must not execute the guest side effect"
+        );
+
+        run_main_with_args(
+            &runtime,
+            &[s(&source_arg)],
+            CliHostBinding::FileRunner(register_dispatch_ok),
+        )
+        .expect("the same guest source must run when register succeeds");
+        assert_eq!(
+            DISPATCH_CALLBACKS.load(Ordering::SeqCst),
+            2,
+            "the success control must call register exactly once more"
+        );
+        assert_eq!(
+            SINK_VALUE.load(Ordering::SeqCst),
+            42,
+            "the success control must observe the guest side effect"
+        );
+        std::fs::remove_file(&source_path).expect("dispatch guest cleanup");
     }
 
     #[test]
@@ -2311,12 +2539,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn file_runner_standalone_aot_load_binds_through_register() {
-        if !native_aot_supported() {
-            return;
-        }
-
+    #[cfg(all(
+        feature = "cranelift-jit",
+        any(
+            all(
+                target_arch = "x86_64",
+                any(target_os = "windows", all(unix, not(target_os = "macos")))
+            ),
+            all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+        )
+    ))]
+    fn file_runner_standalone_aot_positive_coverage() {
         let mut builder_vm = Vm::new(compile_exact_fixture());
         builder_vm
             .compile_aot()
@@ -2340,6 +2573,38 @@ mod tests {
             "standalone aot load must call the host callback exactly once"
         );
         std::fs::remove_file(&artifact_path).expect("aot artifact cleanup");
+    }
+
+    #[test]
+    fn file_runner_standalone_aot_load_binds_through_register() {
+        #[cfg(not(all(
+            feature = "cranelift-jit",
+            any(
+                all(
+                    target_arch = "x86_64",
+                    any(target_os = "windows", all(unix, not(target_os = "macos")))
+                ),
+                all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+            )
+        )))]
+        {
+            eprintln!(
+                "skip: native AOT positive coverage requires feature cranelift-jit and a supported platform (x86_64 windows or non-macOS unix, or aarch64 linux/macos)"
+            );
+            return;
+        }
+
+        #[cfg(all(
+            feature = "cranelift-jit",
+            any(
+                all(
+                    target_arch = "x86_64",
+                    any(target_os = "windows", all(unix, not(target_os = "macos")))
+                ),
+                all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos"))
+            )
+        ))]
+        file_runner_standalone_aot_positive_coverage();
     }
 
     #[test]
