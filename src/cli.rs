@@ -1775,6 +1775,7 @@ fn hex_nibble(value: u8) -> char {
 #[cfg(test)]
 mod tests {
     use crate as vm;
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock};
@@ -1950,14 +1951,49 @@ mod tests {
         Ok(CallOutcome::Return(CallReturn::one(Value::Int(42))))
     }
 
-    static SINK_VALUE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+    // Register callbacks and host adapters run on the calling test thread.
+    // bind_file_runner_imports calls register directly. The interpreter and
+    // the non-yielding AOT bridge both invoke the adapter inline on the VM
+    // thread. Compilation may hop to a helper thread, but it does not write
+    // these observers, so a thread-local cell isolates parallel libtest
+    // workers without a process-global lock.
+    thread_local! {
+        static SINK_VALUE: Cell<i64> = const { Cell::new(i64::MIN) };
+        static RECORD_CALLBACKS: Cell<usize> = const { Cell::new(0) };
+        static DISPATCH_CALLBACKS: Cell<usize> = const { Cell::new(0) };
+        static MARK_CALLS: Cell<usize> = const { Cell::new(0) };
+        static EMIT_CALLBACKS: Cell<usize> = const { Cell::new(0) };
+        static AOT_CALLBACKS: Cell<usize> = const { Cell::new(0) };
+        static HTTP_CALLBACKS: Cell<usize> = const { Cell::new(0) };
+        static EMPTY_CALLBACKS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn observed_sink() -> i64 {
+        SINK_VALUE.with(|cell| cell.get())
+    }
+
+    fn set_observed_sink(value: i64) {
+        SINK_VALUE.with(|cell| cell.set(value));
+    }
+
+    fn observed_count(counter: &'static std::thread::LocalKey<Cell<usize>>) -> usize {
+        counter.with(|cell| cell.get())
+    }
+
+    fn set_observed_count(counter: &'static std::thread::LocalKey<Cell<usize>>, value: usize) {
+        counter.with(|cell| cell.set(value));
+    }
+
+    fn add_observed_count(counter: &'static std::thread::LocalKey<Cell<usize>>) {
+        counter.with(|cell| cell.set(cell.get().wrapping_add(1)));
+    }
 
     fn sink_adapter(_vm: &mut Vm, args: &[Value]) -> Result<CallOutcome, VmError> {
         let value = match args.first() {
             Some(Value::Int(value)) => *value,
             _ => return Err(VmError::TypeMismatch("int")),
         };
-        SINK_VALUE.store(value, Ordering::SeqCst);
+        set_observed_sink(value);
         Ok(CallOutcome::Return(CallReturn::one(Value::Null)))
     }
 
@@ -2003,45 +2039,33 @@ mod tests {
         Ok(())
     }
 
-    static EMIT_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
-
     fn register_for_emit(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
-        EMIT_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        add_observed_count(&EMIT_CALLBACKS);
         register_triple(registry)
     }
 
-    static AOT_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
-
     fn register_for_aot(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
-        AOT_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        add_observed_count(&AOT_CALLBACKS);
         register_flow_exact(registry)
     }
-
-    static RECORD_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
 
     fn register_for_record(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
-        RECORD_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        add_observed_count(&RECORD_CALLBACKS);
         register_flow_exact(registry)
     }
 
-    static HTTP_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
-
     fn register_for_http(_registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
-        HTTP_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        add_observed_count(&HTTP_CALLBACKS);
         Ok(())
     }
-
-    static EMPTY_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
 
     fn register_for_empty(_registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
-        EMPTY_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        add_observed_count(&EMPTY_CALLBACKS);
         Ok(())
     }
 
-    static MARK_CALLS: AtomicUsize = AtomicUsize::new(0);
-
     fn mark_adapter(_vm: &mut Vm, _args: &[Value]) -> Result<CallOutcome, VmError> {
-        MARK_CALLS.fetch_add(1, Ordering::SeqCst);
+        add_observed_count(&MARK_CALLS);
         Ok(CallOutcome::Return(CallReturn::one(Value::Null)))
     }
 
@@ -2062,6 +2086,92 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::SeqCst)
         ))
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct FileRunnerObserverSnapshot {
+        sink: i64,
+        record_callbacks: usize,
+        dispatch_callbacks: usize,
+        mark_calls: usize,
+        emit_callbacks: usize,
+        aot_callbacks: usize,
+        http_callbacks: usize,
+        empty_callbacks: usize,
+    }
+
+    fn publish_file_runner_observers(snapshot: FileRunnerObserverSnapshot) {
+        set_observed_sink(snapshot.sink);
+        set_observed_count(&RECORD_CALLBACKS, snapshot.record_callbacks);
+        set_observed_count(&DISPATCH_CALLBACKS, snapshot.dispatch_callbacks);
+        set_observed_count(&MARK_CALLS, snapshot.mark_calls);
+        set_observed_count(&EMIT_CALLBACKS, snapshot.emit_callbacks);
+        set_observed_count(&AOT_CALLBACKS, snapshot.aot_callbacks);
+        set_observed_count(&HTTP_CALLBACKS, snapshot.http_callbacks);
+        set_observed_count(&EMPTY_CALLBACKS, snapshot.empty_callbacks);
+    }
+
+    fn current_file_runner_observers() -> FileRunnerObserverSnapshot {
+        FileRunnerObserverSnapshot {
+            sink: observed_sink(),
+            record_callbacks: observed_count(&RECORD_CALLBACKS),
+            dispatch_callbacks: observed_count(&DISPATCH_CALLBACKS),
+            mark_calls: observed_count(&MARK_CALLS),
+            emit_callbacks: observed_count(&EMIT_CALLBACKS),
+            aot_callbacks: observed_count(&AOT_CALLBACKS),
+            http_callbacks: observed_count(&HTTP_CALLBACKS),
+            empty_callbacks: observed_count(&EMPTY_CALLBACKS),
+        }
+    }
+
+    #[test]
+    fn file_runner_test_observers_are_isolated_across_parallel_threads() {
+        // Two test threads publish different callback and sink observations,
+        // wait until both writes have happened, then read them back. Each
+        // thread must still see only the observation it published.
+        let barrier = std::sync::Barrier::new(2);
+        let snapshots = [
+            FileRunnerObserverSnapshot {
+                sink: 11,
+                record_callbacks: 3,
+                dispatch_callbacks: 5,
+                mark_calls: 7,
+                emit_callbacks: 9,
+                aot_callbacks: 11,
+                http_callbacks: 13,
+                empty_callbacks: 15,
+            },
+            FileRunnerObserverSnapshot {
+                sink: 22,
+                record_callbacks: 4,
+                dispatch_callbacks: 6,
+                mark_calls: 8,
+                emit_callbacks: 10,
+                aot_callbacks: 12,
+                http_callbacks: 14,
+                empty_callbacks: 16,
+            },
+        ];
+        let observed = std::thread::scope(|scope| {
+            let mut joins = Vec::new();
+            for snapshot in snapshots {
+                let barrier = &barrier;
+                joins.push(scope.spawn(move || {
+                    publish_file_runner_observers(snapshot);
+                    barrier.wait();
+                    current_file_runner_observers()
+                }));
+            }
+            joins
+                .into_iter()
+                .map(|join| join.join().expect("observer thread should finish"))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            observed.as_slice(),
+            snapshots.as_slice(),
+            "callback and sink observers must stay isolated across parallel test threads"
+        );
     }
 
     #[test]
@@ -2109,7 +2219,7 @@ mod tests {
         let source_path = temp_cli_path("emit-source", "rss");
         let output_path = temp_cli_path("emit-output", "vmbc");
         std::fs::write(&source_path, exact_guest_source()).expect("emit fixture should write");
-        let before = EMIT_CALLBACKS.load(Ordering::SeqCst);
+        let before = observed_count(&EMIT_CALLBACKS);
 
         run_main_with_args(
             &file_runner_runtime(),
@@ -2123,7 +2233,7 @@ mod tests {
         .expect("source emit should compile without host binding");
 
         assert_eq!(
-            EMIT_CALLBACKS.load(Ordering::SeqCst),
+            observed_count(&EMIT_CALLBACKS),
             before,
             "source emit must not call the host callback"
         );
@@ -2221,16 +2331,16 @@ mod tests {
             ),
         ];
 
-        SINK_VALUE.store(i64::MIN, Ordering::SeqCst);
-        let callbacks_before = RECORD_CALLBACKS.load(Ordering::SeqCst);
+        set_observed_sink(i64::MIN);
+        let callbacks_before = observed_count(&RECORD_CALLBACKS);
         for (mode, args, artifact) in modes {
             let result = run_main_with_args(
                 &runtime,
                 &args,
                 CliHostBinding::FileRunner(register_for_record),
             );
-            let callbacks = RECORD_CALLBACKS.load(Ordering::SeqCst);
-            let sink = SINK_VALUE.load(Ordering::SeqCst);
+            let callbacks = observed_count(&RECORD_CALLBACKS);
+            let sink = observed_sink();
             let artifact_exists = artifact.as_ref().is_some_and(|path| path.exists());
             assert!(
                 result.is_err()
@@ -2288,23 +2398,21 @@ mod tests {
         )
         .expect("file runner view-record must not require a source path");
 
-        assert_eq!(RECORD_CALLBACKS.load(Ordering::SeqCst), callbacks_before);
-        assert_eq!(SINK_VALUE.load(Ordering::SeqCst), i64::MIN);
+        assert_eq!(observed_count(&RECORD_CALLBACKS), callbacks_before);
+        assert_eq!(observed_sink(), i64::MIN);
         std::fs::remove_file(&source_path).expect("default guest cleanup");
         std::fs::remove_file(&disasm_path).expect("disasm fixture cleanup");
         std::fs::remove_file(&view_path).expect("view-record fixture cleanup");
     }
 
-    static DISPATCH_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
-
     fn register_dispatch_fail(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
-        DISPATCH_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        add_observed_count(&DISPATCH_CALLBACKS);
         register_flow_exact(registry)?;
         Err(VmError::HostError("callback refused".to_string()))
     }
 
     fn register_dispatch_ok(registry: &mut HostFunctionRegistry) -> vm::VmResult<()> {
-        DISPATCH_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        add_observed_count(&DISPATCH_CALLBACKS);
         register_flow_exact(registry)
     }
 
@@ -2314,8 +2422,8 @@ mod tests {
         std::fs::write(&source_path, exact_guest_source()).expect("dispatch guest should write");
         let source_arg = source_path.display().to_string();
         let runtime = file_runner_runtime();
-        SINK_VALUE.store(i64::MIN, Ordering::SeqCst);
-        DISPATCH_CALLBACKS.store(0, Ordering::SeqCst);
+        set_observed_sink(i64::MIN);
+        set_observed_count(&DISPATCH_CALLBACKS, 0);
 
         let error = run_main_with_args(
             &runtime,
@@ -2330,12 +2438,12 @@ mod tests {
             "callback error must propagate unchanged"
         );
         assert_eq!(
-            DISPATCH_CALLBACKS.load(Ordering::SeqCst),
+            observed_count(&DISPATCH_CALLBACKS),
             1,
             "the file runner must call the register callback exactly once"
         );
         assert_eq!(
-            SINK_VALUE.load(Ordering::SeqCst),
+            observed_sink(),
             i64::MIN,
             "a callback failure must not execute the guest side effect"
         );
@@ -2347,12 +2455,12 @@ mod tests {
         )
         .expect("the same guest source must run when register succeeds");
         assert_eq!(
-            DISPATCH_CALLBACKS.load(Ordering::SeqCst),
+            observed_count(&DISPATCH_CALLBACKS),
             2,
             "the success control must call register exactly once more"
         );
         assert_eq!(
-            SINK_VALUE.load(Ordering::SeqCst),
+            observed_sink(),
             42,
             "the success control must observe the guest side effect"
         );
@@ -2380,7 +2488,7 @@ mod tests {
         );
 
         let mut vm = Vm::new(program);
-        SINK_VALUE.store(i64::MIN, Ordering::SeqCst);
+        set_observed_sink(i64::MIN);
         bind_file_runner_imports(&mut vm, &imports, register_flow_exact)
             .expect("file runner binder should bind the exact registry entries");
         assert_eq!(
@@ -2388,7 +2496,7 @@ mod tests {
             VmStatus::Halted
         );
         assert_eq!(
-            SINK_VALUE.load(Ordering::SeqCst),
+            observed_sink(),
             42,
             "the guest should observe the adapter return value"
         );
@@ -2468,7 +2576,7 @@ mod tests {
         bind_file_runner_imports(&mut vm, &[], register_for_empty)
             .expect("empty imports should early-return");
         assert_eq!(
-            EMPTY_CALLBACKS.load(Ordering::SeqCst),
+            observed_count(&EMPTY_CALLBACKS),
             0,
             "empty imports must not call the host callback"
         );
@@ -2500,7 +2608,7 @@ mod tests {
             "unexpected http rejection: {error}"
         );
         assert_eq!(
-            HTTP_CALLBACKS.load(Ordering::SeqCst),
+            observed_count(&HTTP_CALLBACKS),
             0,
             "http rejection must happen before the host callback"
         );
@@ -2533,7 +2641,7 @@ mod tests {
             "unexpected callback failure: {error}"
         );
         assert_eq!(
-            MARK_CALLS.load(Ordering::SeqCst),
+            observed_count(&MARK_CALLS),
             0,
             "guest must not execute after a callback failure"
         );
@@ -2568,7 +2676,7 @@ mod tests {
         .expect("standalone aot load should bind and run through the callback");
 
         assert_eq!(
-            AOT_CALLBACKS.load(Ordering::SeqCst),
+            observed_count(&AOT_CALLBACKS),
             1,
             "standalone aot load must call the host callback exactly once"
         );
@@ -2629,7 +2737,7 @@ mod tests {
         .expect("record mode should bind and run through the callback");
 
         assert_eq!(
-            RECORD_CALLBACKS.load(Ordering::SeqCst),
+            observed_count(&RECORD_CALLBACKS),
             1,
             "record mode must call the host callback exactly once"
         );
